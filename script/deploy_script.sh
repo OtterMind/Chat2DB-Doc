@@ -18,7 +18,7 @@ echo "压缩 .next 目录和 public  文件夹..."
 tar -czf deploy.tar.gz .next public 
 
 echo "传输文件到国内服务器..."
-scp deploy.tar.gz package.json package-lock.json root@123.249.32.97:/root/Chat2DB-Doc
+scp deploy.tar.gz package.json pnpm-lock.yaml root@39.99.250.107:/root/Chat2DB-Doc
 
 echo "在国内服务器上解压文件, 并重启服务"
-ssh root@123.249.32.97 "cd /root/Chat2DB-Doc && rm -rf .next && tar -xzvf deploy.tar.gz --warning=no-unknown-keyword && pm2 restart Chat2DB-Doc"
+ssh root@39.99.250.107 "cd /root/Chat2DB-Doc && rm -rf .next && tar -xzvf deploy.tar.gz --warning=no-unknown-keyword && pm2 restart Chat2DB-Doc"
