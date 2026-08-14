@@ -2,6 +2,28 @@ import { useRouter } from "next/router";
 import { DiscordIcon, GitHubIcon } from "nextra/icons";
 import { useConfig } from 'nextra-theme-docs'
 
+const DEFAULT_DESCRIPTION =
+  "An intelligent and versatile general-purpose SQL client and reporting tool for databases which integrates AI capabilities.";
+
+// meta description 控制在 160 字符内(搜索结果会截断更长的描述),
+// 没写 description 的页面用标题兜底,避免出现无描述/全站同一描述的页面。
+const seoDescription = (frontMatter, pageTitle) => {
+  const raw = (frontMatter.description || "").trim();
+  const title = frontMatter.title || pageTitle;
+  const base =
+    raw ||
+    (title
+      ? `${title} – Chat2DB documentation. Learn how to use Chat2DB, the AI-powered SQL client and database management tool.`
+      : DEFAULT_DESCRIPTION);
+  if (base.length <= 160) return base;
+  const cut = base.slice(0, 157);
+  return `${cut.slice(0, Math.max(cut.lastIndexOf(" "), 120))}...`;
+};
+
+// canonical 不能带 query/hash,否则同一页面会派生出多个 URL
+const canonicalUrl = (basePath, asPath) =>
+  `https://chat2db.ai${basePath}${asPath.split(/[?#]/)[0]}`;
+
 export default {
   logo: (
     <div style={{ display: "flex", alignItems: "center" }}>
@@ -23,16 +45,17 @@ export default {
 
   useNextSeoProps() {
     const { asPath, basePath } = useRouter();
-    const { frontMatter } = useConfig()
+    const { frontMatter, title: pageTitle } = useConfig()
     const { title, description, image, category, date, author = "Chat2DB Team" } = frontMatter;
+    const finalDescription = seoDescription(frontMatter, pageTitle);
     return {
       titleTemplate: "%s – Chat2DB",
-      description: description,
+      description: finalDescription,
       openGraph: {
         title: title || "Chat2DB",
-        description: description || "An intelligent and versatile general-purpose SQL client and reporting tool for databases which integrates AI capabilities.",
+        description: finalDescription,
         type: "article",
-        url: `https://chat2db.ai${basePath}${asPath}`,
+        url: canonicalUrl(basePath, asPath),
         images: [
           {
             url: image || "https://cdn.chat2db-ai.com/img/logo.svg",
@@ -55,8 +78,8 @@ export default {
   },
   head: () => {
     const { asPath, basePath } = useRouter();
-    const { frontMatter } = useConfig()
-    const des = frontMatter.description || "An intelligent and versatile general-purpose SQL client and reporting tool for databases which integrates AI capabilities.";
+    const { frontMatter, title: pageTitle } = useConfig()
+    const des = seoDescription(frontMatter, pageTitle);
 
     return (
       <>
@@ -66,12 +89,12 @@ export default {
         <meta property="article:published_time" content={frontMatter.date} />
         <meta property="article:author" content={frontMatter.author} />
         <meta property="article:tag" content={frontMatter.category} />
-        <link rel="canonical" href={`https://chat2db.ai${basePath}${asPath}`} />
+        <link rel="canonical" href={canonicalUrl(basePath, asPath)} />
         <script type="application/ld+json">
           {JSON.stringify({
             "@context": "https://schema.org",
             "@type": "Article",
-            url: `https://chat2db.ai${basePath}${asPath}`,
+            url: canonicalUrl(basePath, asPath),
             name: frontMatter.title || "Chat2DB",
             headline: frontMatter.title,
             description: des,
@@ -188,7 +211,7 @@ export default {
                   Download
                 </a>
                 <a
-                  href="https://chat2db.ai/quick-start"
+                  href="https://chat2db.ai/resources/docs/start-guide/getting-started"
                   target="_blank"
                   rel="noopener noreferrer"
                 >
