@@ -1,0 +1,252 @@
+---
+title: "User-Defined Functions in SQL: CREATE FUNCTION Guide"
+description: "Learn user defined functions in SQL: CREATE FUNCTION syntax for MySQL, PostgreSQL, and SQL Server, scalar vs table-valued UDFs, and performance caveats."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: August 14, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# User-Defined Functions in SQL: CREATE FUNCTION Guide
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="August 14, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+User-defined functions (UDFs) let you package a calculation or a reusable query fragment behind a name, then call it from any `SELECT`, `WHERE`, or `JOIN` like a built-in function. Used well, they remove duplicated expressions from dozens of queries; used carelessly, they are one of the most common causes of mysteriously slow queries, because the optimizer often cannot see inside them.
+
+This guide covers what user defined functions in SQL are, the `CREATE FUNCTION` syntax in MySQL, PostgreSQL, and SQL Server, practical examples you can run, the performance traps unique to each engine, and when a view or computed column is the better tool.
+
+## What Is a User-Defined Function?
+
+A UDF is a named routine stored in the database that accepts parameters and returns either:
+
+- **A scalar value** — one value per call (a formatted string, a computed tax amount). Callable anywhere an expression is allowed.
+- **A table** — a result set you can `SELECT` from or join against. These are *table-valued functions* (TVFs), supported natively by PostgreSQL and SQL Server; MySQL does not support SQL-defined table functions (only scalar stored functions, plus C/C++ loadable functions at the server level).
+
+Unlike stored procedures, functions are (by design) side-effect-light and composable inside queries: you call them in expressions, not with `CALL`/`EXEC`.
+
+### Sample Data
+
+The examples share this schema. Adjust types per engine as noted; a cross-database client such as [Chat2DB](https://chat2db.ai/download) is convenient here because you can run the same script against MySQL, PostgreSQL, and SQL Server connections side by side.
+
+```sql
+CREATE TABLE orders (
+  id INT PRIMARY KEY,
+  customer VARCHAR(50) NOT NULL,
+  country CHAR(2) NOT NULL,
+  amount DECIMAL(10,2) NOT NULL,
+  order_date DATE NOT NULL
+);
+
+INSERT INTO orders (id, customer, country, amount, order_date) VALUES
+(1, 'Acme GmbH',  'DE',  100.00, '2026-07-01'),
+(2, 'Acme GmbH',  'DE',  250.00, '2026-07-15'),
+(3, 'Bolt Ltd',   'GB',   80.00, '2026-07-20'),
+(4, 'Cato Inc',   'US',  500.00, '2026-08-02'),
+(5, 'Cato Inc',   'US',   40.00, '2026-08-10');
+```
+
+## MySQL: CREATE FUNCTION
+
+MySQL stored functions are always scalar. The minimal syntax:
+
+```sql
+DELIMITER $$
+
+CREATE FUNCTION vat_amount(net DECIMAL(10,2), country CHAR(2))
+RETURNS DECIMAL(10,2)
+DETERMINISTIC
+BEGIN
+  DECLARE rate DECIMAL(4,3);
+  SET rate = CASE country
+    WHEN 'DE' THEN 0.190
+    WHEN 'GB' THEN 0.200
+    WHEN 'US' THEN 0.000
+    ELSE 0.150
+  END;
+  RETURN ROUND(net * rate, 2);
+END$$
+
+DELIMITER ;
+```
+
+Usage and expected output:
+
+```sql
+SELECT id, country, amount, vat_amount(amount, country) AS vat
+FROM orders;
+```
+
+```text
+id | country | amount | vat
+1  | DE      | 100.00 | 19.00
+2  | DE      | 250.00 | 47.50
+3  | GB      |  80.00 | 16.00
+4  | US      | 500.00 |  0.00
+5  | US      |  40.00 |  0.00
+```
+
+The characteristic keywords matter more than they look:
+
+- `DETERMINISTIC` declares that the same inputs always produce the same output. MySQL does not verify this — you are making a promise. It affects binary logging: with `log_bin` enabled and `log_bin_trust_function_creators = 0`, MySQL refuses to create a function unless it is declared `DETERMINISTIC`, `NO SQL`, or `READS SQL DATA`, because non-deterministic functions can break statement-based replication.
+- `READS SQL DATA` / `NO SQL` / `MODIFIES SQL DATA` describe whether the body touches tables. A function that queries a rate table would be `READS SQL DATA` and typically *not* `DETERMINISTIC` (its result changes when the table changes).
+
+A lookup-based variant:
+
+```sql
+DELIMITER $$
+CREATE FUNCTION customer_lifetime(cust VARCHAR(50))
+RETURNS DECIMAL(12,2)
+READS SQL DATA
+BEGIN
+  RETURN (SELECT COALESCE(SUM(amount), 0) FROM orders WHERE customer = cust);
+END$$
+DELIMITER ;
+```
+
+Be careful calling functions like this in large `SELECT`s: MySQL executes the body once per row, and the inner query is not merged into the outer plan.
+
+## PostgreSQL: LANGUAGE SQL and plpgsql
+
+PostgreSQL supports functions in several languages; the two everyday choices are `SQL` (a body that is just a query) and `plpgsql` (procedural logic).
+
+A scalar SQL function for display formatting:
+
+```sql
+CREATE FUNCTION format_money(v NUMERIC, cur TEXT)
+RETURNS TEXT
+LANGUAGE sql
+IMMUTABLE
+RETURN cur || ' ' || to_char(v, 'FM999,999,990.00');
+```
+
+```sql
+SELECT format_money(amount, 'EUR') FROM orders WHERE id = 2;
+-- => EUR 250.00
+```
+
+(The compact `RETURN expression` body requires PostgreSQL 14+; on older versions use `AS $$ SELECT ... $$`.)
+
+Volatility labels — `IMMUTABLE`, `STABLE`, `VOLATILE` (the default) — are PostgreSQL's version of `DETERMINISTIC`, and they directly affect optimization: `IMMUTABLE` functions can be folded to constants and used in expression indexes; `VOLATILE` functions are re-executed for every row and block many optimizations. Mislabeling a function `IMMUTABLE` when it reads tables produces wrong cached results, so label honestly.
+
+### RETURNS TABLE
+
+Table-valued functions shine as reusable, parameterized filters:
+
+```sql
+CREATE FUNCTION orders_in_range(d1 DATE, d2 DATE)
+RETURNS TABLE (id INT, customer VARCHAR, amount NUMERIC)
+LANGUAGE sql
+STABLE
+AS $$
+  SELECT id, customer, amount
+  FROM orders
+  WHERE order_date BETWEEN d1 AND d2
+$$;
+
+SELECT * FROM orders_in_range('2026-07-01', '2026-07-31');
+```
+
+```text
+id | customer  | amount
+1  | Acme GmbH | 100.00
+2  | Acme GmbH | 250.00
+3  | Bolt Ltd  |  80.00
+```
+
+A key PostgreSQL behavior: simple `LANGUAGE sql` functions can be **inlined** into the calling query, letting the planner optimize the combined query as if you had written the `SELECT` by hand — indexes on `order_date` are used normally. Inlining requires, among other things, that the function is `LANGUAGE sql`, not `VOLATILE` when used in scalar context (for TVFs the rules differ slightly), has no `SECURITY DEFINER`, and its body is a single `SELECT`. `plpgsql` functions are never inlined — they run as a black box per call. When performance matters, prefer `LANGUAGE sql` for query-shaped functions and reserve `plpgsql` for genuine procedural logic (loops, exception handling):
+
+```sql
+CREATE FUNCTION safe_div(a NUMERIC, b NUMERIC)
+RETURNS NUMERIC
+LANGUAGE plpgsql
+IMMUTABLE
+AS $$
+BEGIN
+  IF b = 0 THEN
+    RETURN NULL;
+  END IF;
+  RETURN a / b;
+END;
+$$;
+```
+
+## SQL Server: Scalar and Inline Table-Valued Functions
+
+A scalar function in T-SQL:
+
+```sql
+CREATE FUNCTION dbo.VatAmount (@net DECIMAL(10,2), @country CHAR(2))
+RETURNS DECIMAL(10,2)
+AS
+BEGIN
+  RETURN ROUND(@net * CASE @country
+    WHEN 'DE' THEN 0.19
+    WHEN 'GB' THEN 0.20
+    WHEN 'US' THEN 0.00
+    ELSE 0.15 END, 2);
+END;
+```
+
+And the far more optimizer-friendly **inline table-valued function** (iTVF) — a single `RETURN (SELECT ...)` with no `BEGIN/END`:
+
+```sql
+CREATE FUNCTION dbo.OrdersInRange (@d1 DATE, @d2 DATE)
+RETURNS TABLE
+AS
+RETURN (
+  SELECT id, customer, amount
+  FROM dbo.orders
+  WHERE order_date BETWEEN @d1 AND @d2
+);
+```
+
+```sql
+SELECT o.customer, SUM(o.amount) AS total
+FROM dbo.OrdersInRange('2026-07-01', '2026-07-31') AS o
+GROUP BY o.customer;
+```
+
+An iTVF is expanded into the calling query like a parameterized view, so it costs essentially nothing over inline SQL. By contrast, *multi-statement* TVFs (`RETURNS @t TABLE (...)` with a body that fills the variable) materialize their result with poor cardinality estimates and should be a last resort.
+
+## Performance Caveats
+
+The single biggest UDF pitfall is **scalar UDFs in SQL Server**. Historically, a scalar UDF in a query forced row-by-row execution, prevented parallelism for the whole plan, and hid its cost from execution plans. A query over a million rows calling `dbo.VatAmount` per row could be orders of magnitude slower than the equivalent inline `CASE` expression. SQL Server 2019 introduced *scalar UDF inlining* (automatic translation of eligible T-SQL scalar UDFs into relational expressions), which fixes many cases — but eligibility rules are long (no `GETDATE()` in some patterns, no table variables, etc.), and inlining can be disabled per function. Check `sys.sql_modules.is_inlineable` before relying on it.
+
+Engine-by-engine summary:
+
+- **SQL Server**: prefer iTVFs and inline expressions; treat multi-statement TVFs and non-inlineable scalar UDFs as performance hazards.
+- **PostgreSQL**: prefer `LANGUAGE sql` with correct volatility so inlining applies; `plpgsql` in hot paths means one function-call overhead (and often one plan) per row.
+- **MySQL**: every stored function call interprets the body; there is no inlining at all. Avoid calling functions that contain queries (`READS SQL DATA`) inside large scans — rewrite as a `JOIN`. Also note that a WHERE clause like `WHERE vat_amount(amount, country) > 50` is not sargable in any engine: it defeats index use on the wrapped column.
+
+## When to Prefer Views or Computed Columns
+
+A UDF is not always the right abstraction:
+
+- **Views** are better for reusable *row sets without parameters*. The optimizer merges views into queries reliably in all three engines, and permissions, indexing (indexed views in SQL Server, materialized views in PostgreSQL) and tooling support are stronger. If your "function" takes no arguments, make it a view.
+- **Computed / generated columns** are better for per-row derived values you filter or sort on. MySQL generated columns (`vat DECIMAL(10,2) AS (ROUND(amount * 0.19, 2)) STORED`) and SQL Server computed columns can be indexed, making the derived value sargable — something a scalar UDF call in `WHERE` never is. PostgreSQL offers `GENERATED ALWAYS AS (...) STORED` plus expression indexes on `IMMUTABLE` functions.
+- **Keep UDFs** for genuinely parameterized logic (tax by country and date), cross-query business rules that must have one authoritative implementation, and table-valued filters that inline well.
+
+## Dropping and Altering Functions
+
+Removing a function is uniform:
+
+```sql
+DROP FUNCTION IF EXISTS vat_amount;            -- MySQL
+DROP FUNCTION IF EXISTS format_money(NUMERIC, TEXT);  -- PostgreSQL (signature needed if overloaded)
+DROP FUNCTION IF EXISTS dbo.VatAmount;         -- SQL Server
+```
+
+Changing a body differs:
+
+- **MySQL**: `ALTER FUNCTION` can only change characteristics (`COMMENT`, `SQL SECURITY`, data-access clause) — *not* the body or parameters. To change logic, `DROP` and `CREATE` again (grants on the function are lost and must be re-issued).
+- **PostgreSQL**: `CREATE OR REPLACE FUNCTION` swaps the body in place, preserving grants and dependent objects, as long as the parameter types and return type are unchanged. Since PostgreSQL supports overloading, the signature identifies the function.
+- **SQL Server**: use `CREATE OR ALTER FUNCTION` (SQL Server 2016 SP1+) to update in place while keeping permissions.
+
+Watch dependencies before dropping: PostgreSQL blocks `DROP` if an index or generated column depends on the function (`CASCADE` drops those too — usually not what you want), while MySQL and SQL Server will happily let you break callers at runtime.
+
+## Conclusion
+
+User-defined functions in SQL are a contract between readability and the optimizer. Scalar UDFs make code cleaner but can hide per-row costs; table-valued functions — PostgreSQL inlined SQL functions and SQL Server iTVFs — give you reuse *and* good plans when written as single, simple queries. Declare determinism and data access honestly (`DETERMINISTIC`/`READS SQL DATA` in MySQL, volatility labels in PostgreSQL), reach for views or generated columns when the logic is parameter-free or needs indexing, and always benchmark a UDF-based query against its inlined equivalent before shipping it on a hot path.

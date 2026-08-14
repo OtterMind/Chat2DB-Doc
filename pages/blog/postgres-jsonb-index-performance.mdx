@@ -1,0 +1,235 @@
+---
+title: "Postgres JSONB Indexing: GIN Indexes and Performance"
+description: "A practical guide to the Postgres JSONB index: GIN operator classes, expression and partial indexes, EXPLAIN ANALYZE checks, and common mistakes."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: August 14, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# Postgres JSONB Indexing: GIN Indexes and Performance
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="August 14, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+Storing documents in a `jsonb` column is easy; querying them fast is where teams stumble. A `jsonb` filter that runs instantly on ten thousand rows can grind on ten million, and the fix is almost never "more hardware" — it is choosing the right Postgres JSONB index for the operators your queries actually use. This guide covers GIN indexes and their two operator classes, expression indexes for single keys, partial indexes, how to verify index usage with `EXPLAIN ANALYZE`, and the mistakes that quietly force sequential scans.
+
+All examples run on PostgreSQL 13 or newer. Start with a reproducible dataset:
+
+```sql
+CREATE TABLE orders (
+    id       bigserial PRIMARY KEY,
+    placed_at timestamptz NOT NULL DEFAULT now(),
+    doc      jsonb NOT NULL
+);
+
+-- 200k synthetic orders so the planner has a reason to use indexes
+INSERT INTO orders (doc)
+SELECT jsonb_build_object(
+    'status',   (ARRAY['pending','paid','shipped','cancelled'])[1 + (g % 4)],
+    'customer', jsonb_build_object('id', g % 5000, 'country',
+                (ARRAY['US','DE','JP','BR','IN'])[1 + (g % 5)]),
+    'total',    round((random() * 500)::numeric, 2),
+    'items',    jsonb_build_array(jsonb_build_object('sku', 'SKU-' || (g % 300)))
+)
+FROM generate_series(1, 200000) AS g;
+
+ANALYZE orders;
+```
+
+## Creating a GIN Index on a JSONB Column
+
+The workhorse for document search is the GIN (Generalized Inverted Index) access method. Like a book's back-of-book index, it maps each extracted element — keys and values — to the rows containing it:
+
+```sql
+CREATE INDEX idx_orders_doc ON orders USING gin (doc);
+```
+
+This uses the default operator class, `jsonb_ops`, and immediately accelerates containment and existence queries:
+
+```sql
+EXPLAIN ANALYZE
+SELECT count(*) FROM orders WHERE doc @> '{"status": "shipped"}';
+```
+
+Expected plan shape (timings will vary by machine):
+
+```text
+Aggregate
+  ->  Bitmap Heap Scan on orders
+        Recheck Cond: (doc @> '{"status": "shipped"}'::jsonb)
+        ->  Bitmap Index Scan on idx_orders_doc
+              Index Cond: (doc @> '{"status": "shipped"}'::jsonb)
+```
+
+The key lines are `Bitmap Index Scan` on your index and the query's predicate appearing as `Index Cond`. If you instead see `Seq Scan` with the predicate under `Filter`, the index was not used.
+
+For production tables, build the index without blocking writes:
+
+```sql
+CREATE INDEX CONCURRENTLY idx_orders_doc ON orders USING gin (doc);
+```
+
+## jsonb_ops vs jsonb_path_ops
+
+GIN indexes on `jsonb` come in two operator classes, and the choice matters.
+
+### jsonb_ops (default)
+
+`jsonb_ops` indexes every key and every value as independent entries. That breadth is what lets it serve the key-existence operators. A query like `doc @> '{"customer": {"country": "DE"}}'` is answered by intersecting the postings for the involved keys and values, with a recheck against the heap row.
+
+### jsonb_path_ops
+
+`jsonb_path_ops` hashes each complete path-to-value chain (for example `customer → country → "DE"`) into a single entry:
+
+```sql
+CREATE INDEX idx_orders_doc_path
+    ON orders USING gin (doc jsonb_path_ops);
+```
+
+Consequences of that design:
+
+- It supports **only** containment (`@>`) and the jsonpath match operators (`@?`, `@@`). Key-existence operators (`?`, `?|`, `?&`) cannot use it, because bare keys are not indexed on their own.
+- It is typically **smaller** and **faster for nested containment**, because one hashed path entry replaces several key/value entries and there are fewer postings to intersect.
+- Queries on common top-level keys generate fewer false candidate rows, since the value is bound to its full path.
+
+A reasonable rule: if your workload is purely `@>`/`@?` filters, prefer `jsonb_path_ops`; if you also need `?` or want one general-purpose index, use the default `jsonb_ops`. Compare their footprints on your own data:
+
+```sql
+SELECT indexrelid::regclass AS index_name,
+       pg_size_pretty(pg_relation_size(indexrelid)) AS size
+FROM pg_index
+WHERE indrelid = 'orders'::regclass;
+```
+
+## Which Operators Use the Index
+
+Only a specific set of operators is indexable by GIN on `jsonb`:
+
+| Operator | Meaning                          | jsonb_ops | jsonb_path_ops |
+| -------- | -------------------------------- | --------- | -------------- |
+| `@>`     | left contains right              | yes       | yes            |
+| `?`      | key exists                       | yes       | no             |
+| `?|`     | any of these keys exist          | yes       | no             |
+| `?&`     | all of these keys exist          | yes       | no             |
+| `@?`     | jsonpath returns any item        | yes       | yes            |
+| `@@`     | jsonpath predicate is true       | yes       | yes            |
+
+Crucially, the extraction operators `->` and `->>` are **not** in this table. `WHERE doc ->> 'status' = 'shipped'` cannot use a GIN index on `doc`, no matter how large the table. Rewriting to containment makes the same logical query indexable:
+
+```sql
+-- Not indexable by GIN:
+SELECT count(*) FROM orders WHERE doc ->> 'status' = 'shipped';
+
+-- Indexable by GIN:
+SELECT count(*) FROM orders WHERE doc @> '{"status": "shipped"}';
+```
+
+The jsonpath form is also indexable and handles nested conditions cleanly:
+
+```sql
+SELECT count(*) FROM orders
+WHERE doc @? '$.customer ? (@.country == "DE")';
+```
+
+## Expression Indexes: BTree on an Extracted Key
+
+Sometimes you filter one specific scalar field with equality, range, or sorting — exactly what btree does best and GIN cannot do (GIN has no ordering and no range support). Build a btree over the extracted expression:
+
+```sql
+CREATE INDEX idx_orders_customer_id
+    ON orders (((doc -> 'customer' ->> 'id')::int));
+
+EXPLAIN ANALYZE
+SELECT id, doc ->> 'total'
+FROM orders
+WHERE (doc -> 'customer' ->> 'id')::int = 4242;
+```
+
+Expected plan shape:
+
+```text
+Index Scan using idx_orders_customer_id on orders
+  Index Cond: (((doc -> 'customer'::text) ->> 'id'::text))::int = 4242)
+```
+
+Two rules govern expression indexes:
+
+1. The expression in the `WHERE` clause must match the indexed expression essentially verbatim, including the cast. `(doc -> 'customer' ->> 'id') = '4242'` (text comparison, no cast) will not use the integer expression index above.
+2. Range predicates now work: `WHERE (doc -> 'customer' ->> 'id')::int BETWEEN 100 AND 200` can use the same btree, something no GIN index can serve.
+
+This pattern — a small number of hot scalar fields promoted into btree expression indexes, plus one GIN index for ad hoc containment — covers most real workloads.
+
+## Partial Indexes
+
+If queries always constrain the same subset of rows, index only that subset. A partial index is smaller, cheaper to maintain, and more likely to stay cached:
+
+```sql
+-- Only pending orders are polled by the fulfillment worker
+CREATE INDEX idx_orders_pending_customer
+    ON orders (((doc -> 'customer' ->> 'id')::int))
+    WHERE doc @> '{"status": "pending"}';
+
+EXPLAIN ANALYZE
+SELECT id FROM orders
+WHERE doc @> '{"status": "pending"}'
+  AND (doc -> 'customer' ->> 'id')::int = 777;
+```
+
+The planner uses the partial index only when it can prove the query's `WHERE` clause implies the index predicate, so keep the predicate expression identical between index definition and queries. Partial GIN indexes are equally valid — for example a GIN index on `doc` restricted to `WHERE placed_at > '2026-01-01'` for a table where old rows are never searched.
+
+## Verifying Index Usage with EXPLAIN ANALYZE
+
+Never assume an index is used; check. The `BUFFERS` option shows how much data each node touched, which is the honest measure of work:
+
+```sql
+EXPLAIN (ANALYZE, BUFFERS)
+SELECT id FROM orders WHERE doc @> '{"customer": {"country": "JP"}}';
+```
+
+Things to read in the output:
+
+- **`Bitmap Index Scan` + `Index Cond`** — the index served the predicate.
+- **`Rows Removed by Index Recheck`** — GIN results are candidate matches; a large recheck count relative to returned rows suggests `jsonb_path_ops` might prune better, or your predicate is unselective.
+- **`Buffers: shared hit/read`** — compare against the same query after `DROP INDEX` (in a test environment) to quantify the win.
+- **`Seq Scan` on a big table** — either the operator is not indexable, the expression does not match, or the predicate matches so many rows that a scan is genuinely cheaper.
+
+Also confirm indexes earn their keep over time via `pg_stat_user_indexes.idx_scan`; an index with zero scans after weeks in production is pure write overhead. A SQL client that keeps plans visible while you edit — [Chat2DB](https://chat2db.ai/download) displays `EXPLAIN` output alongside the editor — makes this compare-and-iterate loop considerably less tedious than copy-pasting plans into a scratch file.
+
+## Index Size and Write Overhead
+
+GIN's power is not free, and the costs are structural:
+
+- **Size.** A GIN index over whole documents indexes every key and value, so it can rival or exceed the table's own size for key-rich documents. `jsonb_path_ops` shrinks this; expression indexes shrink it dramatically by indexing one value per row.
+- **Write amplification.** Every `INSERT` or `UPDATE` must add postings for each extracted element. GIN mitigates this with a pending list (`fastupdate`, on by default) that batches new entries, but the deferred work surfaces later — during autovacuum, or as latency spikes on the unlucky query that merges the pending list. For update-heavy tables, consider `gin_pending_list_limit` tuning, or index less (partial and expression indexes) instead of tuning more.
+- **No HOT updates.** Updating any part of an indexed `jsonb` document prevents heap-only-tuple optimization for that index, increasing bloat under churn.
+
+The practical guidance: index what you query, not what you store. One targeted `jsonb_path_ops` GIN index plus one or two btree expression indexes routinely outperforms a single kitchen-sink `jsonb_ops` index on both reads and writes.
+
+## Common Mistakes
+
+### Filtering with ->> and expecting the GIN index to help
+
+The most frequent mistake by far. `WHERE doc ->> 'status' = 'paid'` sequential-scans forever next to an unused GIN index. Fix it either by rewriting to `doc @> '{"status": "paid"}'` or by adding a btree expression index on `(doc ->> 'status')`.
+
+### Mismatched expression or cast
+
+An index on `((doc ->> 'total')::numeric)` does not serve `WHERE (doc ->> 'total')::float8 > 100`. The cast is part of the expression; keep them identical.
+
+### Using jsonb_path_ops, then querying with ?
+
+`WHERE doc ? 'coupon'` silently ignores a `jsonb_path_ops` index. If key-existence checks matter, you need `jsonb_ops` (or model the flag as a value you can test with `@>`).
+
+### Indexing the whole document when queries touch two fields
+
+If every query filters `status` and `customer.id`, two small targeted indexes beat one huge document-wide index on size, cache residency, and write cost.
+
+### Forgetting ANALYZE after bulk loads
+
+Statistics drive the seq-scan-versus-index decision. After large loads, run `ANALYZE` before concluding an index "doesn't work".
+
+## Conclusion
+
+A Postgres JSONB index strategy comes down to matching operators to access methods: GIN (`jsonb_ops` for existence plus containment, `jsonb_path_ops` for containment-only workloads) for searching inside documents, btree expression indexes for hot scalar fields with equality or range predicates, and partial indexes to shrink either kind when queries target a known subset. Verify every assumption with `EXPLAIN (ANALYZE, BUFFERS)`, watch recheck and buffer numbers rather than guessing, and prune indexes that `pg_stat_user_indexes` shows are never scanned. Do that, and `jsonb` gives you document flexibility without giving up relational-grade query performance.

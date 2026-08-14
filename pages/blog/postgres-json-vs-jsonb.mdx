@@ -1,0 +1,247 @@
+---
+title: "Postgres JSON vs JSONB: Differences and When to Use Each"
+description: "Postgres JSON vs JSONB explained: storage format, operator support, indexing, and performance trade-offs, with runnable SQL examples for choosing each type."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: August 14, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# Postgres JSON vs JSONB: Differences and When to Use Each
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="August 14, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+PostgreSQL ships two column types for storing JSON documents: `json` and `jsonb`. They accept the same input syntax, expose overlapping operator sets, and at first glance look interchangeable. They are not. The choice between them affects write cost, read cost, index availability, and even whether your data survives round-trips byte-for-byte. This article walks through the differences in detail, with reproducible SQL you can run against any PostgreSQL 12+ instance, and closes with concrete guidance on when each type is the right call.
+
+## How the Two Types Store Data
+
+### json: text, stored as-is
+
+A `json` column stores the exact text you inserted. PostgreSQL validates that the text is syntactically valid JSON at insert time, but after that it keeps the raw string. Whitespace, key order, duplicate keys, and number formatting are all preserved verbatim.
+
+### jsonb: decomposed binary
+
+A `jsonb` column parses the input once and stores a decomposed binary representation. Keys are deduplicated (last value wins), object keys are stored in a sorted internal order, insignificant whitespace is discarded, and numbers are normalized into PostgreSQL's numeric representation. What you get back is a semantically equivalent document, not the original bytes.
+
+You can see all of this with a single example:
+
+```sql
+CREATE TABLE format_demo (
+    id      serial PRIMARY KEY,
+    doc_j   json,
+    doc_jb  jsonb
+);
+
+INSERT INTO format_demo (doc_j, doc_jb) VALUES (
+    '{"b": 1,   "a": 2, "a": 3}',
+    '{"b": 1,   "a": 2, "a": 3}'
+);
+
+SELECT doc_j, doc_jb FROM format_demo;
+```
+
+Expected output:
+
+```text
+           doc_j            |     doc_jb
+----------------------------+------------------
+ {"b": 1,   "a": 2, "a": 3} | {"a": 3, "b": 1}
+```
+
+The `json` column returned the literal input, including the extra spaces and the duplicate `"a"` key. The `jsonb` column collapsed whitespace, kept only the last `"a"`, and reordered keys. If any downstream system depends on the original bytes — for example, a stored webhook payload whose signature you must re-verify against the raw body — `jsonb` will silently break it, and `json` (or plain `text`) is the correct type.
+
+## Write vs Read Performance Trade-offs
+
+The storage difference drives a predictable performance trade-off:
+
+- **Writes:** `json` is cheaper to ingest. PostgreSQL only validates the text; there is no conversion to a binary structure. `jsonb` pays a parsing and normalization cost on every insert or update.
+- **Reads and processing:** `jsonb` is cheaper to query. Operators like `->` and `@>` work directly on the binary tree. With `json`, every access re-parses the text from scratch, so a query that extracts three fields parses the same document three times.
+
+Qualitatively: if a document is written once and rarely inspected inside SQL, `json` avoids conversion overhead you would never recoup. If a document is queried, filtered, or indexed after being written, `jsonb`'s one-time parse cost is quickly amortized. For most application tables the read side dominates, which is why `jsonb` is the community default recommendation.
+
+## Operator Support
+
+Both types support the extraction operators, but only `jsonb` supports containment and existence operators. Set up a small realistic table to compare:
+
+```sql
+CREATE TABLE events (
+    id       bigserial PRIMARY KEY,
+    payload  jsonb NOT NULL
+);
+
+INSERT INTO events (payload) VALUES
+    ('{"type": "signup", "user": {"id": 101, "plan": "free"},  "tags": ["web", "organic"]}'),
+    ('{"type": "signup", "user": {"id": 102, "plan": "pro"},   "tags": ["mobile"]}'),
+    ('{"type": "churn",  "user": {"id": 101, "plan": "free"},  "tags": ["email"]}'),
+    ('{"type": "upgrade","user": {"id": 103, "plan": "team"},  "tags": ["web", "sales"]}');
+```
+
+### Extraction: -> and ->>
+
+`->` returns a JSON value (of the column's own type); `->>` returns `text`. Both work on `json` and `jsonb`:
+
+```sql
+SELECT payload -> 'user' ->> 'plan' AS plan,
+       payload ->> 'type'           AS event_type
+FROM events
+WHERE (payload -> 'user' ->> 'id')::int = 101;
+```
+
+Expected output:
+
+```text
+ plan | event_type
+------+------------
+ free | signup
+ free | churn
+```
+
+### Containment: @> (jsonb only)
+
+`@>` asks "does the left document contain the right document?" and is the idiomatic way to filter on nested structure:
+
+```sql
+-- All events for pro-plan users
+SELECT id, payload ->> 'type' AS event_type
+FROM events
+WHERE payload @> '{"user": {"plan": "pro"}}';
+```
+
+Expected output:
+
+```text
+ id | event_type
+----+------------
+  2 | signup
+```
+
+Containment also matches array elements, so `payload @> '{"tags": ["web"]}'` finds rows 1 and 4.
+
+### Existence: ? , ?| , ?& (jsonb only)
+
+`?` checks whether a string exists as a top-level key (or as an element of a top-level array of strings):
+
+```sql
+SELECT count(*) FROM events WHERE payload ? 'tags';   -- 4
+SELECT count(*) FROM events WHERE payload ? 'coupon'; -- 0
+```
+
+If you try any of `@>`, `?`, `?|`, or `?&` on a `json` column, PostgreSQL raises an operator-does-not-exist error. You would have to cast (`payload::jsonb @> ...`), which re-parses the text on every row and defeats indexing.
+
+## Indexing: Only jsonb Supports GIN
+
+This is often the deciding factor. `jsonb` columns can carry a GIN index that accelerates `@>`, `?`, `?|`, `?&`, and (since PostgreSQL 12) the jsonpath operators `@?` and `@@`:
+
+```sql
+CREATE INDEX idx_events_payload ON events USING gin (payload);
+
+EXPLAIN (COSTS OFF)
+SELECT * FROM events WHERE payload @> '{"type": "signup"}';
+```
+
+On a table large enough for the planner to prefer the index, you will see a plan like:
+
+```text
+Bitmap Heap Scan on events
+  Recheck Cond: (payload @> '{"type": "signup"}'::jsonb)
+  ->  Bitmap Index Scan on idx_events_payload
+        Index Cond: (payload @> '{"type": "signup"}'::jsonb)
+```
+
+There is no GIN operator class for the `json` type at all. The only indexing option for `json` is an expression index over an extracted, cast value (for example a btree on `(payload ->> 'type')`), which helps a single field but cannot serve arbitrary containment queries. If you need to search inside documents, `jsonb` is effectively mandatory.
+
+When exploring which queries actually hit your indexes, running `EXPLAIN` variations side by side is much faster in a visual SQL client; [Chat2DB](https://chat2db.ai/download) renders execution plans next to the query editor so you can iterate on operator and index choices without leaving the results grid.
+
+## What json Preserves That jsonb Does Not
+
+To summarize the fidelity differences in one place:
+
+| Property                     | json           | jsonb                        |
+| ---------------------------- | -------------- | ---------------------------- |
+| Insignificant whitespace     | preserved      | discarded                    |
+| Object key order             | preserved      | internal sorted order        |
+| Duplicate keys               | preserved      | last value wins              |
+| Number formatting (`1e2`)    | preserved      | normalized (`100`)           |
+| Trailing zeros (`1.50`)      | preserved      | kept as numeric (`1.50`)     |
+
+One more subtlety: `jsonb` rejects `\u0000` escape sequences inside strings because PostgreSQL text values cannot contain NUL bytes, while `json` accepts them (it only stores text). If you ingest third-party payloads you do not control, this is a real-world failure mode worth handling at the application boundary.
+
+## When to Choose Each Type
+
+Choose **jsonb** when:
+
+- You will query inside the documents with `WHERE` clauses — containment, key existence, or jsonpath.
+- You need GIN indexing for those queries.
+- You update documents in place with `jsonb_set`, `||` concatenation, or the `-` delete operator, none of which exist for `json`.
+- You want deterministic equality comparison of documents regardless of formatting.
+
+Choose **json** when:
+
+- The column is an audit log or raw payload archive where byte-exact fidelity matters (signatures, legal retention, replaying requests).
+- Data is written once and read back whole, never filtered by content in SQL, and insert throughput matters more than query speed.
+- You must preserve key order or duplicate keys for a downstream consumer.
+
+If neither fidelity nor duplicates matter, default to `jsonb`. It is what nearly all of PostgreSQL's JSON feature development targets.
+
+## Migrating Between the Types
+
+Converting an existing column is a straight cast in either direction.
+
+### json to jsonb
+
+```sql
+CREATE TABLE api_log (
+    id   serial PRIMARY KEY,
+    body json NOT NULL
+);
+
+INSERT INTO api_log (body) VALUES
+    ('{"route": "/v1/users",  "status": 200}'),
+    ('{"route": "/v1/orders", "status": 404}');
+
+ALTER TABLE api_log
+    ALTER COLUMN body TYPE jsonb
+    USING body::jsonb;
+
+-- Now GIN indexing becomes possible
+CREATE INDEX idx_api_log_body ON api_log USING gin (body);
+```
+
+Be aware that this conversion rewrites the whole table, takes an `ACCESS EXCLUSIVE` lock for the duration, and irreversibly normalizes the documents (duplicate keys and formatting are lost). For large hot tables, the safer pattern is to add a new `jsonb` column, backfill in batches, then swap:
+
+```sql
+ALTER TABLE api_log ADD COLUMN body_jb jsonb;
+
+UPDATE api_log SET body_jb = body::jsonb WHERE body_jb IS NULL;
+
+-- After verification:
+ALTER TABLE api_log DROP COLUMN body;
+ALTER TABLE api_log RENAME COLUMN body_jb TO body;
+```
+
+### jsonb to json
+
+The reverse cast (`USING body::json`) always succeeds, but it cannot restore what normalization already discarded — you get `jsonb`'s canonical form rendered as text. In other words, migrating to `jsonb` is a one-way door for formatting fidelity.
+
+### Casting inside queries
+
+You can also cast ad hoc without changing the schema, which is handy for one-off analysis on a `json` column:
+
+```sql
+SELECT count(*) FROM api_log WHERE body::jsonb @> '{"status": 404}';
+```
+
+Just remember this per-row cast cannot use a GIN index; if the query is recurring, migrate the column.
+
+## FAQ
+
+**Is jsonb always slower to write?** It does more work per write (parse plus binary encoding), so inserts of large documents cost more than for `json`. Whether that is measurable in your workload depends on document size and write volume; for small documents the difference is usually negligible next to WAL and index costs.
+
+**Does jsonb store data smaller than json?** Not reliably. `jsonb`'s binary format carries structural overhead and can be larger than compact text, though discarded whitespace can also make it smaller. Both are TOAST-compressed when large. Measure with `pg_column_size()` on your own data.
+
+**Can I keep key order with jsonb?** No. If order carries meaning, either use `json` or restructure the document as an array of `{"key": ..., "value": ...}` objects.
+
+**Which should a new project pick?** `jsonb`, unless you have a specific requirement to preserve the original text. Indexing, in-place update functions, and containment operators all live on the `jsonb` side, and tools such as [Chat2DB](https://app.chat2db.ai) can pretty-print and edit `jsonb` cells directly, so the loss of original formatting rarely matters in practice.
