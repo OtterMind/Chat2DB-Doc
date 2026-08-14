@@ -84,7 +84,7 @@ export default {
     return (
       <>
         <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-        <meta property="og:title" content={frontMatter.title || 'Chat2DB'} />
+        <meta property="og:title" content={frontMatter.title || pageTitle || 'Chat2DB'} />
         <meta property="og:description" content={des} />
         <meta property="article:published_time" content={frontMatter.date} />
         <meta property="article:author" content={frontMatter.author} />
@@ -165,12 +165,12 @@ export default {
           </div>
           <div style={{ display: "flex", gap: "30px" }}>
             <div>
-              <h4
+              <div
                 style={{ margin: "0 0 10px 0", fontWeight: 600 }}
                 className="nx-text-slate-100"
               >
                 Products
-              </h4>
+              </div>
               <div
                 style={{ display: "flex", flexDirection: "column", gap: "5px" }}
                 className="nx-text-slate-300"
@@ -193,12 +193,12 @@ export default {
               </div>
             </div>
             <div>
-              <h4
+              <div
                 style={{ margin: "0 0 10px 0", fontWeight: 600 }}
                 className="nx-text-slate-100"
               >
                 Resources
-              </h4>
+              </div>
               <div
                 style={{ display: "flex", flexDirection: "column", gap: "5px" }}
                 className="nx-text-slate-300"
@@ -227,12 +227,12 @@ export default {
               </div>
             </div>
             <div>
-              <h4
+              <div
                 style={{ margin: "0 0 10px 0", fontWeight: 600 }}
                 className="nx-text-slate-100"
               >
                 Company
-              </h4>
+              </div>
               <div
                 style={{ display: "flex", flexDirection: "column", gap: "5px" }}
                 className="nx-text-slate-300"
