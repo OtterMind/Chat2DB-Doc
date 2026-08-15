@@ -1,0 +1,213 @@
+---
+title: "PostgreSQL VACUUM and Autovacuum Tuning Guide"
+description: "How PostgreSQL VACUUM reclaims dead tuples, why tables bloat, and how to tune autovacuum thresholds and cost limits on busy production databases."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: August 15, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# PostgreSQL VACUUM and Autovacuum Tuning Guide
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="August 15, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+Every PostgreSQL table quietly accumulates garbage. An `UPDATE` does not overwrite a row — it writes a new version and marks the old one dead. A `DELETE` does not free space — it marks the row dead and moves on. Those dead row versions stay on disk until `VACUUM` reclaims them, and if vacuuming falls behind, your tables bloat, your indexes grow, and queries that used to take milliseconds start taking seconds.
+
+This guide explains what VACUUM actually does, how to tell whether autovacuum is keeping up, and which settings to change when it is not.
+
+## Why dead tuples exist at all
+
+PostgreSQL uses MVCC — Multi-Version Concurrency Control — so that readers never block writers. Each row version carries the transaction IDs that created and deleted it, and each transaction sees only the versions that were visible when it started.
+
+The consequence is that an update is really an insert plus a logical delete:
+
+```sql
+CREATE TABLE accounts (
+    id      bigint PRIMARY KEY,
+    balance numeric NOT NULL
+);
+
+INSERT INTO accounts VALUES (1, 100.00);
+
+-- This writes a SECOND version of row 1; the first is now dead.
+UPDATE accounts SET balance = 90.00 WHERE id = 1;
+```
+
+After that update the table holds two physical row versions for one logical row. Only when no running transaction can still see the old version may VACUUM reclaim it.
+
+## What VACUUM actually does
+
+A plain `VACUUM` performs four jobs:
+
+1. **Reclaims dead tuples** — marks their space reusable for future inserts and updates in the same table.
+2. **Updates the visibility map** — records which pages contain only tuples visible to all transactions, which is what makes index-only scans possible.
+3. **Updates the free space map** — so the next `INSERT` knows where the reusable space is.
+4. **Freezes old rows** — rewrites very old transaction IDs so the 32-bit transaction counter can wrap around safely.
+
+Crucially, plain VACUUM does **not** return disk space to the operating system. It makes space reusable *within* the table. That distinction is the single most common source of confusion.
+
+### VACUUM versus VACUUM FULL
+
+```sql
+-- Reclaims space for reuse inside the table. Non-blocking; safe in production.
+VACUUM verbose accounts;
+
+-- Rewrites the whole table into a new file, returning space to the OS.
+-- Takes an ACCESS EXCLUSIVE lock: nothing can read or write the table.
+VACUUM FULL accounts;
+```
+
+`VACUUM FULL` genuinely shrinks the table, but it locks it completely and needs enough free disk space to hold a second copy. On a large production table that is usually unacceptable. Reach for the `pg_repack` extension instead — it achieves the same compaction with only a brief lock.
+
+### VACUUM versus ANALYZE
+
+These are different jobs that are often run together:
+
+```sql
+-- Reclaim dead tuples AND refresh planner statistics.
+VACUUM ANALYZE accounts;
+```
+
+`ANALYZE` samples the table and updates the statistics the query planner uses to estimate row counts. Stale statistics do not cause bloat, but they do cause bad plans — the planner expects 10 rows, gets 4 million, and picks a nested loop that never finishes. If you see wildly wrong row estimates in `EXPLAIN ANALYZE` output, run `ANALYZE`, not `VACUUM`. You can paste a plan into the free [EXPLAIN plan visualizer](https://chat2db.ai/tools/explain-plan-visualizer) to see those estimate errors highlighted.
+
+## How autovacuum decides when to run
+
+The autovacuum daemon wakes up every `autovacuum_naptime` (default 1 minute) and checks each table against a threshold formula:
+
+```
+vacuum threshold = autovacuum_vacuum_threshold
+                 + autovacuum_vacuum_scale_factor * number_of_rows
+```
+
+With the defaults — a threshold of 50 and a scale factor of 0.2 — a table is vacuumed once 20% of its rows are dead, plus 50.
+
+That default is reasonable for small tables and terrible for large ones. On a table with 50 million rows, 20% means **10 million dead tuples** must accumulate before autovacuum even starts. By then the table is badly bloated and the vacuum run itself is enormous.
+
+The analyze threshold works identically, with `autovacuum_analyze_scale_factor` defaulting to 0.1.
+
+## Diagnosing the problem
+
+Start with `pg_stat_user_tables`, which records dead tuple counts and the last time each table was vacuumed:
+
+```sql
+SELECT relname,
+       n_live_tup,
+       n_dead_tup,
+       round(n_dead_tup * 100.0 / NULLIF(n_live_tup + n_dead_tup, 0), 1) AS dead_pct,
+       last_autovacuum,
+       last_autoanalyze
+FROM   pg_stat_user_tables
+WHERE  n_dead_tup > 1000
+ORDER  BY n_dead_tup DESC
+LIMIT  20;
+```
+
+A table with a high `dead_pct` and a `last_autovacuum` timestamp hours or days old is your problem table.
+
+To see actual bloat rather than just dead tuple counts, install the `pgstattuple` extension:
+
+```sql
+CREATE EXTENSION IF NOT EXISTS pgstattuple;
+
+SELECT * FROM pgstattuple('accounts');
+```
+
+The `free_percent` column tells you how much of the table is reusable empty space. Anything above 20% on a large, actively updated table deserves attention.
+
+You can also catch autovacuum runs in progress:
+
+```sql
+SELECT pid, datname, relid::regclass AS table_name, phase,
+       heap_blks_scanned, heap_blks_total
+FROM   pg_stat_progress_vacuum;
+```
+
+## Tuning autovacuum
+
+### Lower the scale factor on large tables
+
+The single most effective change is to set a per-table scale factor so that big tables are vacuumed on an absolute row count rather than a percentage:
+
+```sql
+-- Vacuum once 50,000 rows are dead, regardless of table size.
+ALTER TABLE accounts SET (
+    autovacuum_vacuum_scale_factor = 0,
+    autovacuum_vacuum_threshold    = 50000,
+    autovacuum_analyze_scale_factor = 0,
+    autovacuum_analyze_threshold    = 25000
+);
+```
+
+Setting the scale factor to zero makes the threshold purely absolute. This keeps vacuum runs small and frequent instead of rare and enormous.
+
+### Raise the cost limit so vacuum can keep up
+
+Autovacuum deliberately throttles itself. It accumulates a "cost" for each page it touches, and once it exceeds `autovacuum_vacuum_cost_limit` it sleeps for `autovacuum_vacuum_cost_delay`. On modern SSDs the defaults are far too conservative:
+
+```sql
+-- In postgresql.conf
+autovacuum_vacuum_cost_limit = 2000   -- default 200 (or -1, inheriting vacuum_cost_limit)
+autovacuum_vacuum_cost_delay = 2ms    -- default 2ms in PG 12+; was 20ms before
+```
+
+Raising the cost limit tenfold lets autovacuum do roughly ten times as much work per second. If your I/O system is idle while tables bloat, this is the setting to change.
+
+### Run more workers
+
+```sql
+autovacuum_max_workers = 6   -- default 3
+```
+
+Be aware that the cost limit is *shared* across all workers by default — adding workers without raising `autovacuum_vacuum_cost_limit` simply splits the same I/O budget more thinly. Raise both together.
+
+### Never turn autovacuum off
+
+It is tempting to disable autovacuum when it interferes with a busy period. Do not. Beyond bloat, autovacuum is what prevents transaction ID wraparound, and a database that hits the wraparound limit shuts down to protect itself and requires a lengthy single-user recovery. If you must reduce its impact, tune the thresholds and cost settings instead.
+
+## Transaction ID wraparound and freezing
+
+PostgreSQL's transaction counter is 32 bits, so it wraps after about 4 billion transactions. To prevent old rows from suddenly appearing to be in the future, VACUUM "freezes" rows older than `vacuum_freeze_min_age`, marking them as visible to everyone forever.
+
+Monitor how close you are to the limit:
+
+```sql
+SELECT datname,
+       age(datfrozenxid) AS xid_age,
+       2000000000 - age(datfrozenxid) AS xids_remaining
+FROM   pg_database
+ORDER  BY xid_age DESC;
+```
+
+When `age(datfrozenxid)` approaches `autovacuum_freeze_max_age` (default 200 million), PostgreSQL launches an aggressive anti-wraparound vacuum that cannot be skipped and will not yield the lock as readily. These are the vacuums that surprise teams at 3 a.m. Keeping ordinary autovacuum healthy is what prevents them.
+
+## A practical checklist
+
+- Query `pg_stat_user_tables` weekly for tables with high dead tuple ratios.
+- Set absolute vacuum thresholds on every table above roughly 10 million rows.
+- Raise `autovacuum_vacuum_cost_limit` if I/O headroom exists.
+- Use `pg_repack`, not `VACUUM FULL`, to compact a bloated production table.
+- Alert on `age(datfrozenxid)` crossing 150 million.
+- Remember that long-running transactions and abandoned replication slots block vacuum entirely — check `pg_stat_activity` and `pg_replication_slots` when dead tuples refuse to fall.
+
+That last point deserves emphasis. VACUUM can only remove row versions that no transaction can still see. A single forgotten `BEGIN;` in an open psql session, or an inactive logical replication slot, pins the oldest visible transaction and makes vacuum ineffective across the *entire* database, no matter how you tune it:
+
+```sql
+-- Find the oldest transaction holding back vacuum
+SELECT pid, state, now() - xact_start AS duration, query
+FROM   pg_stat_activity
+WHERE  xact_start IS NOT NULL
+ORDER  BY xact_start
+LIMIT  5;
+
+-- Find inactive replication slots
+SELECT slot_name, active, restart_lsn FROM pg_replication_slots WHERE NOT active;
+```
+
+## Wrapping up
+
+VACUUM is not a maintenance chore you run occasionally — it is a continuous, load-bearing part of how PostgreSQL works. The defaults are tuned for a small database on slow hardware from a decade ago. On a large modern system, lower the scale factors so vacuums stay small and frequent, raise the cost limit so they can actually finish, and watch for long transactions that block them entirely.
+
+If you would rather see bloat, vacuum history and slow queries in one place instead of assembling them from catalog queries, [Chat2DB](https://chat2db.ai/download) connects to PostgreSQL and lets you explore these statistics — and ask for the query you need in plain English.

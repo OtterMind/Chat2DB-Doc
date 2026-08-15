@@ -1,0 +1,236 @@
+---
+title: "Choosing a Vector Database for RAG in 2026"
+description: "How vector databases power RAG, how to choose between pgvector, Chroma, Qdrant and Pinecone, and how to build a retrieval layer that returns good chunks."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: August 15, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# Choosing a Vector Database for RAG in 2026
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="August 15, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+Retrieval-augmented generation works on a simple premise: instead of hoping a language model memorised your documentation, you retrieve the relevant passages at query time and put them in the prompt. The retrieval step is where most RAG systems succeed or fail, and the vector database is the component doing that work.
+
+This guide covers what a vector database actually does, how the main options differ, and how to build a retrieval layer that returns the right chunks.
+
+## What a vector database does
+
+An embedding model converts text into a fixed-length array of floats — a vector — positioned so that semantically similar texts land near each other. "How do I reset my password?" and "I forgot my login credentials" produce vectors that are close together despite sharing almost no words.
+
+A vector database stores those vectors and answers one question quickly: *which stored vectors are nearest to this query vector?*
+
+The naive approach compares the query against every stored vector. At a few thousand documents that is fine. At ten million it is hopeless, so vector databases use approximate nearest neighbour (ANN) indexes that trade a small amount of recall for enormous speed gains.
+
+### Distance metrics
+
+Three metrics dominate:
+
+- **Cosine similarity** — measures the angle between vectors, ignoring magnitude. The default for text embeddings.
+- **Inner product** — cosine's faster cousin when vectors are already normalised.
+- **Euclidean (L2)** — straight-line distance; more common in image embeddings.
+
+Use whichever metric your embedding model was trained with. OpenAI, Cohere and most sentence-transformer models expect cosine.
+
+### Index types
+
+**HNSW** (Hierarchical Navigable Small World) builds a multi-layer graph. It gives excellent recall and low query latency, at the cost of high memory usage and slow index builds. It is the default choice for most workloads.
+
+**IVFFlat** partitions vectors into clusters and searches only the nearest few. It builds faster and uses less memory than HNSW but generally offers worse recall at equivalent speed. It also requires the data to exist before building the index, since the clusters are derived from it.
+
+## The options
+
+### pgvector — PostgreSQL as a vector database
+
+If your application already runs on PostgreSQL, start here. The `pgvector` extension adds a `vector` type and ANN indexing to the database you already operate, back up and monitor.
+
+```sql
+CREATE EXTENSION IF NOT EXISTS vector;
+
+CREATE TABLE documents (
+    id         bigserial PRIMARY KEY,
+    content    text        NOT NULL,
+    source     text        NOT NULL,
+    tenant_id  bigint      NOT NULL,
+    embedding  vector(1536) NOT NULL,
+    created_at timestamptz NOT NULL DEFAULT now()
+);
+
+-- HNSW index for cosine distance
+CREATE INDEX idx_documents_embedding
+    ON documents
+    USING hnsw (embedding vector_cosine_ops)
+    WITH (m = 16, ef_construction = 64);
+```
+
+Querying uses the `<=>` operator for cosine distance:
+
+```sql
+SELECT id, content, source,
+       1 - (embedding <=> $1) AS similarity
+FROM   documents
+WHERE  tenant_id = $2
+ORDER  BY embedding <=> $1
+LIMIT  5;
+```
+
+The decisive advantage is that filter — `tenant_id = $2` is an ordinary SQL predicate, enforced with the same correctness guarantees as the rest of your data. In a dedicated vector store, metadata filtering is a separate subsystem with its own semantics, and multi-tenant isolation becomes something you have to get right twice.
+
+Tune recall at query time with `ef_search`:
+
+```sql
+SET hnsw.ef_search = 100;   -- higher = better recall, slower
+```
+
+pgvector scales comfortably into the millions of vectors. Beyond roughly 10–50 million, dedicated stores start to win on memory efficiency and query latency.
+
+### Chroma — the fastest path to a prototype
+
+Chroma is an open-source, developer-friendly store that runs embedded in your Python process or as a server. It handles embedding generation for you, which removes a whole step from a first prototype.
+
+```python
+import chromadb
+
+client = chromadb.PersistentClient(path="./chroma_data")
+collection = client.get_or_create_collection(
+    name="docs",
+    metadata={"hnsw:space": "cosine"},
+)
+
+collection.add(
+    documents=["PostgreSQL VACUUM reclaims dead tuples.",
+               "PgBouncer pools connections in transaction mode."],
+    metadatas=[{"source": "vacuum.md"}, {"source": "pooling.md"}],
+    ids=["doc1", "doc2"],
+)
+
+results = collection.query(
+    query_texts=["how do I reclaim disk space in postgres"],
+    n_results=3,
+    where={"source": "vacuum.md"},
+)
+```
+
+Chroma is ideal for prototypes and small-to-medium collections. It is less proven at very large scale or under heavy concurrent write load.
+
+### Qdrant — production open source
+
+Written in Rust, Qdrant offers strong filtering, quantisation to reduce memory, and clean horizontal scaling. Its filtered search is genuinely good — filters are applied during graph traversal rather than as a post-processing step, which avoids the classic failure where you request 10 results, filter them down, and end up with two.
+
+```python
+from qdrant_client import QdrantClient
+from qdrant_client.models import Distance, VectorParams, PointStruct, Filter, FieldCondition, MatchValue
+
+client = QdrantClient(url="http://localhost:6333")
+
+client.create_collection(
+    collection_name="docs",
+    vectors_config=VectorParams(size=1536, distance=Distance.COSINE),
+)
+
+client.upsert(
+    collection_name="docs",
+    points=[PointStruct(id=1, vector=embedding, payload={"tenant_id": 42, "source": "vacuum.md"})],
+)
+
+hits = client.search(
+    collection_name="docs",
+    query_vector=query_embedding,
+    query_filter=Filter(must=[FieldCondition(key="tenant_id", match=MatchValue(value=42))]),
+    limit=5,
+)
+```
+
+### Pinecone — fully managed
+
+Pinecone removes operational work entirely: no index tuning, no capacity planning, no upgrades. You pay for that convenience, and your vectors live in someone else's infrastructure. It is a reasonable choice when the team has no appetite for running stateful services.
+
+### Others worth knowing
+
+**Weaviate** offers built-in hybrid search and a GraphQL API. **Milvus** targets billion-scale deployments with a more complex distributed architecture. **Elasticsearch** and **OpenSearch** added dense vector support and are natural picks if you already run them for keyword search.
+
+## Choosing
+
+| Situation | Recommendation |
+| --- | --- |
+| Already on PostgreSQL, under ~10M vectors | pgvector |
+| Prototype or notebook | Chroma |
+| Self-hosted production, heavy filtering | Qdrant |
+| No appetite to operate infrastructure | Pinecone |
+| Already running Elasticsearch | Elasticsearch dense vectors |
+| Billion-scale | Milvus |
+
+The honest summary: most teams reaching for a dedicated vector database do not have a scale problem yet. Starting with pgvector keeps your embeddings transactionally consistent with the data they describe, and gives you one system to back up rather than two that can drift apart.
+
+## Building the retrieval layer
+
+The database choice matters less than the retrieval quality. Three things affect that far more.
+
+### Chunking
+
+Embedding an entire document produces a vector that means everything and therefore nothing. Split documents into passages of roughly 200–500 tokens with some overlap so a sentence spanning a boundary is not lost:
+
+```python
+def chunk(text: str, size: int = 400, overlap: int = 50) -> list[str]:
+    words = text.split()
+    step = size - overlap
+    return [" ".join(words[i:i + size]) for i in range(0, len(words), step)]
+```
+
+Splitting on semantic boundaries — headings, paragraphs — beats fixed windows when the document structure allows it.
+
+### Hybrid search
+
+Pure vector search is weak at exact terms: error codes, product SKUs, function names. A user searching for `ERROR 1045` wants a lexical match, not something semantically adjacent. Combine both. PostgreSQL can do this in a single query using reciprocal rank fusion:
+
+```sql
+WITH semantic AS (
+    SELECT id, row_number() OVER (ORDER BY embedding <=> $1) AS rank
+    FROM   documents
+    WHERE  tenant_id = $3
+    ORDER  BY embedding <=> $1
+    LIMIT  40
+),
+keyword AS (
+    SELECT id, row_number() OVER (
+             ORDER BY ts_rank_cd(search_vector, plainto_tsquery('english', $2)) DESC
+           ) AS rank
+    FROM   documents
+    WHERE  tenant_id = $3
+      AND  search_vector @@ plainto_tsquery('english', $2)
+    LIMIT  40
+)
+SELECT d.id, d.content,
+       COALESCE(1.0 / (60 + s.rank), 0) + COALESCE(1.0 / (60 + k.rank), 0) AS score
+FROM   documents d
+LEFT   JOIN semantic s ON s.id = d.id
+LEFT   JOIN keyword  k ON k.id = d.id
+WHERE  s.id IS NOT NULL OR k.id IS NOT NULL
+ORDER  BY score DESC
+LIMIT  10;
+```
+
+Hybrid retrieval is consistently the single largest quality improvement in production RAG systems.
+
+### Reranking
+
+Retrieve generously — 30 to 50 candidates — then rerank with a cross-encoder that scores each passage against the query directly. Cross-encoders are far more accurate than embedding similarity but too slow to run over the whole corpus, which is exactly why they belong in a second stage over a small candidate set.
+
+## Measuring retrieval quality
+
+Do not evaluate RAG by reading a few answers and forming an impression. Build a small labelled set — 50 to 100 questions with known correct passages — and measure:
+
+- **Recall@k** — fraction of questions where a correct passage appears in the top k.
+- **MRR** — mean reciprocal rank of the first correct passage.
+
+If recall@10 is poor, the generation model cannot save you. Fix retrieval first; prompt engineering on top of bad retrieval is wasted effort.
+
+## Wrapping up
+
+For most teams in 2026, the right first vector database is the one you already run. pgvector turns PostgreSQL into a capable vector store with real SQL filtering and transactional consistency, and it will carry you well past the point where you know what your workload actually looks like. Move to Qdrant, Milvus or Pinecone when you have measured a specific limit — not before.
+
+If you are working with pgvector, [Chat2DB](https://chat2db.ai/download) connects to PostgreSQL, lets you inspect embedding tables and index definitions directly, and can generate the similarity queries from a plain-English description of what you want to retrieve.

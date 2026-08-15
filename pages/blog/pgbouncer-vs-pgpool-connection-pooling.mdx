@@ -1,0 +1,220 @@
+---
+title: "PgBouncer vs Pgpool-II: PostgreSQL Pooling Compared"
+description: "A practical comparison of PgBouncer and Pgpool-II for PostgreSQL pooling: pool modes, load balancing, memory footprint and which fits your workload."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: August 15, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# PgBouncer vs Pgpool-II: PostgreSQL Pooling Compared
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="August 15, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+PostgreSQL uses one operating-system process per connection. Each backend costs several megabytes of memory before it does any work, and the more of them exist, the more time the server spends on context switching and lock contention rather than executing queries. A database configured with `max_connections = 500` will usually perform *worse* under load than the same hardware with `max_connections = 100` behind a pooler.
+
+Two tools dominate the PostgreSQL pooling landscape: PgBouncer and Pgpool-II. They are frequently compared as though they were alternatives, but they solve overlapping-yet-different problems. This guide covers how each works and which to pick.
+
+## Why pooling matters
+
+Consider a typical deployment: 8 application instances, each with a 20-connection pool. That is 160 potential PostgreSQL connections, most of them idle at any moment while the application waits on business logic, HTTP calls or the event loop.
+
+Measure the real concurrency:
+
+```sql
+SELECT state, count(*)
+FROM   pg_stat_activity
+WHERE  backend_type = 'client backend'
+GROUP  BY state;
+```
+
+A typical result looks like this:
+
+```
+ state  | count
+--------+-------
+ active |     6
+ idle   |   148
+```
+
+Six connections are doing work; 148 are consuming memory for nothing. A pooler in transaction mode would serve that same workload with roughly a dozen PostgreSQL backends.
+
+## PgBouncer: the lightweight specialist
+
+PgBouncer does one thing — connection pooling — in a single process using an asynchronous event loop. Its memory footprint is around 2 KB per client connection, so a single instance handles tens of thousands of clients comfortably.
+
+### Pool modes
+
+The mode determines when a server connection is returned to the pool, and is the most important setting:
+
+**Session mode** — a server connection is held for the entire client session. Safe for everything, but the pooling benefit is minimal: you still need roughly as many server connections as concurrent clients.
+
+**Transaction mode** — a server connection is held only for the duration of a transaction. This is the mode that delivers the dramatic ratio, and the right default for web applications.
+
+**Statement mode** — the connection is released after every single statement. Multi-statement transactions are forbidden entirely. Suitable only for autocommit analytics workloads.
+
+### A working configuration
+
+```ini
+[databases]
+appdb = host=10.0.0.10 port=5432 dbname=appdb
+
+[pgbouncer]
+listen_addr = 0.0.0.0
+listen_port = 6432
+auth_type = scram-sha-256
+auth_file = /etc/pgbouncer/userlist.txt
+
+pool_mode = transaction
+max_client_conn = 2000
+default_pool_size = 20
+reserve_pool_size = 5
+reserve_pool_timeout = 3
+
+server_idle_timeout = 600
+server_lifetime = 3600
+query_wait_timeout = 120
+
+admin_users = postgres
+stats_users = postgres
+ignore_startup_parameters = extra_float_digits
+```
+
+`max_client_conn = 2000` with `default_pool_size = 20` means 2000 application connections are multiplexed onto 20 PostgreSQL backends. If you would rather derive these numbers from your own instance count and CPU budget, the free [PgBouncer config generator](https://chat2db.ai/tools/pgbouncer-config-generator) does the arithmetic and flags combinations that cannot work.
+
+### What transaction mode breaks
+
+This is the trade-off nobody mentions until production breaks. In transaction mode, consecutive statements from one client may land on *different* server connections, so anything with session-level state fails:
+
+- **Session-level `SET`** — `SET search_path` outside a transaction may not apply to your next query. Use `SET LOCAL` inside a transaction instead.
+- **`LISTEN` / `NOTIFY`** — needs a persistent session; not supported.
+- **Advisory locks held across statements** — a session-scoped `pg_advisory_lock()` may be released on a connection you no longer own. Use `pg_advisory_xact_lock()` instead.
+- **`WITH HOLD` cursors** and temporary tables that outlive a transaction.
+- **Server-side prepared statements** — the biggest one in practice.
+
+That last item bites every JDBC, asyncpg and SQLAlchemy user eventually, producing errors like `prepared statement "S_1" already exists`. Modern PgBouncer (1.21+) handles this if you enable tracking:
+
+```ini
+max_prepared_statements = 200
+```
+
+Otherwise disable server-side prepared statements in the driver:
+
+```
+# JDBC
+jdbc:postgresql://pgbouncer:6432/appdb?prepareThreshold=0
+
+# asyncpg
+await asyncpg.connect(dsn, statement_cache_size=0)
+```
+
+### Monitoring PgBouncer
+
+Connect to the admin database and inspect the pools:
+
+```bash
+psql -h 127.0.0.1 -p 6432 -U postgres pgbouncer
+```
+
+```
+SHOW POOLS;
+SHOW STATS;
+SHOW SERVERS;
+```
+
+The column that matters most is `cl_waiting` in `SHOW POOLS` — the number of clients queued for a server connection. Persistent nonzero values mean `default_pool_size` is too small. `maxwait` tells you the longest a client has waited; anything above a few hundred milliseconds is a problem.
+
+## Pgpool-II: the full middleware
+
+Pgpool-II is a much broader piece of software. Alongside connection pooling it provides:
+
+- **Load balancing** — distributes `SELECT` statements across streaming replicas while routing writes to the primary.
+- **Automatic failover** — detects a dead primary and promotes a standby.
+- **Watchdog** — coordinates multiple Pgpool nodes with a virtual IP to avoid becoming a single point of failure.
+- **In-memory query cache** — caches result sets.
+- **Query parsing** — it inspects SQL to decide routing, which is what enables read/write splitting.
+
+### A basic configuration
+
+```ini
+# pgpool.conf
+listen_addresses = '*'
+port = 9999
+
+backend_hostname0 = '10.0.0.10'
+backend_port0 = 5432
+backend_weight0 = 1
+backend_flag0 = 'ALLOW_TO_FAILOVER'
+
+backend_hostname1 = '10.0.0.11'
+backend_port1 = 5432
+backend_weight1 = 1
+backend_flag1 = 'ALLOW_TO_FAILOVER'
+
+load_balance_mode = on
+master_slave_mode = on
+master_slave_sub_mode = 'stream'
+
+connection_cache = on
+num_init_children = 32
+max_pool = 4
+
+sr_check_period = 10
+health_check_period = 10
+health_check_timeout = 20
+```
+
+### The architectural cost
+
+Pgpool-II uses a pre-forked process model: `num_init_children` processes are started up front, and each can hold `max_pool` connections. The maximum concurrent clients is `num_init_children`, and total possible backend connections is `num_init_children * max_pool`. Sizing this incorrectly is the classic Pgpool mistake — the numbers must satisfy:
+
+```
+num_init_children * max_pool <= (PostgreSQL max_connections - superuser_reserved_connections)
+```
+
+Because it forks a process per client rather than multiplexing with an event loop, Pgpool-II is far heavier than PgBouncer at high client counts. And because it parses every statement to decide routing, it adds measurably more latency per query.
+
+Its load balancing also has sharp edges. A `SELECT` issued inside a transaction that has already written must go to the primary, and a read immediately after a write may hit a replica that has not yet caught up, returning stale data. Pgpool offers `delay_threshold` to exclude lagging replicas, but application-level awareness of read-after-write consistency is still required.
+
+## Head to head
+
+| | PgBouncer | Pgpool-II |
+| --- | --- | --- |
+| Primary purpose | Connection pooling | Pooling + LB + failover |
+| Architecture | Single process, event loop | Pre-forked process per client |
+| Memory per client | ~2 KB | ~ MB (a full process) |
+| Max practical clients | Tens of thousands | Hundreds to low thousands |
+| Latency overhead | Very low | Higher (parses SQL) |
+| Read/write splitting | No | Yes |
+| Automatic failover | No | Yes |
+| Configuration complexity | Low | High |
+| Operational risk | Low | Higher (more moving parts) |
+
+## Which should you choose?
+
+**Choose PgBouncer if** your problem is connection count. This covers the overwhelming majority of cases: web applications, serverless functions with unpredictable concurrency, and anything running on managed PostgreSQL where failover is already handled by the provider. It is simple, fast and boring — exactly what you want in the connection path.
+
+**Choose Pgpool-II if** you genuinely need query-level read/write splitting and automatic failover, and you do not have those capabilities elsewhere in your stack.
+
+**Consider both** — a common production topology puts PgBouncer in front of Pgpool-II, letting PgBouncer absorb the thousands of client connections cheaply while Pgpool handles routing across a smaller number of them.
+
+In practice, many teams that reach for Pgpool-II for high availability are better served by PgBouncer plus a dedicated failover manager such as Patroni. Splitting "pool connections" from "manage cluster topology" into separate tools keeps each one simple, and keeps a failover bug out of your query path.
+
+## Sizing the pool
+
+Whichever you choose, the server-side pool size follows the same logic. PostgreSQL cannot execute more concurrent queries than it has CPU cores, so a common starting point is:
+
+```
+default_pool_size ≈ (CPU cores × 2) + effective_spindle_count
+```
+
+For an 8-core server with SSDs, that is roughly 18–20. Start there, then watch `cl_waiting` under real load and raise it only if clients queue. Raising it far beyond the core count reliably makes throughput worse, not better — the queries simply take turns less efficiently.
+
+## Wrapping up
+
+PgBouncer is the right answer to "we have too many connections," which is the actual problem most teams have. Pgpool-II is a cluster middleware that happens to include pooling; adopt it for its routing and failover features, not for pooling alone.
+
+Whichever pooler sits in front of your database, remember to point your client tools at the pooler port when testing — and that some session features will behave differently through it. [Chat2DB](https://chat2db.ai/download) connects to PostgreSQL through PgBouncer or directly, so you can compare behaviour on both paths while you tune.

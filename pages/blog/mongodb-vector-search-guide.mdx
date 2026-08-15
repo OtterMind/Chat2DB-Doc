@@ -1,0 +1,352 @@
+---
+title: "MongoDB Vector Search: A Complete Setup Guide"
+description: "Build semantic search on MongoDB Atlas Vector Search: index setup, the $vectorSearch stage, pre-filtering, hybrid search and production tuning tips."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: August 15, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# MongoDB Vector Search: A Complete Setup Guide
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="August 15, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+If your application data already lives in MongoDB, adding a separate vector database means running two stores, keeping them synchronised, and reconciling them when they drift. MongoDB Atlas Vector Search removes that problem: embeddings live in the same documents as the data they describe, and semantic search becomes another aggregation stage.
+
+This guide covers index setup, querying, filtering and the operational details that matter in production.
+
+## What you need
+
+Atlas Vector Search is a feature of **MongoDB Atlas**, the managed cloud service. It is not available in a self-hosted community deployment. You need an Atlas cluster on M10 or above for production workloads; the free M0 tier supports vector search for experimentation with lower limits.
+
+## Data model
+
+Store the embedding as an array of numbers on the document itself:
+
+```javascript
+{
+  _id: ObjectId("..."),
+  title: "PostgreSQL VACUUM and Autovacuum Tuning",
+  content: "Every PostgreSQL table quietly accumulates garbage...",
+  category: "databases",
+  tags: ["postgres", "maintenance"],
+  published: ISODate("2026-08-15T00:00:00Z"),
+  views: 1420,
+  embedding: [0.0231, -0.1142, 0.3351, /* ... 1536 floats ... */]
+}
+```
+
+Two design decisions worth making early.
+
+**Chunk before embedding.** A 5,000-word article embedded as one vector produces a blurry average of everything it discusses. Split into passages of a few hundred tokens and store each as its own document with a reference back to the parent:
+
+```javascript
+{
+  _id: ObjectId("..."),
+  parent_id: ObjectId("..."),
+  chunk_index: 3,
+  content: "The autovacuum daemon wakes up every autovacuum_naptime...",
+  category: "databases",
+  embedding: [/* ... */]
+}
+```
+
+**Watch the document size limit.** MongoDB documents cap at 16 MB. A 1536-dimension float embedding is about 12 KB in BSON, so embedding arrays inside a document with hundreds of chunks will hit that ceiling. One document per chunk avoids the problem entirely.
+
+## Creating the vector search index
+
+Vector indexes are defined in Atlas, either through the UI, the Atlas CLI, or the driver. The definition specifies dimensions, similarity metric, and which fields are filterable:
+
+```json
+{
+  "fields": [
+    {
+      "type": "vector",
+      "path": "embedding",
+      "numDimensions": 1536,
+      "similarity": "cosine"
+    },
+    {
+      "type": "filter",
+      "path": "category"
+    },
+    {
+      "type": "filter",
+      "path": "tags"
+    },
+    {
+      "type": "filter",
+      "path": "published"
+    }
+  ]
+}
+```
+
+Create it from the Node.js driver:
+
+```javascript
+const collection = db.collection("articles");
+
+await collection.createSearchIndex({
+  name: "vector_index",
+  type: "vectorSearch",
+  definition: {
+    fields: [
+      { type: "vector", path: "embedding", numDimensions: 1536, similarity: "cosine" },
+      { type: "filter", path: "category" },
+      { type: "filter", path: "published" },
+    ],
+  },
+});
+```
+
+Three things to get right:
+
+- **`numDimensions` must match your embedding model exactly.** `text-embedding-3-small` produces 1536; `text-embedding-3-large` produces 3072; `all-MiniLM-L6-v2` produces 384. A mismatch means the index silently skips those documents.
+- **`similarity`** is `cosine`, `euclidean` or `dotProduct`. Use `cosine` for most text embeddings; use `dotProduct` only if your vectors are already normalised, where it is equivalent and faster.
+- **Every field you intend to filter on must be declared** with `type: "filter"`. You cannot filter on an undeclared field.
+
+Index builds are asynchronous. Check readiness before querying:
+
+```javascript
+const indexes = await collection.listSearchIndexes().toArray();
+console.log(indexes.map(i => ({ name: i.name, status: i.status })));
+```
+
+Wait for `status: "READY"`.
+
+## Querying with $vectorSearch
+
+`$vectorSearch` must be the **first stage** of an aggregation pipeline:
+
+```javascript
+const results = await collection.aggregate([
+  {
+    $vectorSearch: {
+      index: "vector_index",
+      path: "embedding",
+      queryVector: queryEmbedding,   // array of floats from your model
+      numCandidates: 150,
+      limit: 10,
+    },
+  },
+  {
+    $project: {
+      _id: 1,
+      title: 1,
+      content: 1,
+      category: 1,
+      score: { $meta: "vectorSearchScore" },
+    },
+  },
+]).toArray();
+```
+
+### numCandidates versus limit
+
+This pair controls the recall/latency trade-off and is the most important tuning knob.
+
+`numCandidates` is how many nearest neighbours the approximate search considers internally; `limit` is how many you get back. Atlas recommends `numCandidates` between 10 and 20 times `limit`. Setting them equal produces fast but noticeably worse results — the ANN search does not explore enough of the graph to find the true nearest neighbours.
+
+For `limit: 10`, start with `numCandidates: 150` and adjust based on measured recall.
+
+### Exact search
+
+For small collections or when you need guaranteed-correct results to benchmark recall against, request exact search:
+
+```javascript
+{
+  $vectorSearch: {
+    index: "vector_index",
+    path: "embedding",
+    queryVector: queryEmbedding,
+    exact: true,
+    limit: 10,
+  },
+}
+```
+
+With `exact: true` you omit `numCandidates`. This scans every vector, so it is only viable on modest collections — but it is invaluable for measuring how much recall your approximate settings are actually losing.
+
+## Filtering
+
+Filters are applied as **pre-filters** — during the vector search rather than after it. This matters enormously: post-filtering would retrieve 10 nearest neighbours and then discard those that fail the filter, potentially leaving you with two results.
+
+```javascript
+const results = await collection.aggregate([
+  {
+    $vectorSearch: {
+      index: "vector_index",
+      path: "embedding",
+      queryVector: queryEmbedding,
+      numCandidates: 200,
+      limit: 10,
+      filter: {
+        category: "databases",
+        published: { $gte: new Date("2026-01-01") },
+      },
+    },
+  },
+  { $project: { title: 1, score: { $meta: "vectorSearchScore" } } },
+]).toArray();
+```
+
+Supported filter operators include `$eq`, `$ne`, `$gt`, `$gte`, `$lt`, `$lte`, `$in`, `$nin`, `$and`, `$or` and `$not`.
+
+When a filter is highly selective — matching a tiny fraction of documents — raise `numCandidates` substantially, since the search must traverse further to find enough matching neighbours.
+
+## Combining with other stages
+
+Because `$vectorSearch` is an ordinary aggregation stage, everything downstream works normally:
+
+```javascript
+const results = await collection.aggregate([
+  {
+    $vectorSearch: {
+      index: "vector_index",
+      path: "embedding",
+      queryVector: queryEmbedding,
+      numCandidates: 150,
+      limit: 20,
+    },
+  },
+  { $addFields: { score: { $meta: "vectorSearchScore" } } },
+  { $match: { score: { $gte: 0.75 } } },       // drop weak matches
+  {
+    $lookup: {                                  // join back to parent documents
+      from: "articles",
+      localField: "parent_id",
+      foreignField: "_id",
+      as: "parent",
+    },
+  },
+  { $unwind: "$parent" },
+  {
+    $group: {                                   // one result per parent article
+      _id: "$parent_id",
+      title: { $first: "$parent.title" },
+      bestScore: { $max: "$score" },
+      chunks: { $push: "$content" },
+    },
+  },
+  { $sort: { bestScore: -1 } },
+  { $limit: 5 },
+]).toArray();
+```
+
+That `$group` step is a genuinely useful pattern: chunk-level retrieval finds the right passages, then grouping by parent returns whole articles ranked by their best-matching chunk.
+
+The `$match` on score is worth including. Vector search always returns *something* — the nearest vectors exist even when nothing is relevant. Without a threshold, an unrelated query returns confidently-ranked nonsense.
+
+## Hybrid search
+
+Vector search is poor at exact tokens: error codes, part numbers, function names. Atlas supports `$rankFusion` to combine vector and full-text search into one ranked list:
+
+```javascript
+const results = await collection.aggregate([
+  {
+    $rankFusion: {
+      input: {
+        pipelines: {
+          semantic: [
+            {
+              $vectorSearch: {
+                index: "vector_index",
+                path: "embedding",
+                queryVector: queryEmbedding,
+                numCandidates: 150,
+                limit: 40,
+              },
+            },
+          ],
+          keyword: [
+            {
+              $search: {
+                index: "text_index",
+                text: { query: userQuery, path: "content" },
+              },
+            },
+            { $limit: 40 },
+          ],
+        },
+      },
+      combination: { weights: { semantic: 0.7, keyword: 0.3 } },
+    },
+  },
+  { $limit: 10 },
+]).toArray();
+```
+
+This requires a separate Atlas Search text index alongside the vector index. On older cluster versions without `$rankFusion`, achieve the same result with `$unionWith` and manual reciprocal rank fusion scoring.
+
+## Generating and storing embeddings
+
+A minimal ingestion pipeline:
+
+```javascript
+import OpenAI from "openai";
+const openai = new OpenAI();
+
+async function embed(texts) {
+  const res = await openai.embeddings.create({
+    model: "text-embedding-3-small",
+    input: texts,
+  });
+  return res.data.map(d => d.embedding);
+}
+
+async function indexChunks(parentId, chunks, meta) {
+  const vectors = await embed(chunks);          // batch — far cheaper than one call each
+
+  const ops = chunks.map((content, i) => ({
+    updateOne: {
+      filter: { parent_id: parentId, chunk_index: i },
+      update: {
+        $set: { parent_id: parentId, chunk_index: i, content, embedding: vectors[i], ...meta },
+      },
+      upsert: true,
+    },
+  }));
+
+  await collection.bulkWrite(ops);
+}
+```
+
+Two practical notes. Batch your embedding calls — embedding APIs accept arrays and charge per token, so one call with 100 chunks is dramatically faster and cheaper than 100 calls. And use `upsert` keyed on `(parent_id, chunk_index)` so re-indexing an edited document replaces its chunks instead of duplicating them. If the new version has fewer chunks, delete the stale tail:
+
+```javascript
+await collection.deleteMany({ parent_id: parentId, chunk_index: { $gte: chunks.length } });
+```
+
+## Production considerations
+
+**Memory.** Vector indexes are held in memory. Roughly, `numDimensions × 4 bytes × document count`, plus graph overhead. One million 1536-dimension vectors is about 6 GB before overhead — size your cluster tier accordingly, or use quantisation.
+
+**Quantisation.** Atlas supports scalar and binary quantisation to cut memory substantially:
+
+```json
+{
+  "type": "vector",
+  "path": "embedding",
+  "numDimensions": 1536,
+  "similarity": "cosine",
+  "quantization": "scalar"
+}
+```
+
+Scalar quantisation reduces memory roughly fourfold with minor recall loss; binary goes much further with a larger accuracy cost, usually paired with a rescoring pass.
+
+**Dedicated search nodes.** On larger deployments, Atlas lets you run Search on separate nodes so vector queries do not compete with transactional workload for memory and CPU.
+
+**Changing embedding models** invalidates every stored vector. Plan for it: write to a new field, backfill, swap the index, then drop the old field — rather than re-embedding in place and leaving the collection in a mixed state where results are silently wrong.
+
+## Wrapping up
+
+MongoDB Atlas Vector Search is the pragmatic choice when your documents already live in MongoDB. Keeping embeddings beside the data they describe removes an entire class of synchronisation bugs, and `$vectorSearch` composing with the rest of the aggregation pipeline means filtering, joining and grouping all work the way you already know.
+
+The details that decide quality are `numCandidates` relative to `limit`, declaring filter fields in the index, a similarity threshold to reject weak matches, and hybrid search when exact terms matter.
+
+If you work across MongoDB and relational databases, [Chat2DB](https://chat2db.ai/download) connects to MongoDB, PostgreSQL, MySQL and 20+ others in one client, so you can inspect collections, build aggregation pipelines and query relational data without switching tools.

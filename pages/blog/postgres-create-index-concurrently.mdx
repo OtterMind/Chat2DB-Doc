@@ -1,0 +1,262 @@
+---
+title: "CREATE INDEX CONCURRENTLY in PostgreSQL: A Guide"
+description: "How to add PostgreSQL indexes without blocking writes using CREATE INDEX CONCURRENTLY, why builds fail, and how to find and clean up invalid indexes."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: August 15, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# CREATE INDEX CONCURRENTLY in PostgreSQL: A Guide
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="August 15, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+Running a plain `CREATE INDEX` on a large production table is one of the classic ways to cause an outage. The statement takes a `SHARE` lock, which blocks every `INSERT`, `UPDATE` and `DELETE` on that table until the index is fully built — potentially many minutes on a table with hundreds of millions of rows. Meanwhile connections pile up, the pooler saturates, and the application starts timing out.
+
+`CREATE INDEX CONCURRENTLY` exists to avoid exactly this. It is slower and more fragile, but it lets writes continue. This guide covers how it works, the failure modes nobody warns you about, and the operational recipe for using it safely.
+
+## The problem, demonstrated
+
+Set up a table to experiment with:
+
+```sql
+CREATE TABLE events (
+    id         bigserial PRIMARY KEY,
+    user_id    bigint      NOT NULL,
+    event_type text        NOT NULL,
+    payload    jsonb       NOT NULL DEFAULT '{}',
+    created_at timestamptz NOT NULL DEFAULT now()
+);
+
+INSERT INTO events (user_id, event_type, created_at)
+SELECT (random() * 100000)::bigint,
+       (ARRAY['click','view','purchase','signup'])[1 + (random() * 3)::int],
+       now() - (random() * 90 || ' days')::interval
+FROM generate_series(1, 5000000);
+```
+
+In one session, start a plain index build:
+
+```sql
+CREATE INDEX idx_events_user_id ON events (user_id);
+```
+
+In a second session, try to write:
+
+```sql
+INSERT INTO events (user_id, event_type) VALUES (42, 'click');
+-- blocks until the index build finishes
+```
+
+You can watch the lock in a third session:
+
+```sql
+SELECT a.pid, a.wait_event_type, a.wait_event, l.mode, l.granted, a.query
+FROM   pg_stat_activity a
+JOIN   pg_locks l ON l.pid = a.pid
+WHERE  l.relation = 'events'::regclass;
+```
+
+## How CONCURRENTLY works
+
+```sql
+CREATE INDEX CONCURRENTLY idx_events_user_id ON events (user_id);
+```
+
+Instead of one pass under a heavy lock, PostgreSQL performs two table scans under a much weaker `SHARE UPDATE EXCLUSIVE` lock, which permits concurrent reads and writes:
+
+1. **First pass** — builds the index from a snapshot of the table taken at the start.
+2. **Wait** — waits for every transaction that started before the first pass to finish, so no in-flight transaction can be writing rows the index does not know about.
+3. **Second pass** — scans again to add rows that were inserted or updated during the first pass.
+4. **Wait again** — waits for transactions that could still see the index as unusable.
+5. **Mark valid** — the index becomes usable by the planner.
+
+The two-pass approach is why it takes roughly two to three times as long as a plain build, and why it cannot run inside a transaction block.
+
+## Restriction: no transaction blocks
+
+```sql
+BEGIN;
+CREATE INDEX CONCURRENTLY idx_events_created ON events (created_at);
+-- ERROR: CREATE INDEX CONCURRENTLY cannot run inside a transaction block
+COMMIT;
+```
+
+This matters more than it first appears, because many migration frameworks wrap every migration in a transaction by default. You must opt out explicitly:
+
+**Rails**
+
+```ruby
+class AddIndexToEvents < ActiveRecord::Migration[7.1]
+  disable_ddl_transaction!
+
+  def change
+    add_index :events, :user_id, algorithm: :concurrently
+  end
+end
+```
+
+**Django**
+
+```python
+from django.contrib.postgres.operations import AddIndexConcurrently
+from django.db import migrations, models
+
+class Migration(migrations.Migration):
+    atomic = False   # required
+
+    operations = [
+        AddIndexConcurrently(
+            model_name="event",
+            index=models.Index(fields=["user_id"], name="idx_events_user_id"),
+        ),
+    ]
+```
+
+**Flyway** — put the statement in its own migration file and disable the transaction with the `-- executeInTransaction=false` script config or a matching `.conf` file, since Flyway wraps migrations in a transaction on PostgreSQL by default.
+
+## The failure mode: invalid indexes
+
+Here is the part that surprises people. If a concurrent build fails — a deadlock, a uniqueness violation, a cancelled session, a `pg_terminate_backend` — PostgreSQL leaves behind an **invalid index**. It is not automatically cleaned up.
+
+An invalid index is the worst of both worlds: the planner will not use it for queries, but every `INSERT` and `UPDATE` still has to maintain it. You pay the write cost and get no read benefit.
+
+Detect them with:
+
+```sql
+SELECT i.indexrelid::regclass AS index_name,
+       i.indrelid::regclass   AS table_name,
+       pg_size_pretty(pg_relation_size(i.indexrelid)) AS size
+FROM   pg_index i
+WHERE  NOT i.indisvalid;
+```
+
+Clean up with — again, concurrently, so the drop does not take a heavy lock:
+
+```sql
+DROP INDEX CONCURRENTLY idx_events_user_id;
+```
+
+Then investigate why it failed and retry. A useful habit: add this invalid-index query to your monitoring so a failed build raises an alert instead of silently taxing writes for months.
+
+### Why a unique index fails differently
+
+```sql
+CREATE UNIQUE INDEX CONCURRENTLY idx_events_unique_id ON events (user_id, created_at);
+```
+
+For a unique index, the second pass enforces the constraint. If duplicates were inserted while the build was running, the build fails at the very end — after doing all the work. Check for duplicates first:
+
+```sql
+SELECT user_id, created_at, count(*)
+FROM   events
+GROUP  BY user_id, created_at
+HAVING count(*) > 1
+LIMIT  10;
+```
+
+## It still needs a lock — briefly
+
+`SHARE UPDATE EXCLUSIVE` allows DML but conflicts with other `SHARE UPDATE EXCLUSIVE` holders — notably `VACUUM`, `ANALYZE`, and other concurrent index builds on the same table — and with any `ALTER TABLE`. More importantly, acquiring that lock still requires waiting for conflicting locks to clear.
+
+That means a single long-running transaction holding a lock on the table will stall the build at step one. Worse, once `CREATE INDEX CONCURRENTLY` is queued waiting for a lock, everything queued behind *it* also waits. Always check for long transactions first:
+
+```sql
+SELECT pid,
+       now() - xact_start AS xact_age,
+       state,
+       left(query, 80) AS query
+FROM   pg_stat_activity
+WHERE  xact_start IS NOT NULL
+  AND  now() - xact_start > interval '1 minute'
+ORDER  BY xact_start;
+```
+
+Setting a lock timeout keeps a stalled build from becoming a queue of blocked writes:
+
+```sql
+SET lock_timeout = '5s';
+CREATE INDEX CONCURRENTLY idx_events_created_at ON events (created_at);
+```
+
+If it cannot get the lock within five seconds it fails fast, leaving an invalid index to drop and retry — far better than blocking production traffic indefinitely.
+
+## Monitoring progress
+
+Since PostgreSQL 12 you can watch a build in real time:
+
+```sql
+SELECT pid,
+       relid::regclass AS table_name,
+       phase,
+       blocks_done,
+       blocks_total,
+       round(100.0 * blocks_done / NULLIF(blocks_total, 0), 1) AS pct,
+       tuples_done,
+       tuples_total
+FROM   pg_stat_progress_create_index;
+```
+
+The `phase` column tells you exactly where you are — `building index: scanning table`, `waiting for writers before validation`, `index validation: scanning index`, and so on. If the phase sits on one of the waiting states, a long transaction is the cause.
+
+## Speeding up the build
+
+Index builds are sort-bound. Raising `maintenance_work_mem` for the session makes a large difference:
+
+```sql
+SET maintenance_work_mem = '2GB';
+SET max_parallel_maintenance_workers = 4;
+
+CREATE INDEX CONCURRENTLY idx_events_user_type ON events (user_id, event_type);
+```
+
+Note that parallel workers are **not** used for concurrent builds in most versions — parallelism applies to plain `CREATE INDEX`. `maintenance_work_mem` still helps either way.
+
+## Rebuilding a bloated index
+
+To rebuild an existing index without downtime, `REINDEX CONCURRENTLY` (PostgreSQL 12+) is the clean approach:
+
+```sql
+REINDEX INDEX CONCURRENTLY idx_events_user_id;
+
+-- Or every index on the table
+REINDEX TABLE CONCURRENTLY events;
+```
+
+It builds a replacement, swaps it in, and drops the old one. If it fails partway you may find a leftover index suffixed `_ccnew` — drop it concurrently and retry.
+
+## An operational checklist
+
+Before running a concurrent index build on a production table:
+
+1. Check for long-running transactions and idle-in-transaction sessions.
+2. Set a `lock_timeout` so the build fails fast rather than queueing writes behind it.
+3. Raise `maintenance_work_mem` for the session.
+4. Ensure your migration tool is not wrapping the statement in a transaction.
+5. Run during a lower-traffic window — writes continue, but the build competes for I/O.
+6. Afterwards, verify the index is valid, then `ANALYZE` the table so the planner has fresh statistics.
+
+```sql
+-- Post-build verification
+SELECT indexrelid::regclass, indisvalid, indisready
+FROM   pg_index
+WHERE  indrelid = 'events'::regclass;
+
+ANALYZE events;
+```
+
+Finally, confirm the planner actually uses the new index:
+
+```sql
+EXPLAIN (ANALYZE, BUFFERS)
+SELECT * FROM events WHERE user_id = 42 ORDER BY created_at DESC LIMIT 20;
+```
+
+## Wrapping up
+
+`CREATE INDEX CONCURRENTLY` is the right default for any table large enough that a lock would be noticed. The price is a slower build, no transaction wrapping, and a real chance of leaving an invalid index behind — all manageable as long as you monitor for invalid indexes rather than assuming success.
+
+If you would rather see index status, build progress and query plans in one interface than assemble them from catalog queries, [Chat2DB](https://chat2db.ai/download) connects to PostgreSQL and surfaces them directly, and can draft the DDL for you from a plain-English description.

@@ -1,0 +1,268 @@
+---
+title: "PostgreSQL Index Types Explained: B-tree, GIN, GiST"
+description: "A practical guide to PostgreSQL index types — B-tree, Hash, GIN, GiST, SP-GiST and BRIN — with runnable examples of the queries each one speeds up."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: August 15, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# PostgreSQL Index Types Explained: B-tree, GIN, GiST
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="August 15, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+Most developers create exactly one kind of PostgreSQL index — the default B-tree — and then wonder why their full-text search, JSONB lookups and geometric queries are still slow. PostgreSQL ships with six index types, and choosing the right one is often the difference between a 900 ms sequential scan and a 3 ms index scan.
+
+This guide walks through each type with a runnable example, and explains how to tell which one a query actually needs.
+
+## Setting up a test table
+
+Every example below uses this table:
+
+```sql
+CREATE TABLE articles (
+    id         bigserial PRIMARY KEY,
+    title      text        NOT NULL,
+    body       text        NOT NULL,
+    tags       text[]      NOT NULL DEFAULT '{}',
+    metadata   jsonb       NOT NULL DEFAULT '{}',
+    published  timestamptz NOT NULL DEFAULT now(),
+    views      integer     NOT NULL DEFAULT 0
+);
+
+INSERT INTO articles (title, body, tags, metadata, published, views)
+SELECT
+    'Article ' || i,
+    'Body text for article ' || i || ' about databases and indexing.',
+    CASE WHEN i % 3 = 0 THEN ARRAY['postgres','indexing']
+         WHEN i % 3 = 1 THEN ARRAY['mysql']
+         ELSE ARRAY['postgres','performance'] END,
+    jsonb_build_object('author', 'user' || (i % 500), 'featured', i % 50 = 0),
+    now() - (i || ' minutes')::interval,
+    (random() * 10000)::int
+FROM generate_series(1, 500000) AS i;
+
+ANALYZE articles;
+```
+
+## B-tree: the default, and usually the right answer
+
+B-tree is what you get when you write `CREATE INDEX` without specifying a type. It stores values in sorted order, which makes it useful for far more than equality.
+
+```sql
+CREATE INDEX idx_articles_published ON articles (published);
+```
+
+A B-tree accelerates:
+
+- Equality: `WHERE published = '2026-08-15'`
+- Range scans: `WHERE published > now() - interval '7 days'`
+- Sorting: `ORDER BY published DESC` — the index is already in order, so no sort node is needed
+- `BETWEEN`, `<`, `<=`, `>`, `>=`, and `IS NULL`
+- Prefix matching with `LIKE 'foo%'`, but only if the index uses `text_pattern_ops` on a non-C locale
+
+That last point trips people up:
+
+```sql
+-- Does NOT help LIKE 'Article 42%' on a typical en_US.UTF-8 database
+CREATE INDEX idx_title ON articles (title);
+
+-- DOES help prefix matching
+CREATE INDEX idx_title_pattern ON articles (title text_pattern_ops);
+```
+
+### Multi-column B-trees and column order
+
+Column order matters enormously:
+
+```sql
+CREATE INDEX idx_articles_views_published ON articles (views, published);
+```
+
+This index serves `WHERE views = 100`, `WHERE views = 100 AND published > ...`, and `WHERE views BETWEEN 10 AND 20`. It does **not** efficiently serve `WHERE published > ...` alone, because `published` is the second column — the index is sorted by `views` first. The rule of thumb: put equality columns first, range columns last.
+
+### Covering indexes with INCLUDE
+
+If a query reads only a few columns, you can attach them to the index so PostgreSQL never touches the table:
+
+```sql
+CREATE INDEX idx_articles_pub_covering
+    ON articles (published) INCLUDE (title, views);
+```
+
+Now `SELECT title, views FROM articles WHERE published > now() - interval '1 day'` can use an index-only scan. Note that index-only scans also require the visibility map to be current, which means the table must be well vacuumed.
+
+## Hash: equality only
+
+Hash indexes store a hash of the value, so they handle `=` and nothing else — no ranges, no sorting.
+
+```sql
+CREATE INDEX idx_articles_title_hash ON articles USING hash (title);
+```
+
+Before PostgreSQL 10 these were not WAL-logged and did not survive a crash, which earned them a bad reputation. Today they are crash-safe and can be slightly smaller than a B-tree for long values. In practice a B-tree is almost always the better default, because it handles equality just as well *and* everything else. Reach for hash only when you have a very wide key, need equality only, and have measured a real size benefit.
+
+## GIN: for values that contain many items
+
+GIN — Generalized Inverted Index — is built for columns where each row holds *multiple* searchable values: arrays, JSONB documents, and full-text vectors. It maps each individual element back to the rows containing it, exactly like the index at the back of a book.
+
+### Arrays
+
+```sql
+CREATE INDEX idx_articles_tags ON articles USING gin (tags);
+
+-- Now this uses the index instead of scanning 500,000 rows
+SELECT id, title FROM articles WHERE tags @> ARRAY['postgres'];
+```
+
+The `@>` ("contains") operator, along with `&&` ("overlaps") and `<@` ("is contained by"), is what GIN accelerates on arrays.
+
+### JSONB
+
+```sql
+CREATE INDEX idx_articles_metadata ON articles USING gin (metadata);
+
+SELECT id FROM articles WHERE metadata @> '{"featured": true}';
+```
+
+The default `jsonb_ops` operator class indexes every key *and* every value, which makes the index large. If you only ever query with the containment operator `@>`, the `jsonb_path_ops` class is considerably smaller and faster:
+
+```sql
+CREATE INDEX idx_articles_metadata_path
+    ON articles USING gin (metadata jsonb_path_ops);
+```
+
+The trade-off: `jsonb_path_ops` supports only `@>`, not key-existence operators like `?`.
+
+### Full-text search
+
+```sql
+CREATE INDEX idx_articles_fts
+    ON articles USING gin (to_tsvector('english', title || ' ' || body));
+
+SELECT id, title
+FROM   articles
+WHERE  to_tsvector('english', title || ' ' || body) @@ plainto_tsquery('english', 'indexing databases');
+```
+
+The expression in the index must match the expression in the query exactly, or PostgreSQL will not use it. For anything beyond a toy schema, store the `tsvector` in a generated column instead:
+
+```sql
+ALTER TABLE articles
+    ADD COLUMN search_vector tsvector
+    GENERATED ALWAYS AS (to_tsvector('english', title || ' ' || body)) STORED;
+
+CREATE INDEX idx_articles_search ON articles USING gin (search_vector);
+```
+
+GIN's weakness is write cost — updating a GIN index is expensive because one row touches many index entries. The `fastupdate` setting buffers those writes into a pending list, trading read latency for write throughput.
+
+## GiST: for overlapping and nearest-neighbour queries
+
+GiST — Generalized Search Tree — is a framework rather than a single algorithm. It excels at data where "close to" and "overlaps" are meaningful: geometric shapes, ranges, and full-text with ranking.
+
+```sql
+CREATE TABLE reservations (
+    room_id  int,
+    during   tstzrange
+);
+
+CREATE INDEX idx_reservations_during ON reservations USING gist (during);
+
+-- Find bookings that overlap a window
+SELECT * FROM reservations
+WHERE during && tstzrange('2026-08-15 09:00', '2026-08-15 17:00');
+```
+
+GiST also powers exclusion constraints, which enforce "no two reservations for the same room may overlap" at the database level:
+
+```sql
+CREATE EXTENSION IF NOT EXISTS btree_gist;
+
+ALTER TABLE reservations
+    ADD CONSTRAINT no_double_booking
+    EXCLUDE USING gist (room_id WITH =, during WITH &&);
+```
+
+This is the index type PostGIS builds on for spatial queries, and it is what makes `ORDER BY location <-> point(...) LIMIT 10` a fast nearest-neighbour search rather than a full scan.
+
+## SP-GiST: space-partitioned trees
+
+SP-GiST supports partitioned search structures — quadtrees, k-d trees, radix trees — which suit non-balanced data such as IP address hierarchies and phone number prefixes.
+
+```sql
+CREATE TABLE visits (ip inet);
+CREATE INDEX idx_visits_ip ON visits USING spgist (ip inet_ops);
+```
+
+In practice most teams never need SP-GiST directly; it matters when your data has a natural hierarchical partitioning that a balanced B-tree handles poorly.
+
+## BRIN: tiny indexes for naturally ordered data
+
+BRIN — Block Range Index — stores only the minimum and maximum value per block range, making it hundreds of times smaller than a B-tree. It works brilliantly when the physical row order correlates with the column value, which is typical of append-only time-series tables.
+
+```sql
+CREATE INDEX idx_articles_published_brin
+    ON articles USING brin (published) WITH (pages_per_range = 64);
+```
+
+For a table where rows are inserted in timestamp order, a BRIN index on `published` might be a few hundred kilobytes where a B-tree would be several hundred megabytes. The catch is correlation: if the rows are shuffled, BRIN degrades to a full scan because almost every block range contains almost every value. Check correlation before committing:
+
+```sql
+SELECT attname, correlation
+FROM   pg_stats
+WHERE  tablename = 'articles' AND attname = 'published';
+```
+
+A correlation near 1.0 or -1.0 means BRIN will work well; near 0 means it will not.
+
+## Choosing the right type
+
+| Data / query pattern | Index type |
+| --- | --- |
+| Equality, ranges, sorting, most columns | B-tree |
+| Equality only on a very wide key | Hash |
+| Array containment, JSONB containment, full-text | GIN |
+| Range overlap, geometric, nearest-neighbour | GiST |
+| Hierarchical / prefix-partitioned data | SP-GiST |
+| Huge append-only table, column correlates with physical order | BRIN |
+
+## Verifying that the index is actually used
+
+Creating an index is not the same as using one. Always confirm with `EXPLAIN ANALYZE`:
+
+```sql
+EXPLAIN (ANALYZE, BUFFERS)
+SELECT id, title FROM articles WHERE tags @> ARRAY['postgres'];
+```
+
+Look for a `Bitmap Index Scan on idx_articles_tags` rather than a `Seq Scan on articles`. If PostgreSQL still chooses a sequential scan, the usual reasons are that the query returns a large fraction of the table (a scan really is cheaper), statistics are stale (`ANALYZE` the table), or the query expression does not match the indexed expression.
+
+If reading raw plan output is tedious, paste it into the free [PostgreSQL EXPLAIN plan visualizer](https://chat2db.ai/tools/explain-plan-visualizer), which renders the tree with per-node timings and flags row-estimate errors.
+
+## Finding unused indexes
+
+Indexes cost write throughput and disk space, so audit them periodically:
+
+```sql
+SELECT s.relname AS table_name,
+       s.indexrelname AS index_name,
+       s.idx_scan AS times_used,
+       pg_size_pretty(pg_relation_size(s.indexrelid)) AS index_size
+FROM   pg_stat_user_indexes s
+JOIN   pg_index i ON i.indexrelid = s.indexrelid
+WHERE  s.idx_scan = 0
+  AND  NOT i.indisunique
+ORDER  BY pg_relation_size(s.indexrelid) DESC;
+```
+
+Any large index with zero scans since the last statistics reset is a candidate for removal — after confirming it is not serving a rarely-run but critical report.
+
+## Wrapping up
+
+The default B-tree covers the majority of queries, but it is genuinely the wrong tool for arrays, JSONB documents, full-text search and range overlaps. Matching the index type to the query operator is one of the highest-leverage changes you can make to a PostgreSQL schema.
+
+When you are experimenting with index strategies across several databases, [Chat2DB](https://chat2db.ai/download) lets you inspect existing indexes, run `EXPLAIN` side by side, and generate the DDL from a plain-English description of what you are trying to speed up.
