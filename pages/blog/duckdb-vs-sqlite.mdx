@@ -1,0 +1,203 @@
+---
+title: "DuckDB vs SQLite: Which Embedded Database to Use"
+description: "DuckDB vs SQLite compared: columnar OLAP versus row-based OLTP, concurrency, file formats and SQL features, with guidance on choosing between them."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: August 16, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# DuckDB vs SQLite: Which Embedded Database to Use
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="August 16, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+DuckDB is frequently described as "SQLite for analytics", and the comparison is apt enough to be useful and misleading enough to cause bad decisions. Both are embedded databases: a library you link into your process, storing data in a single file, with no server to run and no connection string to configure. That shared shape hides a fundamental difference in how they store and process data, and that difference determines which one you should use.
+
+## The core difference: rows versus columns
+
+SQLite stores data **row-wise**. All the values of one row sit together on a page. To read a row, you read one page.
+
+DuckDB stores data **column-wise**. All the values of one column sit together in compressed blocks. To read a column, you read only that column's blocks.
+
+Everything else follows from this.
+
+Consider a table with 30 columns and 50 million rows, and this query:
+
+```sql
+SELECT avg(amount) FROM transactions WHERE year = 2026;
+```
+
+SQLite must read every page containing a matching row, and each page contains all 30 columns — so it reads roughly 30 times more data than the query needs. DuckDB reads two columns and ignores the other 28. On a wide table, that alone is an order of magnitude.
+
+Then compression compounds it. A column of repeated country codes or timestamps compresses far better than a mixed row does, because adjacent values are similar. And DuckDB processes data in **vectors** of about 2,048 values at a time rather than row by row, which keeps the CPU pipeline full and enables SIMD instructions.
+
+Now the opposite query:
+
+```sql
+SELECT * FROM transactions WHERE id = 4711;
+```
+
+SQLite reads one page and returns the row. DuckDB has to reach into 30 separate column segments and reassemble it. SQLite wins comfortably.
+
+That is the whole trade-off: scan many rows and few columns, or fetch few rows and all columns.
+
+## Concurrency
+
+This is the difference most likely to break an application, and it is easy to miss.
+
+**SQLite** in WAL mode supports one writer and many concurrent readers. Readers do not block the writer and the writer does not block readers. A second writer gets `SQLITE_BUSY` and has to retry. Multiple processes can safely open the same file.
+
+**DuckDB** allows either one process with read-write access, or multiple processes with read-only access. It does not support multiple processes writing to the same database file. Within a single process, DuckDB is fully multi-threaded and parallelises a single query across cores — something SQLite does not do at all.
+
+The practical implication: a web application with several worker processes sharing a database file works with SQLite and does not work with DuckDB. That is not a tuning problem, it is the design.
+
+## SQL and type system
+
+SQLite's SQL is deliberately minimal and its type system is unusual. Columns have *type affinity* rather than strict types, so a `TEXT` column will accept an integer and store it as an integer unless you create the table with `STRICT`:
+
+```sql
+-- Classic SQLite: this succeeds
+CREATE TABLE t (id INTEGER, name TEXT);
+INSERT INTO t VALUES ('not-a-number', 42);
+
+-- Since 3.37, opt into real type checking
+CREATE TABLE t2 (id INTEGER, name TEXT) STRICT;
+INSERT INTO t2 VALUES ('not-a-number', 42);  -- ERROR
+```
+
+DuckDB has strict PostgreSQL-compatible types — `DECIMAL`, `INTERVAL`, `UUID`, `LIST`, `STRUCT`, `MAP`, `ENUM` — and rejects mismatches outright.
+
+DuckDB's dialect is much richer, and for analytical work the differences are substantial. Window functions exist in both, but DuckDB adds `QUALIFY`, `GROUPING SETS`, `ROLLUP`, `CUBE`, `PIVOT` and `UNPIVOT` as first-class syntax:
+
+```sql
+-- DuckDB: filter on a window function result without a subquery
+SELECT customer_id, order_date, total,
+       row_number() OVER (PARTITION BY customer_id ORDER BY total DESC) AS rn
+FROM orders
+QUALIFY rn <= 3;
+```
+
+```sql
+-- DuckDB: reshape without hand-written CASE expressions
+PIVOT sales ON quarter USING sum(revenue) GROUP BY region;
+```
+
+DuckDB also has genuinely convenient extensions to standard SQL:
+
+```sql
+-- Select all columns except some
+SELECT * EXCLUDE (internal_id, updated_at) FROM orders;
+
+-- Apply a function to matching columns
+SELECT COLUMNS('.*_cents') / 100 FROM orders;
+
+-- Reference an alias defined in the same SELECT
+SELECT price * quantity AS subtotal,
+       subtotal * 0.2 AS vat
+FROM order_items;
+```
+
+That last one — using an alias later in the same `SELECT` list — is not standard SQL and works in neither SQLite nor PostgreSQL, but it removes a lot of nested subqueries.
+
+## Reading external files
+
+DuckDB queries files directly, without loading them first. This is arguably its most practically useful feature:
+
+```sql
+-- Query a CSV with no CREATE TABLE, no import step
+SELECT country, count(*) AS n
+FROM 'data/customers.csv'
+GROUP BY country
+ORDER BY n DESC;
+
+-- Query Parquet, including partitioned directory trees and globs
+SELECT date_trunc('month', ts) AS month, sum(amount)
+FROM 's3://bucket/events/year=*/month=*/*.parquet'
+GROUP BY month
+ORDER BY month;
+
+-- Join a local Parquet file against a remote JSON file
+SELECT o.id, c.name
+FROM 'orders.parquet' o
+JOIN 'https://example.com/customers.json' c ON c.id = o.customer_id;
+```
+
+Parquet reading includes predicate pushdown and column pruning, so a `WHERE` clause on a partitioned dataset skips files entirely.
+
+SQLite has nothing comparable. Its CSV virtual table exists but requires setup and does no type inference, and there is no Parquet support. Getting data into SQLite means an import step:
+
+```bash
+sqlite3 data.db ".mode csv" ".import customers.csv customers"
+```
+
+DuckDB can also read SQLite files directly, which makes "use both" a real option:
+
+```sql
+INSTALL sqlite;
+LOAD sqlite;
+
+ATTACH 'app.db' AS app (TYPE sqlite);
+
+-- Analytical query over your SQLite production data
+SELECT status, count(*), avg(total)
+FROM app.orders
+GROUP BY status;
+```
+
+That pattern — SQLite as the transactional store, DuckDB attached for reporting — sidesteps the choice entirely.
+
+## Writes and updates
+
+SQLite handles single-row inserts and updates efficiently. That is what a row store is for.
+
+DuckDB's columnar storage makes single-row `UPDATE` and `DELETE` comparatively expensive, because a change touches every column segment. Bulk operations are where it shines:
+
+```sql
+-- DuckDB: excellent
+INSERT INTO events SELECT * FROM 'new_events.parquet';
+COPY events TO 'export.parquet' (FORMAT parquet, COMPRESSION zstd);
+
+-- DuckDB: works, but not what it is built for
+UPDATE events SET status = 'processed' WHERE id = 12345;
+```
+
+If your workload is a stream of small individual writes, that is SQLite's territory.
+
+## Ecosystem and footprint
+
+SQLite's maturity is difficult to overstate. It ships on every phone, in every browser, in aircraft and cars. The test suite has more lines than the implementation. It has a public-domain licence, a stable file format guaranteed until 2050, and an amount of production exposure no other database can match. The library is a few hundred kilobytes.
+
+DuckDB is MIT licensed, first released in 2019, and reached 1.0 in 2024 with a stable storage format. The binary is larger — tens of megabytes — and the extension ecosystem is growing rapidly: `httpfs` for remote files, `postgres` and `mysql` scanners for querying live servers, `spatial` for geospatial, `iceberg` and `delta` for lakehouse formats, plus vector similarity search.
+
+For a mobile app, an embedded device or anything that needs a decade of format stability behind it, SQLite's track record is a real argument.
+
+## Choosing
+
+Use **SQLite** when:
+
+- The workload is transactional — many small reads and writes of individual rows.
+- Multiple processes need to write to the same database.
+- You are on mobile or embedded hardware, or binary size matters.
+- You need the maximum possible maturity and format stability.
+- The data is small enough that scan performance never becomes the issue.
+
+Use **DuckDB** when:
+
+- The workload is analytical — aggregations, joins and window functions over many rows.
+- You want to query CSV, Parquet or JSON files without an import step.
+- The data is larger than memory but fits on local disk; DuckDB spills to disk gracefully.
+- You are replacing a pandas or Polars pipeline that has outgrown available RAM.
+- One process does the analysis, which is the normal case for a notebook or ETL job.
+
+And frequently, use **both**. SQLite for the application's operational data, DuckDB attached over it for reporting.
+
+Neither is a replacement for a server database when you need concurrent writers across machines, network access, role-based permissions or high availability. Both are embedded libraries, and that is a hard boundary — when you hit it, you want PostgreSQL, MySQL or a warehouse.
+
+When you are working across an embedded file and a server database in the same investigation, a client that speaks both saves the constant tool switching. [Chat2DB](https://chat2db.ai/download) connects to SQLite files alongside PostgreSQL, MySQL, ClickHouse and 20+ other engines, and its AI assistant will translate a query between dialects when you are moving logic from one to the other.
+
+## Summary
+
+SQLite is a row store built for transactional workloads: single-row access, multi-process writes, minimal footprint, unmatched maturity. DuckDB is a column store built for analytics: vectorised execution, parallel single-query processing, direct Parquet and CSV querying, and a far richer SQL dialect. They are not competitors so much as complements — the question is not which is better but whether your query reads a few rows entirely or many rows partially. If you find yourself running `GROUP BY` over millions of rows in SQLite, that is the signal to attach DuckDB rather than to migrate.

@@ -1,0 +1,309 @@
+---
+title: "PostgreSQL Full Text Search: tsvector and GIN Indexes"
+description: "Build full text search in PostgreSQL with tsvector, tsquery, GIN indexes and ranking. Runnable SQL for generated columns, weighting and highlighting."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: August 16, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# PostgreSQL Full Text Search: tsvector and GIN Indexes
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="August 16, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+Before you add Elasticsearch to your stack, it is worth knowing what PostgreSQL already does. Full text search has been built in since 8.3: stemming, stop words, ranking, phrase queries, multi-language dictionaries and highlighting, all with index support. For a corpus in the millions of documents, it is usually enough — and it means your search results are transactionally consistent with your data instead of eventually consistent with a separate cluster.
+
+This guide covers how it works and how to set it up properly, with SQL you can run.
+
+## Why LIKE is not search
+
+The naive approach:
+
+```sql
+SELECT * FROM articles WHERE body ILIKE '%database%';
+```
+
+This has three problems. It cannot use a normal B-tree index because of the leading wildcard, so it scans every row. It matches substrings rather than words, so `%cat%` matches "concatenate". And it does no linguistic processing, so a search for "running" misses "run", "ran" and "runs".
+
+Full text search fixes all three by transforming text into a normalized, indexable representation.
+
+## tsvector and tsquery
+
+Two types do the work. `tsvector` is a processed document; `tsquery` is a processed search query.
+
+Watch what `to_tsvector` does:
+
+```sql
+SELECT to_tsvector('english', 'The databases were running quickly and efficiently');
+```
+
+```
+'databas':2 'effici':7 'quick':5 'run':4
+```
+
+Three things happened. Stop words — "the", "were", "and" — were discarded. Remaining words were **stemmed** to their root form: "databases" became `databas`, "running" became `run`, "efficiently" became `effici`. And each remaining lexeme kept its position in the original text, which is what makes phrase search and ranking possible.
+
+The query side does the same normalization:
+
+```sql
+SELECT to_tsquery('english', 'running & database');
+```
+
+```
+'run' & 'databas'
+```
+
+Because both sides are stemmed the same way, they match:
+
+```sql
+SELECT to_tsvector('english', 'The databases were running quickly')
+       @@ to_tsquery('english', 'running & database');
+```
+
+```
+ ?column?
+----------
+ t
+```
+
+The `@@` operator is the match operator. That is the whole idea: normalize document and query the same way, then compare.
+
+The language configuration matters. `to_tsvector('simple', ...)` does no stemming at all, only lowercasing and stop word removal. Using `simple` when you meant `english` is a common cause of "why doesn't my search find plurals".
+
+## Building the queries
+
+There are four functions that produce a `tsquery`, and picking the right one avoids a lot of pain.
+
+`to_tsquery` requires explicit operators and **throws an error** on malformed input:
+
+```sql
+SELECT to_tsquery('english', 'postgres & (index | performance) & !mysql');
+```
+
+```
+'postgr' & ( 'index' | 'perform' ) & !'mysql'
+```
+
+Never pass raw user input to this one. A user typing `postgres &` gets a syntax error.
+
+`plainto_tsquery` takes plain text and ANDs the words together:
+
+```sql
+SELECT plainto_tsquery('english', 'postgres index performance');
+```
+
+```
+'postgr' & 'index' & 'perform'
+```
+
+`phraseto_tsquery` requires the words to appear adjacently, in order:
+
+```sql
+SELECT phraseto_tsquery('english', 'full text search');
+```
+
+```
+'full' <-> 'text' <-> 'search'
+```
+
+The `<->` operator means "immediately followed by". This is what makes a quoted-phrase search work.
+
+`websearch_to_tsquery` (PostgreSQL 11+) accepts the syntax users already know from search engines — quoted phrases, `or`, and a leading minus to exclude:
+
+```sql
+SELECT websearch_to_tsquery('english', '"connection pooling" postgres -mysql');
+```
+
+```
+'connect' <-> 'pool' & 'postgr' & !'mysql'
+```
+
+For a user-facing search box, `websearch_to_tsquery` is almost always the right choice. It never raises a syntax error on odd input, and it does what users expect.
+
+## A real table
+
+Let us build something searchable.
+
+```sql
+CREATE TABLE articles (
+  id        bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  title     text NOT NULL,
+  body      text NOT NULL,
+  author    text,
+  published timestamptz NOT NULL DEFAULT now()
+);
+
+INSERT INTO articles (title, body, author) VALUES
+  ('Postgres Connection Pooling',
+   'PgBouncer sits between your application and PostgreSQL, reusing server connections across many clients.',
+   'A. Developer'),
+  ('Indexing JSONB Efficiently',
+   'A GIN index on a jsonb column makes containment queries fast, but it is larger than a B-tree.',
+   'B. Engineer'),
+  ('Scaling Reads with Replicas',
+   'Streaming replication lets you run read-only queries on a standby server without loading the primary.',
+   'C. Architect');
+```
+
+The naive way to search this would be to call `to_tsvector` in the `WHERE` clause. Do not — it recomputes the vector for every row on every query and cannot use an index effectively. Instead, store the vector in a **generated column**:
+
+```sql
+ALTER TABLE articles
+  ADD COLUMN search_vector tsvector
+  GENERATED ALWAYS AS (
+    setweight(to_tsvector('english', coalesce(title, '')),  'A') ||
+    setweight(to_tsvector('english', coalesce(body, '')),   'B') ||
+    setweight(to_tsvector('english', coalesce(author, '')), 'C')
+  ) STORED;
+```
+
+Several things are going on here.
+
+`coalesce(..., '')` is essential: `to_tsvector` of `NULL` is `NULL`, and concatenating anything with `NULL` gives `NULL`, so one missing author would wipe out the entire search vector for that row.
+
+`setweight` tags lexemes with a weight class from `A` (most important) to `D`. A match in the title will later be scored higher than a match in the body.
+
+`STORED` means the column is computed on write and saved. Generated columns require PostgreSQL 12 or later; on older versions you would use a trigger to maintain the column.
+
+Note that a generated column expression must be immutable, which is why the language configuration is written as the literal `'english'` rather than relying on `default_text_search_config`.
+
+## The index
+
+Without an index, every search scans the whole table. Add a GIN index:
+
+```sql
+CREATE INDEX articles_search_idx ON articles USING gin (search_vector);
+```
+
+On a live table, build it without blocking writes:
+
+```sql
+CREATE INDEX CONCURRENTLY articles_search_idx ON articles USING gin (search_vector);
+```
+
+GIN is the right index type for full text search. It stores each lexeme once with a compressed list of the rows containing it, which is exactly the lookup pattern a search performs. GiST is the alternative — smaller and faster to update, but lossy, meaning it produces candidate rows that must be rechecked. Use GIN unless your table has a very high write rate and you have measured that GIN updates are the bottleneck.
+
+Now search:
+
+```sql
+SELECT id, title
+FROM articles
+WHERE search_vector @@ websearch_to_tsquery('english', 'connection pooling');
+```
+
+```
+ id |          title
+----+--------------------------
+  1 | Postgres Connection Pooling
+```
+
+Confirm the index is being used:
+
+```sql
+EXPLAIN (ANALYZE, BUFFERS)
+SELECT id, title
+FROM articles
+WHERE search_vector @@ websearch_to_tsquery('english', 'connection pooling');
+```
+
+On a table of any size you should see a `Bitmap Index Scan on articles_search_idx`. If you see a `Seq Scan`, either the table is too small for the planner to bother — which is fine — or your `WHERE` clause is not using the indexed expression.
+
+## Ranking results
+
+Matching is binary; ranking is what makes search useful. `ts_rank` scores by term frequency, and `ts_rank_cd` additionally considers how close the terms are to each other.
+
+```sql
+SELECT id,
+       title,
+       ts_rank(search_vector, query) AS rank
+FROM articles, websearch_to_tsquery('english', 'postgres index') AS query
+WHERE search_vector @@ query
+ORDER BY rank DESC
+LIMIT 10;
+```
+
+Putting the query in the `FROM` clause avoids parsing it twice.
+
+The weights assigned with `setweight` are applied here. By default `A`, `B`, `C` and `D` map to `{0.1, 0.2, 0.4, 1.0}` — read in reverse, so `D` is 1.0 and `A` is 0.1. You can override them; the array is given in `{D, C, B, A}` order:
+
+```sql
+SELECT id, title,
+       ts_rank('{0.1, 0.2, 0.4, 1.0}', search_vector, query) AS rank
+FROM articles, websearch_to_tsquery('english', 'postgres index') AS query
+WHERE search_vector @@ query
+ORDER BY rank DESC;
+```
+
+A word of caution about ranking and performance: `ORDER BY rank DESC LIMIT 10` has to compute the rank for every matching row before it can sort. If a query matches 500,000 rows, that is 500,000 rank computations. For large corpora, narrow the candidate set first — by date, category or tenant — before ranking.
+
+Combining recency with relevance is a common requirement:
+
+```sql
+SELECT id, title, published,
+       ts_rank(search_vector, query)
+         / (1 + extract(epoch FROM now() - published) / 86400 / 30) AS score
+FROM articles, websearch_to_tsquery('english', 'postgres') AS query
+WHERE search_vector @@ query
+ORDER BY score DESC
+LIMIT 20;
+```
+
+That divides relevance by an age factor in months, so a fresh article outranks an equally relevant one from two years ago.
+
+## Highlighting matches
+
+`ts_headline` returns a snippet with the matched terms marked up:
+
+```sql
+SELECT id,
+       ts_headline('english', body, query,
+                   'StartSel=<mark>, StopSel=</mark>, MaxWords=35, MinWords=15')
+         AS snippet
+FROM articles, websearch_to_tsquery('english', 'connection pooling') AS query
+WHERE search_vector @@ query;
+```
+
+Important: `ts_headline` works on the **original text**, not the `tsvector`, because it needs the actual words to display. That makes it expensive — it reparses the document each time. Only call it on the page of results you are about to display, never on the full result set before pagination.
+
+## Searching multiple languages
+
+The configuration name determines the dictionary. Store it per row when your corpus is mixed:
+
+```sql
+ALTER TABLE articles ADD COLUMN lang regconfig NOT NULL DEFAULT 'english';
+```
+
+Then generate the vector from that column. Because a generated column requires an immutable expression and `to_tsvector(regconfig, text)` qualifies, this works:
+
+```sql
+ALTER TABLE articles
+  ADD COLUMN search_vector_ml tsvector
+  GENERATED ALWAYS AS (to_tsvector(lang, coalesce(title,'') || ' ' || coalesce(body,''))) STORED;
+```
+
+To see which configurations your server has:
+
+```sql
+SELECT cfgname FROM pg_ts_config ORDER BY cfgname;
+```
+
+## Where full text search stops
+
+PostgreSQL full text search is good, but it is not a search engine, and it is worth knowing the edges.
+
+It does not handle typos. A search for "postgers" finds nothing, because stemming is not fuzzy matching. For that you want `pg_trgm` trigram similarity or the `fuzzystrmatch` extension, which can be combined with full text search in the same query.
+
+It has no built-in relevance tuning beyond weights and rank functions — no BM25, no learning to rank, no synonym expansion unless you build a thesaurus dictionary yourself.
+
+And ranking large result sets is CPU-bound in a way that dedicated engines optimize harder. If you are searching hundreds of millions of documents with sub-100ms latency requirements and complex relevance rules, a specialised engine earns its operational cost.
+
+For the large middle ground — a product catalogue, a documentation site, an internal knowledge base, a support ticket system — built-in full text search removes an entire piece of infrastructure and keeps your search index in the same transaction as your writes.
+
+When you are iterating on `tsvector` output and rank tuning, being able to run a query and read the result immediately speeds things up a lot; [Chat2DB](https://chat2db.ai/download) gives you a SQL editor with schema autocomplete across PostgreSQL and 20+ other databases, and will also explain a query plan in plain language when the index is not being used.
+
+## Summary
+
+Store a `tsvector` in a generated column with `setweight` applied per field, index it with GIN, and query it with `websearch_to_tsquery` so user input never causes a syntax error. Rank with `ts_rank` or `ts_rank_cd`, highlight with `ts_headline` on the displayed page only, and always `coalesce` nullable fields before concatenating. Check `EXPLAIN` output to confirm the GIN index is used, and reach for `pg_trgm` when you need typo tolerance that stemming cannot provide.

@@ -1,0 +1,255 @@
+---
+title: "Postgres Sharding with Citus: A Practical Guide"
+description: "How to shard PostgreSQL horizontally with the Citus extension: choosing a distribution column, distributed and reference tables, colocation and routing."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: August 16, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# Postgres Sharding with Citus: A Practical Guide
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="August 16, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+There is a point where a single PostgreSQL server stops being enough. Not because the queries are badly written — you have already fixed those — but because the working set no longer fits in memory and the write volume saturates one machine's I/O. Read replicas help with reads and do nothing for writes. Vertical scaling works until you buy the biggest instance available.
+
+Sharding splits the data across multiple machines so that both storage and write throughput scale horizontally. Citus is an open-source PostgreSQL extension that does this while keeping the PostgreSQL interface, so your application still speaks ordinary SQL to what looks like an ordinary database.
+
+This guide covers how it works and, more importantly, the decision that determines whether it works well for you.
+
+## Sharding is not partitioning
+
+These get conflated constantly. Partitioning splits one table into multiple physical tables **on the same server** — it helps with maintenance and lets the planner skip irrelevant partitions, but every partition shares the same CPU, memory and disk. Sharding splits data across **different servers**, so each one holds a subset and contributes its own resources.
+
+They compose: a sharded table can also be partitioned by time on each node, which is a common pattern for large time-series workloads.
+
+The practical difference is that partitioning is a local optimization you can undo, while sharding is a distributed systems commitment with real consequences for cross-shard queries, transactions and operational complexity.
+
+## The Citus architecture
+
+A Citus cluster has one **coordinator** node and several **worker** nodes. The coordinator holds metadata about how tables are distributed and no user data. Your application connects to the coordinator, which parses each query, works out which shards are involved, and either routes the query to a single worker or fans it out and combines results.
+
+Each distributed table is split into **shards** — ordinary PostgreSQL tables on the workers, named things like `orders_102008`. The default is 32 shards per distributed table, which matters because it sets your rebalancing granularity: you can move shards between workers, but you cannot split a shard cheaply, so a shard count well above your expected node count gives room to grow.
+
+Setting up a cluster:
+
+```sql
+-- On the coordinator
+CREATE EXTENSION citus;
+
+SELECT citus_set_coordinator_host('coordinator.internal', 5432);
+
+SELECT citus_add_node('worker-1.internal', 5432);
+SELECT citus_add_node('worker-2.internal', 5432);
+SELECT citus_add_node('worker-3.internal', 5432);
+
+SELECT * FROM citus_get_active_worker_nodes();
+```
+
+## Choosing the distribution column
+
+This is the decision that determines whether Citus works for you, and it is very hard to change afterwards. Everything else is mechanics.
+
+The distribution column determines which shard a row lands on: Citus hashes the value and maps it to a shard range. A good distribution column has three properties.
+
+**High cardinality.** Distributing by a column with ten distinct values means at most ten shards hold data. Distributing by a boolean is a way to build a two-node cluster with one node doing everything.
+
+**Even distribution.** If one tenant produces 60% of your rows, the shard holding that tenant becomes a hotspot and you have not really scaled. Check before committing:
+
+```sql
+SELECT tenant_id, count(*) AS rows,
+       round(100.0 * count(*) / sum(count(*)) OVER (), 2) AS pct
+FROM orders
+GROUP BY tenant_id
+ORDER BY rows DESC
+LIMIT 20;
+```
+
+If the top tenant is more than a few percent of the total, plan for it — Citus supports isolating a specific tenant onto its own shard with `isolate_tenant_to_new_shard`.
+
+**Present in your queries.** This is the one people underestimate. A query that filters on the distribution column routes to exactly one worker and runs at full PostgreSQL speed. A query that does not must fan out to every worker, and the coordinator merges the results. Fan-out queries work, but they are limited by the slowest worker and they do not scale the way routed queries do.
+
+For a multi-tenant SaaS application, `tenant_id` (or `organization_id`, `account_id`) is almost always the right choice, because nearly every query is already scoped to one tenant. For a real-time analytics workload, a high-cardinality dimension like `device_id` or `user_id` usually works.
+
+## Creating distributed tables
+
+```sql
+CREATE TABLE tenants (
+  id          bigint PRIMARY KEY,
+  name        text NOT NULL,
+  plan        text NOT NULL DEFAULT 'free',
+  created_at  timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE TABLE orders (
+  id          bigint GENERATED ALWAYS AS IDENTITY,
+  tenant_id   bigint NOT NULL,
+  customer_id bigint NOT NULL,
+  total_cents bigint NOT NULL,
+  status      text NOT NULL,
+  created_at  timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY (tenant_id, id)
+);
+
+CREATE TABLE order_items (
+  id         bigint GENERATED ALWAYS AS IDENTITY,
+  tenant_id  bigint NOT NULL,
+  order_id   bigint NOT NULL,
+  sku        text NOT NULL,
+  quantity   int NOT NULL,
+  PRIMARY KEY (tenant_id, id)
+);
+
+CREATE TABLE currencies (
+  code  text PRIMARY KEY,
+  name  text NOT NULL,
+  rate  numeric(12,6) NOT NULL
+);
+```
+
+Note the composite primary keys. Just as with declarative partitioning, a distributed table's primary key and unique constraints must include the distribution column — Citus cannot enforce global uniqueness without knowing which shard to check.
+
+Now distribute them:
+
+```sql
+SELECT create_distributed_table('orders',      'tenant_id');
+SELECT create_distributed_table('order_items', 'tenant_id', colocate_with => 'orders');
+SELECT create_distributed_table('tenants',     'id',        colocate_with => 'orders');
+
+SELECT create_reference_table('currencies');
+```
+
+Two different things happened there.
+
+`create_distributed_table` splits the table into shards spread across the workers. `create_reference_table` copies the entire table to **every** worker. Reference tables are for small, rarely-changing lookup data — currencies, countries, feature flags — and they exist so that joins against them never require network traffic. The cost is that every write to a reference table is a distributed transaction touching all nodes, so never use one for a table that changes frequently.
+
+## Colocation is the point
+
+`colocate_with => 'orders'` is doing the heavy lifting. It tells Citus to place shards with the same distribution column value on the same worker. Tenant 42's rows in `orders`, `order_items` and `tenants` all live on the same node.
+
+That means this join happens entirely on one worker, with no data movement:
+
+```sql
+SELECT o.id, o.total_cents, count(oi.id) AS items
+FROM orders o
+JOIN order_items oi
+  ON oi.order_id = o.id
+ AND oi.tenant_id = o.tenant_id     -- distribution column in the join!
+WHERE o.tenant_id = 42
+  AND o.created_at >= now() - interval '30 days'
+GROUP BY o.id, o.total_cents
+ORDER BY o.total_cents DESC
+LIMIT 20;
+```
+
+The `AND oi.tenant_id = o.tenant_id` predicate is not optional bookkeeping — it is what allows Citus to prove the join is local. Without it, Citus must consider that any `order_items` row might match, and the join becomes a repartition join that shuffles data between workers. Always include the distribution column in joins between colocated tables.
+
+Verify the routing:
+
+```sql
+EXPLAIN (ANALYZE)
+SELECT count(*) FROM orders WHERE tenant_id = 42;
+```
+
+A single-shard query shows `Task Count: 1`. A fan-out shows `Task Count: 32`. That number is the single most useful diagnostic in Citus — if a query you expected to route is showing a task count equal to your shard count, the distribution column is missing from the `WHERE` clause.
+
+## Queries that fan out
+
+Not every query can be routed, and that is fine as long as you know which ones.
+
+```sql
+-- Fans out to all shards, results merged on the coordinator
+SELECT status, count(*), sum(total_cents)
+FROM orders
+WHERE created_at >= now() - interval '1 day'
+GROUP BY status;
+```
+
+Citus pushes the aggregation down to each worker and combines partial results, so this parallelises well — each worker aggregates its own shards concurrently. For analytics across all tenants, that parallelism is a feature, not a problem.
+
+What does not work well is a fan-out query with a `LIMIT` on an unsorted result, or a `DISTINCT` over a high-cardinality column, because the coordinator has to pull large intermediate results back. `count(DISTINCT ...)` is the classic offender; Citus offers approximate counting with the `hll` extension for exactly this reason:
+
+```sql
+CREATE EXTENSION hll;
+SET citus.count_distinct_error_rate = 0.005;
+
+SELECT count(DISTINCT customer_id) FROM orders;
+```
+
+That returns an approximation within roughly half a percent, computed from HyperLogLog sketches per shard, instead of shipping every distinct value to the coordinator.
+
+## Migrating an existing table
+
+`create_distributed_table` on a table that already contains data moves those rows to the workers. On a large table this takes a while and blocks writes. Citus offers a non-blocking variant:
+
+```sql
+SELECT create_distributed_table_concurrently('orders', 'tenant_id');
+```
+
+Before running either, add the distribution column to every table that needs it. This is usually the real migration work: an existing schema with a global `orders.id` primary key and no `tenant_id` on `order_items` has to be backfilled first.
+
+```sql
+ALTER TABLE order_items ADD COLUMN tenant_id bigint;
+
+UPDATE order_items oi
+SET tenant_id = o.tenant_id
+FROM orders o
+WHERE o.id = oi.order_id
+  AND oi.tenant_id IS NULL;
+
+ALTER TABLE order_items ALTER COLUMN tenant_id SET NOT NULL;
+```
+
+Do that update in batches on a large table, or you will hold a transaction open long enough to block autovacuum and bloat the table.
+
+## Operating the cluster
+
+Adding a node does not move data automatically. After `citus_add_node`, rebalance:
+
+```sql
+SELECT citus_add_node('worker-4.internal', 5432);
+
+SELECT citus_rebalance_start();
+SELECT * FROM citus_rebalance_status();
+```
+
+The rebalancer uses logical replication to move shards without blocking writes, which is why shard count matters — with 32 shards and 4 workers you get 8 shards each, and the rebalancer has reasonable granularity to work with.
+
+Useful introspection:
+
+```sql
+-- How much data is on each node
+SELECT nodename, count(*) AS shards,
+       pg_size_pretty(sum(shard_size)) AS total
+FROM citus_shards
+GROUP BY nodename
+ORDER BY nodename;
+
+-- Which tables are distributed, and how
+SELECT table_name, citus_table_type, distribution_column, colocation_id
+FROM citus_tables
+ORDER BY table_name;
+```
+
+That `colocation_id` column is worth watching. Tables in the same colocation group can be joined locally; tables in different groups cannot. If a join is unexpectedly slow, check whether the two tables actually share a colocation id.
+
+Because a Citus cluster means several PostgreSQL endpoints — coordinator plus workers you occasionally need to inspect directly — a client that holds multiple saved connections helps. [Chat2DB](https://chat2db.ai/download) keeps them side by side and runs `EXPLAIN` output through a readable plan view, which makes checking task counts less tedious than reading raw text.
+
+## When Citus is the wrong answer
+
+Sharding adds real complexity, and a lot of teams reach for it too early. Consider it only after you have genuinely exhausted the alternatives:
+
+- **You have not tuned the single node.** Missing indexes, no connection pooler, default `work_mem`, autovacuum falling behind — these account for most "we need to shard" conversations. A well-tuned PostgreSQL instance on modern hardware handles a great deal.
+- **Your bottleneck is reads.** Read replicas are far simpler than sharding and solve read scaling directly.
+- **Your data has no natural distribution key.** If queries filter on many different dimensions with no dominant one, most queries will fan out and you get complexity without much benefit.
+- **You need cross-shard transactions constantly.** Citus supports distributed transactions with two-phase commit, but they are slower and introduce failure modes that single-node transactions do not have. A workload where most writes span tenants is a poor fit.
+- **You need many cross-shard foreign keys.** Foreign keys from a distributed table to a reference table work; arbitrary foreign keys between differently-distributed tables do not.
+
+The workloads Citus fits best are multi-tenant SaaS, where tenant isolation gives you a natural key and most queries are single-tenant, and real-time analytics, where parallel fan-out aggregation across workers is exactly the access pattern.
+
+## Summary
+
+Citus shards PostgreSQL across worker nodes while keeping the SQL interface. The whole design hinges on the distribution column: pick one with high cardinality, even distribution and — most importantly — presence in the `WHERE` clause of your common queries. Colocate related tables so joins stay local, use reference tables for small lookup data, always include the distribution column in joins, and watch `Task Count` in `EXPLAIN` to confirm queries route to a single shard. And before any of that, make sure you have actually outgrown a single well-tuned server, because sharding is a commitment that is much easier to make than to undo.

@@ -1,0 +1,309 @@
+---
+title: "Postgres Fuzzy Search with pg_trgm and Levenshtein"
+description: "Handle typos in PostgreSQL search using pg_trgm similarity, levenshtein distance and soundex, with GIN and GiST trigram indexes and performance notes."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: August 16, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# Postgres Fuzzy Search with pg_trgm and Levenshtein
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="August 16, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+Users misspell things. They type "Jonh Smith" instead of "John Smith", search for "postgers" and paste product codes with a stray character. Exact matching returns nothing, full text search returns nothing either — stemming normalizes word forms, not typos — and the user concludes your search is broken.
+
+PostgreSQL ships with two extensions that solve this, and they work quite differently. This guide covers both, when to use each, and how to keep fuzzy search fast enough to run on a real table.
+
+## Enable the extensions
+
+```sql
+CREATE EXTENSION IF NOT EXISTS pg_trgm;
+CREATE EXTENSION IF NOT EXISTS fuzzystrmatch;
+```
+
+Both ship with PostgreSQL as contrib modules. On managed services — RDS, Cloud SQL, Azure Database — both are on the allowed list, though you may need to add them to `shared_preload_libraries` equivalents in the provider console for some configurations.
+
+Check what you have:
+
+```sql
+SELECT extname, extversion FROM pg_extension ORDER BY extname;
+```
+
+## How trigram similarity works
+
+`pg_trgm` breaks a string into overlapping three-character sequences. Seeing the actual output makes the rest of this obvious:
+
+```sql
+SELECT show_trgm('john');
+```
+
+```
+{"  j"," jo",ohn,hn ,joh}
+```
+
+The string is padded with spaces at the start and end, then cut into three-character windows. Two strings are similar to the extent that their trigram sets overlap:
+
+```sql
+SELECT similarity('john', 'jonh');
+```
+
+```
+ similarity
+------------
+        0.5
+```
+
+Half the trigrams match, so the score is 0.5. Identical strings score 1.0, and strings with no shared trigrams score 0.
+
+The key property is that this is **position independent**. A transposition, an inserted character, a missing character — each destroys only the trigrams that touch it, leaving the rest intact. That makes trigram similarity robust for the kinds of errors people actually make.
+
+```sql
+SELECT similarity('postgresql', 'postgers'),
+       similarity('postgresql', 'postgresq'),
+       similarity('postgresql', 'mysql');
+```
+
+```
+ similarity | similarity | similarity
+------------+------------+------------
+   0.416667 |   0.818182 |   0.111111
+```
+
+## Searching with similarity
+
+Let us build a table to search.
+
+```sql
+CREATE TABLE customers (
+  id      bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  name    text NOT NULL,
+  email   text NOT NULL,
+  city    text
+);
+
+INSERT INTO customers (name, email, city) VALUES
+  ('John Smith',        'john.smith@example.com',  'London'),
+  ('Jonathan Smythe',   'jsmythe@example.com',     'Manchester'),
+  ('Joan Smithers',     'joan.s@example.com',      'Bristol'),
+  ('Michael Johnson',   'mjohnson@example.com',    'Birmingham'),
+  ('Sarah Connor',      'sconnor@example.com',     'Leeds');
+```
+
+The `%` operator returns true when two strings exceed the similarity threshold:
+
+```sql
+SELECT name, similarity(name, 'Jonh Smith') AS score
+FROM customers
+WHERE name % 'Jonh Smith'
+ORDER BY score DESC;
+```
+
+```
+     name      |  score
+---------------+----------
+ John Smith    | 0.615385
+ Joan Smithers |    0.375
+```
+
+The threshold defaults to 0.3 and is adjustable per session:
+
+```sql
+SET pg_trgm.similarity_threshold = 0.4;
+SHOW pg_trgm.similarity_threshold;
+```
+
+Raising it returns fewer, more confident matches; lowering it catches worse typos at the cost of noise. For names, 0.3 to 0.4 is a reasonable range. For short strings like product codes you often need to go lower, because a single wrong character in a six-character string destroys a large fraction of the trigrams.
+
+There is a more convenient form. The `<->` distance operator is defined as `1 - similarity`, so ordering by it puts the best match first:
+
+```sql
+SELECT name, name <-> 'Jonh Smith' AS distance
+FROM customers
+ORDER BY name <-> 'Jonh Smith'
+LIMIT 5;
+```
+
+```
+      name       | distance
+-----------------+----------
+ John Smith      | 0.384615
+ Joan Smithers   |    0.625
+ Jonathan Smythe | 0.708333
+ Michael Johnson | 0.842105
+ Sarah Connor    |        1
+```
+
+This form always returns the top N, even when nothing crosses the threshold, which is usually what a "did you mean" feature wants.
+
+## Indexing trigram search
+
+Without an index, every one of these queries scans the whole table and computes similarity for every row. On anything larger than a toy table that is unacceptable.
+
+```sql
+CREATE INDEX customers_name_trgm_idx ON customers USING gin (name gin_trgm_ops);
+```
+
+Or on a live table:
+
+```sql
+CREATE INDEX CONCURRENTLY customers_name_trgm_idx ON customers USING gin (name gin_trgm_ops);
+```
+
+GIN with `gin_trgm_ops` accelerates the `%` operator and `LIKE '%pattern%'` queries. That second point deserves emphasis, because it is one of the most useful things `pg_trgm` does:
+
+```sql
+EXPLAIN (ANALYZE)
+SELECT * FROM customers WHERE name ILIKE '%smith%';
+```
+
+With a trigram GIN index in place, this uses a `Bitmap Index Scan` instead of a sequential scan. A leading-wildcard `LIKE`, which no B-tree can help with, becomes indexable. If you have ever added a "contains" search box and watched it melt the database, this is the fix.
+
+There is an important limitation: GIN does **not** accelerate `ORDER BY name <-> 'query'`. Distance ordering requires GiST:
+
+```sql
+CREATE INDEX customers_name_trgm_gist_idx ON customers USING gist (name gist_trgm_ops);
+```
+
+So the choice is:
+
+- **GIN** — faster lookups, larger index, slower to update. Use for `%` threshold matching and `LIKE '%...%'`.
+- **GiST** — supports indexed `<->` distance ordering (nearest-neighbour search), smaller, faster updates, but slower lookups.
+
+If you need both patterns, having both indexes is legitimate. Check that the planner is actually using them:
+
+```sql
+EXPLAIN (ANALYZE, BUFFERS)
+SELECT name FROM customers ORDER BY name <-> 'Jonh Smith' LIMIT 5;
+```
+
+You want to see `Index Scan using customers_name_trgm_gist_idx`. Seeing a `Sort` node above a `Seq Scan` means the index is not being used.
+
+## Levenshtein distance
+
+`fuzzystrmatch` takes a completely different approach. `levenshtein` counts the minimum number of single-character edits — insertions, deletions, substitutions — needed to turn one string into the other.
+
+```sql
+SELECT levenshtein('john', 'jonh'),
+       levenshtein('postgresql', 'postgers'),
+       levenshtein('kitten', 'sitting');
+```
+
+```
+ levenshtein | levenshtein | levenshtein
+-------------+-------------+-------------
+           2 |           3 |           3
+```
+
+Note that "john" to "jonh" costs 2, not 1: classic Levenshtein treats a transposition as two substitutions. (Damerau-Levenshtein counts it as one, but PostgreSQL does not ship that variant.)
+
+You can weight the operations differently — insertion, deletion, substitution:
+
+```sql
+SELECT levenshtein('john', 'johnathan', 1, 10, 5);
+```
+
+Making deletions expensive is useful when you want to match prefixes generously but penalise dropped characters.
+
+There is also a bounded version that stops computing once the distance exceeds a limit, which is much faster when you only care about close matches:
+
+```sql
+SELECT levenshtein_less_equal('postgresql', 'postgers', 3);
+```
+
+The critical operational fact about `levenshtein` is that **it cannot be indexed**. It is a function over two arbitrary strings, and there is no index type that accelerates it. This query scans your entire table:
+
+```sql
+-- Full scan. Fine on 5,000 rows, disastrous on 5 million.
+SELECT name FROM customers
+WHERE levenshtein(lower(name), lower('Jonh Smith')) <= 3
+ORDER BY levenshtein(lower(name), lower('Jonh Smith'));
+```
+
+The right pattern is to use an indexed trigram search to narrow candidates, then rank those candidates with Levenshtein:
+
+```sql
+SELECT name,
+       levenshtein(lower(name), lower('Jonh Smith')) AS edits
+FROM customers
+WHERE name % 'Jonh Smith'                 -- indexed, cuts to a handful of rows
+ORDER BY edits, name
+LIMIT 10;
+```
+
+The trigram index does the heavy filtering; Levenshtein does the precise ordering on a small set. This two-stage pattern is the practical way to combine them.
+
+## Phonetic matching
+
+`fuzzystrmatch` also provides phonetic algorithms, which match on how a word sounds rather than how it is spelled:
+
+```sql
+SELECT soundex('Smith'), soundex('Smythe'), difference('Smith', 'Smythe');
+```
+
+```
+ soundex | soundex | difference
+---------+---------+------------
+ S530    | S530    |          4
+```
+
+`difference` scores the agreement between two soundex codes from 0 to 4. "Smith" and "Smythe" score a perfect 4 — a match that trigram similarity rates only 0.36, since they share few trigrams.
+
+`metaphone` and `dmetaphone` are more sophisticated and handle more cases:
+
+```sql
+SELECT metaphone('Thompson', 10), dmetaphone('Thompson');
+```
+
+Phonetic matching is genuinely useful for name lookup — customer service searching for a caller whose name was heard, not read. It is close to useless for anything else, since it is tuned for English pronunciation and will happily match unrelated technical terms.
+
+Like Levenshtein, soundex is not directly indexable — but unlike Levenshtein, you can index it, because it is a function of a single column:
+
+```sql
+CREATE INDEX customers_name_soundex_idx ON customers (soundex(name));
+
+SELECT name FROM customers WHERE soundex(name) = soundex('Smyth');
+```
+
+That is an ordinary B-tree on an expression, and it works.
+
+## Choosing between them
+
+| Need | Use |
+|---|---|
+| Typo-tolerant search on a large table | `pg_trgm` with a GIN index |
+| "Did you mean" / nearest match | `pg_trgm` `<->` with a GiST index |
+| Indexed `LIKE '%pattern%'` | `pg_trgm` GIN index |
+| Precise edit-distance ranking on few rows | `levenshtein` after a trigram filter |
+| Matching names by sound | `soundex` / `dmetaphone` on an expression index |
+| Word-form variations (run/running/ran) | Full text search with `tsvector` |
+
+That last row is worth stressing. Fuzzy matching and full text search solve different problems and combine well. Full text search handles stemming and multi-word relevance but is exact at the character level; trigram search handles character-level errors but knows nothing about language. A search box that handles both typically runs a full text query first and falls back to a trigram query when it returns nothing.
+
+## Performance notes
+
+A few things that bite in production:
+
+**Trigram indexes are large.** A GIN trigram index on a text column can exceed the size of the column itself, since each row contributes many trigrams. Check with `pg_size_pretty(pg_relation_size('customers_name_trgm_idx'))` before rolling it out on a wide table.
+
+**Short strings behave badly.** A three-character string has very few trigrams, so similarity scores are extreme — either near 1.0 or near 0. Threshold tuning does not help much. Consider exact or prefix matching for short codes.
+
+**Lower the threshold carefully.** Dropping `pg_trgm.similarity_threshold` to 0.1 makes the index return a huge candidate set, and the recheck step then dominates. If queries got slower after lowering the threshold, that is why.
+
+**`word_similarity` exists for a reason.** When matching a short query against a long text, plain `similarity` scores badly because the long string has many unmatched trigrams. `word_similarity('smith', name)` compares against the best-matching substring instead:
+
+```sql
+SELECT name, word_similarity('smith', name) AS ws
+FROM customers
+ORDER BY ws DESC
+LIMIT 3;
+```
+
+If you are tuning thresholds and comparing plans across variants, running these side by side with visible timings makes the trade-offs obvious. [Chat2DB](https://chat2db.ai/download) lets you keep several query tabs against the same PostgreSQL connection and reads back `EXPLAIN ANALYZE` output as a plan tree, which is easier than eyeballing nested text when you are checking whether the GiST index actually kicked in.
+
+## Summary
+
+Use `pg_trgm` for typo tolerance at scale: GIN indexes for threshold matching and indexed `LIKE '%...%'`, GiST when you need `ORDER BY <->` nearest-neighbour results. Use `levenshtein` for exact edit-distance ranking, but only after a trigram filter has cut the candidate set down, because it can never use an index. Reach for `soundex` or `dmetaphone` when matching names by sound, and index them as expression indexes. And remember that fuzzy matching complements full text search rather than replacing it — one handles misspelled characters, the other handles inflected words.

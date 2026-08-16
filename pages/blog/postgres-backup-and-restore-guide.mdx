@@ -1,0 +1,239 @@
+---
+title: "How to Backup and Restore a Postgres Database"
+description: "A practical guide to PostgreSQL backup and restore with pg_dump, pg_restore and psql: choosing a format, parallel dumps and verifying the result."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: August 16, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# How to Backup and Restore a Postgres Database
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="August 16, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+Most teams discover the gaps in their PostgreSQL backup strategy during the restore, which is the worst possible time. The dump ran nightly and exited zero, so everyone assumed it worked — but it turns out the format does not support the parallel restore you now need, the roles referenced in the dump do not exist on the target, and nobody ever measured how long a restore actually takes.
+
+This guide walks through backing up and restoring a Postgres database with the tools that ship with it, and points out the failure modes worth knowing before you need them.
+
+## Two kinds of backup
+
+PostgreSQL has two fundamentally different backup mechanisms, and confusing them causes a lot of grief.
+
+**Logical backups** (`pg_dump`, `pg_dumpall`) produce a description of your data: SQL statements or an archive that can regenerate it. They are portable across PostgreSQL versions, architectures and operating systems, and you can restore a single table from one. They are also slow to restore, because the target has to execute every statement and rebuild every index from scratch.
+
+**Physical backups** (`pg_basebackup`, pgBackRest, Barman) copy the actual data files. Combined with continuous WAL archiving they allow point-in-time recovery — restoring to 14:32 last Tuesday, just before someone ran an unqualified `UPDATE`. They are much faster to restore for large databases, but they are tied to the same major version and platform, and you cannot extract a single table from one.
+
+This guide focuses on logical backups, which cover the common cases: moving a database between environments, upgrading across major versions, and keeping an extractable copy of specific data. For production disaster recovery you want physical backups with WAL archiving as well — a nightly dump means your worst-case data loss is a full day.
+
+## Basic pg_dump
+
+The simplest useful command:
+
+```bash
+pg_dump -h localhost -p 5432 -U postgres -d appdb -Fc -f appdb.dump
+```
+
+Breaking that down:
+
+- `-Fc` selects the **custom** format. This is the right default. It is compressed, and because `pg_restore` can read its table of contents you can restore selectively, reorder the restore, or inspect the dump without unpacking it.
+- `-f appdb.dump` writes to a file rather than stdout.
+
+Note there is no password flag, and this is deliberate — `pg_dump` has no `--password=...` option because anything on the command line is visible in `ps` output and shell history. Use a `.pgpass` file instead:
+
+```bash
+echo "localhost:5432:appdb:postgres:s3cr3t" >> ~/.pgpass
+chmod 600 ~/.pgpass
+```
+
+PostgreSQL refuses to read `.pgpass` if the permissions are looser than `600`. The alternative is the `PGPASSWORD` environment variable, which is safer than the command line but still visible in `/proc` on some systems.
+
+## Choosing a format
+
+`pg_dump` writes four formats, and the choice constrains what you can do at restore time.
+
+| Format | Flag | Compressed | Parallel dump | Parallel restore | Selective restore |
+|---|---|---|---|---|---|
+| Plain SQL | `-Fp` | No | No | No | No |
+| Custom | `-Fc` | Yes | No | Yes | Yes |
+| Directory | `-Fd` | Yes | Yes | Yes | Yes |
+| Tar | `-Ft` | No | No | No | Yes |
+
+Custom is the default choice. Directory format is what you want when the dump itself is slow, because it is the only format `pg_dump` can write with multiple jobs:
+
+```bash
+pg_dump -h localhost -U postgres -d appdb -Fd -j 8 -f appdb_dumpdir
+```
+
+That runs eight concurrent worker connections, each dumping different tables. On a database with several large tables and enough I/O headroom, it is dramatically faster than a serial dump. Two constraints: `-j` requires the directory format (passing it with `-Fc` is an error), and each job opens its own connection, so `max_connections` must have room.
+
+Plain format is worth using when you actually want readable SQL:
+
+```bash
+pg_dump -h localhost -U postgres -d appdb -Fp --schema-only -f schema.sql
+```
+
+Getting the flag combinations right — and knowing which ones silently do nothing — is fiddly. Our [pg_dump command generator](https://chat2db.ai/tools/pg-dump-command-generator) builds the command from a form and warns when two options contradict each other, then generates the matching restore command.
+
+## Dumping part of a database
+
+Schema only, no rows:
+
+```bash
+pg_dump -U postgres -d appdb --schema-only -Fc -f schema.dump
+```
+
+Data only, no `CREATE TABLE`:
+
+```bash
+pg_dump -U postgres -d appdb --data-only -Fc -f data.dump
+```
+
+Specific tables:
+
+```bash
+pg_dump -U postgres -d appdb -t public.orders -t public.order_items -Fc -f orders.dump
+```
+
+Everything except some noisy tables:
+
+```bash
+pg_dump -U postgres -d appdb -T 'public.audit_*' -T public.sessions -Fc -f appdb.dump
+```
+
+A warning about `-t`: it does not follow foreign keys. Dumping `orders` without `customers` produces an archive that fails to restore into an empty database because the referenced table does not exist. List every table in the dependency chain, or dump the whole schema and restore selectively.
+
+Similarly, `--data-only` does not disable triggers or defer foreign key checks by default, so rows can be rejected simply because they arrive in the wrong order. Add `--disable-triggers` when restoring as a superuser, or dump schema and data together.
+
+## What pg_dump does not include
+
+`pg_dump` operates on a single database. It does **not** dump:
+
+- Roles and users
+- Tablespace definitions
+- Databases other than the one named
+
+Those are cluster-wide objects, and you get them with `pg_dumpall --globals-only`:
+
+```bash
+pg_dumpall -h localhost -U postgres --globals-only -f globals.sql
+```
+
+A complete logical backup of a cluster is therefore two commands. Skipping the globals is the reason a restore so often fails with `role "app_user" does not exist`.
+
+## Does pg_dump lock the database?
+
+No, and this is worth understanding because it determines whether you can dump during business hours.
+
+`pg_dump` runs inside a repeatable-read transaction and takes only an `ACCESS SHARE` lock on each table. Selects, inserts, updates and deletes all continue normally. The dump is a consistent snapshot of the moment it started, so changes made during the run are not included — which is exactly what you want.
+
+What it does block is anything requiring an `ACCESS EXCLUSIVE` lock on a table being dumped: `ALTER TABLE`, `DROP TABLE`, `TRUNCATE`, and `REFRESH MATERIALIZED VIEW` without `CONCURRENTLY`. A migration deploy that runs during a long dump will queue behind it — and worse, that queued `ALTER TABLE` then blocks every subsequent query on that table. Do not run schema migrations and long dumps at the same time.
+
+One more side effect: a long-running dump holds an old snapshot open, which prevents autovacuum from cleaning up rows that were deleted after the dump started. A multi-hour dump on a write-heavy database can leave real bloat behind.
+
+## Restoring
+
+The restore command depends on the format you dumped with.
+
+For **plain** format, the dump is an SQL script, so you replay it with `psql`:
+
+```bash
+psql -h localhost -U postgres -d appdb_restored -v ON_ERROR_STOP=1 -f appdb.sql
+```
+
+`ON_ERROR_STOP=1` matters. Without it, `psql` prints errors and keeps going, and you end up with a database that looks restored but is missing objects. Always set it.
+
+For **custom**, **directory** or **tar** format, use `pg_restore`:
+
+```bash
+createdb -h localhost -U postgres appdb_restored
+
+pg_restore -h localhost -U postgres -d appdb_restored \
+  -j 8 --no-owner --exit-on-error appdb.dump
+```
+
+- `-j 8` restores with eight parallel workers. This is the biggest single lever on restore time, because index builds dominate and they parallelise well. Not supported for tar format.
+- `--no-owner` skips `ALTER ... OWNER TO` statements, which is what you want when restoring into a database where the original roles do not exist.
+- `--exit-on-error` is the `pg_restore` equivalent of `ON_ERROR_STOP`. By default `pg_restore` continues past errors and exits zero, which is how a broken restore passes unnoticed.
+
+Note that `pg_restore` does not create the target database unless you pass `--create` (which requires that the dump was taken without `-n`/`-t` restrictions). Usually you `createdb` first.
+
+To inspect a dump without restoring it:
+
+```bash
+pg_restore --list appdb.dump
+```
+
+That prints every object in the archive with an ID. You can edit that list and feed it back with `-L` to restore a precise subset — useful when you need one table out of a 200 GB dump:
+
+```bash
+pg_restore --list appdb.dump | grep 'TABLE DATA public orders' > restore.list
+pg_restore -d appdb_restored -L restore.list appdb.dump
+```
+
+## Verify the restore
+
+An exit code of zero is not verification. Two things are worth checking every time.
+
+First, compare row counts against the source:
+
+```sql
+SELECT relname, n_live_tup
+FROM pg_stat_user_tables
+ORDER BY n_live_tup DESC
+LIMIT 20;
+```
+
+Note that `n_live_tup` is an estimate maintained by the statistics collector; for an exact comparison of a critical table use `SELECT count(*)`.
+
+Second — and this one is skipped constantly — run `ANALYZE`:
+
+```sql
+ANALYZE;
+```
+
+`pg_restore` rebuilds indexes but does **not** collect planner statistics. Until `ANALYZE` runs, every query plan is based on default estimates for empty tables, so a freshly restored database can be spectacularly slow in a way that has nothing to do with the data. If a restored database "feels broken", this is the first thing to check.
+
+A quick sanity query for missing statistics:
+
+```sql
+SELECT relname, last_analyze, last_autoanalyze
+FROM pg_stat_user_tables
+WHERE last_analyze IS NULL AND last_autoanalyze IS NULL
+ORDER BY relname;
+```
+
+## Speeding up large restores
+
+For a one-off restore into a database that has no other users, several settings can be relaxed temporarily:
+
+```sql
+ALTER SYSTEM SET maintenance_work_mem = '2GB';   -- faster index builds
+ALTER SYSTEM SET max_wal_size = '8GB';           -- fewer checkpoints
+ALTER SYSTEM SET checkpoint_timeout = '30min';
+SELECT pg_reload_conf();
+```
+
+Reset them afterwards. Some guides also suggest turning off `fsync` during a restore; that does make it faster, and it also means a crash mid-restore leaves a corrupt cluster. It is acceptable only when you can simply start the restore over.
+
+## Restoring across major versions
+
+Logical dumps are the supported path for major version upgrades. The rule to remember: **use the newer version's `pg_dump`**. A PostgreSQL 17 `pg_dump` can read a PostgreSQL 13 server and produce output that a 17 server accepts. The reverse — using an old `pg_dump` against a newer server — is not supported and can fail in confusing ways.
+
+```bash
+/usr/lib/postgresql/17/bin/pg_dump -h old-server -U postgres -d appdb -Fc -f appdb.dump
+```
+
+## Practise the restore
+
+The recurring theme in postmortems is that the backup existed and the restore had never been tested. Two specific things are worth measuring before you need them: how long a full restore of your largest database actually takes, and whether the restore succeeds on a machine that has none of your production roles, extensions or tablespaces.
+
+Schedule that test. A backup you have never restored is a hypothesis, not a backup.
+
+If you want to inspect a restored database quickly — compare table structures, spot-check row counts across two connections, browse the data without writing catalog queries — [Chat2DB](https://chat2db.ai/download) connects to both source and target at once and makes that comparison a lot less tedious than switching `psql` sessions.
+
+## Summary
+
+Use `pg_dump -Fc` for most logical backups, `-Fd -j N` when the dump itself is the bottleneck, and remember `pg_dumpall --globals-only` for roles. Restore with `pg_restore -j N --exit-on-error`, or `psql -v ON_ERROR_STOP=1` for plain SQL. Always run `ANALYZE` afterwards, always verify row counts, and treat logical dumps as a complement to physical backups with WAL archiving rather than a replacement for them.

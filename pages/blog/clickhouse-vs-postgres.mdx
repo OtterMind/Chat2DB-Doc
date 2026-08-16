@@ -1,0 +1,232 @@
+---
+title: "ClickHouse vs Postgres: Choosing Between OLAP and OLTP"
+description: "ClickHouse vs PostgreSQL compared on storage, query speed, updates, joins, transactions and cost, with runnable SQL and guidance on when to run both together."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: August 16, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# ClickHouse vs Postgres: Choosing Between OLAP and OLTP
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="August 16, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+The question usually arrives in a specific form. Your PostgreSQL database is fine for the application, but the analytics dashboard takes 40 seconds to load, and someone has suggested ClickHouse. Is that the right move, or is it a missing index and a lot of new operational burden?
+
+The honest answer depends on what those slow queries are doing. This guide lays out the actual differences so you can tell.
+
+## They solve different problems
+
+PostgreSQL is an OLTP database: many concurrent transactions, each touching a small number of rows, with full ACID guarantees, foreign keys, constraints and row-level locking. It is a system of record.
+
+ClickHouse is an OLAP database: analytical queries scanning millions or billions of rows, aggregating them, returning summaries. It is built for reading, and its design sacrifices a great deal on the write and update side to get there.
+
+That is not a marketing distinction. It shows up in every architectural choice below.
+
+## Storage layout
+
+PostgreSQL stores rows together in 8 KB pages. Reading one row means reading one page — efficient when you want the whole row, wasteful when you want two columns out of forty.
+
+ClickHouse stores each column in its own file, sorted by a primary key that is not unique and does not enforce anything. It is a *sorting key*: it determines physical order on disk, which enables both compression and the ability to skip large ranges of data.
+
+Compression is where the size difference comes from. Adjacent values in a column are similar, so ClickHouse routinely achieves 10–30× compression on real data — timestamps with delta encoding, low-cardinality strings with dictionary encoding, repeated values with run-length encoding. A 2 TB PostgreSQL table can land under 100 GB in ClickHouse.
+
+Compare table definitions. PostgreSQL:
+
+```sql
+CREATE TABLE events (
+  id          bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  user_id     bigint NOT NULL REFERENCES users(id),
+  event_type  text NOT NULL,
+  country     text NOT NULL,
+  created_at  timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE INDEX ON events (user_id);
+CREATE INDEX ON events (created_at);
+```
+
+ClickHouse:
+
+```sql
+CREATE TABLE events (
+  id          UInt64,
+  user_id     UInt64,
+  event_type  LowCardinality(String),
+  country     LowCardinality(String),
+  created_at  DateTime
+)
+ENGINE = MergeTree
+PARTITION BY toYYYYMM(created_at)
+ORDER BY (created_at, user_id);
+```
+
+Note what is absent: no foreign key, no unique constraint, no auto-increment. `ORDER BY (created_at, user_id)` is the sorting key, and column order in it matters enormously — queries filtering on `created_at` skip data efficiently, queries filtering only on `user_id` do not.
+
+`LowCardinality(String)` replaces repeated strings with dictionary-encoded integers. On a column with a few hundred distinct values across a billion rows, it is a large win and costs nothing.
+
+## Query performance
+
+For a scan-and-aggregate query, the difference is not incremental.
+
+```sql
+SELECT country, count(*) AS events, uniq(user_id) AS users
+FROM events
+WHERE created_at >= now() - INTERVAL 30 DAY
+GROUP BY country
+ORDER BY events DESC;
+```
+
+On a billion-row table, ClickHouse answers this in low single-digit seconds on commodity hardware. It reads three columns instead of all of them, decompresses vectorised blocks, parallelises across every core, and uses partition pruning plus sparse primary index granules to skip data entirely.
+
+PostgreSQL on the same data will take minutes. Parallel query helps, indexes help less than you would hope — an index on `created_at` still means a heap fetch per row, and once the planner estimates it will read a large fraction of the table, it correctly chooses a sequential scan.
+
+Now reverse it:
+
+```sql
+SELECT * FROM events WHERE id = 8471263;
+```
+
+PostgreSQL: an index lookup, sub-millisecond. ClickHouse: potentially a scan of a large granule range, because `id` is not in the sorting key and ClickHouse has no B-tree on it. Even with the sorting key, ClickHouse's index is *sparse* — it indexes every 8,192nd row by default, so a point lookup reads a whole granule.
+
+Point lookups on ClickHouse are a known anti-pattern. If your application needs them, that data belongs in PostgreSQL.
+
+## Updates and deletes
+
+This is the difference most likely to catch you out.
+
+PostgreSQL: `UPDATE users SET email = $1 WHERE id = $2` — immediate, transactional, indexed, unremarkable.
+
+ClickHouse: updates are *mutations*, executed asynchronously by rewriting entire data parts.
+
+```sql
+ALTER TABLE events UPDATE country = 'GB' WHERE country = 'UK';
+ALTER TABLE events DELETE WHERE created_at < now() - INTERVAL 2 YEAR;
+```
+
+These return immediately, then run in the background, potentially for hours. Check progress:
+
+```sql
+SELECT database, table, mutation_id, is_done, parts_to_do
+FROM system.mutations
+WHERE is_done = 0;
+```
+
+Newer versions offer lightweight deletes (`DELETE FROM events WHERE ...`), which mark rows deleted rather than rewriting parts — faster, but still not an OLTP delete.
+
+The rule: ClickHouse is for append-only or rarely-mutated data. Events, logs, metrics, clickstream, IoT telemetry, immutable financial transactions. If rows change frequently after being written, ClickHouse is the wrong store.
+
+There is no `UNIQUE` constraint either. `ReplacingMergeTree` deduplicates eventually, during background merges, on a schedule you do not control:
+
+```sql
+CREATE TABLE user_state (
+  user_id UInt64,
+  status  String,
+  updated DateTime
+)
+ENGINE = ReplacingMergeTree(updated)
+ORDER BY user_id;
+
+-- Deduplication is eventual. To read deduplicated data now:
+SELECT * FROM user_state FINAL WHERE user_id = 42;
+```
+
+`FINAL` forces deduplication at query time and is expensive. Do not build application logic that depends on it.
+
+## Transactions and constraints
+
+PostgreSQL gives you multi-statement transactions, savepoints, all four isolation levels, foreign keys, check constraints and unique indexes. Correctness is enforced by the database.
+
+ClickHouse has no multi-table transactions, no foreign keys, no enforced constraints. An insert of a block is atomic; that is essentially the guarantee. Referential integrity is the application's job.
+
+For a system of record handling money or user accounts, this is disqualifying. For an analytics store fed from a system of record, it is irrelevant — the upstream database already enforced correctness.
+
+## Joins
+
+PostgreSQL's planner has decades of work behind it: hash joins, merge joins, nested loops, and cost-based selection between them, with statistics driving the choice.
+
+ClickHouse joins are weaker. The default implementation builds a hash table from the right-hand table in memory on the initiating node, so joining two large tables can exhaust memory. The idiomatic ClickHouse answer is to avoid the join — denormalise at write time, or use a dictionary for lookups:
+
+```sql
+CREATE DICTIONARY country_names (
+  code String,
+  name String
+)
+PRIMARY KEY code
+SOURCE(POSTGRESQL(host 'pg' port 5432 user 'ro' password '...' db 'appdb' table 'countries'))
+LAYOUT(HASHED())
+LIFETIME(3600);
+
+SELECT dictGet('country_names', 'name', country) AS country_name,
+       count(*)
+FROM events
+GROUP BY country_name;
+```
+
+Dictionaries live in memory on every node and are refreshed on a schedule, which turns a join into a hash lookup. It is a genuinely good pattern, but it is a different way of thinking about schema design.
+
+If your analytics involve joining six normalised tables, expect to redesign rather than port.
+
+## Ingest rate
+
+ClickHouse ingests very fast — hundreds of thousands to millions of rows per second per node — **provided you insert in large batches**. Each insert creates a data part that must later be merged, so many small inserts produce a part explosion and the infamous `Too many parts` error.
+
+```sql
+-- Good: one part
+INSERT INTO events SELECT * FROM input_batch;   -- 100,000+ rows
+
+-- Bad: 100,000 parts, then the merge scheduler falls over
+-- INSERT INTO events VALUES (...);  repeated per row
+```
+
+Batch to at least 1,000 rows, ideally tens of thousands, or enable asynchronous inserts:
+
+```sql
+SET async_insert = 1;
+SET wait_for_async_insert = 0;
+```
+
+PostgreSQL has the opposite profile: single-row inserts are perfectly normal, and bulk load is done with `COPY`.
+
+## Running both
+
+For most teams the answer is not either/or. PostgreSQL remains the system of record; ClickHouse becomes the analytics layer, fed continuously.
+
+ClickHouse can read PostgreSQL directly for smaller tables:
+
+```sql
+CREATE TABLE users_pg (
+  id    UInt64,
+  email String,
+  plan  String
+)
+ENGINE = PostgreSQL('pg-host:5432', 'appdb', 'users', 'readonly_user', 'password');
+
+SELECT u.plan, count(*) AS events
+FROM events e
+JOIN users_pg u ON u.id = e.user_id
+GROUP BY u.plan;
+```
+
+For continuous replication of large tables, use change data capture — Debezium into Kafka, consumed by ClickHouse's Kafka engine, or the managed ClickPipes equivalent. That keeps ClickHouse minutes behind PostgreSQL without either database noticing the other.
+
+Working across both means two dialects, two type systems and two sets of tooling. A client that speaks both reduces the friction: [Chat2DB](https://chat2db.ai/download) connects to PostgreSQL and ClickHouse alongside 20+ other engines, and its natural-language SQL generation is genuinely useful when you know exactly what you want but not the ClickHouse function name for it.
+
+## Before you migrate anything
+
+A slow dashboard is not automatic evidence that you need a different database. Check these first:
+
+- **Read the plan.** `EXPLAIN (ANALYZE, BUFFERS)` on the slow query. A sequential scan on a filtered column is a missing index, not an architecture problem.
+- **Check your indexes.** A covering index or a BRIN index on a time column can transform an analytical query on PostgreSQL.
+- **Try materialized views.** If the dashboard runs the same aggregation repeatedly over data that changes hourly, precompute it. This alone resolves a large share of "we need OLAP" cases.
+- **Consider partitioning.** Range partitioning by time gives PostgreSQL pruning behaviour that is qualitatively similar to what makes ClickHouse fast on time-filtered queries.
+- **Check the data volume.** Below roughly 100 million rows, a well-tuned PostgreSQL instance handles most analytical queries acceptably.
+
+ClickHouse earns its operational cost when you have genuinely large, append-only, time-series-shaped data and queries that scan a lot of it. It does not fix a query that was slow because of a missing index.
+
+## Summary
+
+PostgreSQL is a row-store OLTP database with real transactions, constraints and fast point lookups; ClickHouse is a column-store OLAP database with extreme compression and scan performance, no transactions, weak joins and asynchronous updates. The decisive questions are whether your data is append-only and whether your queries scan many rows or fetch few. If rows change after being written, or you need referential integrity, stay on PostgreSQL. If you are aggregating billions of immutable events and have already exhausted indexes, materialized views and partitioning, ClickHouse will be dramatically faster — and the usual end state is running both, with PostgreSQL as the source of truth feeding ClickHouse for analytics.

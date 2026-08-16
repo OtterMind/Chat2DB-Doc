@@ -1,0 +1,287 @@
+---
+title: "PostgreSQL Table Partitioning: A Practical Guide"
+description: "Learn PostgreSQL declarative table partitioning with runnable SQL: RANGE, LIST and HASH strategies, partition pruning, indexes and detaching partitions."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: August 16, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# PostgreSQL Table Partitioning: A Practical Guide
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="August 16, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+A table with 400 million rows does not become slow all at once. Queries stay acceptable for a long time because indexes keep working. What breaks first is maintenance: the nightly `DELETE FROM events WHERE created_at < now() - interval '90 days'` runs for six hours, leaves millions of dead tuples behind, and autovacuum spends the rest of the day catching up. Then the index rebuild you needed no longer fits in the maintenance window.
+
+Partitioning solves that class of problem. It splits one logical table into many physical tables, so deleting old data becomes a metadata operation instead of a row-by-row scan, and queries that filter on the partition key can skip whole partitions.
+
+This guide covers declarative partitioning as it works in PostgreSQL 12 and later, with SQL you can run.
+
+## What declarative partitioning actually does
+
+A partitioned table holds no data itself. It is a routing layer: you define a partition key, and every row you insert is sent to a child table based on that key. To the application, it looks like an ordinary table.
+
+```sql
+CREATE TABLE events (
+  id          bigint GENERATED ALWAYS AS IDENTITY,
+  tenant_id   bigint NOT NULL,
+  event_type  text NOT NULL,
+  payload     jsonb NOT NULL DEFAULT '{}'::jsonb,
+  created_at  timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY (id, created_at)
+) PARTITION BY RANGE (created_at);
+```
+
+Two details in that statement trip people up.
+
+First, `PARTITION BY RANGE (created_at)` must be present at creation time. You cannot convert an existing plain table into a partitioned one with `ALTER TABLE`; you create a new partitioned table and move the data across.
+
+Second, the primary key is `(id, created_at)`, not `(id)`. Every unique index on a partitioned table must contain the partition key. PostgreSQL builds one index per partition rather than a single global index, so uniqueness can only be enforced if the key itself determines which partition a row lives in. If you write `PRIMARY KEY (id)` here, PostgreSQL rejects it:
+
+```
+ERROR:  unique constraint on partitioned table must include all partitioning columns
+DETAIL:  PRIMARY KEY constraint on table "events" lacks column "created_at" which is part of the partition key.
+```
+
+That is the single most common surprise when adopting partitioning, and it has consequences for ORMs that assume a single-column surrogate key.
+
+## Creating range partitions
+
+Range partitioning assigns rows to a partition using a lower bound (inclusive) and an upper bound (exclusive). This is the right strategy for anything time-based.
+
+```sql
+CREATE TABLE events_2026_06 PARTITION OF events
+  FOR VALUES FROM ('2026-06-01') TO ('2026-07-01');
+
+CREATE TABLE events_2026_07 PARTITION OF events
+  FOR VALUES FROM ('2026-07-01') TO ('2026-08-01');
+
+CREATE TABLE events_2026_08 PARTITION OF events
+  FOR VALUES FROM ('2026-08-01') TO ('2026-09-01');
+```
+
+The bounds must not overlap, and because the upper bound is exclusive, `'2026-07-01'` belongs to the July partition, not June. Writing `FROM ('2026-06-01') TO ('2026-06-30')` is a classic off-by-one that silently loses the last day of the month into the default partition — or fails outright if there is no default.
+
+Speaking of which:
+
+```sql
+CREATE TABLE events_default PARTITION OF events DEFAULT;
+```
+
+Without a default partition, inserting a row whose key falls outside every declared range fails:
+
+```
+ERROR:  no partition of relation "events" found for row
+DETAIL:  Partition key of the failing row contains (created_at) = (2026-09-04 10:22:31+00).
+```
+
+A default partition prevents that error, but it is not a substitute for creating partitions ahead of time. Attaching a new partition whose range overlaps rows already sitting in the default requires a full scan of the default partition to verify none of them belong in the new one. Keep the default empty in normal operation and treat rows landing there as an alert.
+
+Writing these statements by hand for a year of daily partitions gets tedious quickly. Our free [PostgreSQL partition table generator](https://chat2db.ai/tools/postgres-partition-generator) produces the parent table, every child partition, the indexes and the maintenance SQL from a form, entirely in your browser.
+
+## LIST and HASH partitioning
+
+Range is not the only strategy. `LIST` routes rows by exact value, which fits a small and stable set of categories:
+
+```sql
+CREATE TABLE customers (
+  id       bigint GENERATED ALWAYS AS IDENTITY,
+  country  text NOT NULL,
+  name     text NOT NULL,
+  PRIMARY KEY (id, country)
+) PARTITION BY LIST (country);
+
+CREATE TABLE customers_eu PARTITION OF customers
+  FOR VALUES IN ('DE', 'FR', 'NL', 'ES', 'IT');
+
+CREATE TABLE customers_uk PARTITION OF customers
+  FOR VALUES IN ('GB');
+
+CREATE TABLE customers_us PARTITION OF customers
+  FOR VALUES IN ('US');
+
+CREATE TABLE customers_other PARTITION OF customers DEFAULT;
+```
+
+This pattern is popular for data residency: the EU partition can live in a tablespace on encrypted storage in an EU region.
+
+`HASH` spreads rows evenly across a fixed number of buckets:
+
+```sql
+CREATE TABLE sessions (
+  id          bigint NOT NULL,
+  user_id     bigint NOT NULL,
+  started_at  timestamptz NOT NULL,
+  PRIMARY KEY (id)
+) PARTITION BY HASH (id);
+
+CREATE TABLE sessions_h0 PARTITION OF sessions FOR VALUES WITH (MODULUS 4, REMAINDER 0);
+CREATE TABLE sessions_h1 PARTITION OF sessions FOR VALUES WITH (MODULUS 4, REMAINDER 1);
+CREATE TABLE sessions_h2 PARTITION OF sessions FOR VALUES WITH (MODULUS 4, REMAINDER 2);
+CREATE TABLE sessions_h3 PARTITION OF sessions FOR VALUES WITH (MODULUS 4, REMAINDER 3);
+```
+
+Be clear-eyed about what hash partitioning gives you. There is no default partition, because every possible value already maps to a bucket. There is no cheap bulk delete, because old rows are scattered across all partitions. And range queries prune nothing, since hashing destroys ordering. Hash partitioning is mainly about spreading write contention and shrinking individual index sizes — not about the maintenance wins that motivate most partitioning projects.
+
+## Partition pruning is the payoff
+
+Pruning is the planner skipping partitions that cannot contain matching rows. Verify it rather than assuming it:
+
+```sql
+EXPLAIN (ANALYZE, BUFFERS)
+SELECT count(*)
+FROM events
+WHERE created_at >= '2026-08-01' AND created_at < '2026-09-01';
+```
+
+A healthy plan touches exactly one partition:
+
+```
+Aggregate  (cost=8412.11..8412.12 rows=1 width=8) (actual time=41.2..41.2 rows=1 loops=1)
+  ->  Seq Scan on events_2026_08 events  (cost=0.00..7891.00 rows=208444 width=0)
+        Filter: ((created_at >= '2026-08-01'::timestamptz) AND (created_at < '2026-09-01'::timestamptz))
+Planning Time: 0.31 ms
+Execution Time: 41.3 ms
+```
+
+If instead you see every partition listed under an `Append` node, pruning failed. The usual causes:
+
+- **The filter does not reference the partition key.** `WHERE tenant_id = 42` cannot prune a table partitioned by `created_at`. No index will fix this; the planner has to read every partition.
+- **A function wraps the key.** `WHERE date_trunc('month', created_at) = '2026-08-01'` is opaque to the planner. Rewrite it as a range: `WHERE created_at >= '2026-08-01' AND created_at < '2026-09-01'`.
+- **A type mismatch.** Comparing a `timestamptz` column against a `date` parameter can prevent pruning depending on the session time zone. Match the types.
+
+Note that pruning happens twice: at planning time for constant predicates, and at execution time for parameters that are only known when the query runs. Execution-time pruning shows up in `EXPLAIN ANALYZE` as `Subplans Removed: N`.
+
+## Indexes on partitioned tables
+
+Create indexes on the parent and PostgreSQL propagates them:
+
+```sql
+CREATE INDEX ON events (tenant_id);
+CREATE INDEX ON events USING gin (payload jsonb_path_ops);
+```
+
+Each existing partition gets its own physical index, and each future partition gets one automatically at creation. The parent index is metadata only.
+
+One caveat: `CREATE INDEX` on a partitioned parent does **not** support `CONCURRENTLY`. On a live system, the workaround is to build the index concurrently on each partition individually, then create the parent index with `ON ONLY` and attach the children:
+
+```sql
+CREATE INDEX CONCURRENTLY events_2026_08_tenant_idx ON events_2026_08 (tenant_id);
+CREATE INDEX CONCURRENTLY events_2026_07_tenant_idx ON events_2026_07 (tenant_id);
+
+CREATE INDEX events_tenant_idx ON ONLY events (tenant_id);
+
+ALTER INDEX events_tenant_idx ATTACH PARTITION events_2026_08_tenant_idx;
+ALTER INDEX events_tenant_idx ATTACH PARTITION events_2026_07_tenant_idx;
+```
+
+The parent index is marked valid only once every partition's index is attached.
+
+## The operation that justifies all of this
+
+Here is the reason partitioning is worth the trouble. Dropping a month of data:
+
+```sql
+ALTER TABLE events DETACH PARTITION events_2026_06 CONCURRENTLY;
+DROP TABLE events_2026_06;
+```
+
+That runs in milliseconds. It produces no dead tuples, no WAL flood, no autovacuum backlog and no index bloat. The equivalent `DELETE FROM events WHERE created_at < '2026-07-01'` would rewrite millions of index entries and leave the table needing a `VACUUM FULL` to reclaim the space.
+
+`DETACH PARTITION ... CONCURRENTLY` (PostgreSQL 14 and later) avoids taking an `ACCESS EXCLUSIVE` lock on the parent, so readers and writers keep running. On older versions, plain `DETACH PARTITION` briefly locks the parent.
+
+Going the other way, attaching a table that already holds data forces PostgreSQL to scan it to prove every row fits the bounds. You can skip that scan by adding a matching `CHECK` constraint first:
+
+```sql
+ALTER TABLE events_incoming
+  ADD CONSTRAINT events_incoming_range
+  CHECK (created_at >= '2026-09-01' AND created_at < '2026-10-01');
+
+ALTER TABLE events ATTACH PARTITION events_incoming
+  FOR VALUES FROM ('2026-09-01') TO ('2026-10-01');
+```
+
+PostgreSQL recognises that the constraint already proves what the attach needs to verify, and skips the scan.
+
+## Automating partition creation
+
+Partitions do not create themselves. If you partition by month and nobody creates September, every September insert lands in the default partition — or fails. Two common approaches:
+
+**pg_partman**, an extension that manages a rolling window:
+
+```sql
+CREATE EXTENSION pg_partman;
+
+SELECT partman.create_parent(
+  p_parent_table := 'public.events',
+  p_control      := 'created_at',
+  p_interval     := '1 month',
+  p_premake      := 3
+);
+```
+
+With `p_premake := 3`, a background worker keeps three months of future partitions ready and can drop partitions older than a retention setting.
+
+**A scheduled function**, if you would rather not add an extension:
+
+```sql
+CREATE OR REPLACE FUNCTION create_next_events_partition()
+RETURNS void
+LANGUAGE plpgsql AS $$
+DECLARE
+  start_date date := date_trunc('month', now() + interval '1 month')::date;
+  end_date   date := date_trunc('month', now() + interval '2 month')::date;
+  part_name  text := format('events_%s', to_char(start_date, 'YYYY_MM'));
+BEGIN
+  EXECUTE format(
+    'CREATE TABLE IF NOT EXISTS %I PARTITION OF events FOR VALUES FROM (%L) TO (%L)',
+    part_name, start_date, end_date
+  );
+END;
+$$;
+```
+
+Call it from `pg_cron` or an external scheduler, and monitor that it actually ran. A silent failure here shows up weeks later as a bloated default partition.
+
+## Checking on your partitions
+
+To see what exists and how large each partition is:
+
+```sql
+SELECT c.relname                                   AS partition,
+       pg_size_pretty(pg_relation_size(c.oid))     AS size,
+       pg_get_expr(c.relpartbound, c.oid)          AS bounds
+FROM pg_class c
+JOIN pg_inherits i ON i.inhrelid = c.oid
+JOIN pg_class p    ON p.oid = i.inhparent
+WHERE p.relname = 'events'
+ORDER BY c.relname;
+```
+
+And to confirm nothing is accumulating in the default partition:
+
+```sql
+SELECT count(*) FROM events_default;
+```
+
+That count should be zero. If it is not, either a partition is missing or a row arrived with an unexpected timestamp.
+
+If you would rather see partition sizes, bounds and query plans without writing catalog queries, [Chat2DB](https://chat2db.ai/download) shows the partition tree in its object browser and renders `EXPLAIN` output as a readable plan tree, which makes verifying pruning considerably faster than reading nested text.
+
+## When not to partition
+
+Partitioning is not free. It adds planning overhead proportional to the partition count, complicates unique constraints, and makes queries that do not filter on the partition key slower than they were on a plain table. A few rules of thumb:
+
+- Below roughly 50–100 million rows, a well-indexed plain table with healthy autovacuum settings usually outperforms a partitioned one.
+- Keep the partition count in the low hundreds. Thousands of partitions inflate planning time noticeably, even with pruning.
+- If your dominant query pattern does not filter on a single natural key, you get the costs without the pruning benefit.
+- Partitioning does not reduce total data size or replace indexes. A partition still needs its own indexes to answer selective queries efficiently.
+
+The strongest signal that you should partition is a retention policy. If your data has a natural expiry — logs, events, metrics, audit trails — then range partitioning by time turns your most expensive recurring maintenance job into a `DROP TABLE`, and that alone usually justifies the migration.
+
+## Summary
+
+Declarative partitioning gives PostgreSQL a way to treat one logical table as many physical ones. Choose `RANGE` for time-series data, `LIST` for stable categories, and `HASH` only when you want even distribution rather than pruning or cheap deletes. Remember that unique constraints must include the partition key, that pruning only works when queries filter on that key, and that partitions must be created ahead of time by an extension or a scheduled job. Verify with `EXPLAIN (ANALYZE, BUFFERS)` rather than trusting that pruning is happening — the difference between one partition scanned and forty is the whole point.
