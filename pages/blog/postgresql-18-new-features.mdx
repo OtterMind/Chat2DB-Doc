@@ -1,0 +1,208 @@
+---
+title: "PostgreSQL 18 New Features: What's New and Why It Matters"
+description: "A practical tour of PostgreSQL 18 new features: async I/O, uuidv7(), temporal constraints, B-tree skip scans, OLD/NEW in RETURNING, and an upgrade checklist."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: August 17, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# PostgreSQL 18 New Features: What's New and Why It Matters
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="August 17, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+PostgreSQL 18 shipped in September 2025, and it is one of the most substantial releases in years. Instead of a single headline feature, it delivers a set of changes that touch the storage layer, the SQL language, indexing, and even authentication. This article walks through the PostgreSQL 18 new features that matter most in day-to-day work, with runnable SQL for each one, and closes with a practical upgrade checklist.
+
+## Asynchronous I/O: a new foundation for reads
+
+The biggest architectural change in PostgreSQL 18 is the asynchronous I/O (AIO) subsystem. Historically, PostgreSQL issued synchronous read requests: a backend process asked the kernel for a page, then waited until the data arrived before doing anything else. The database relied on the operating system's readahead heuristics to hide latency, which works reasonably well for local disks but poorly for cloud block storage, where each individual read can carry noticeable latency.
+
+PostgreSQL 18 introduces a real asynchronous read path, controlled by the new `io_method` parameter:
+
+```sql
+-- Inspect the current setting
+SHOW io_method;
+
+-- Switch methods (requires a server restart)
+ALTER SYSTEM SET io_method = 'io_uring';
+```
+
+The three supported values are:
+
+- `sync` — the classic synchronous behavior, kept as a fallback.
+- `worker` — the default. A pool of dedicated I/O worker processes performs reads on behalf of backends. The pool size is controlled by `io_workers`.
+- `io_uring` — on Linux, backends submit reads directly through the kernel's io_uring interface, avoiding inter-process handoff entirely. PostgreSQL must be built with io_uring support for this option to be available.
+
+Asynchronous I/O in this release applies to reads: sequential scans, bitmap heap scans, and maintenance operations such as VACUUM can keep many read requests in flight at once instead of waiting on each page. The practical effect is most visible on network-attached storage (EBS, cloud persistent disks) where per-request latency is high but the device can serve many concurrent requests. The `effective_io_concurrency` setting now genuinely controls how many requests are kept in flight, and its default was raised in this release.
+
+Why it matters: if your workload is dominated by large scans or your storage is cloud-based, this is a performance improvement you get without rewriting a single query. It is also the groundwork for asynchronous writes in future releases.
+
+## uuidv7(): time-ordered UUIDs for primary keys
+
+Random UUIDs (version 4) are a popular primary key choice, but they are hostile to B-tree indexes: every insert lands at a random position in the index, causing page splits, cache misses, and index bloat. UUIDv7, standardized in RFC 9562, embeds a millisecond-precision Unix timestamp in the most significant bits, so newly generated values sort roughly in insertion order.
+
+PostgreSQL 18 ships a native `uuidv7()` function (plus `uuidv4()` as a clearer alias for `gen_random_uuid()`):
+
+```sql
+CREATE TABLE orders (
+    id          uuid PRIMARY KEY DEFAULT uuidv7(),
+    customer_id bigint NOT NULL,
+    total       numeric(12,2) NOT NULL,
+    created_at  timestamptz NOT NULL DEFAULT now()
+);
+
+INSERT INTO orders (customer_id, total)
+VALUES (1001, 249.90), (1002, 15.00)
+RETURNING id;
+```
+
+Because consecutive inserts produce nearby key values, index pages fill left to right, much like a `bigint` sequence, while the values remain globally unique and safe to generate on any node. You can also recover the embedded timestamp:
+
+```sql
+SELECT uuid_extract_timestamp(uuidv7());
+```
+
+Why it matters: you get the operational benefits of UUID keys (no central sequence, mergeable across shards or services) without the index-fragmentation penalty of UUIDv4. For new schemas that want UUID primary keys, `uuidv7()` should be the default choice.
+
+## Virtual generated columns are now the default
+
+Generated columns were added in PostgreSQL 12, but only the `STORED` variant existed: the computed value was written to disk on every insert and update. PostgreSQL 18 adds virtual generated columns, which are computed on read, and makes `VIRTUAL` the default when you omit the keyword:
+
+```sql
+CREATE TABLE line_items (
+    order_id   uuid NOT NULL,
+    quantity   int NOT NULL,
+    unit_price numeric(10,2) NOT NULL,
+    -- VIRTUAL is now the default: computed when read, not stored
+    line_total numeric GENERATED ALWAYS AS (quantity * unit_price),
+    -- Explicitly stored version, materialized on write
+    line_total_stored numeric GENERATED ALWAYS AS (quantity * unit_price) STORED
+);
+
+INSERT INTO line_items (order_id, quantity, unit_price)
+VALUES (uuidv7(), 3, 19.99);
+
+SELECT quantity, unit_price, line_total FROM line_items;
+```
+
+A virtual column occupies no storage and adds no write amplification; the trade-off is that the expression is evaluated on every read, and virtual columns currently come with restrictions (for example, you cannot build an index directly on one — use an expression index instead).
+
+Why it matters: derived values that are cheap to compute but frequently displayed (totals, normalized text, unit conversions) no longer cost disk space or slow down writes. Be aware of the default change when migrating DDL scripts from older versions: if you relied on the stored behavior, you must now write `STORED` explicitly.
+
+## Temporal constraints: WITHOUT OVERLAPS
+
+Scheduling and versioned-data schemas have always needed "no two rows for the same key may overlap in time." Before PostgreSQL 18, you enforced that with a manually created exclusion constraint. Now the SQL-standard syntax is supported directly in `PRIMARY KEY` and `UNIQUE` constraints:
+
+```sql
+CREATE EXTENSION IF NOT EXISTS btree_gist;
+
+CREATE TABLE room_bookings (
+    room_id  int NOT NULL,
+    during   tstzrange NOT NULL,
+    booked_by text NOT NULL,
+    PRIMARY KEY (room_id, during WITHOUT OVERLAPS)
+);
+
+INSERT INTO room_bookings VALUES
+  (101, '[2026-08-17 09:00, 2026-08-17 11:00)', 'alice');
+
+-- Fails: overlaps the existing booking for room 101
+INSERT INTO room_bookings VALUES
+  (101, '[2026-08-17 10:00, 2026-08-17 12:00)', 'bob');
+```
+
+The second insert raises a conflict error because the ranges intersect. Under the hood this builds a GiST index (hence the `btree_gist` extension, which lets the scalar `room_id` participate). PostgreSQL 18 also adds `PERIOD` support in foreign keys, so a child row's validity range can be required to fall within the referenced row's range.
+
+Why it matters: bookings, price validity windows, contract versions, and slowly changing dimensions can now be guaranteed consistent by the database itself, with one line of declarative DDL instead of application-side checks that inevitably race.
+
+## Skip scan for multicolumn B-tree indexes
+
+A long-standing rule of thumb said a multicolumn B-tree index on `(a, b)` is useless for a query that filters only on `b`. PostgreSQL 18 relaxes this with skip scan support: if the leading column has relatively few distinct values, the planner can iterate over each distinct value of `a` and probe the index for the matching `b` values.
+
+```sql
+CREATE TABLE sales (
+    region  text NOT NULL,      -- low cardinality: a handful of regions
+    sold_on date NOT NULL,
+    amount  numeric(12,2) NOT NULL
+);
+
+CREATE INDEX sales_region_sold_on_idx ON sales (region, sold_on);
+
+-- Pre-18 this predicate could not use the index efficiently.
+-- With skip scan, the index is probed once per distinct region.
+EXPLAIN (COSTS OFF)
+SELECT * FROM sales WHERE sold_on = DATE '2026-08-01';
+```
+
+The plan can now show an index scan on `sales_region_sold_on_idx` even though `region` is not constrained. The optimizer decides based on statistics, so the benefit is largest when the leading column is low-cardinality.
+
+Why it matters: fewer redundant single-column indexes. Where you previously needed both `(region, sold_on)` and `(sold_on)`, one composite index may now serve both query shapes, saving write overhead and disk space.
+
+## OLD and NEW in the RETURNING clause
+
+`RETURNING` has always exposed the post-operation row for `INSERT`/`UPDATE` and the pre-operation row for `DELETE`. PostgreSQL 18 lets you reference both explicitly via `old` and `new`:
+
+```sql
+UPDATE accounts
+SET balance = balance - 100
+WHERE id = 42
+RETURNING old.balance AS balance_before,
+          new.balance AS balance_after;
+```
+
+A particularly useful pattern is detecting whether an upsert inserted or updated:
+
+```sql
+INSERT INTO settings (key, value)
+VALUES ('theme', 'dark')
+ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value
+RETURNING (old.key IS NULL) AS was_inserted,
+          old.value AS previous_value,
+          new.value AS current_value;
+```
+
+For a fresh insert, all `old` references are NULL, so `was_inserted` is true; for a conflict-turned-update you get the previous value back in the same round trip.
+
+Why it matters: audit logging, change feeds, and upsert result handling no longer need an extra `SELECT` or a trigger just to see what a statement changed.
+
+## A smoother upgrade: pg_upgrade keeps planner statistics
+
+Before version 18, `pg_upgrade` migrated your data but discarded optimizer statistics, so the first hours after a major upgrade often suffered terrible plans until `ANALYZE` finished across the cluster. PostgreSQL 18's `pg_upgrade` transfers planner statistics from the old cluster, dramatically shrinking that vulnerable window. The release also improves `pg_upgrade` parallelism for clusters with many databases, and `vacuumdb` gains a `--missing-stats-only` mode so you can compute only the statistics that could not be carried over (such as extended statistics):
+
+```sql
+-- After upgrading, fill in only what pg_upgrade could not migrate:
+-- vacuumdb --all --analyze-in-stages --missing-stats-only
+```
+
+Why it matters: the effective downtime of a major upgrade is not just the cutover, it is the time until performance is back to normal. Preserved statistics remove most of that tail.
+
+## OAuth 2.0 authentication
+
+PostgreSQL 18 adds an `oauth` authentication method. Clients obtain a bearer token from your identity provider (Keycloak, Entra ID, Okta, and so on), and the server hands the token to a validator module for verification. A `pg_hba.conf` entry looks like this:
+
+```
+# TYPE  DATABASE  USER  ADDRESS       METHOD
+host    all       all   10.0.0.0/8    oauth issuer="https://idp.example.com" scope="openid"
+```
+
+The server side requires a validator library configured via `oauth_validator_libraries`; PostgreSQL defines the module API and leaves token validation policy to the integration.
+
+Why it matters: centralized identity, token expiry, and MFA policies can now cover database logins without password sprawl or ad-hoc LDAP bridges. Client tools are adopting the flow through libpq, so GUI clients and drivers built on libpq inherit it. If you manage many databases across versions, a client such as [Chat2DB](https://chat2db.ai/download) gives you one place to organize connections and credentials while your team transitions authentication schemes.
+
+## Upgrade checklist for PostgreSQL 18
+
+Before you move production to PostgreSQL 18, walk through this list:
+
+- **Read the release notes for incompatibilities.** In particular, plain `GENERATED ALWAYS AS (...)` now means VIRTUAL; audit DDL scripts and add `STORED` where you depend on materialized values.
+- **Check extension compatibility.** Confirm that every extension (PostGIS, pgvector, pg_partman, and so on) has a release supporting 18 before scheduling the upgrade.
+- **Test `io_method` on a staging replica.** Start with the default `worker` mode; benchmark `io_uring` on Linux with your real scan-heavy workloads before enabling it in production.
+- **Plan the upgrade path.** Use `pg_upgrade --link` (or evaluate the new file-swap option) for large clusters, and verify that planner statistics arrived by querying `pg_stats` after cutover.
+- **Run `vacuumdb --analyze-in-stages --missing-stats-only`** post-upgrade to rebuild only what was not migrated.
+- **Revisit indexing.** With skip scan available, identify redundant single-column indexes that duplicate the trailing columns of composite indexes, and drop them after verifying plans.
+- **Adopt `uuidv7()` for new tables** where you want UUID keys, and consider it for partitioned or high-insert tables suffering from UUIDv4 index bloat.
+- **Pilot OAuth authentication** in a non-critical environment first, since it involves an external validator component and identity-provider configuration.
+
+PostgreSQL 18 is a release where infrastructure work (asynchronous I/O, statistics-preserving upgrades) and developer-facing SQL (uuidv7, temporal constraints, OLD/NEW in RETURNING) land together. Few upgrades offer this much value for this little migration effort — but as always, rehearse the upgrade on a copy of production before the real cutover.

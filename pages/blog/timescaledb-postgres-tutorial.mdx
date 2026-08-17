@@ -1,0 +1,239 @@
+---
+title: "TimescaleDB Tutorial: Time-Series Data in Postgres"
+description: "Hands-on TimescaleDB Postgres tutorial: Docker install, hypertables, time_bucket queries, continuous aggregates, compression, and retention policies."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: August 17, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# TimescaleDB Tutorial: Time-Series Data in Postgres
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="August 17, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+TimescaleDB is an open-source extension that turns PostgreSQL into a full-featured time-series database. Instead of learning a new query language or running a separate specialized system, you keep everything you already know about Postgres — SQL, joins, indexes, drivers, backup tooling — and add automatic time-based partitioning, columnar compression, continuous aggregation, and retention policies on top.
+
+This tutorial walks through a complete workflow: installing TimescaleDB with Docker, creating a hypertable for sensor data, querying it with `time_bucket()`, building continuous aggregates, enabling compression, and setting up data retention. Every SQL statement shown is runnable as-is.
+
+## What Is TimescaleDB?
+
+TimescaleDB is packaged as a standard PostgreSQL extension. Once loaded, it introduces a new abstraction called a **hypertable**: a table that looks and behaves like an ordinary Postgres table but is physically stored as many smaller child tables called **chunks**, each covering a time interval. You `INSERT`, `SELECT`, `UPDATE`, and `JOIN` against the hypertable; the extension routes rows to the correct chunk and prunes irrelevant chunks at query time.
+
+Because it is genuinely Postgres underneath, everything in the Postgres ecosystem works: psql, pgAdmin, ORMs, foreign data wrappers, logical replication, and GUI clients. For example, [Chat2DB](https://chat2db.ai/download) connects to a TimescaleDB instance with an ordinary PostgreSQL connection and lets you browse chunks and run the queries in this article directly, since TimescaleDB speaks the standard Postgres wire protocol.
+
+## Installing TimescaleDB with Docker
+
+The fastest way to get a working instance is the official Docker image, which bundles PostgreSQL with the extension preinstalled:
+
+```sql
+-- Run this in your shell, not in SQL:
+-- docker run -d --name timescaledb -p 5432:5432 \
+--   -e POSTGRES_PASSWORD=password timescale/timescaledb:latest-pg16
+```
+
+Connect with any Postgres client (`psql -h localhost -U postgres`), then enable the extension in your target database:
+
+```sql
+CREATE EXTENSION IF NOT EXISTS timescaledb;
+```
+
+Verify the installed version:
+
+```sql
+SELECT extname, extversion FROM pg_extension WHERE extname = 'timescaledb';
+```
+
+If you run Postgres outside Docker, install the package for your OS and add `timescaledb` to `shared_preload_libraries` in `postgresql.conf` before running `CREATE EXTENSION`. The Docker image handles that step for you.
+
+## Creating a Hypertable
+
+### Step 1: Define a regular table
+
+Start with a plain relational schema. We will model temperature and humidity readings from IoT sensors:
+
+```sql
+CREATE TABLE sensor_data (
+  time        TIMESTAMPTZ       NOT NULL,
+  sensor_id   INTEGER           NOT NULL,
+  location    TEXT              NOT NULL,
+  temperature DOUBLE PRECISION,
+  humidity    DOUBLE PRECISION
+);
+```
+
+Nothing time-series-specific yet — this is standard DDL. Note the `TIMESTAMPTZ` column: hypertables require a time column to partition on.
+
+### Step 2: Convert it to a hypertable
+
+```sql
+SELECT create_hypertable('sensor_data', by_range('time'));
+```
+
+On older TimescaleDB versions (before 2.13) the equivalent call is `SELECT create_hypertable('sensor_data', 'time');`. Either way, the table is now partitioned by time. The default chunk interval is 7 days; you can tune it:
+
+```sql
+SELECT set_chunk_time_interval('sensor_data', INTERVAL '1 day');
+```
+
+A common rule of thumb is to size chunks so that the indexes of all recently written chunks fit in memory, which keeps ingest fast.
+
+### Step 3: Insert data
+
+Inserts are ordinary SQL. Let's generate three days of synthetic readings for four sensors at one-minute resolution using `generate_series`:
+
+```sql
+INSERT INTO sensor_data (time, sensor_id, location, temperature, humidity)
+SELECT
+  ts,
+  s.sensor_id,
+  'warehouse-' || (s.sensor_id % 2 + 1),
+  20 + 5 * sin(extract(epoch FROM ts) / 3600.0) + random(),
+  50 + 10 * random()
+FROM generate_series(
+       now() - INTERVAL '3 days',
+       now(),
+       INTERVAL '1 minute'
+     ) AS ts
+CROSS JOIN (SELECT generate_series(1, 4) AS sensor_id) AS s;
+```
+
+This produces roughly 17,000 rows: a timestamp series cross-joined with four sensor IDs, with a sine wave plus noise standing in for a daily temperature cycle. TimescaleDB routes each row to the chunk covering its timestamp automatically.
+
+## Querying with time_bucket()
+
+### Hourly averages
+
+`time_bucket()` is TimescaleDB's workhorse aggregation function. It truncates timestamps into fixed-width buckets, similar to `date_trunc` but with arbitrary intervals:
+
+```sql
+SELECT
+  time_bucket('1 hour', time) AS bucket,
+  sensor_id,
+  avg(temperature) AS avg_temp,
+  max(temperature) AS max_temp,
+  min(temperature) AS min_temp
+FROM sensor_data
+WHERE time > now() - INTERVAL '24 hours'
+GROUP BY bucket, sensor_id
+ORDER BY bucket, sensor_id;
+```
+
+Step by step: the `WHERE` clause lets the planner exclude every chunk outside the last 24 hours (chunk pruning), `time_bucket('1 hour', time)` maps each row's timestamp to the start of its hour, and the `GROUP BY` computes per-sensor statistics per hour. Because chunks outside the time range are never touched, this stays fast even when the table holds years of history.
+
+### Gap filling for dashboards
+
+Real sensors go offline. If a sensor sent nothing between 02:00 and 04:00, the query above simply has no rows for those buckets, which makes charting libraries draw misleading lines. `time_bucket_gapfill()` emits a row for every bucket in the requested range:
+
+```sql
+SELECT
+  time_bucket_gapfill('1 hour', time) AS bucket,
+  sensor_id,
+  avg(temperature) AS avg_temp,
+  locf(avg(temperature)) AS temp_carried_forward,
+  interpolate(avg(temperature)) AS temp_interpolated
+FROM sensor_data
+WHERE time > now() - INTERVAL '24 hours'
+  AND time < now()
+GROUP BY bucket, sensor_id
+ORDER BY bucket;
+```
+
+Three things to note. First, gapfill requires an explicit bounded time range in the `WHERE` clause (both a start and an end) so it knows which buckets to generate. Second, `locf()` ("last observation carried forward") fills a missing bucket with the previous bucket's value — appropriate for slowly changing readings like temperature. Third, `interpolate()` linearly interpolates between the surrounding known values instead. Buckets with no data and no applicable fill return `NULL`, which most charting tools render as a visible gap.
+
+## Continuous Aggregates
+
+Recomputing hourly averages over months of raw data on every dashboard refresh is wasteful. A **continuous aggregate** is a materialized view that TimescaleDB keeps incrementally up to date:
+
+```sql
+CREATE MATERIALIZED VIEW sensor_hourly
+WITH (timescaledb.continuous) AS
+SELECT
+  time_bucket('1 hour', time) AS bucket,
+  sensor_id,
+  avg(temperature) AS avg_temp,
+  max(temperature) AS max_temp,
+  count(*) AS sample_count
+FROM sensor_data
+GROUP BY bucket, sensor_id
+WITH NO DATA;
+```
+
+The `WITH (timescaledb.continuous)` clause is what distinguishes this from a plain materialized view: instead of full rebuilds, TimescaleDB tracks which regions of raw data changed and refreshes only those buckets. Now attach a refresh policy so it updates itself:
+
+```sql
+SELECT add_continuous_aggregate_policy('sensor_hourly',
+  start_offset      => INTERVAL '3 hours',
+  end_offset        => INTERVAL '1 hour',
+  schedule_interval => INTERVAL '30 minutes');
+```
+
+Every 30 minutes, a background worker refreshes buckets between 3 hours ago and 1 hour ago. The `end_offset` of 1 hour deliberately excludes the current, still-changing bucket so the aggregate only materializes settled data. Querying it is just:
+
+```sql
+SELECT bucket, sensor_id, avg_temp
+FROM sensor_hourly
+WHERE bucket > now() - INTERVAL '7 days'
+ORDER BY bucket;
+```
+
+By default, continuous aggregates use *real-time aggregation*: results from the materialized region are combined with an on-the-fly aggregation of the not-yet-materialized tail, so you get both speed and freshness.
+
+## Compression
+
+Time-series data is written once and rarely updated, which makes old chunks ideal candidates for columnar compression. Enable it on the hypertable:
+
+```sql
+ALTER TABLE sensor_data SET (
+  timescaledb.compress,
+  timescaledb.compress_segmentby = 'sensor_id',
+  timescaledb.compress_orderby   = 'time DESC'
+);
+
+SELECT add_compression_policy('sensor_data', INTERVAL '7 days');
+```
+
+The policy compresses any chunk whose data is older than 7 days.
+
+### How columnar compression works conceptually
+
+When a chunk is compressed, TimescaleDB pivots its row-oriented storage into a column-oriented layout: many consecutive values of the *same column* are packed together into large batches stored as single rows. Grouping like-typed values enables type-specific encodings — delta-of-delta for timestamps that tick at regular intervals, Gorilla-style XOR encoding for floats that change slowly, run-length and dictionary encoding for repetitive text such as our `location` column.
+
+The `segmentby` option keeps each sensor's data in its own batches, so a query filtering on `sensor_id` can skip other sensors' batches entirely. The `orderby` option controls sort order inside a batch, which both improves compression ratios (adjacent values are similar) and preserves efficient time-ordered reads. Compressed chunks remain fully queryable with normal SQL; recent chunks stay in row format for fast inserts, giving you a hybrid row/columnar store in one table. Actual compression ratios depend heavily on your data's regularity, so measure on your own workload with `hypertable_compression_stats('sensor_data')`.
+
+## Data Retention
+
+When old raw data stops being useful, drop it automatically:
+
+```sql
+SELECT add_retention_policy('sensor_data', INTERVAL '90 days');
+```
+
+A background job periodically drops entire chunks older than 90 days. This is the key efficiency win over `DELETE`: dropping a chunk is a metadata operation that removes a child table instantly, with no row-by-row deletion, no dead tuples, and no vacuum debt. A common pattern is to combine retention on the raw hypertable with a longer-lived continuous aggregate — keep 90 days of raw readings but years of hourly rollups, since `sensor_hourly` is its own hypertable with its own (optional) retention policy.
+
+## Chunk Architecture and When It Beats Vanilla Partitioning
+
+Under the hood, each chunk is a real Postgres table with its own indexes, inheriting from the hypertable. You can inspect them:
+
+```sql
+SELECT chunk_name, range_start, range_end
+FROM timescaledb_information.chunks
+WHERE hypertable_name = 'sensor_data'
+ORDER BY range_start;
+```
+
+PostgreSQL's native declarative partitioning can also split a table by time, so when is TimescaleDB worth it?
+
+- **Automatic partition management.** With native partitioning you must create future partitions yourself (or script it with cron or pg_partman). Hypertables create chunks on demand as data arrives — an insert for a new time range just works.
+- **Policy automation.** Compression, retention, and refresh policies are built-in background jobs. With vanilla Postgres you assemble the same behavior from external schedulers and custom scripts.
+- **Columnar compression.** Native partitioning stores every partition as row-oriented heap pages. TimescaleDB's compressed chunks can dramatically shrink storage and speed up analytical scans over old data.
+- **Time-series SQL.** `time_bucket_gapfill`, `locf`, `interpolate`, `first`/`last`, and continuous aggregates have no native equivalent.
+- **High partition counts.** Hypertables routinely run with thousands of chunks, with planning optimizations (constraint exclusion at both plan and execution time) tuned for that scale.
+
+Conversely, if you only need a handful of coarse partitions, rarely expire data, and want zero extensions, native partitioning is simpler and perfectly adequate. TimescaleDB earns its place when data arrives continuously, dashboards aggregate over time windows, and old data must be compressed or expired on a schedule.
+
+## Conclusion
+
+You now have the full lifecycle of a TimescaleDB Postgres deployment: a Dockerized install, a hypertable receiving sensor data, `time_bucket` and gap-filled queries feeding dashboards, a continuous aggregate refreshing itself, and compression plus retention policies managing storage automatically. Because it is all plain SQL against a Postgres-compatible server, you can experiment with every statement above in any Postgres client, including [Chat2DB](https://app.chat2db.ai/), and promote the same schema to production without changing tools.

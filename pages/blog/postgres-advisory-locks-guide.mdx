@@ -1,0 +1,235 @@
+---
+title: "Postgres Advisory Locks: A Practical Guide with Examples"
+description: "How Postgres advisory locks work: session vs transaction level, pg_try_advisory_lock, hashtext keys, cron and queue examples, pg_locks, and pooling pitfalls."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: August 17, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# Postgres Advisory Locks: A Practical Guide with Examples
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="August 17, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+Most Postgres locks protect data: a row lock stops two transactions from updating the same tuple, a table lock stops a `DROP` from racing an insert. Advisory locks are different. They protect *whatever you say they protect*. Postgres gives you a fast, cluster-wide mutex keyed by a number you choose, and it never inspects or enforces what that number means. If every participant agrees that lock key `42` means "the nightly billing job is running," you have distributed coordination without deploying Redis, ZooKeeper, or etcd — the database you already run does it.
+
+This guide covers the full API surface — session vs transaction scope, blocking vs try variants, one-bigint vs two-int key forms — then works through three production use cases with complete code, shows how to inspect held advisory locks in `pg_locks`, and finishes with the pitfalls that bite people in real deployments, especially around connection pooling.
+
+## What Advisory Locks Are (and Are Not)
+
+A regular lock in Postgres is attached to a database object. When you run `UPDATE accounts SET ... WHERE id = 1`, Postgres locks that heap tuple; when you run `ALTER TABLE`, it locks the relation. These locks exist so that MVCC and DDL stay correct, and the server acquires and enforces them automatically.
+
+An advisory lock is attached to nothing but a 64-bit key. Calling `pg_advisory_lock(42)` does not touch any table, block any query, or interact with row or table locks in any way. Its only effect is that another session calling `pg_advisory_lock(42)` will wait until the first releases it. The name is literal: the lock is *advisory* — cooperation is voluntary, and code that never asks for the lock is never blocked by it.
+
+That trade sounds weak but is exactly what application-level mutual exclusion needs:
+
+- **No table required.** You can serialize "regenerate the sitemap" or "run schema migration" — operations that touch many tables or no tables at all.
+- **No MVCC overhead.** Advisory locks live in shared memory; acquiring one writes no WAL, creates no dead tuples, and never triggers vacuum work, unlike the common anti-pattern of locking a row in a `locks` table.
+- **Fast and reentrant.** Acquisition is a lightweight function call, and the same session can take the same lock repeatedly (more on the reentrancy trap later).
+
+## The API: Scope, Blocking Behavior, and Key Forms
+
+The function family is a grid of three choices: session vs transaction scope, blocking vs try, shared vs exclusive. In practice you will use four functions most of the time: `pg_advisory_lock`, `pg_advisory_unlock`, `pg_advisory_xact_lock`, and `pg_try_advisory_lock`.
+
+### Session-Level Locks: pg_advisory_lock
+
+```sql
+-- Blocks until the lock is available, then holds it
+SELECT pg_advisory_lock(42);
+
+-- ... do work, possibly across many transactions ...
+
+-- Explicitly release; returns true if you held it
+SELECT pg_advisory_unlock(42);
+```
+
+A session-level lock belongs to the *connection*, not to any transaction. It survives `COMMIT` and `ROLLBACK`, and is released only by an explicit `pg_advisory_unlock`, by `pg_advisory_unlock_all()`, or when the connection closes. This is what you want for long-running work that spans transactions — a batch job that commits every thousand rows but must remain the only runner throughout.
+
+### Transaction-Level Locks: pg_advisory_xact_lock
+
+```sql
+BEGIN;
+SELECT pg_advisory_xact_lock(42);
+-- ... protected work ...
+COMMIT;  -- lock released automatically here (also on ROLLBACK)
+```
+
+Transaction-level locks release themselves at transaction end, and there is deliberately no unlock function for them. They cannot leak: if your code throws, the rollback frees the lock. Prefer them whenever the critical section fits in one transaction — which is most of the time — and they are the only safe choice behind transaction-mode poolers, as discussed below.
+
+### Try Variants: pg_try_advisory_lock
+
+The blocking forms wait, potentially forever. The `try` forms return immediately with a boolean:
+
+```sql
+SELECT pg_try_advisory_lock(42) AS acquired;
+-- acquired = true  -> you hold the lock, proceed
+-- acquired = false -> someone else holds it, do NOT proceed (and do NOT unlock)
+```
+
+This turns the lock into a "should I even run?" check, which is the backbone of the scheduler pattern below. There is also `pg_try_advisory_xact_lock` for the transaction-scoped equivalent, plus `_shared` variants of everything (`pg_advisory_lock_shared`, etc.) that implement a readers-writer pattern: any number of shared holders coexist, but a shared holder excludes exclusive ones.
+
+### Key Forms: One bigint or Two int4
+
+Every function comes in two signatures:
+
+```sql
+SELECT pg_advisory_lock(1234567890123::bigint); -- one 64-bit key
+SELECT pg_advisory_lock(1001, 42);              -- two 32-bit keys
+```
+
+The two-int form is convenient for namespacing: use the first int as an application- or subsystem-ID and the second as the entity ID, e.g. `pg_advisory_lock(1001, user_id)`. Note the two forms use separate keyspaces — `pg_advisory_lock(0, 42)` and `pg_advisory_lock(42)` are different locks — so pick one convention per codebase and stick to it.
+
+### Hashing Text Keys with hashtext
+
+Lock keys are integers, but real identifiers are usually strings. Hash them:
+
+```sql
+-- hashtext returns int4: pair it with a namespace int
+SELECT pg_advisory_lock(1001, hashtext('billing:invoice-run'));
+
+-- or produce a bigint key with hashtextextended (seed 0)
+SELECT pg_advisory_lock(hashtextextended('billing:invoice-run', 0));
+```
+
+Hash collisions are possible in principle — two different strings could map to the same key and would then exclude each other. For coordination locks (dozens or thousands of distinct names) this is a theoretical concern; the failure mode is extra waiting, never corruption. If your keys are already integers (primary keys, tenant IDs), use them directly and skip hashing.
+
+## Use Case 1: Distributed Cron — Only One Worker Runs the Job
+
+You run three app servers, each with the same crontab entry. The nightly cleanup must run exactly once. Instead of electing a leader, let every server try and let the lock elect the winner:
+
+```sql
+-- Executed by every server at 02:00; namespace 20 = "scheduled jobs"
+SELECT pg_try_advisory_lock(20, hashtext('nightly-cleanup')) AS is_leader;
+```
+
+Wrapped in application code (Python, but the shape is language-agnostic):
+
+```python
+def run_nightly_cleanup(conn):
+    cur = conn.cursor()
+    cur.execute("SELECT pg_try_advisory_lock(20, hashtext('nightly-cleanup'))")
+    if not cur.fetchone()[0]:
+        log.info("another node is running nightly-cleanup; skipping")
+        return
+    try:
+        do_cleanup(conn)          # may commit many transactions
+    finally:
+        cur.execute("SELECT pg_advisory_unlock(20, hashtext('nightly-cleanup'))")
+```
+
+Step by step: every node calls `pg_try_advisory_lock` at the same moment; exactly one gets `true` and becomes the runner; the rest get `false` and exit instantly without waiting. A session-level lock is used because the job commits multiple transactions while it must stay exclusive, and the `finally` block guarantees release even when the job raises. If the winning node crashes mid-job, its connection drops and Postgres frees the lock automatically — no stale-lock cleanup script, which is precisely the property row-in-a-table lock schemes lack.
+
+## Use Case 2: Preventing Duplicate Processing in Queue Workers
+
+Suppose workers process webhook deliveries and the same `delivery_id` must never be handled by two workers at once, even if it is enqueued twice. Take a per-entity transaction lock keyed by the ID:
+
+```sql
+BEGIN;
+SELECT pg_try_advisory_xact_lock(30, 8675309) AS got_it;  -- 30 = webhook namespace
+
+-- if got_it is false: another worker is on this delivery right now.
+-- COMMIT and move on to the next message.
+
+-- if got_it is true:
+UPDATE deliveries
+SET    status = 'processing', started_at = now()
+WHERE  id = 8675309 AND status = 'pending';
+-- ... call the remote endpoint, record the result ...
+COMMIT;  -- advisory lock released with the transaction
+```
+
+The transaction-scoped `try` variant is ideal here: the lock cannot outlive the transaction, so an exception path can never strand it, and a `false` result costs nothing — the worker just requeues or skips. The key is the entity ID itself, so distinct deliveries never contend with each other.
+
+## Use Case 3: An Application-Level Mutex for Migrations
+
+Deploying to multiple instances simultaneously means multiple processes may attempt schema migrations at once. Serialize them with a single well-known lock (several migration frameworks do exactly this internally):
+
+```sql
+-- At migration start: block until we are the only migrator
+SELECT pg_advisory_lock(hashtextextended('schema-migrations', 0));
+
+-- ... run pending migration files, each in its own transaction ...
+
+SELECT pg_advisory_unlock(hashtextextended('schema-migrations', 0));
+```
+
+Here the *blocking* form is correct — a second deployer should wait for the first to finish, then find no pending migrations and continue. A session lock is required because DDL like `CREATE INDEX CONCURRENTLY` cannot run inside a transaction block, so a transaction-scoped lock could not span the work.
+
+## Viewing Held Advisory Locks in pg_locks
+
+Advisory locks appear in `pg_locks` with `locktype = 'advisory'`. Join to `pg_stat_activity` to see who holds what:
+
+```sql
+SELECT l.pid,
+       a.usename,
+       a.application_name,
+       l.classid,        -- first int4 key (namespace), or high bits of bigint key
+       l.objid,          -- second int4 key, or low bits of bigint key
+       l.objsubid,       -- 1 = single-bigint form, 2 = two-int form
+       l.granted,
+       a.state,
+       a.query
+FROM pg_locks l
+JOIN pg_stat_activity a ON a.pid = l.pid
+WHERE l.locktype = 'advisory'
+ORDER BY l.classid, l.objid;
+```
+
+The key is encoded across two columns: for the two-int form, `classid` is your first argument and `objid` the second; for the bigint form, the value is split into `classid` (upper 32 bits) and `objid` (lower 32 bits), and `objsubid` tells you which form was used. Rows with `granted = false` are sessions currently blocked in `pg_advisory_lock` — if you see those piling up on one key, you have found your bottleneck. Keeping this query saved in a SQL client such as [Chat2DB](https://chat2db.ai/download) makes it a two-second check whenever "the job scheduler seems stuck."
+
+## Pitfalls
+
+### Connection Pooling: The PgBouncer Trap
+
+Session-level advisory locks belong to the *server connection*. Under PgBouncer in transaction pooling mode, your application's "connection" is remapped to a different server connection at every transaction boundary. The consequences are nasty:
+
+- You acquire `pg_advisory_lock(42)` through server connection S1. Your next statement runs on S2. Your `pg_advisory_unlock(42)` fails (returns `false` with a warning) because S2 never held the lock.
+- Worse, the lock on S1 stays held indefinitely, because S1 went back into the pool still owning it. Every future attempt to take key 42 now blocks or fails — a phantom lock with no owner in sight.
+
+Rules of thumb: behind a transaction-mode pooler, use **only** `pg_advisory_xact_lock` / `pg_try_advisory_xact_lock`, which are acquired and released within one transaction and therefore on one server connection. If you genuinely need session locks, use session pooling mode or a dedicated direct connection for the locking session.
+
+### Forgetting to Unlock
+
+Session locks have no timeout. A code path that acquires and then returns early without unlocking holds the lock until the connection closes — which, with a healthy pooled connection, may be days. Always release in a `finally` block, or sidestep the problem entirely by preferring transaction-scoped locks. As a break-glass measure, `SELECT pg_advisory_unlock_all();` releases every session lock the current session holds, and terminating the offending backend (`pg_terminate_backend(pid)` using the PID from the `pg_locks` query above) frees its locks.
+
+### Reentrancy: Unlock Releases One Level
+
+Advisory locks are reentrant per session, and acquisitions stack:
+
+```sql
+SELECT pg_advisory_lock(42);   -- depth 1
+SELECT pg_advisory_lock(42);   -- succeeds instantly, depth 2
+SELECT pg_advisory_unlock(42); -- depth 1: STILL HELD
+SELECT pg_advisory_unlock(42); -- depth 0: now actually released
+```
+
+Each `pg_advisory_unlock` pops exactly one level. A helper function that "makes sure the lock is taken" and is accidentally called twice will silently require two unlocks, and the second is usually missing. Either structure code so acquisition happens exactly once, or check `pg_locks` when a lock seems to survive its unlock.
+
+### It Only Works If Everyone Plays
+
+Worth restating: advisory locks constrain only code that asks for them. They will not stop an ad-hoc `UPDATE` from a console session, and they do not protect rows. If the invariant is about data, enforce it with constraints and row locks; use advisory locks for *process* coordination.
+
+## Advisory Locks vs SELECT FOR UPDATE SKIP LOCKED for Queues
+
+Both patterns build job queues, and choosing wrong causes real pain, so compare them directly:
+
+```sql
+-- Row-lock approach: claim a batch of jobs
+SELECT id, payload
+FROM jobs
+WHERE status = 'pending'
+ORDER BY id
+LIMIT 10
+FOR UPDATE SKIP LOCKED;
+```
+
+`FOR UPDATE SKIP LOCKED` locks the actual job rows, and `SKIP LOCKED` makes each worker leap over rows other workers hold, so a pool of workers partitions pending work with no contention. The claim lives inside the row lock, so it lasts exactly one transaction — great for short jobs, and the queue state (the row) and the claim (its lock) can never disagree.
+
+Advisory locks earn their place when the thing being serialized is not a row you are updating: a job that must survive multiple transactions, a resource with no table (a file export, an external API with a concurrency limit of one), or a per-entity guard layered on top of any queue transport (as in use case 2, where the queue might be SQS or Kafka rather than a table). A reasonable rule: **queue of short DB-backed jobs → `FOR UPDATE SKIP LOCKED`; singleton processes and cross-transaction or non-row resources → advisory locks.** Many systems use both, and they compose cleanly because they live in different lock spaces.
+
+## Summary
+
+Advisory locks are Postgres's application-defined mutex: keyed by a bigint (or an int pair, often via `hashtext`), scoped to a session or a transaction, available in blocking and `try` flavors, visible in `pg_locks` under `locktype = 'advisory'`, and automatically freed when the owning connection or transaction ends. Use `pg_try_advisory_lock` for "exactly one runner" scheduling, `pg_try_advisory_xact_lock` for per-entity dedup, and the blocking session form for migration-style mutexes — and respect the two rules that prevent nearly all advisory-lock incidents: transaction-scoped locks only behind transaction-mode poolers, and every session-level lock released on every code path.

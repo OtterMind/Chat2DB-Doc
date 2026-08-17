@@ -1,0 +1,220 @@
+---
+title: "PostgreSQL Row-Level Security: A Practical Guide"
+description: "Learn Postgres row level security: CREATE POLICY, USING vs WITH CHECK, restrictive policies, and a full multi-tenant isolation pattern with examples."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: August 17, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# PostgreSQL Row-Level Security: A Practical Guide
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="August 17, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+Most applications enforce data access rules in application code: every query gets a `WHERE tenant_id = ?` clause bolted on, and everyone hopes nobody ever forgets one. Postgres row level security (RLS) moves that enforcement into the database itself. Once a policy is attached to a table, the server appends the predicate to every query automatically, no matter which ORM, script, or ad-hoc console session issued it.
+
+This guide walks through how row-level security works, the exact syntax of `CREATE POLICY`, the difference between `USING` and `WITH CHECK`, permissive versus restrictive policies, and a complete multi-tenant isolation pattern built on `current_setting()`. All examples run on any supported PostgreSQL version.
+
+## What Row-Level Security Is and When to Use It
+
+Row-level security is a table-level feature that filters which rows a given role can see or modify. When RLS is enabled on a table, the default is deny-all: with no policies defined, ordinary users see zero rows. Policies then selectively open access by attaching boolean expressions that Postgres evaluates per row.
+
+The classic use case is multi-tenant SaaS on a shared schema. Instead of one database per customer, all customers share the same `orders` table, and a policy guarantees each session can only touch rows belonging to its own tenant. Other common uses:
+
+- Restricting support staff to read-only visibility of specific regions or accounts.
+- Letting users edit only rows they created (`created_by = current_user`).
+- Hiding soft-deleted or embargoed rows from every consumer except an admin role.
+
+RLS is not a substitute for column-level privileges or encryption, and it does not hide the table's existence or its schema. It controls rows, nothing else.
+
+## Enabling RLS on a Table
+
+Start with a minimal schema:
+
+```sql
+CREATE TABLE documents (
+    id         bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    owner      text NOT NULL DEFAULT current_user,
+    title      text NOT NULL,
+    body       text
+);
+
+ALTER TABLE documents ENABLE ROW LEVEL SECURITY;
+```
+
+The `ALTER TABLE ... ENABLE ROW LEVEL SECURITY` statement flips the table into enforcement mode. From this moment, any role that is not the table owner and does not have the `BYPASSRLS` attribute gets an empty result set from `SELECT * FROM documents` — until a policy grants access. Note that regular `GRANT` privileges are still required on top of RLS; a policy never grants more than the role's table privileges allow.
+
+## CREATE POLICY Syntax
+
+The general shape of a policy is:
+
+```sql
+CREATE POLICY policy_name ON table_name
+    [ AS { PERMISSIVE | RESTRICTIVE } ]
+    [ FOR { ALL | SELECT | INSERT | UPDATE | DELETE } ]
+    [ TO role_name [, ...] ]
+    [ USING ( boolean_expression ) ]
+    [ WITH CHECK ( boolean_expression ) ];
+```
+
+A first concrete policy — each user manages only their own documents:
+
+```sql
+CREATE POLICY documents_owner_all ON documents
+    FOR ALL
+    TO app_user
+    USING (owner = current_user)
+    WITH CHECK (owner = current_user);
+```
+
+Step by step:
+
+1. `FOR ALL` applies the policy to `SELECT`, `INSERT`, `UPDATE`, and `DELETE`.
+2. `TO app_user` scopes it to one role. Omitting `TO` targets `PUBLIC`, i.e. every role.
+3. `USING` filters rows that already exist. Rows failing the expression are silently invisible to reads and untouchable by updates or deletes.
+4. `WITH CHECK` validates rows being written. An `INSERT` or the new version of an `UPDATE` that fails the check raises an error instead of being silently skipped.
+
+### USING vs WITH CHECK
+
+The distinction trips up almost everyone at first:
+
+- `USING` answers: "which existing rows can this statement see?" It applies to `SELECT`, `UPDATE` (the old row), and `DELETE`.
+- `WITH CHECK` answers: "is this new or modified row allowed to exist?" It applies to `INSERT` and `UPDATE` (the new row).
+
+If you define `USING` but omit `WITH CHECK` on a `FOR ALL` or `FOR UPDATE` policy, Postgres reuses the `USING` expression as the check. That default is usually what you want, but be explicit in production code — a policy that lets users read all rows in their department but write only their own rows needs the two expressions to differ.
+
+### One Policy per Command
+
+You can split policies by command for finer control:
+
+```sql
+-- Everyone in the tenant can read
+CREATE POLICY documents_select ON documents
+    FOR SELECT
+    USING (owner = current_user OR is_public);
+
+-- Only the owner can insert rows attributed to themselves
+CREATE POLICY documents_insert ON documents
+    FOR INSERT
+    WITH CHECK (owner = current_user);
+
+-- Updates: must own the old row AND may not reassign ownership
+CREATE POLICY documents_update ON documents
+    FOR UPDATE
+    USING (owner = current_user)
+    WITH CHECK (owner = current_user);
+
+-- Deletes: owner only
+CREATE POLICY documents_delete ON documents
+    FOR DELETE
+    USING (owner = current_user);
+```
+
+Note the asymmetry in what each command accepts: `FOR SELECT` and `FOR DELETE` policies take only `USING`; `FOR INSERT` policies take only `WITH CHECK`; `FOR UPDATE` and `FOR ALL` can take both.
+
+## Permissive vs Restrictive Policies
+
+Policies are `PERMISSIVE` by default. When multiple permissive policies apply to the same command, their expressions are combined with `OR` — any one policy passing grants access. Restrictive policies are combined with `AND` and act as mandatory filters layered on top:
+
+```sql
+-- Permissive: tenant members can see tenant rows
+CREATE POLICY tenant_read ON documents
+    FOR SELECT
+    USING (owner = current_user OR is_public);
+
+-- Restrictive: but never expose archived rows, regardless of other policies
+CREATE POLICY hide_archived ON documents
+    AS RESTRICTIVE
+    FOR SELECT
+    USING (NOT archived);
+```
+
+Two rules to remember. First, at least one permissive policy must pass — a table with only restrictive policies returns nothing. Second, restrictive policies are the right tool for cross-cutting invariants ("no session may ever cross a tenant boundary") because a later, sloppily written permissive policy cannot override them.
+
+## A Full Multi-Tenant Pattern with current_setting()
+
+In a typical SaaS backend, all requests share one database role from a connection pool, so `current_user` cannot identify the tenant. The standard pattern uses a session variable instead:
+
+```sql
+CREATE TABLE orders (
+    id         bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    tenant_id  uuid NOT NULL,
+    customer   text NOT NULL,
+    total      numeric(12,2) NOT NULL CHECK (total >= 0),
+    created_at timestamptz NOT NULL DEFAULT now()
+);
+
+ALTER TABLE orders ENABLE ROW LEVEL SECURITY;
+ALTER TABLE orders FORCE ROW LEVEL SECURITY;
+
+CREATE POLICY orders_tenant_isolation ON orders
+    AS RESTRICTIVE
+    USING (tenant_id = current_setting('app.tenant_id')::uuid)
+    WITH CHECK (tenant_id = current_setting('app.tenant_id')::uuid);
+
+CREATE POLICY orders_tenant_all ON orders
+    FOR ALL
+    TO app_user
+    USING (true)
+    WITH CHECK (true);
+```
+
+The restrictive policy carries the actual isolation logic; the permissive policy exists only to satisfy the "at least one permissive policy" rule for `app_user`. The application sets the tenant at the start of each transaction:
+
+```sql
+BEGIN;
+SET LOCAL app.tenant_id = '6f9619ff-8b86-d011-b42d-00c04fc964ff';
+
+INSERT INTO orders (tenant_id, customer, total)
+VALUES ('6f9619ff-8b86-d011-b42d-00c04fc964ff', 'Acme Corp', 149.00);
+
+SELECT id, customer, total FROM orders;  -- only this tenant's rows
+COMMIT;
+```
+
+`SET LOCAL` scopes the variable to the transaction, which matters with pooled connections: when the transaction ends, the setting reverts, so the next request on the same physical connection cannot inherit a stale tenant. If the variable is unset, `current_setting('app.tenant_id')` raises an error and the query fails closed rather than leaking rows — a useful property. If you prefer a soft failure, use `current_setting('app.tenant_id', true)`, which returns NULL and therefore matches no rows.
+
+A convenient way to sanity-check this pattern interactively is to open two SQL console tabs in a client such as [Chat2DB](https://chat2db.ai/download), set a different `app.tenant_id` in each, and confirm the same `SELECT` returns disjoint result sets.
+
+## Caveats: Table Owners, BYPASSRLS, and FORCE
+
+Three escape hatches can silently disable your policies if you are not aware of them:
+
+- **Table owners bypass RLS by default.** If your application connects as the role that owns the tables, policies do nothing. Fix it with `ALTER TABLE orders FORCE ROW LEVEL SECURITY`, as shown above, which makes even the owner subject to policies.
+- **Superusers and roles with `BYPASSRLS`** always skip policies, even under `FORCE`. Never run application traffic as a superuser; reserve `BYPASSRLS` for maintenance and logical dump roles.
+- **`pg_dump` runs with `row_security = off` by default** and errors out if it cannot read everything — a deliberate safety default so backups are never silently partial.
+
+## Performance Considerations
+
+A policy predicate is added to the query plan like any other `WHERE` clause, so it benefits from — and needs — the same indexing discipline. For the tenant pattern, an index with `tenant_id` as the leading column is essential:
+
+```sql
+CREATE INDEX orders_tenant_created_idx
+    ON orders (tenant_id, created_at DESC);
+```
+
+Run `EXPLAIN ANALYZE` on your hot queries after enabling RLS and confirm the planner uses the index rather than filtering the tenant predicate against a sequential scan. Two more tips: keep policy expressions simple (a subquery inside a policy runs per statement and can defeat index usage), and mark helper functions used in policies as `STABLE` with correct cost estimates so the planner can place them sensibly.
+
+## Testing Policies with SET ROLE
+
+You can verify policies from a superuser session without reconnecting:
+
+```sql
+SET ROLE app_user;
+SET app.tenant_id = '6f9619ff-8b86-d011-b42d-00c04fc964ff';
+SELECT count(*) FROM orders;   -- sees only tenant rows
+RESET ROLE;
+```
+
+Because `SET ROLE` adopts the target role's privileges (and drops superuser bypass for the duration), this is an accurate simulation of what the application will see. Wrap these checks in automated tests: create two tenants, insert rows for each, and assert that cross-tenant reads return zero rows and cross-tenant writes raise a `new row violates row-level security policy` error.
+
+## A Note on Supabase
+
+If RLS feels niche, consider that Supabase exposes Postgres tables directly to browsers through its auto-generated REST API, and its entire authorization model is plain Postgres RLS: policies reference the authenticated user's JWT claims via helper functions. It is a large-scale demonstration that row-level security is robust enough to be the only line of defense between an end user and the table.
+
+## Wrapping Up
+
+Row-level security turns tenant isolation from a convention ("remember the WHERE clause") into a guarantee enforced by the database. The working recipe: enable and `FORCE` RLS, express the isolation rule as a restrictive policy on `current_setting('app.tenant_id')`, set the variable with `SET LOCAL` per transaction, index the policy predicate, and test with `SET ROLE`. Once those pieces are in place, every query path — ORM, migration script, or an analyst exploring data in [Chat2DB](https://app.chat2db.ai/) — goes through the same policy checks.

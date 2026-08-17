@@ -1,0 +1,196 @@
+---
+title: "PostgreSQL Generated Columns: STORED and VIRTUAL Explained"
+description: "A practical guide to Postgres generated columns: STORED vs PostgreSQL 18 virtual columns, JSONB extraction, tsvector search, indexing, and migrations."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: August 17, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# PostgreSQL Generated Columns: STORED and VIRTUAL Explained
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="August 17, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+A generated column is a column whose value is computed from other columns in the same row. You never write to it; the database derives it for you, and it can never drift out of sync with its inputs. Postgres generated columns landed in PostgreSQL 12 in `STORED` form, and PostgreSQL 18 added the long-awaited `VIRTUAL` variant — which is now the default when you omit the keyword.
+
+This article covers the syntax of both flavors, when to choose which, the restrictions that surprise people, how generated columns interact with indexes and full-text search, how they compare to triggers and views, and how to add one to an existing table safely.
+
+## The Basic Syntax: GENERATED ALWAYS AS (...) STORED
+
+The core clause is `GENERATED ALWAYS AS (expression)`:
+
+```sql
+CREATE TABLE order_items (
+    id         bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    product    text NOT NULL,
+    quantity   integer NOT NULL CHECK (quantity > 0),
+    unit_price numeric(10,2) NOT NULL,
+    line_total numeric(12,2) GENERATED ALWAYS AS (quantity * unit_price) STORED
+);
+```
+
+Walking through it:
+
+1. `GENERATED ALWAYS AS (quantity * unit_price)` defines the derivation. The expression may reference any non-generated column of the same row.
+2. `STORED` means the value is computed on `INSERT` and on any `UPDATE` that touches a referenced column, then written to disk like a normal column. Reads pay nothing extra; writes pay the computation and the storage.
+3. You cannot supply a value yourself. `INSERT INTO order_items (..., line_total) VALUES (..., 10)` fails with `cannot insert a non-DEFAULT value into column "line_total"`.
+
+Verify the behavior:
+
+```sql
+INSERT INTO order_items (product, quantity, unit_price)
+VALUES ('keyboard', 3, 49.90);
+
+SELECT product, quantity, unit_price, line_total FROM order_items;
+-- keyboard | 3 | 49.90 | 149.70
+
+UPDATE order_items SET quantity = 4 WHERE product = 'keyboard';
+
+SELECT line_total FROM order_items WHERE product = 'keyboard';
+-- 199.60  (recomputed automatically)
+```
+
+## Virtual Generated Columns in PostgreSQL 18
+
+Before PostgreSQL 18, `STORED` was the only option and the keyword was mandatory. PostgreSQL 18 introduces virtual generated columns: the expression is not materialized on disk at all but evaluated at read time, whenever the column appears in a query. Notably, `VIRTUAL` is now the default — writing `GENERATED ALWAYS AS (expr)` with no keyword on PostgreSQL 18 gives you a virtual column, so be explicit in DDL that must behave identically across versions.
+
+```sql
+-- PostgreSQL 18+
+CREATE TABLE measurements (
+    id        bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    celsius   numeric NOT NULL,
+    fahrenheit numeric GENERATED ALWAYS AS (celsius * 9 / 5 + 32) VIRTUAL
+);
+```
+
+The trade-off is the classic compute-versus-store decision:
+
+- **STORED**: pays at write time, costs disk space, rewrites the row on relevant updates — but reads are free and the column can be indexed.
+- **VIRTUAL**: zero storage and zero write overhead, always up to date by construction — but every read re-evaluates the expression, and in PostgreSQL 18 virtual columns cannot be indexed and cannot have expressions that reference user-defined functions unless those are immutable and permitted by the additional restrictions on virtual columns.
+
+A good rule of thumb: cheap expressions read often on wide tables suit `VIRTUAL`; expensive expressions, or anything you need to index, must be `STORED`.
+
+## Practical Use Cases
+
+### Computed Totals and Normalized Numbers
+
+The `line_total` example above is the canonical case: arithmetic you would otherwise repeat in every query and every report. Keeping it in the table means aggregations stay trivial:
+
+```sql
+SELECT product, sum(line_total) AS revenue
+FROM order_items
+GROUP BY product
+ORDER BY revenue DESC;
+```
+
+### Extracting Fields from JSONB
+
+APIs often land whole payloads into a `jsonb` column. A generated column lifts the hot fields into typed, indexable relational columns without touching ingestion code:
+
+```sql
+CREATE TABLE events (
+    id       bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    payload  jsonb NOT NULL,
+    event_type text GENERATED ALWAYS AS (payload ->> 'type') STORED,
+    user_id  bigint GENERATED ALWAYS AS ((payload ->> 'user_id')::bigint) STORED
+);
+
+CREATE INDEX events_user_type_idx ON events (user_id, event_type);
+
+SELECT count(*) FROM events
+WHERE user_id = 42 AND event_type = 'checkout';
+```
+
+The query planner treats `event_type` and `user_id` as ordinary columns, collects real per-column statistics on them, and uses the B-tree index — three things that are harder to get with expression indexes over raw `jsonb`.
+
+### Normalized Text for Search and Uniqueness
+
+Case-insensitive lookups and deduplication become straightforward when the normalized form is a real column:
+
+```sql
+CREATE TABLE users (
+    id     bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    email  text NOT NULL,
+    email_lower text GENERATED ALWAYS AS (lower(email)) STORED,
+    UNIQUE (email_lower)
+);
+```
+
+Now `alice@example.com` and `Alice@Example.com` collide at insert time, and equality searches on `email_lower` are index-backed without every query author remembering to wrap `lower()` around the predicate.
+
+## Generated Columns and Full-Text Search
+
+The pattern that used to require a trigger — maintaining a `tsvector` column — is one `ALTER TABLE` away with stored generated columns:
+
+```sql
+CREATE TABLE articles (
+    id     bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    title  text NOT NULL,
+    body   text NOT NULL,
+    search_vec tsvector GENERATED ALWAYS AS (
+        setweight(to_tsvector('english', title), 'A') ||
+        setweight(to_tsvector('english', coalesce(body, '')), 'B')
+    ) STORED
+);
+
+CREATE INDEX articles_search_idx ON articles USING gin (search_vec);
+```
+
+Step by step: `to_tsvector('english', ...)` parses text into lexemes with an explicit configuration (the explicit configuration argument is what makes the function immutable, which generated columns require); `setweight` ranks title matches above body matches; the concatenated vector is stored and GIN-indexed. Querying:
+
+```sql
+SELECT id, title,
+       ts_rank(search_vec, websearch_to_tsquery('english', 'generated columns')) AS rank
+FROM articles
+WHERE search_vec @@ websearch_to_tsquery('english', 'generated columns')
+ORDER BY rank DESC
+LIMIT 10;
+```
+
+Because the vector is maintained by the storage layer itself, there is no trigger to forget when someone adds a new write path.
+
+## Restrictions to Know Before You Rely on Them
+
+Generated columns come with firm rules, most of them consequences of the requirement that the value be deterministic:
+
+- **Immutable expressions only.** The expression may use only immutable functions and operators. `now()`, `random()`, `currval()`, and single-argument `to_tsvector(text)` (which consults a session setting) are all rejected at `CREATE TABLE` time.
+- **No references to other generated columns.** `GENERATED ALWAYS AS (line_total * 1.2)` fails if `line_total` is itself generated; inline the full expression instead.
+- **Same-row only.** No subqueries, no references to other tables, no aggregate or window functions.
+- **No column defaults or identity** on the generated column itself, and it cannot be part of a partition key.
+- **You cannot write to it.** `INSERT` and `UPDATE` must omit it or specify `DEFAULT`.
+- **Virtual columns (PG18) cannot be indexed** and cannot be used everywhere stored ones can; when in doubt for search or constraint use cases, choose `STORED`.
+
+## Generated Columns vs Triggers vs Views
+
+All three techniques can present derived data; they occupy different points on the spectrum:
+
+- **Triggers** can do everything generated columns can, plus non-immutable logic, cross-table lookups, and writing to other tables. The costs: more code, per-row PL/pgSQL overhead, and the perennial risk that the trigger and the column definition drift apart. Prefer a generated column whenever the expression qualifies; reach for a trigger only when it does not.
+- **Views** compute at read time without changing the table, similar in spirit to virtual generated columns, but the derived expression lives outside the table, is not visible to `SELECT * FROM table`, and (for a plain view) cannot be directly indexed — you would need a materialized view with its own refresh policy.
+- **Generated columns** keep the derivation next to the data, enforce it on every write path, and (stored ones) index cleanly. Their limitation is exactly their guarantee: immutable, same-row expressions only.
+
+## Adding a Generated Column to an Existing Table
+
+Migration is a single statement:
+
+```sql
+ALTER TABLE order_items
+    ADD COLUMN tax numeric(12,2)
+    GENERATED ALWAYS AS (round(quantity * unit_price * 0.20, 2)) STORED;
+```
+
+Two operational notes. First, adding a stored generated column rewrites the whole table — Postgres must compute the value for every existing row — so on a large, hot table schedule it like any table rewrite: low-traffic window, and watch for the `ACCESS EXCLUSIVE` lock it holds for the duration. On PostgreSQL 18, adding a `VIRTUAL` generated column avoids the rewrite entirely, since nothing is materialized. Second, if you are replacing an old trigger-maintained column, do it in stages: add the generated column under a new name, backfill nothing (it is automatic), swap reads over, then drop the trigger and the old column.
+
+A quick way to confirm the migration behaved is to inspect the table's DDL and spot-check computed values side by side; a visual client such as [Chat2DB](https://chat2db.ai/download) shows the generation expression in the column definition and lets you run the verification queries in the same view.
+
+```sql
+SELECT column_name, generation_expression
+FROM information_schema.columns
+WHERE table_name = 'order_items' AND is_generated = 'ALWAYS';
+```
+
+## Summary
+
+Postgres generated columns move derived values out of application code and into the schema, where they cannot go stale. Use `STORED` when you need indexes, statistics, or cheap reads — JSONB field extraction and `tsvector` search columns are the standout wins. On PostgreSQL 18, reach for `VIRTUAL` when the expression is cheap and storage or write amplification matters, and remember that `VIRTUAL` is now the default when the keyword is omitted. Keep the restrictions in mind — immutable, same-row, no chaining — and you get trigger-like consistency with none of the trigger maintenance.

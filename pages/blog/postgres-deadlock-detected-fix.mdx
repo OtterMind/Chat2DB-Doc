@@ -1,0 +1,313 @@
+---
+title: "How to Fix ERROR: deadlock detected in Postgres (40P01)"
+description: "Reproduce, diagnose, and fix the Postgres deadlock detected error (40P01) with pg_locks queries, consistent lock ordering, lock_timeout, and retry logic."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: August 17, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# How to Fix ERROR: deadlock detected in Postgres (40P01)
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="August 17, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+If your application logs show `ERROR: deadlock detected` with SQLSTATE `40P01`, two or more transactions grabbed locks in an order that formed a cycle, and PostgreSQL killed one of them to break the tie. The error is not a bug in Postgres — it is the deadlock detector doing its job. The real problem is in how your transactions acquire locks, and that is what you need to fix.
+
+This guide walks through what the error means, how to reproduce it in two sessions so you can see the mechanics, how to read the error detail, how to inspect live lock waits with `pg_locks`, and the concrete changes — SQL and application-side — that make deadlocks stop happening.
+
+## What the 40P01 deadlock_detected Error Means
+
+A deadlock occurs when transaction A holds a lock that transaction B needs, while B holds a lock that A needs. Neither can proceed, and neither will ever release its lock voluntarily because each is stuck waiting. Left alone, both would wait forever.
+
+PostgreSQL resolves this by detecting the cycle and aborting one of the participating transactions with:
+
+```
+ERROR:  deadlock detected
+SQLSTATE: 40P01
+```
+
+The aborted transaction is rolled back entirely. The surviving transaction continues as if nothing happened — its lock wait ends and its statement completes. This is important for recovery strategy: exactly one side loses, and that side can safely retry.
+
+Deadlocks in Postgres almost always involve row-level locks taken implicitly by `UPDATE`, `DELETE`, `SELECT ... FOR UPDATE`, or foreign-key checks. Table-level deadlocks (from `LOCK TABLE` or DDL) happen too, but row-level ordering problems are the common case in application workloads.
+
+## A Minimal Reproducible Deadlock
+
+Seeing a deadlock happen step by step makes every fix in this article obvious. Set up a small table first:
+
+```sql
+CREATE TABLE accounts (
+    id      integer PRIMARY KEY,
+    balance numeric NOT NULL
+);
+
+INSERT INTO accounts (id, balance) VALUES (1, 100), (2, 100);
+```
+
+Now open two database sessions (two `psql` windows, or two SQL consoles). Run the statements in exactly this order.
+
+### Step 1: Session A locks row 1
+
+```sql
+-- Session A
+BEGIN;
+UPDATE accounts SET balance = balance - 10 WHERE id = 1;
+-- Session A now holds a row lock on id = 1
+```
+
+### Step 2: Session B locks row 2
+
+```sql
+-- Session B
+BEGIN;
+UPDATE accounts SET balance = balance - 10 WHERE id = 2;
+-- Session B now holds a row lock on id = 2
+```
+
+### Step 3: Session A tries to lock row 2 and blocks
+
+```sql
+-- Session A
+UPDATE accounts SET balance = balance + 10 WHERE id = 2;
+-- This statement hangs: row 2 is locked by Session B
+```
+
+Session A is now waiting. No error yet — waiting for a lock is normal.
+
+### Step 4: Session B tries to lock row 1 and completes the cycle
+
+```sql
+-- Session B
+UPDATE accounts SET balance = balance + 10 WHERE id = 1;
+```
+
+Session B blocks on row 1, which Session A holds. A waits for B, B waits for A — a cycle. After roughly one second (see `deadlock_timeout` below), one session — typically Session B here, since it is the one whose wait triggered the check — fails with:
+
+```
+ERROR:  deadlock detected
+DETAIL:  Process 21360 waits for ShareLock on transaction 771; blocked by process 21351.
+         Process 21351 waits for ShareLock on transaction 772; blocked by process 21360.
+HINT:  See server log for query details.
+CONTEXT:  while updating tuple (0,1) in relation "accounts"
+```
+
+The other session's `UPDATE` immediately succeeds. Roll both transactions back and you are ready to experiment again.
+
+## How Postgres Detects Deadlocks
+
+Postgres does not run a permanent background deadlock scanner. Instead, when a backend has been waiting on a lock for longer than `deadlock_timeout` (default `1s`), that backend runs a check: it walks the waits-for graph of all lock waiters looking for a cycle that includes itself. If it finds one, it aborts its own transaction with `40P01`. If not, it keeps waiting and the check may run again later.
+
+Two practical consequences:
+
+- Deadlocks cost you at least `deadlock_timeout` of stalled time before detection fires. Statements involved in a deadlock look like a one-second latency spike plus an error.
+- The victim is essentially "whichever waiter ran the check and found the cycle," not a cost-based choice. You cannot pick the victim; design so cycles cannot form instead.
+
+You can lower `deadlock_timeout` to detect faster, but the check itself is not free on busy systems with many lock waiters, so the default is a reasonable trade-off for most workloads.
+
+### Reading the Error Detail
+
+The `DETAIL` lines are more useful than they look:
+
+```
+Process 21360 waits for ShareLock on transaction 771; blocked by process 21351.
+```
+
+- `Process 21360` — the backend PID of the waiting session. Match it against `pg_stat_activity.pid` (or your server log lines) to find which client and query it was.
+- `waits for ShareLock on transaction 771` — row locks in Postgres are implemented by waiting on the *transaction ID* of the lock holder. When you block on a locked row, you take a `ShareLock` on the holder's transaction ID and wait for that transaction to end. So "ShareLock on transaction 771" means "waiting for transaction 771 to commit or roll back."
+- `CONTEXT: while updating tuple (0,1) in relation "accounts"` — the physical tuple (page 0, item 1) and table involved, which tells you exactly which row the victim was trying to lock.
+
+With `log_lock_waits = on` (covered below), the server log also records the queries each PID was executing, which usually identifies the offending code path directly.
+
+## Finding Lock Waits with pg_locks and pg_stat_activity
+
+A deadlock error is instantaneous, but the lock contention that produces deadlocks is observable while it happens. This query joins `pg_locks` to itself to pair each ungranted lock request with the session holding the conflicting lock, and pulls in the SQL text from `pg_stat_activity`:
+
+```sql
+SELECT
+    waiting.pid                         AS waiting_pid,
+    waiting_act.usename                 AS waiting_user,
+    waiting_act.query                   AS waiting_query,
+    waiting.mode                        AS requested_mode,
+    blocking.pid                        AS blocking_pid,
+    blocking_act.usename                AS blocking_user,
+    blocking_act.query                  AS blocking_query,
+    blocking.mode                       AS held_mode,
+    now() - waiting_act.query_start     AS wait_duration
+FROM pg_locks waiting
+JOIN pg_stat_activity waiting_act
+    ON waiting_act.pid = waiting.pid
+JOIN pg_locks blocking
+    ON  blocking.locktype                    = waiting.locktype
+    AND blocking.database      IS NOT DISTINCT FROM waiting.database
+    AND blocking.relation      IS NOT DISTINCT FROM waiting.relation
+    AND blocking.page          IS NOT DISTINCT FROM waiting.page
+    AND blocking.tuple         IS NOT DISTINCT FROM waiting.tuple
+    AND blocking.transactionid IS NOT DISTINCT FROM waiting.transactionid
+    AND blocking.classid       IS NOT DISTINCT FROM waiting.classid
+    AND blocking.objid         IS NOT DISTINCT FROM waiting.objid
+    AND blocking.objsubid      IS NOT DISTINCT FROM waiting.objsubid
+    AND blocking.pid           <> waiting.pid
+JOIN pg_stat_activity blocking_act
+    ON blocking_act.pid = blocking.pid
+WHERE NOT waiting.granted
+  AND blocking.granted;
+```
+
+Step by step: the `waiting` alias selects lock requests with `granted = false`; the self-join matches them to granted locks on the same lockable object (`IS NOT DISTINCT FROM` handles the NULL columns that differ per lock type); and the two `pg_stat_activity` joins attach usernames and query text. Run it during the hang in Step 3 of the reproduction above and you will see Session A waiting on Session B before the deadlock even forms.
+
+On modern Postgres there is also a shortcut function that skips the self-join:
+
+```sql
+SELECT pid,
+       pg_blocking_pids(pid) AS blocked_by,
+       state,
+       wait_event_type,
+       query
+FROM pg_stat_activity
+WHERE cardinality(pg_blocking_pids(pid)) > 0;
+```
+
+Running these against a production incident is much easier in a SQL client with a persistent connection and result grid — [Chat2DB](https://chat2db.ai/download) works well here because you can keep the blocking-locks query saved and watch results across multiple connections side by side.
+
+## Common Causes of Postgres Deadlocks
+
+Almost every real-world deadlock reduces to one of these patterns:
+
+- **Inconsistent update ordering.** Code path 1 updates row X then row Y; code path 2 updates Y then X. This is exactly the reproduction above. The order may be hidden — for example, two different service endpoints touching the same pair of tables in opposite order.
+- **Batch updates in different orders.** Two batch jobs each update thousands of rows with `UPDATE ... WHERE category = ...`. The rows are locked in whatever order the executor visits them (heap order, index order after a plan change, parallel workers), which can differ between the two statements and interleave into a cycle.
+- **Foreign-key locks.** Inserting or updating a child row takes a `FOR KEY SHARE` lock on the referenced parent row. Two transactions that each insert children of the other's parent, while also updating those parents, can deadlock without ever "touching the same table" in the application's mental model.
+- **`SELECT ... FOR UPDATE` on overlapping sets.** Two transactions lock overlapping row sets in different scan orders, with the same effect as unordered batch updates.
+- **Long transactions.** Long-lived transactions do not cause cycles by themselves, but they widen the window in which some other transaction can interleave into one.
+
+## Concrete Fixes
+
+### Acquire Locks in a Consistent Global Order
+
+The structural fix: if every transaction locks rows (and tables) in the same order — for example, always ascending by primary key, or always parent before child — a cycle cannot form. In the two-session example, if both sessions updated `id = 1` before `id = 2`, Session B would simply wait for A and then proceed. Nobody deadlocks; someone briefly queues.
+
+For transfer-style logic between two rows:
+
+```sql
+BEGIN;
+-- Lock both rows first, in a deterministic order
+SELECT id FROM accounts
+WHERE id IN (1, 2)
+ORDER BY id
+FOR UPDATE;
+
+UPDATE accounts SET balance = balance - 10 WHERE id = 2;
+UPDATE accounts SET balance = balance + 10 WHERE id = 1;
+COMMIT;
+```
+
+The `SELECT ... ORDER BY id FOR UPDATE` locks both rows in ascending id order regardless of which direction the money moves, so every concurrent transfer serializes cleanly.
+
+### Order Batch Updates Explicitly
+
+`UPDATE` has no `ORDER BY` clause, so impose ordering through a locking subquery:
+
+```sql
+UPDATE accounts a
+SET    balance = a.balance * 1.01
+FROM (
+    SELECT id
+    FROM accounts
+    WHERE balance > 0
+    ORDER BY id
+    FOR UPDATE
+) locked
+WHERE a.id = locked.id;
+```
+
+The inner query locks every target row in id order before the outer update touches anything, so two concurrent batches lock rows in the same sequence and one simply waits for the other.
+
+### Fail Fast Instead of Waiting: NOWAIT, SKIP LOCKED, lock_timeout
+
+Sometimes the right answer is to not wait at all:
+
+```sql
+-- Error immediately (55P03) if any row is already locked
+SELECT * FROM accounts WHERE id = 1 FOR UPDATE NOWAIT;
+
+-- Silently skip locked rows: ideal for job-queue workers
+SELECT * FROM jobs
+WHERE status = 'pending'
+ORDER BY id
+LIMIT 10
+FOR UPDATE SKIP LOCKED;
+
+-- Bound every lock wait in this session to 2 seconds (error 55P03 on timeout)
+SET lock_timeout = '2s';
+```
+
+`SKIP LOCKED` deserves special mention: worker pools that previously fought over the same "next pending row" stop contending entirely, because each worker grabs rows nobody else holds. `lock_timeout` does not prevent deadlocks, but it converts long, tangled waits into fast, clean failures your retry layer can handle — and a transaction that gives up quickly cannot sit in the middle of a forming cycle.
+
+### Keep Transactions Short
+
+Do not hold a transaction open across network calls, user interaction, or unrelated work. Read what you need, compute outside the transaction, then run a short write transaction. Also index your foreign-key columns: FK checks and cascades on unindexed columns scan the child table while holding locks, stretching lock hold times dramatically.
+
+## Retry Logic in Application Code
+
+Because exactly one transaction is aborted and the deadlock is transient, `40P01` is one of the safest errors to retry. The rolled-back transaction lost no data — rerunning it from the top is correct as long as the whole unit of work is inside the retry:
+
+```python
+import time
+import psycopg2
+
+RETRYABLE = {"40P01", "40001"}  # deadlock_detected, serialization_failure
+
+def transfer(conn, from_id, to_id, amount, max_attempts=3):
+    for attempt in range(1, max_attempts + 1):
+        try:
+            with conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "SELECT id FROM accounts WHERE id IN (%s, %s) "
+                        "ORDER BY id FOR UPDATE",
+                        (from_id, to_id),
+                    )
+                    cur.execute(
+                        "UPDATE accounts SET balance = balance - %s WHERE id = %s",
+                        (amount, from_id),
+                    )
+                    cur.execute(
+                        "UPDATE accounts SET balance = balance + %s WHERE id = %s",
+                        (amount, to_id),
+                    )
+            return
+        except psycopg2.OperationalError as e:
+            if e.pgcode in RETRYABLE and attempt < max_attempts:
+                time.sleep(0.05 * (2 ** attempt))  # exponential backoff
+                conn.rollback()
+                continue
+            raise
+```
+
+Key points: match on SQLSTATE, not on the error message text; back off with jitter so the retry does not collide with the surviving transaction; and retry the *whole* transaction, never a single statement, since the failed transaction was fully rolled back.
+
+## Monitoring Deadlocks
+
+Turn on lock-wait logging so every slow wait — not just fatal deadlocks — leaves evidence:
+
+```sql
+ALTER SYSTEM SET log_lock_waits = on;      -- log waits exceeding deadlock_timeout
+SELECT pg_reload_conf();
+```
+
+With this enabled, the server log records which process waited, for how long, on what, and the queries on both sides — the full story a `40P01` error message only hints at.
+
+Track deadlock frequency per database via cumulative statistics:
+
+```sql
+SELECT datname, deadlocks, stats_reset
+FROM pg_stat_database
+WHERE datname = current_database();
+```
+
+`pg_stat_database.deadlocks` counts every deadlock detected since the last stats reset. Sample it on a schedule and alert when the counter's growth rate changes: a jump after a deploy almost always points to a new code path that acquires locks in a fresh order. Charting this counter alongside your release markers in a tool like [Chat2DB](https://app.chat2db.ai/) makes the correlation easy to spot.
+
+## Summary
+
+`ERROR: deadlock detected` means two transactions locked resources in opposite orders and Postgres broke the cycle by aborting one. Reproduce it with two sessions to build intuition, read the `DETAIL` lines to identify the PIDs and rows involved, and watch live contention with the `pg_locks` join query. Then fix the cause, not the symptom: lock rows in one global order, force ordering in batch updates with `SELECT ... ORDER BY ... FOR UPDATE`, prefer `SKIP LOCKED` for queue-style access, bound waits with `lock_timeout`, keep transactions short, and wrap write transactions in SQLSTATE-based retry logic. Finally, leave `log_lock_waits` on and watch `pg_stat_database.deadlocks` so the next locking regression shows up in a graph before it shows up in a pager alert.
