@@ -1,0 +1,248 @@
+---
+title: "Postgres MERGE vs ON CONFLICT: Which Upsert to Use"
+description: "Compare Postgres MERGE and INSERT ... ON CONFLICT for upserts: syntax, concurrency behaviour, RETURNING support, and which one to pick for your workload."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: August 18, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# Postgres MERGE vs ON CONFLICT: Which Upsert to Use
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="August 18, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+PostgreSQL now has two ways to write an upsert. `INSERT ... ON CONFLICT` has been there since 9.5 and is what most application code uses. `MERGE` arrived in PostgreSQL 15, follows the SQL standard, and handles cases `ON CONFLICT` cannot express — but it behaves differently under concurrency in a way that surprises people migrating from Oracle or SQL Server.
+
+They are not interchangeable. This guide shows both, with runnable examples, and lays out exactly when each one is the right tool.
+
+## The Test Schema
+
+Everything below runs against this table:
+
+```sql
+CREATE TABLE inventory (
+  sku         TEXT PRIMARY KEY,
+  warehouse   TEXT NOT NULL,
+  quantity    INT  NOT NULL DEFAULT 0,
+  updated_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+INSERT INTO inventory (sku, warehouse, quantity) VALUES
+  ('SKU-001', 'EU-WEST', 40),
+  ('SKU-002', 'EU-WEST', 12);
+```
+
+## INSERT ... ON CONFLICT
+
+The familiar form. Insert a row; if it collides with a unique constraint, update instead:
+
+```sql
+INSERT INTO inventory (sku, warehouse, quantity)
+VALUES ('SKU-001', 'EU-WEST', 15)
+ON CONFLICT (sku) DO UPDATE
+SET quantity   = inventory.quantity + EXCLUDED.quantity,
+    updated_at = now()
+RETURNING sku, quantity;
+```
+
+Two identifiers do the work here. `EXCLUDED` is the row that the `INSERT` *tried* to add, and the table name (`inventory`) refers to the row already stored. So `inventory.quantity + EXCLUDED.quantity` means "existing stock plus the incoming delta" — the result is 55.
+
+The conflict target `(sku)` must match a unique index or a primary key. You can name the constraint instead:
+
+```sql
+ON CONFLICT ON CONSTRAINT inventory_pkey DO UPDATE ...
+```
+
+`DO NOTHING` skips the row silently, which is the cheapest way to make an insert idempotent:
+
+```sql
+INSERT INTO inventory (sku, warehouse, quantity)
+VALUES ('SKU-002', 'EU-WEST', 99)
+ON CONFLICT (sku) DO NOTHING;
+```
+
+A `WHERE` clause on the update makes it conditional — useful for late-arriving data that should not overwrite a newer row:
+
+```sql
+INSERT INTO inventory (sku, warehouse, quantity, updated_at)
+VALUES ('SKU-001', 'EU-WEST', 7, '2026-08-18 09:00:00+00')
+ON CONFLICT (sku) DO UPDATE
+SET quantity   = EXCLUDED.quantity,
+    updated_at = EXCLUDED.updated_at
+WHERE inventory.updated_at < EXCLUDED.updated_at;
+```
+
+If the `WHERE` is false, nothing is written and no error is raised.
+
+### Bulk Upsert
+
+The same syntax handles many rows at once, which is how you should load a batch:
+
+```sql
+INSERT INTO inventory (sku, warehouse, quantity)
+VALUES
+  ('SKU-001', 'EU-WEST', 5),
+  ('SKU-003', 'EU-EAST', 30),
+  ('SKU-004', 'EU-EAST', 18)
+ON CONFLICT (sku) DO UPDATE
+SET quantity   = inventory.quantity + EXCLUDED.quantity,
+    updated_at = now();
+```
+
+One caveat: the batch must not contain the same key twice. If it does, PostgreSQL raises
+
+```
+ERROR:  ON CONFLICT DO UPDATE command cannot affect row a second time
+```
+
+Deduplicate before sending, typically with `DISTINCT ON` or an aggregate in a CTE:
+
+```sql
+WITH incoming (sku, warehouse, quantity) AS (
+  VALUES ('SKU-001', 'EU-WEST', 5),
+         ('SKU-001', 'EU-WEST', 3),
+         ('SKU-003', 'EU-EAST', 30)
+),
+deduped AS (
+  SELECT sku, max(warehouse) AS warehouse, sum(quantity) AS quantity
+  FROM incoming
+  GROUP BY sku
+)
+INSERT INTO inventory (sku, warehouse, quantity)
+SELECT sku, warehouse, quantity FROM deduped
+ON CONFLICT (sku) DO UPDATE
+SET quantity = inventory.quantity + EXCLUDED.quantity;
+```
+
+## MERGE
+
+`MERGE` takes a source relation, joins it to the target, and applies a different action per match category:
+
+```sql
+MERGE INTO inventory AS t
+USING (VALUES ('SKU-001', 'EU-WEST', 5),
+              ('SKU-005', 'EU-EAST', 60))
+       AS s (sku, warehouse, quantity)
+ON t.sku = s.sku
+WHEN MATCHED THEN
+  UPDATE SET quantity   = t.quantity + s.quantity,
+             updated_at = now()
+WHEN NOT MATCHED THEN
+  INSERT (sku, warehouse, quantity)
+  VALUES (s.sku, s.warehouse, s.quantity);
+```
+
+The source can be any table, subquery or CTE — it does not have to be a `VALUES` list, which is already more flexible than `ON CONFLICT`.
+
+Three things `MERGE` does that `ON CONFLICT` cannot:
+
+**Delete as part of the same statement.** Zero quantity means retire the SKU:
+
+```sql
+MERGE INTO inventory AS t
+USING (VALUES ('SKU-002', 0)) AS s (sku, quantity)
+ON t.sku = s.sku
+WHEN MATCHED AND s.quantity = 0 THEN
+  DELETE
+WHEN MATCHED THEN
+  UPDATE SET quantity = s.quantity
+WHEN NOT MATCHED THEN
+  INSERT (sku, warehouse, quantity) VALUES (s.sku, 'EU-WEST', s.quantity);
+```
+
+**Match on arbitrary conditions.** `ON CONFLICT` requires a unique index; `MERGE` joins on whatever predicate you write, including multi-column or inequality conditions.
+
+**Multiple branches with different conditions.** Clauses are evaluated top to bottom and the first matching one wins, so you can encode a small decision table in one statement.
+
+PostgreSQL 17 added `WHEN NOT MATCHED BY SOURCE`, which acts on target rows that the source did not mention — the natural way to expire rows missing from a full snapshot:
+
+```sql
+MERGE INTO inventory AS t
+USING current_feed AS s
+ON t.sku = s.sku
+WHEN MATCHED THEN
+  UPDATE SET quantity = s.quantity, updated_at = now()
+WHEN NOT MATCHED THEN
+  INSERT (sku, warehouse, quantity) VALUES (s.sku, s.warehouse, s.quantity)
+WHEN NOT MATCHED BY SOURCE THEN
+  UPDATE SET quantity = 0, updated_at = now();
+```
+
+PostgreSQL 17 also gave `MERGE` a `RETURNING` clause, along with `merge_action()` to report which branch fired for each row:
+
+```sql
+MERGE INTO inventory AS t
+USING (VALUES ('SKU-006', 'EU-EAST', 10)) AS s (sku, warehouse, quantity)
+ON t.sku = s.sku
+WHEN MATCHED THEN UPDATE SET quantity = s.quantity
+WHEN NOT MATCHED THEN INSERT VALUES (s.sku, s.warehouse, s.quantity, now())
+RETURNING merge_action(), t.sku, t.quantity;
+```
+
+On PostgreSQL 15 and 16, `MERGE` has no `RETURNING` at all. If you need the affected rows back and you are on those versions, that alone decides it.
+
+## The Concurrency Difference That Matters
+
+This is the part that catches people out.
+
+`INSERT ... ON CONFLICT` is **atomic** with respect to concurrent writers. It uses the unique index to detect the conflict as part of the insert itself. Two sessions upserting the same key at the same time will serialize correctly: one inserts, the other takes the `DO UPDATE` branch. Neither fails.
+
+`MERGE` is not built on that mechanism. It evaluates the join, decides which branch applies, then acts. In `READ COMMITTED`, if another transaction inserts the same key between the join and the insert, your `WHEN NOT MATCHED` branch runs an `INSERT` that now violates the unique constraint:
+
+```
+ERROR:  duplicate key value violates unique constraint "inventory_pkey"
+```
+
+The PostgreSQL documentation is explicit about this: `MERGE` does not prevent concurrent inserts into the target, and the recommended mitigation is `SERIALIZABLE` isolation plus retry logic on serialization failures.
+
+You can reproduce it in two psql sessions. Both begin a transaction, both run the same `MERGE` for a key that does not yet exist, then commit one and the other. The second gets a duplicate key error.
+
+The practical consequence: **for a concurrent write path — an API endpoint, a queue consumer, anything running many at once — use `ON CONFLICT`.** For a batch job that runs single-threaded against a table nobody else is writing, `MERGE` is fine.
+
+If you must use `MERGE` concurrently, wrap it:
+
+```sql
+BEGIN ISOLATION LEVEL SERIALIZABLE;
+MERGE INTO inventory AS t
+USING ...;
+COMMIT;
+```
+
+and retry on SQLSTATE `40001`. Application-side retry is not optional here; serialization failures are expected, not exceptional.
+
+## Which One Should You Use?
+
+| Requirement | ON CONFLICT | MERGE |
+| --- | --- | --- |
+| Available since | 9.5 | 15 |
+| Safe under concurrent upserts | Yes | No (needs SERIALIZABLE + retry) |
+| Requires a unique index | Yes | No |
+| Can DELETE | No | Yes |
+| RETURNING | Yes | 17+ only |
+| Join to an arbitrary source | Limited | Yes |
+| Handles duplicate keys within one batch | No (error) | Last matching branch wins |
+
+The short version:
+
+- **Application writes, concurrent traffic, single key upsert** → `INSERT ... ON CONFLICT`. It is older, faster for the simple case, and concurrency-safe by construction.
+- **ETL, nightly sync, snapshot reconciliation, or logic that needs to delete** → `MERGE`, ideally on PostgreSQL 17 for `RETURNING` and `WHEN NOT MATCHED BY SOURCE`.
+- **Porting from Oracle or SQL Server** → the `MERGE` syntax will look familiar, but audit every use for concurrency before it reaches production.
+
+## A Note on Performance
+
+Neither statement is meaningfully faster than the other for equivalent work; both are limited by index maintenance and WAL volume. What does matter is batching. One statement upserting 5,000 rows will beat 5,000 single-row statements by an order of magnitude, because you pay the round-trip and transaction overhead once. Where possible, stage the incoming data into a temporary or unlogged table, then run a single `MERGE` or `INSERT ... SELECT ... ON CONFLICT` against it.
+
+```sql
+CREATE TEMP TABLE staging (LIKE inventory) ON COMMIT DROP;
+COPY staging FROM STDIN WITH (FORMAT csv);
+
+INSERT INTO inventory (sku, warehouse, quantity)
+SELECT sku, warehouse, quantity FROM staging
+ON CONFLICT (sku) DO UPDATE
+SET quantity = inventory.quantity + EXCLUDED.quantity;
+```
+
+Testing upsert logic is easier when you can see the before and after side by side. [Chat2DB](https://chat2db.ai/download) runs both statement forms against PostgreSQL 15 through 18, shows the affected rows, and can generate the `MERGE` or `ON CONFLICT` skeleton from a plain-language description of what you want to reconcile.

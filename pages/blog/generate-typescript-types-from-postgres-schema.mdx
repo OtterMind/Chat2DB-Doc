@@ -1,0 +1,250 @@
+---
+title: "Generate TypeScript Types From a Postgres Schema"
+description: "Four ways to generate TypeScript types from a PostgreSQL schema: kysely-codegen, pg-to-ts, Prisma and Drizzle. Covers nullability, numerics and CI checks."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: August 18, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# Generate TypeScript Types From a Postgres Schema
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="August 18, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+Hand-written TypeScript interfaces that mirror database tables go stale the moment someone runs a migration. The type says `email: string`, the column has been nullable for three weeks, and the null pointer surfaces in production. Generating types from the schema removes that whole class of bug — the database becomes the source of truth and the compiler enforces it.
+
+This guide covers four approaches, the type mapping decisions that actually matter, and how to stop generated types from silently drifting.
+
+## The Schema We Are Mapping
+
+```sql
+CREATE TYPE order_status AS ENUM ('pending', 'paid', 'shipped', 'cancelled');
+
+CREATE TABLE orders (
+  id           BIGSERIAL PRIMARY KEY,
+  customer_id  BIGINT NOT NULL REFERENCES customers(id),
+  status       order_status NOT NULL DEFAULT 'pending',
+  total_amount NUMERIC(12,2) NOT NULL,
+  metadata     JSONB,
+  shipped_at   TIMESTAMPTZ,
+  created_at   TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+```
+
+Six columns, and four of them contain a decision that generators get wrong in different ways.
+
+## Option 1: kysely-codegen
+
+Kysely is a type-safe query builder, and `kysely-codegen` introspects a live database to produce its type definitions.
+
+```bash
+npm install --save-dev kysely-codegen kysely pg
+npx kysely-codegen --dialect postgres --url $DATABASE_URL --out-file src/db/types.ts
+```
+
+Output:
+
+```ts
+export type OrderStatus = "pending" | "paid" | "shipped" | "cancelled";
+
+export interface Orders {
+  id: Generated<string>;
+  customerId: string;
+  status: Generated<OrderStatus>;
+  totalAmount: string;
+  metadata: Json | null;
+  shippedAt: Timestamp | null;
+  createdAt: Generated<Timestamp>;
+}
+
+export interface DB {
+  orders: Orders;
+}
+```
+
+The `Generated<T>` wrapper is the detail that makes this genuinely useful: columns with defaults are optional on insert but always present on select, and Kysely encodes that difference in one type. `BIGSERIAL` becoming `string` is also correct by default — `node-postgres` returns `bigint` as a string to avoid silent precision loss beyond 2^53.
+
+Useful flags: `--camel-case` for camelCase property names, `--include-pattern` to limit which schemas are introspected.
+
+## Option 2: pg-to-ts
+
+If you are writing raw SQL rather than using a query builder, `pg-to-ts` produces plain interfaces with no framework attached:
+
+```bash
+npx pg-to-ts generate -c $DATABASE_URL -o src/db/schema.ts
+```
+
+```ts
+export interface Orders {
+  id: number;
+  customer_id: number;
+  status: 'pending' | 'paid' | 'shipped' | 'cancelled';
+  total_amount: number;
+  metadata: unknown | null;
+  shipped_at: Date | null;
+  created_at: Date;
+}
+
+export interface OrdersInput {
+  id?: number;
+  customer_id: number;
+  status?: 'pending' | 'paid' | 'shipped' | 'cancelled';
+  total_amount: number;
+  metadata?: unknown | null;
+  shipped_at?: Date | null;
+  created_at?: Date;
+}
+```
+
+The separate `Input` interface handles the same defaults problem in a simpler way. Note that this generator maps `NUMERIC` to `number`, which is a real hazard — see below.
+
+## Option 3: Prisma
+
+Prisma inverts the workflow: it maintains a schema file that it can pull from the database, and generates a fully typed client from it.
+
+```bash
+npx prisma db pull      # introspect into schema.prisma
+npx prisma generate     # emit the typed client
+```
+
+```prisma
+model Order {
+  id          BigInt      @id @default(autoincrement())
+  customerId  BigInt      @map("customer_id")
+  status      OrderStatus @default(pending)
+  totalAmount Decimal     @map("total_amount") @db.Decimal(12, 2)
+  metadata    Json?
+  shippedAt   DateTime?   @map("shipped_at") @db.Timestamptz(6)
+  createdAt   DateTime    @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  @@map("orders")
+}
+```
+
+Prisma maps `NUMERIC` to its own `Decimal` type, which is the correct call — arithmetic stays exact. The trade-off is that `Decimal` is a class instance, so it needs converting before serialising to JSON.
+
+## Option 4: Drizzle
+
+Drizzle's schema is TypeScript, and `drizzle-kit pull` writes it from an existing database:
+
+```bash
+npx drizzle-kit pull --dialect postgresql --url $DATABASE_URL
+```
+
+```ts
+export const orderStatus = pgEnum('order_status',
+  ['pending', 'paid', 'shipped', 'cancelled']);
+
+export const orders = pgTable('orders', {
+  id: bigserial('id', { mode: 'bigint' }).primaryKey(),
+  customerId: bigint('customer_id', { mode: 'bigint' }).notNull(),
+  status: orderStatus('status').default('pending').notNull(),
+  totalAmount: numeric('total_amount', { precision: 12, scale: 2 }).notNull(),
+  metadata: jsonb('metadata'),
+  shippedAt: timestamp('shipped_at', { withTimezone: true }),
+  createdAt: timestamp('created_at', { withTimezone: true }).defaultNow().notNull(),
+});
+
+export type Order = typeof orders.$inferSelect;
+export type NewOrder = typeof orders.$inferInsert;
+```
+
+`$inferSelect` and `$inferInsert` derive the row and insert types from the schema definition, so there is one declaration rather than a schema plus a set of hand-maintained interfaces. Nullability follows `.notNull()` automatically.
+
+If you only need a one-off conversion of a `CREATE TABLE` statement without wiring up a toolchain, the [SQL DDL to code generator](https://chat2db.ai/tools/sql-ddl-to-code) will produce the TypeScript, Drizzle, Prisma, Go or SQLAlchemy version of a schema directly in the browser.
+
+## The Type Mappings That Actually Matter
+
+### NUMERIC and DECIMAL Are Not `number`
+
+This is the one to get right. JavaScript numbers are IEEE 754 doubles: `0.1 + 0.2 !== 0.3`. A `NUMERIC(12,2)` column holding money must not become `number`.
+
+Both `node-postgres` and `postgres.js` return `NUMERIC` as a **string** by default, precisely to avoid the silent rounding. A generator that types it as `number` produces code that compiles and then fails at runtime when you do arithmetic on `"1234.56"`.
+
+Handle it either by keeping the string and using a decimal library:
+
+```ts
+import Decimal from 'decimal.js';
+const total = new Decimal(order.totalAmount).plus(shipping);
+```
+
+or by opting into a parser explicitly, only if you know your values fit in a double:
+
+```ts
+import pg from 'pg';
+pg.types.setTypeParser(1700, (v) => parseFloat(v));   // 1700 = NUMERIC
+```
+
+### BIGINT Overflows Number
+
+`BIGINT` holds values up to 2^63; JavaScript numbers are exact only to 2^53. `node-postgres` returns `bigint` as a string for that reason. Keep it as `string`, or use the native `bigint` type if your serialisation layer can handle it — `JSON.stringify` cannot, without a custom replacer.
+
+### Nullability Comes From the Constraint, Not the Type
+
+`shipped_at TIMESTAMPTZ` is nullable; `created_at TIMESTAMPTZ NOT NULL` is not. Every generator reads `information_schema.columns.is_nullable` correctly, but only if you also enable `strictNullChecks` in `tsconfig.json`. Without it, the `| null` in the generated type is decorative:
+
+```json
+{ "compilerOptions": { "strict": true } }
+```
+
+There is a subtlety worth knowing: a column can be non-null in the table and still be `null` in a result set — any `LEFT JOIN` can produce nulls for a joined table's columns. Generated table types describe the table, not your query's result shape. Query builders like Kysely and Drizzle model this correctly for joins; raw SQL does not.
+
+### JSONB Is `unknown`, Not `any`
+
+The database enforces no shape on a `jsonb` column, so `unknown` is honest and `any` is a lie. Narrow it yourself at the boundary, ideally with a runtime validator:
+
+```ts
+import { z } from 'zod';
+
+const OrderMetadata = z.object({
+  source: z.string(),
+  campaignId: z.string().optional(),
+});
+
+const metadata = OrderMetadata.parse(order.metadata);
+```
+
+You can also override the generated type per column — most generators accept a mapping file for this.
+
+### Enums
+
+A PostgreSQL `ENUM` maps cleanly to a TypeScript union, and this is one of the strongest arguments for generating types at all: add a value to the enum in a migration, regenerate, and every `switch` that no longer covers all cases becomes a compile error.
+
+## Keeping Types From Drifting
+
+Generation only helps if it actually runs. Wire it into the places where the schema changes.
+
+**As an npm script, after migrations:**
+
+```json
+{
+  "scripts": {
+    "migrate": "node-pg-migrate up && npm run db:types",
+    "db:types": "kysely-codegen --dialect postgres --out-file src/db/types.ts"
+  }
+}
+```
+
+**As a CI check that fails on drift:**
+
+```yaml
+- name: Check generated types are current
+  run: |
+    npm run db:types
+    git diff --exit-code src/db/types.ts
+```
+
+The job spins up a Postgres service container, applies migrations, regenerates, and fails if the committed file differs. That converts "someone forgot to regenerate" from a production incident into a red build.
+
+**Commit the generated file.** Types belong in version control: the diff in a pull request shows reviewers exactly what a migration changed, and developers do not need a running database to typecheck.
+
+## Choosing
+
+If you already use an ORM, use its generator — Prisma's or Drizzle's — because the types integrate with the query API. If you write raw SQL with `node-postgres`, `pg-to-ts` gives you interfaces with no runtime dependency. If you want type-safe query building without a full ORM, Kysely plus `kysely-codegen` is the strongest combination, and `Generated<T>` handles the insert/select distinction better than the alternatives.
+
+Whichever you pick, the rule that matters is the same: regenerate automatically, check for drift in CI, and never edit the generated file by hand.
+
+Inspecting the live schema while you set this up — column nullability, enum values, actual types rather than what the migration file claimed — is quicker in a client that shows the whole catalog at once. [Chat2DB](https://chat2db.ai/download) connects to PostgreSQL and twenty-plus other databases, so you can confirm what the database really contains before trusting anything a generator produced.

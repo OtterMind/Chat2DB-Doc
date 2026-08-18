@@ -1,0 +1,239 @@
+---
+title: "pgvector HNSW vs IVFFlat: Choosing a Vector Index"
+description: "Compare pgvector HNSW and IVFFlat indexes on recall, build time and memory. Includes SQL for both, parameter guidance, and how to measure recall properly."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: August 18, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# pgvector HNSW vs IVFFlat: Choosing a Vector Index
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="August 18, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+pgvector gives PostgreSQL two approximate nearest neighbour index types, and the choice between them determines your search quality, your index build time, and how much RAM the database needs. HNSW almost always wins on recall and query speed; IVFFlat wins on build time and memory. Knowing when the second matters is what this guide is about.
+
+## Setup
+
+```sql
+CREATE EXTENSION IF NOT EXISTS vector;
+
+CREATE TABLE documents (
+  id        BIGSERIAL PRIMARY KEY,
+  content   TEXT NOT NULL,
+  embedding VECTOR(1536)     -- e.g. an OpenAI text-embedding-3-small vector
+);
+```
+
+Without an index, a nearest-neighbour query is an exact brute-force scan — perfect recall, linear cost:
+
+```sql
+SELECT id, content, embedding <=> $1 AS distance
+FROM documents
+ORDER BY embedding <=> $1
+LIMIT 10;
+```
+
+`<=>` is cosine distance. The other operators are `<->` (L2/Euclidean), `<#>` (negative inner product), and in pgvector 0.7+, `<+>` (L1/taxicab). **The index must be built with the operator class matching the operator you query with**, or it will not be used at all. That single mismatch is the most common reason people report "my vector index does nothing".
+
+## IVFFlat
+
+IVFFlat partitions the vectors into `lists` clusters using k-means, storing each vector in the cluster whose centroid is closest. A query compares against the nearest `probes` centroids and searches only those clusters.
+
+```sql
+CREATE INDEX ON documents
+USING ivfflat (embedding vector_cosine_ops)
+WITH (lists = 100);
+```
+
+Two rules govern IVFFlat.
+
+**Build it after loading data, never before.** The index needs existing vectors to compute meaningful centroids. An IVFFlat index built on an empty table produces useless clusters and stays useless as rows arrive — the centroids are never recomputed. If you bulk-load after building, drop and rebuild.
+
+**Choose `lists` from the row count.** The pgvector guidance is `rows / 1000` up to a million rows, and `sqrt(rows)` beyond that:
+
+```sql
+-- 500,000 rows
+WITH (lists = 500)
+-- 5,000,000 rows: sqrt(5000000) ≈ 2236
+WITH (lists = 2236)
+```
+
+At query time, `probes` trades recall for speed:
+
+```sql
+SET ivfflat.probes = 10;
+
+SELECT id, embedding <=> $1 AS distance
+FROM documents
+ORDER BY embedding <=> $1
+LIMIT 10;
+```
+
+The default is 1, which is far too low for production — expect poor recall. A reasonable starting point is `sqrt(lists)`. Setting `probes = lists` degenerates to an exact scan with extra overhead.
+
+Use `SET LOCAL` inside a transaction so the setting does not leak into the next query on a pooled connection.
+
+## HNSW
+
+HNSW builds a multi-layer graph. Upper layers are sparse and used for coarse navigation; the bottom layer contains every vector. A search descends from the top, greedily following edges toward the query point.
+
+```sql
+CREATE INDEX ON documents
+USING hnsw (embedding vector_cosine_ops)
+WITH (m = 16, ef_construction = 64);
+```
+
+- `m` — edges per node (default 16). Higher improves recall for high-dimensional data at the cost of index size and build time. 16–32 covers most cases; 32–64 helps for 1536+ dimensions where recall matters more than storage.
+- `ef_construction` — size of the candidate list during construction (default 64). Higher builds a better graph, more slowly. 64–200 is the usual range, and it must be at least `2 * m`.
+
+Query-time recall is controlled separately:
+
+```sql
+SET hnsw.ef_search = 100;   -- default 40
+```
+
+`ef_search` must be at least your `LIMIT`. If you fetch 50 rows with `ef_search = 40`, results will be poor. A good rule is `ef_search >= 4 * LIMIT` when recall matters.
+
+Unlike IVFFlat, an HNSW index can be created on an empty table and stays correct as rows are inserted — no rebuild needed. That alone makes it the easier choice operationally.
+
+## The Comparison
+
+| | IVFFlat | HNSW |
+| --- | --- | --- |
+| Build time | Fast | 10–30× slower |
+| Index size | Small | 2–5× larger |
+| Query speed at equal recall | Slower | Faster |
+| Recall ceiling | Moderate | High |
+| Build on empty table | No | Yes |
+| Handles incremental inserts | Degrades, needs rebuild | Good |
+| Memory during build | Low | High |
+| Tunable at query time | `probes` | `ef_search` |
+
+**Use HNSW** for anything user-facing where result quality matters, for tables that receive continuous inserts, and whenever you can afford the build time and RAM. It is the default recommendation.
+
+**Use IVFFlat** when the index must be built quickly and rebuilt often, when memory is genuinely constrained, or when the dataset is enormous and slightly lower recall is acceptable in exchange for a build that finishes in minutes rather than hours.
+
+## Making HNSW Builds Faster
+
+An HNSW build is memory-hungry. If the graph does not fit in `maintenance_work_mem`, pgvector falls back to a much slower on-disk path, and the build can take hours instead of minutes:
+
+```sql
+SET maintenance_work_mem = '8GB';
+SET max_parallel_maintenance_workers = 7;   -- plus the leader = 8 workers
+
+CREATE INDEX CONCURRENTLY ON documents
+USING hnsw (embedding vector_cosine_ops)
+WITH (m = 16, ef_construction = 64);
+```
+
+Rough sizing: an HNSW index needs on the order of `rows × dimensions × 4 bytes` for the vectors plus the graph edges. A million 1536-dimension vectors is about 6 GB of raw vector data before the graph — so `maintenance_work_mem` should be measured in gigabytes, not megabytes.
+
+`CREATE INDEX CONCURRENTLY` avoids blocking writes but takes longer and can leave an invalid index if it fails:
+
+```sql
+SELECT indexrelid::regclass, indisvalid
+FROM pg_index
+WHERE NOT indisvalid;
+```
+
+Drop and retry any index that comes back invalid.
+
+## Filtered Search: The Real-World Complication
+
+Pure vector search is rare. Most applications filter:
+
+```sql
+SELECT id, content
+FROM documents
+WHERE tenant_id = 42
+  AND created_at > now() - interval '90 days'
+ORDER BY embedding <=> $1
+LIMIT 10;
+```
+
+The planner must choose between using the vector index and then filtering (which may return fewer than 10 rows after filtering, forcing more scanning) or filtering first and then sorting exactly. Neither is always right.
+
+Two approaches help.
+
+**Partial indexes**, when the filter has low cardinality:
+
+```sql
+CREATE INDEX ON documents
+USING hnsw (embedding vector_cosine_ops)
+WHERE tenant_id = 42;
+```
+
+**Iterative scans** (pgvector 0.8+), which let the index keep producing candidates until enough rows survive the filter:
+
+```sql
+SET hnsw.iterative_scan = relaxed_order;
+SET hnsw.max_scan_tuples = 20000;
+```
+
+`strict_order` preserves exact distance ordering; `relaxed_order` is faster and usually fine when results are re-ranked afterwards. IVFFlat has the same setting as `ivfflat.iterative_scan`.
+
+Before 0.8, the common workaround was over-fetching in a subquery and filtering outside — still a reasonable fallback:
+
+```sql
+SELECT * FROM (
+  SELECT id, content, tenant_id, embedding <=> $1 AS distance
+  FROM documents
+  ORDER BY embedding <=> $1
+  LIMIT 200
+) candidates
+WHERE tenant_id = 42
+ORDER BY distance
+LIMIT 10;
+```
+
+## Measuring Recall Instead of Guessing
+
+Recall is the fraction of true nearest neighbours your approximate search actually returned. Measure it against an exact scan:
+
+```sql
+-- Ground truth: disable index usage
+SET enable_indexscan = off;
+SET enable_bitmapscan = off;
+
+CREATE TEMP TABLE truth AS
+SELECT id FROM documents ORDER BY embedding <=> $1 LIMIT 10;
+
+RESET enable_indexscan;
+RESET enable_bitmapscan;
+
+CREATE TEMP TABLE approx AS
+SELECT id FROM documents ORDER BY embedding <=> $1 LIMIT 10;
+
+SELECT count(*) / 10.0 AS recall
+FROM approx a JOIN truth t USING (id);
+```
+
+Run that over a few hundred representative query vectors and average. Then raise `ef_search` (or `probes`) until recall reaches your target — 0.95 is a common bar for search and RAG — and no further, since every increment costs latency.
+
+Confirm the index is being used at all:
+
+```sql
+EXPLAIN (ANALYZE, BUFFERS)
+SELECT id FROM documents ORDER BY embedding <=> $1 LIMIT 10;
+```
+
+You want `Index Scan using documents_embedding_idx`. A `Seq Scan` followed by a `Sort` means something prevented index use — usually an operator/opclass mismatch, a missing `ORDER BY`, or a `LIMIT` large enough that the planner preferred a full scan.
+
+## Practical Defaults
+
+For a typical RAG or semantic search workload on 1536-dimension embeddings:
+
+```sql
+CREATE INDEX ON documents USING hnsw (embedding vector_cosine_ops)
+WITH (m = 16, ef_construction = 64);
+
+SET hnsw.ef_search = 100;
+```
+
+Then measure recall, adjust `ef_search` first (free, no rebuild), and only rebuild with a higher `m` if `ef_search` alone cannot reach your target. Store embeddings as `halfvec` if storage is tight — pgvector 0.7+ supports half-precision vectors, halving index size with minimal recall loss on most embedding models.
+
+Comparing index configurations means running the same queries repeatedly and diffing plans and timings. [Chat2DB](https://chat2db.ai/download) connects to PostgreSQL with pgvector alongside twenty-plus other databases, visualizes execution plans so index usage is obvious at a glance, and keeps your benchmark queries organised while you tune.

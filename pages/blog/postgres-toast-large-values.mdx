@@ -1,0 +1,220 @@
+---
+title: "Postgres TOAST: How Large Values Are Stored"
+description: "How PostgreSQL TOAST stores large text, JSONB and bytea values: compression, out-of-line storage, storage strategies, and the performance traps to avoid."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: August 18, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# Postgres TOAST: How Large Values Are Stored
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="August 18, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+PostgreSQL stores rows in 8 kB pages, and a row cannot span pages. So what happens when you insert a 2 MB JSON document into a `jsonb` column? The answer is TOAST — The Oversized-Attribute Storage Technique — a mechanism that compresses large values and moves them into a side table, transparently, without you writing a line of code.
+
+TOAST works well enough that most developers never think about it. It also explains a set of performance behaviours that are baffling until you know it exists: why `SELECT *` on a table of documents is ten times slower than selecting three columns, why a table's size on disk barely grows when you add a large text column, and why an index on a large column sometimes fails outright.
+
+## The 2 kB Threshold
+
+When a row exceeds roughly 2 kB (`TOAST_TUPLE_THRESHOLD`, one quarter of a page), PostgreSQL tries to shrink it. It works through the variable-length columns, largest first, and for each one:
+
+1. **Compresses** the value, if the column's storage strategy allows it.
+2. If the row still does not fit, **moves** the value out of line into the table's TOAST table, leaving an 18-byte pointer behind.
+
+It keeps going until the row fits within the target size. Only variable-length types participate — `text`, `varchar`, `bytea`, `json`, `jsonb`, arrays, `hstore` and similar. An `integer` or `timestamptz` column is never toasted.
+
+Every table with a toastable column gets a companion TOAST table, hidden in the `pg_toast` schema:
+
+```sql
+SELECT c.relname AS table_name,
+       t.relname AS toast_table,
+       pg_size_pretty(pg_relation_size(c.oid))  AS main_size,
+       pg_size_pretty(pg_relation_size(t.oid))  AS toast_size
+FROM pg_class c
+JOIN pg_class t ON c.reltoastrelid = t.oid
+WHERE c.relkind = 'r'
+  AND c.relnamespace = 'public'::regnamespace
+ORDER BY pg_relation_size(t.oid) DESC;
+```
+
+If `toast_size` dwarfs `main_size`, most of your data lives out of line — worth knowing before you reason about query performance.
+
+The out-of-line value is split into chunks of about 2 kB, each stored as a row in the TOAST table with a unique OID and a sequence number, and retrieved via an index on `(chunk_id, chunk_seq)`. Reading a 2 MB value means fetching around a thousand chunk rows.
+
+## Storage Strategies
+
+Each column has one of four strategies, visible in `psql` with `\d+ tablename` or through the catalog:
+
+```sql
+SELECT attname,
+       format_type(atttypid, atttypmod) AS type,
+       CASE attstorage
+         WHEN 'p' THEN 'plain'
+         WHEN 'e' THEN 'external'
+         WHEN 'm' THEN 'main'
+         WHEN 'x' THEN 'extended'
+       END AS storage
+FROM pg_attribute
+WHERE attrelid = 'documents'::regclass
+  AND attnum > 0
+  AND NOT attisdropped;
+```
+
+- **plain** — no compression, no out-of-line storage. The only option for fixed-length types.
+- **extended** — compress, then move out of line if still too big. The default for most variable-length types, and usually the right choice.
+- **external** — move out of line without compressing.
+- **main** — compress, but keep in the main table if at all possible.
+
+Change one with `ALTER TABLE`:
+
+```sql
+ALTER TABLE documents ALTER COLUMN body SET STORAGE EXTERNAL;
+```
+
+Note that this affects **future** writes only. Existing values keep their current representation until the row is updated. To rewrite everything, force it:
+
+```sql
+UPDATE documents SET body = body;   -- rewrites every row
+VACUUM FULL documents;
+```
+
+### When EXTERNAL Beats EXTENDED
+
+`external` is the right choice for two cases.
+
+**Already-compressed data.** A column holding JPEGs, PNGs, gzipped blobs or encrypted bytes will not compress further. Attempting it burns CPU on every write for a fraction of a percent of savings.
+
+**Substring access on large text.** With `external`, PostgreSQL can fetch only the chunks it needs to satisfy `substr()` or a `LIKE 'prefix%'` anchored match. With `extended`, the value must be decompressed from the beginning, so the entire thing gets read regardless:
+
+```sql
+-- Fast with EXTERNAL, reads the whole value with EXTENDED
+SELECT substr(body, 1, 200) FROM documents WHERE id = 42;
+```
+
+For a table of large documents where the UI shows a preview, that difference is substantial.
+
+## Compression Algorithms
+
+PostgreSQL 14 introduced LZ4 alongside the historical `pglz`. LZ4 compresses several times faster and decompresses faster still, at a modestly worse ratio. For most workloads it is the better trade:
+
+```sql
+SHOW default_toast_compression;   -- 'pglz' or 'lz4'
+
+ALTER TABLE documents ALTER COLUMN body SET COMPRESSION lz4;
+```
+
+LZ4 must be compiled into your build; check with:
+
+```sql
+SELECT * FROM pg_settings WHERE name = 'default_toast_compression';
+```
+
+You can see which algorithm a stored value actually used:
+
+```sql
+SELECT pg_column_compression(body) FROM documents WHERE id = 42;
+```
+
+`NULL` means the value was not compressed — either it was small enough to stay inline, or the strategy is `external` or `plain`. A table can contain a mix of `pglz` and `lz4` values; PostgreSQL records the algorithm per value and decompresses accordingly, so changing the setting is safe and needs no migration.
+
+## The Performance Traps
+
+### SELECT * Fetches Everything
+
+This is the big one. TOAST is lazy — out-of-line values are only fetched when the column is actually referenced. So:
+
+```sql
+-- Fast: never touches the TOAST table
+SELECT id, title, created_at FROM documents ORDER BY created_at DESC LIMIT 20;
+
+-- Slow: fetches and decompresses 20 large bodies just to throw them away
+SELECT * FROM documents ORDER BY created_at DESC LIMIT 20;
+```
+
+If your list endpoint uses `SELECT *` on a table with a large `jsonb` or `text` column, naming the columns you need is often the single largest win available. ORMs are the usual culprit here: many select every mapped column by default, so mark large columns lazy or define a projection for list queries.
+
+You can see the difference in the plan:
+
+```sql
+EXPLAIN (ANALYZE, BUFFERS)
+SELECT * FROM documents ORDER BY created_at DESC LIMIT 20;
+```
+
+Look for buffer reads far exceeding what the main table's size would suggest — those are TOAST chunk fetches.
+
+### Updates Rewrite the Whole Value
+
+PostgreSQL has no partial update of a toasted value. Appending one line to a 5 MB text column writes a fresh 5 MB copy and leaves the old one as a dead tuple for vacuum to clean. A column updated frequently and read rarely is a poor fit for TOAST; splitting the volatile part into its own row or table avoids the rewrite.
+
+There is one important exception: if an `UPDATE` does not modify a toasted column, the existing TOAST pointer is reused. Updating a `status` column on a row with a 5 MB body does not rewrite the body.
+
+### Index Size Limits
+
+A btree index entry must fit within roughly one third of a page, about 2704 bytes. Values are not toasted inside indexes, so indexing a large text column fails at insert time:
+
+```
+ERROR:  index row size 3160 exceeds btree version 4 maximum 2704 for index "documents_body_idx"
+```
+
+Index a hash or a prefix instead:
+
+```sql
+CREATE INDEX ON documents (md5(body));
+CREATE INDEX ON documents (left(body, 100));
+```
+
+Or use a GIN index for full-text or JSONB containment queries, which index tokens and keys rather than the whole value:
+
+```sql
+CREATE INDEX ON documents USING GIN (to_tsvector('english', body));
+CREATE INDEX ON documents USING GIN (payload jsonb_path_ops);
+```
+
+### TOAST Tables Need Vacuuming Too
+
+They are ordinary tables with their own bloat and their own autovacuum thresholds. A workload that constantly rewrites large values can leave a TOAST table badly bloated while the main table looks healthy:
+
+```sql
+SELECT n.nspname, c.relname,
+       pg_size_pretty(pg_relation_size(c.oid)) AS size,
+       c.reltuples::bigint AS approx_rows,
+       s.last_autovacuum
+FROM pg_class c
+JOIN pg_namespace n ON n.oid = c.relnamespace
+LEFT JOIN pg_stat_all_tables s ON s.relid = c.oid
+WHERE n.nspname = 'pg_toast'
+ORDER BY pg_relation_size(c.oid) DESC
+LIMIT 10;
+```
+
+You can tune autovacuum for a TOAST table specifically:
+
+```sql
+ALTER TABLE documents SET (toast.autovacuum_vacuum_scale_factor = 0.05);
+```
+
+## Checking Whether a Value Is Toasted
+
+There is no single flag, but you can infer it. Compare the on-disk size of the value to the threshold:
+
+```sql
+SELECT id,
+       pg_column_size(body)   AS stored_bytes,
+       octet_length(body)     AS logical_bytes,
+       pg_column_compression(body) AS compression
+FROM documents
+ORDER BY octet_length(body) DESC
+LIMIT 10;
+```
+
+`pg_column_size` reports what is stored, including compression; `octet_length` reports the logical length. When `stored_bytes` is 18 or so while `logical_bytes` is large, you are looking at a pointer to out-of-line data. A big gap between the two on inline values shows compression working.
+
+## Practical Guidance
+
+Keep large columns out of hot list queries, and never let an ORM select them implicitly. Use `external` storage for already-compressed binary data and for columns you frequently substring. Switch to LZ4 unless you are storage-constrained enough to want pglz's better ratio. Do not index large text columns directly — index a hash, a prefix, or a tsvector. And if a large column is updated far more often than it is read, consider whether it belongs in a separate table entirely.
+
+Inspecting storage strategies, column sizes and TOAST table growth across several databases goes faster in a client that shows table metadata and query plans in one place — [Chat2DB](https://chat2db.ai/download) connects to PostgreSQL and twenty-plus other databases, and its plan visualizer makes the extra buffer reads from a stray `SELECT *` immediately obvious.

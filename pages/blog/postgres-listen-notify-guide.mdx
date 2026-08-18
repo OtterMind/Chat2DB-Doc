@@ -1,0 +1,246 @@
+---
+title: "Postgres LISTEN/NOTIFY: Pub/Sub Without a Broker"
+description: "A practical guide to Postgres LISTEN and NOTIFY: trigger payloads, listening from Node.js and Python, the 8000-byte limit, and when to use a real queue."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: August 18, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# Postgres LISTEN/NOTIFY: Pub/Sub Without a Broker
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="August 18, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+Plenty of applications add Redis or RabbitMQ purely to tell one process that something changed in the database. If PostgreSQL is already in your stack, `LISTEN`/`NOTIFY` may cover that need with no extra infrastructure: a lightweight publish-subscribe channel built into the server, delivering messages to connected sessions the moment a transaction commits.
+
+It is genuinely useful and genuinely limited. This guide covers how to use it properly and, just as importantly, when it is the wrong tool.
+
+## The Basic Mechanism
+
+Open a session and subscribe to a channel:
+
+```sql
+LISTEN order_events;
+```
+
+From any other session, publish:
+
+```sql
+NOTIFY order_events, 'order 1042 created';
+```
+
+The listening session receives:
+
+```
+Asynchronous notification "order_events" with payload "order 1042 created" received from server process with PID 28134.
+```
+
+Channel names are identifiers, so they follow identifier rules: unquoted names are folded to lower case, and `LISTEN "OrderEvents"` is a different channel from `LISTEN OrderEvents`. Pick one convention — lower case with underscores — and stick to it.
+
+To publish from within a query or a function, use the function form, which takes the channel as a string and lets you compute it:
+
+```sql
+SELECT pg_notify('order_events', json_build_object(
+  'id', 1042,
+  'status', 'created'
+)::text);
+```
+
+`pg_notify` is what you want in practically all real code; `NOTIFY` as a statement only accepts a literal channel name.
+
+Stop listening with `UNLISTEN order_events;` or `UNLISTEN *;`.
+
+## Transactional Semantics
+
+This is the property that makes `LISTEN`/`NOTIFY` worth using over an external broker: notifications are **transactional**.
+
+```sql
+BEGIN;
+INSERT INTO orders (id, status) VALUES (1042, 'created');
+SELECT pg_notify('order_events', '1042');
+ROLLBACK;
+```
+
+No notification is delivered. The message is queued with the transaction and released only at commit. You can never publish an event about a row that does not exist — a race condition that is entirely normal when writing to a database and a message broker separately, and that usually gets papered over with retries and idempotency keys.
+
+Duplicate notifications on the same channel with identical payloads within one transaction are collapsed into one delivery. If you emit one notify per row in a 10,000-row batch with identical payloads, listeners get a single message. With distinct payloads, they get all of them.
+
+## Firing Notifications From a Trigger
+
+The common pattern is to let the database publish changes itself, so no application code can forget to:
+
+```sql
+CREATE OR REPLACE FUNCTION notify_order_change() RETURNS trigger AS $$
+DECLARE
+  payload json;
+BEGIN
+  payload := json_build_object(
+    'op',     TG_OP,
+    'id',     COALESCE(NEW.id, OLD.id),
+    'status', NEW.status
+  );
+  PERFORM pg_notify('order_events', payload::text);
+  RETURN NULL;   -- AFTER trigger: return value is ignored
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER orders_notify
+AFTER INSERT OR UPDATE OR DELETE ON orders
+FOR EACH ROW
+EXECUTE FUNCTION notify_order_change();
+```
+
+Two refinements worth making.
+
+**Only notify when something you care about changed.** A trigger that fires on every column update will flood listeners:
+
+```sql
+CREATE TRIGGER orders_notify
+AFTER UPDATE OF status ON orders
+FOR EACH ROW
+WHEN (OLD.status IS DISTINCT FROM NEW.status)
+EXECUTE FUNCTION notify_order_change();
+```
+
+**For bulk operations, use a statement-level trigger.** A row-level trigger on a 100,000-row update calls `pg_notify` 100,000 times:
+
+```sql
+CREATE OR REPLACE FUNCTION notify_orders_bulk() RETURNS trigger AS $$
+BEGIN
+  PERFORM pg_notify('order_events', json_build_object('op', TG_OP, 'bulk', true)::text);
+  RETURN NULL;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER orders_notify_stmt
+AFTER UPDATE ON orders
+FOR EACH STATEMENT
+EXECUTE FUNCTION notify_orders_bulk();
+```
+
+The listener then re-reads whatever it needs. Which brings us to the most important design rule.
+
+## Send an Identifier, Not the Data
+
+The payload limit is **8000 bytes**. Exceed it and the transaction fails:
+
+```
+ERROR:  payload string too long
+```
+
+Even well under the limit, putting business data in the payload is a mistake. Notifications are not durable — a listener that is disconnected when the notify fires never learns it happened. Send the smallest possible pointer and let the listener fetch current state:
+
+```sql
+SELECT pg_notify('order_events', '1042');
+```
+
+The listener runs `SELECT * FROM orders WHERE id = 1042`, which has the pleasant side effect of always reading the latest state even if three notifications arrived in quick succession.
+
+## Listening From an Application
+
+### Node.js with node-postgres
+
+`LISTEN` requires a dedicated, long-lived connection. A pooled connection will not work, because the pool may hand your session to another caller between notifications:
+
+```js
+import pg from 'pg';
+
+const client = new pg.Client({ connectionString: process.env.DATABASE_URL });
+await client.connect();
+await client.query('LISTEN order_events');
+
+client.on('notification', async (msg) => {
+  const id = msg.payload;
+  const { rows } = await pool.query('SELECT * FROM orders WHERE id = $1', [id]);
+  console.log('order changed', rows[0]);
+});
+
+client.on('error', async (err) => {
+  console.error('listener connection lost', err);
+  // reconnect and re-issue LISTEN — the subscription does not survive a reconnect
+});
+```
+
+The reconnect path is not optional. Every network blip drops the subscription silently, and a listener that never reconnects looks exactly like a system where nothing is happening.
+
+### Python with psycopg 3
+
+```python
+import psycopg
+
+with psycopg.connect(DSN, autocommit=True) as conn:
+    conn.execute("LISTEN order_events")
+    for notify in conn.notifies():
+        print(notify.channel, notify.payload)
+```
+
+`autocommit=True` matters: inside an open transaction the client will not see notifications until that transaction ends.
+
+## Catching Up After Downtime
+
+Because notifications are fire-and-forget, any listener that restarts must reconcile. The standard pattern is a watermark:
+
+```sql
+CREATE TABLE order_events_log (
+  id         BIGSERIAL PRIMARY KEY,
+  order_id   BIGINT NOT NULL,
+  op         TEXT   NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  processed  BOOLEAN NOT NULL DEFAULT false
+);
+
+CREATE INDEX ON order_events_log (processed, id) WHERE NOT processed;
+```
+
+The trigger inserts a durable row *and* notifies. On startup the listener drains unprocessed rows, then switches to reacting to notifications — and re-drains on every reconnect. The notification becomes a latency optimisation over polling rather than the source of truth, which is exactly the right role for it.
+
+Claiming work safely from multiple workers:
+
+```sql
+UPDATE order_events_log
+SET processed = true
+WHERE id IN (
+  SELECT id FROM order_events_log
+  WHERE NOT processed
+  ORDER BY id
+  FOR UPDATE SKIP LOCKED
+  LIMIT 100
+)
+RETURNING order_id, op;
+```
+
+`FOR UPDATE SKIP LOCKED` lets several workers pull disjoint batches without blocking each other. This combination — a durable log table, `SKIP LOCKED` for claiming, `NOTIFY` to wake workers immediately — is a solid job queue that needs no additional infrastructure.
+
+## Operational Limits
+
+**The queue is 8 GB by default.** Committed-but-undelivered notifications are held on disk. A listener that is connected but not reading — stuck in a long transaction, or blocked on slow processing — causes the queue to grow. When it fills, commits that emit notifications start failing. Monitor it:
+
+```sql
+SELECT pg_notification_queue_usage();   -- fraction 0..1
+```
+
+Alert above 0.5. Then find the session holding the queue back:
+
+```sql
+SELECT pid, state, now() - xact_start AS xact_age, query
+FROM pg_stat_activity
+WHERE wait_event_type = 'Extension' OR state = 'idle in transaction'
+ORDER BY xact_age DESC NULLS LAST;
+```
+
+**Notifications do not cross replicas.** They are not written to WAL, so a `NOTIFY` on the primary is invisible to sessions on a physical standby, and logical replication does not carry them either. Listeners must connect to the primary.
+
+**Every listener holds a connection.** A thousand listening processes means a thousand backends. Beyond a few dozen, a single listener that fans out over WebSockets is the better architecture.
+
+**Delivery is at-most-once.** No acknowledgements, no replay, no dead-letter queue.
+
+## When to Use Something Else
+
+Reach for a real broker or a queue extension when you need durable delivery with acknowledgements, retries and dead-lettering; ordering guarantees across producers; consumer groups with partitioned parallelism; payloads over 8 KB; or fan-out to thousands of consumers. If you want queue semantics but would rather not run Kafka, `pgmq` and similar extensions build a proper queue on top of PostgreSQL tables, keeping the transactional guarantee while adding visibility timeouts and retries.
+
+`LISTEN`/`NOTIFY` fits cache invalidation, pushing live updates to a WebSocket gateway, waking a worker that would otherwise poll, coordinating config reloads, and refreshing a materialized view after a data load. For those, it is a few lines of SQL against a database you are already running.
+
+Testing this is awkward from a plain terminal, since you need two sessions and one of them must sit idle waiting. A client that keeps several sessions open at once makes it much easier — [Chat2DB](https://chat2db.ai/download) connects to PostgreSQL and twenty-plus other databases, so you can run `LISTEN` in one tab and fire `pg_notify` from another while watching the trigger fire.

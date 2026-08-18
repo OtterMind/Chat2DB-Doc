@@ -1,0 +1,204 @@
+---
+title: "Fix Postgres ERROR: out of shared memory (max_locks)"
+description: "Diagnose and fix the Postgres out of shared memory error caused by max_locks_per_transaction, with lock queries, partition-aware fixes and safe sizing rules."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: August 18, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# Fix Postgres ERROR: out of shared memory (max_locks)
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="August 18, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+The error looks alarming and its message is misleading:
+
+```
+ERROR:  out of shared memory
+HINT:  You might need to increase max_locks_per_transaction.
+```
+
+Your server is almost certainly not out of memory. What ran out is a fixed-size slot table inside shared memory that tracks locks, and the hint tells you exactly which knob controls its size. This guide explains why the table fills up, how to see what is consuming it, and how to size it correctly instead of doubling the number and hoping.
+
+## What Actually Ran Out
+
+At startup PostgreSQL allocates a shared lock table with a fixed number of slots:
+
+```
+slots = max_locks_per_transaction * (max_connections + max_prepared_transactions)
+```
+
+The defaults are `max_locks_per_transaction = 64` and `max_connections = 100`, giving 6,400 slots for the whole cluster.
+
+The name is the trap. `max_locks_per_transaction` is **not** a per-transaction limit. It is an averaging factor used to size one global pool. A single transaction may take far more than 64 locks, as long as the cluster-wide total stays under the pool size. That is why the error appears intermittently: one heavy transaction is fine on a quiet server, and fails at peak when everything else is also holding locks.
+
+Every distinct object a transaction touches takes a slot: each table, each index on that table, each partition, each partition's indexes. That last part is the usual culprit.
+
+## Confirm the Diagnosis
+
+First, the arithmetic on your own server:
+
+```sql
+SELECT current_setting('max_locks_per_transaction')::int AS locks_per_txn,
+       current_setting('max_connections')::int          AS max_conn,
+       current_setting('max_prepared_transactions')::int AS max_prepared,
+       current_setting('max_locks_per_transaction')::int
+         * (current_setting('max_connections')::int
+            + current_setting('max_prepared_transactions')::int) AS total_slots;
+```
+
+Then how many slots are in use right now:
+
+```sql
+SELECT count(*) AS locks_held FROM pg_locks;
+```
+
+Run that during your peak window, not while the system is idle. If `locks_held` gets anywhere near `total_slots`, you have found it.
+
+Which sessions are responsible:
+
+```sql
+SELECT l.pid,
+       count(*) AS lock_count,
+       a.state,
+       left(a.query, 80) AS query
+FROM pg_locks l
+JOIN pg_stat_activity a USING (pid)
+GROUP BY l.pid, a.state, a.query
+ORDER BY lock_count DESC
+LIMIT 10;
+```
+
+And which relations are eating the slots:
+
+```sql
+SELECT c.relname,
+       c.relkind,
+       count(*) AS locks
+FROM pg_locks l
+JOIN pg_class c ON c.oid = l.relation
+GROUP BY c.relname, c.relkind
+ORDER BY locks DESC
+LIMIT 20;
+```
+
+A `relkind` of `r` is a regular table, `p` a partitioned parent, `i` an index. Seeing hundreds of `i` rows for one logical table is the signature of a partitioned table being scanned in full.
+
+## The Four Common Causes
+
+### 1. Partitioned Tables Without Partition Pruning
+
+This is by far the most frequent cause. A table with 365 daily partitions, each with three indexes, is 365 × 4 = 1,460 lockable objects plus the parent. One query that fails to prune consumes nearly a quarter of the default pool by itself.
+
+Check whether pruning is happening:
+
+```sql
+EXPLAIN (COSTS OFF)
+SELECT * FROM events
+WHERE created_at >= '2026-08-01' AND created_at < '2026-08-02';
+```
+
+If the plan lists every partition instead of one, pruning failed. Common reasons:
+
+- The `WHERE` clause does not reference the partition key at all.
+- The partition key is wrapped in a function: `WHERE date_trunc('day', created_at) = '2026-08-01'` cannot prune, while a plain range comparison can.
+- The comparison value is not a constant at plan time. In a PL/pgSQL function or a prepared statement using a generic plan, the planner may not be able to prune until execution. Runtime pruning helps for execution but the locks are still taken.
+- Types do not match, forcing an implicit cast that blocks pruning.
+
+Fix the query and the lock consumption drops by two orders of magnitude. Also confirm pruning is enabled:
+
+```sql
+SHOW enable_partition_pruning;   -- must be on
+```
+
+Reducing partition count helps too. Daily partitions retained for five years is 1,825 partitions; monthly partitions covering the same span is 60. If your queries always filter on a month, daily granularity buys nothing and costs planning time and lock slots.
+
+### 2. Long Transactions Touching Many Tables
+
+A migration script, a data-fix job, or an ORM that opens a transaction at request start and touches sixty tables before commit. Locks are held until commit or rollback — never released early — so a transaction that touches 500 objects holds 500 slots for its entire lifetime.
+
+Find the offenders:
+
+```sql
+SELECT pid,
+       now() - xact_start AS xact_age,
+       state,
+       left(query, 100) AS query
+FROM pg_stat_activity
+WHERE xact_start IS NOT NULL
+  AND now() - xact_start > interval '1 minute'
+ORDER BY xact_age DESC;
+```
+
+The fix is structural: split the work into smaller transactions. A backfill that loops over 10,000 rows per commit holds a fraction of the locks a single-transaction backfill does.
+
+### 3. pg_dump Against a Schema With Many Objects
+
+`pg_dump` takes an `ACCESS SHARE` lock on every table it exports, inside one transaction, so a database with 20,000 tables needs 20,000 slots at once. This is a legitimate reason to raise the setting — the dump genuinely needs them.
+
+### 4. Too Many Advisory Locks
+
+Advisory locks live in the same pool. Code that takes one per work item and holds them to the end of a long transaction will exhaust it:
+
+```sql
+SELECT count(*) FROM pg_locks WHERE locktype = 'advisory';
+```
+
+Use `pg_advisory_unlock()` explicitly, or prefer `pg_advisory_xact_lock()` so the lock is released at commit rather than at session end.
+
+## Raising the Setting Correctly
+
+Once you know your real peak, size it deliberately. Take the maximum observed `locks_held`, add headroom, and divide:
+
+```sql
+ALTER SYSTEM SET max_locks_per_transaction = 256;
+```
+
+**This requires a full restart.** A reload will not apply it, because the lock table is allocated once at startup:
+
+```bash
+sudo systemctl restart postgresql
+```
+
+Verify afterwards:
+
+```sql
+SHOW max_locks_per_transaction;
+```
+
+How much shared memory does this cost? Each lock slot is on the order of a couple of hundred bytes. Going from 64 to 256 with 200 connections adds roughly 200 × 192 × ~270 bytes — around 10 MB. That is nothing on a modern server, so do not be shy about the increase; the reason to investigate first is that the error is usually a symptom of a query problem worth fixing on its own.
+
+Beware the interaction with `max_connections`: the pool is the product of the two. Raising `max_connections` from 100 to 500 without touching `max_locks_per_transaction` gives you five times the slots, but also five times the backends competing for them.
+
+## A Different Error With a Similar Message
+
+If the hint mentions `max_pred_locks_per_transaction` instead:
+
+```
+ERROR:  out of shared memory
+HINT:  You might need to increase max_pred_locks_per_transaction.
+```
+
+that is the *predicate* lock table, used only by `SERIALIZABLE` isolation. It has its own setting and its own tuning parameters (`max_pred_locks_per_relation`, `max_pred_locks_per_page`). Raise `max_pred_locks_per_transaction` instead, and check whether every transaction really needs `SERIALIZABLE`.
+
+And if you see `out of memory` with a `DETAIL: Failed on request of size ...` line, that is genuine memory exhaustion — usually `work_mem` set too high multiplied by too many concurrent sorts, not a lock table problem at all.
+
+## Prevention
+
+Monitor lock consumption before it becomes an outage. A simple gauge, sampled every minute:
+
+```sql
+SELECT count(*)::float
+       / (current_setting('max_locks_per_transaction')::int
+          * (current_setting('max_connections')::int
+             + current_setting('max_prepared_transactions')::int))
+       * 100 AS lock_table_pct_used
+FROM pg_locks;
+```
+
+Alert above 70%. Combine that with an alert on transactions older than a few minutes, and a check that your partitioned tables prune, and this error stops appearing at 3 a.m.
+
+Watching locks, partition pruning and long-running transactions across several servers is easier from a client that shows them together. [Chat2DB](https://chat2db.ai/download) connects to PostgreSQL and twenty-plus other databases, renders execution plans so you can see immediately whether partition pruning kicked in, and keeps these diagnostic queries a click away instead of buried in a scratch file.

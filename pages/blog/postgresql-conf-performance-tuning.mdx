@@ -1,0 +1,264 @@
+---
+title: "PostgreSQL Configuration Tuning: A Practical Guide"
+description: "Tune postgresql.conf for real workloads: shared_buffers, work_mem, effective_cache_size, WAL sizing and parallel query, with SQL to verify every change."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: August 18, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# PostgreSQL Configuration Tuning: A Practical Guide
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="August 18, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+PostgreSQL ships with settings that are deliberately timid. The defaults are chosen so that the server starts on a small virtual machine, a Raspberry Pi, or a laptop that is also running an IDE and a browser — not so that it uses the 64 GB of RAM you provisioned for it. A default `shared_buffers` of 128 MB on a machine with 64 GB means PostgreSQL is caching a two-thousandth of the memory it could be using.
+
+This guide walks through the settings that actually move the needle, the reasoning behind each number, and the SQL you can run afterwards to check whether the change did anything. If you want the arithmetic done for you first, the [PostgreSQL config calculator](https://chat2db.ai/tools/postgres-config-calculator) generates a starting `postgresql.conf` from your RAM, core count and workload type.
+
+## Start by Reading What You Have
+
+Before changing anything, record the current values. `SHOW` works for one setting, but `pg_settings` gives you the whole picture including where each value came from:
+
+```sql
+SELECT name,
+       setting,
+       unit,
+       source,
+       boot_val,
+       pending_restart
+FROM pg_settings
+WHERE name IN (
+  'shared_buffers', 'work_mem', 'maintenance_work_mem',
+  'effective_cache_size', 'max_connections', 'random_page_cost',
+  'max_wal_size', 'checkpoint_completion_target',
+  'max_parallel_workers_per_gather'
+)
+ORDER BY name;
+```
+
+The `source` column is the one people overlook. If it says `configuration file`, the value comes from `postgresql.conf`. If it says `default`, nobody has ever tuned it. If it says `database` or `user`, someone ran `ALTER DATABASE ... SET` and that override will silently beat anything you put in the config file.
+
+Note that `setting` is reported in `unit` — `shared_buffers` comes back in 8 kB blocks, not bytes. Use `pg_size_pretty` to avoid misreading it:
+
+```sql
+SELECT name,
+       pg_size_pretty(setting::bigint * 8192) AS value
+FROM pg_settings
+WHERE name IN ('shared_buffers', 'effective_cache_size', 'wal_buffers');
+```
+
+## Memory Settings
+
+### shared_buffers
+
+`shared_buffers` is PostgreSQL's own page cache. Pages read from disk land here, and dirty pages live here until a checkpoint writes them out. The conventional starting point on a dedicated database server is **25% of total RAM**.
+
+Why only 25%, when the machine is dedicated to PostgreSQL? Because the operating system page cache also holds database pages, and PostgreSQL relies on it. Pushing `shared_buffers` to 60–70% of RAM means the same pages get cached twice — once by PostgreSQL, once by the kernel — and leaves less room for `work_mem` allocations and per-backend memory. On a 32 GB server:
+
+```ini
+shared_buffers = 8GB
+```
+
+This setting requires a restart. It is one of only a handful that do.
+
+### effective_cache_size
+
+This one allocates nothing at all. It is a hint to the planner about how much memory is likely available for caching database pages across both PostgreSQL and the OS. A larger value makes index scans look cheaper relative to sequential scans, because the planner assumes the index pages are probably cached.
+
+Set it to roughly 75% of RAM on a dedicated server:
+
+```ini
+effective_cache_size = 24GB
+```
+
+If this is left at the 4 GB default on a large server, the planner will systematically over-estimate the cost of index scans and choose sequential scans on tables where an index would have been faster.
+
+### work_mem
+
+`work_mem` is the memory budget for a **single** sort, hash join, or hash aggregate node. It is not per query and it is not per connection. One query with three sort nodes running with two parallel workers can allocate `work_mem` six times over. Multiply that by a hundred concurrent connections and a generous-looking value becomes an out-of-memory kill.
+
+A safe starting formula:
+
+```
+work_mem = (total_RAM - shared_buffers) / (max_connections * 3) / max_parallel_workers_per_gather
+```
+
+On a 32 GB server with `shared_buffers = 8GB`, `max_connections = 200` and two parallel workers, that gives roughly 20 MB. For an OLTP workload:
+
+```ini
+work_mem = 16MB
+```
+
+Rather than guessing, measure. Turn on temp file logging and let it run for a day:
+
+```sql
+ALTER SYSTEM SET log_temp_files = 0;   -- log every temp file, any size
+SELECT pg_reload_conf();
+```
+
+Then check how much spilling is actually happening:
+
+```sql
+SELECT datname,
+       temp_files,
+       pg_size_pretty(temp_bytes) AS temp_written
+FROM pg_stat_database
+WHERE temp_files > 0
+ORDER BY temp_bytes DESC;
+```
+
+Sorts that spill to disk write temp files. If `temp_bytes` is growing steadily, `work_mem` is too small for your query mix. If it is near zero, you have headroom and can leave it alone.
+
+You can also raise it for one session or one statement instead of globally, which is the right move for a nightly reporting job:
+
+```sql
+SET LOCAL work_mem = '256MB';
+```
+
+### maintenance_work_mem
+
+Used by `VACUUM`, `CREATE INDEX`, and `ALTER TABLE ... ADD FOREIGN KEY`. These run rarely and one at a time, so this can be much larger than `work_mem`:
+
+```ini
+maintenance_work_mem = 2GB
+```
+
+A larger value directly shortens index builds and lets a single vacuum pass clean more dead tuples before it has to restart its scan of the indexes.
+
+## Planner Settings for Your Storage
+
+`random_page_cost` defaults to `4.0`, a number chosen when databases lived on spinning disks and a random read genuinely cost about four times a sequential one. On SSD or NVMe that ratio is close to 1:
+
+```ini
+random_page_cost = 1.1
+effective_io_concurrency = 200
+```
+
+This is one of the highest-impact single-line changes on modern hardware. Leaving `random_page_cost` at 4 on flash storage biases the planner toward sequential scans and away from index scans, and the symptom — full table scans on well-indexed tables — often gets misdiagnosed as a missing index.
+
+`effective_io_concurrency` tells the planner how many concurrent I/O requests the storage can absorb, which drives prefetching for bitmap heap scans. Use around 200 for SSD, 2 for a single rotational disk.
+
+## WAL and Checkpoints
+
+Every write goes to the write-ahead log first. When `max_wal_size` worth of WAL accumulates, PostgreSQL forces a checkpoint and flushes dirty buffers. With the default 1 GB, a write-heavy system checkpoints constantly, and each checkpoint causes an I/O spike.
+
+```ini
+max_wal_size = 8GB
+min_wal_size = 2GB
+checkpoint_completion_target = 0.9
+checkpoint_timeout = 15min
+wal_buffers = 16MB
+```
+
+`checkpoint_completion_target = 0.9` spreads the checkpoint's writes over 90% of the interval instead of dumping them as fast as the disk allows, which turns a spike into a plateau. Since PostgreSQL 14 this is the default, but plenty of clusters upgraded from older versions still carry an explicit `0.5`.
+
+To find out whether checkpoints are your bottleneck, look at how many are triggered by WAL volume rather than by the timeout:
+
+```sql
+SELECT num_timed,
+       num_requested,
+       write_time,
+       sync_time
+FROM pg_stat_checkpointer;
+```
+
+On PostgreSQL 16 and earlier, the same columns live in `pg_stat_bgwriter` as `checkpoints_timed` and `checkpoints_req`. If `num_requested` is a significant fraction of `num_timed`, checkpoints are being forced by WAL volume — raise `max_wal_size`. Enabling `log_checkpoints = on` will also record the same information in your server log with a breakdown of buffers written.
+
+## Parallel Query
+
+On a machine with four or more cores, let the planner use them:
+
+```ini
+max_worker_processes = 8
+max_parallel_workers = 8
+max_parallel_workers_per_gather = 4
+max_parallel_maintenance_workers = 4
+```
+
+`max_parallel_workers_per_gather` is the one that changes plans: it caps how many extra workers a single query may recruit. Set it too high on an OLTP system and a handful of analytical queries can starve everything else of workers. Four is a reasonable ceiling for mixed workloads; a dedicated analytics box can go higher.
+
+Remember that `work_mem` is per worker. Raising the worker count multiplies the peak memory of a parallel query, which is exactly why the formula above divides by it.
+
+## Applying Changes Safely
+
+Since PostgreSQL 9.4 you can change settings over SQL, which writes to `postgresql.auto.conf`:
+
+```sql
+ALTER SYSTEM SET work_mem = '16MB';
+ALTER SYSTEM SET random_page_cost = 1.1;
+SELECT pg_reload_conf();
+```
+
+Most settings take effect on reload. The ones that need a full restart announce themselves:
+
+```sql
+SELECT name, setting, pending_restart
+FROM pg_settings
+WHERE pending_restart;
+```
+
+To undo a single `ALTER SYSTEM` change, use `ALTER SYSTEM RESET work_mem;` — editing `postgresql.auto.conf` by hand is not recommended.
+
+## Verifying That It Worked
+
+Configuration tuning without measurement is superstition. Install `pg_stat_statements` and take a baseline before you change anything:
+
+```sql
+CREATE EXTENSION IF NOT EXISTS pg_stat_statements;
+
+SELECT queryid,
+       calls,
+       round(mean_exec_time::numeric, 2) AS avg_ms,
+       round(total_exec_time::numeric / 1000, 1) AS total_s,
+       rows
+FROM pg_stat_statements
+ORDER BY total_exec_time DESC
+LIMIT 20;
+```
+
+Reset the statistics with `SELECT pg_stat_statements_reset();`, apply one change, let the workload run for a representative period, and compare. Change one thing at a time — if you adjust six settings at once and throughput improves 20%, you have learned nothing about which of them mattered.
+
+Cache effectiveness is worth watching too:
+
+```sql
+SELECT datname,
+       round(100.0 * blks_hit / nullif(blks_hit + blks_read, 0), 2) AS cache_hit_pct
+FROM pg_stat_database
+WHERE datname NOT LIKE 'template%';
+```
+
+A hit ratio above 99% on an OLTP database is normal. A number well below that usually points at `shared_buffers` being too small — or at a reporting query repeatedly scanning a table far larger than RAM, which no configuration change will fix.
+
+## A Worked Example
+
+A 16 GB, 4-core VM running a web application backend, on SSD, behind PgBouncer:
+
+```ini
+max_connections = 100
+shared_buffers = 4GB
+effective_cache_size = 12GB
+maintenance_work_mem = 1GB
+work_mem = 20MB
+random_page_cost = 1.1
+effective_io_concurrency = 200
+max_wal_size = 4GB
+min_wal_size = 1GB
+checkpoint_completion_target = 0.9
+wal_buffers = 16MB
+default_statistics_target = 100
+max_worker_processes = 4
+max_parallel_workers = 4
+max_parallel_workers_per_gather = 2
+max_parallel_maintenance_workers = 2
+```
+
+Note `max_connections = 100` rather than 500. Connections are not free: each backend is a process with its own memory. If your application needs a thousand concurrent clients, put PgBouncer in front and keep the server-side pool small.
+
+## What Configuration Cannot Fix
+
+Tuning `postgresql.conf` buys you a solid baseline, usually a large one-time win on a server that has never been touched. It will not fix a missing index, a query that selects a million rows to display ten, or an ORM issuing N+1 queries. Once the configuration is sane, the remaining wins live in the queries themselves — which is where `EXPLAIN (ANALYZE, BUFFERS)` and `pg_stat_statements` take over.
+
+If you would rather see all of this in one place — settings, query statistics and execution plans side by side, without stitching together psql output — [Chat2DB](https://chat2db.ai/download) connects to PostgreSQL along with twenty-plus other databases, visualizes execution plans, and can explain a slow query in plain language before you start rewriting it.

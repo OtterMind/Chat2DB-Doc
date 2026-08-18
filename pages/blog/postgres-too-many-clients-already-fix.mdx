@@ -1,0 +1,210 @@
+---
+title: "Fix FATAL: sorry, too many clients already (Postgres)"
+description: "Why Postgres returns FATAL: sorry, too many clients already, how to find what holds connections, and how to fix it with pooling instead of max_connections."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: August 18, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# Fix FATAL: sorry, too many clients already (Postgres)
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="August 18, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+```
+FATAL: sorry, too many clients already
+```
+
+PostgreSQL is refusing new connections because every slot allowed by `max_connections` is taken. The instinct is to raise `max_connections` and move on. That works for about a week, and then the same error returns on a server that is now slower under load than it was before.
+
+The right fix depends on *why* the connections are there. This guide covers how to find out, and the four fixes that actually hold.
+
+## Why Connections Are Expensive
+
+PostgreSQL uses a process per connection, not a thread. Each backend is a full OS process with its own memory: catalog caches, plan caches, and up to several multiples of `work_mem` while a query runs. A few hundred megabytes per idle connection is not unusual once the caches warm up.
+
+Beyond the memory, more backends means more contention on shared structures — the lock table, the buffer mapping table, the procarray that every snapshot must scan. Past a certain point, adding connections *reduces* total throughput. Benchmarks consistently put peak throughput at a fairly small multiple of the core count, often somewhere between two and four times the number of cores.
+
+That is why "raise `max_connections` to 2000" is usually the wrong answer. Two thousand connections on an eight-core box will not do more work than fifty; they will do less, more slowly, with more memory.
+
+## Step 1: See What Is Actually Connected
+
+```sql
+SELECT count(*) AS total,
+       count(*) FILTER (WHERE state = 'active')             AS active,
+       count(*) FILTER (WHERE state = 'idle')               AS idle,
+       count(*) FILTER (WHERE state = 'idle in transaction') AS idle_in_txn,
+       current_setting('max_connections')::int              AS max_conn
+FROM pg_stat_activity;
+```
+
+The shape of that result tells you which problem you have:
+
+- **Mostly `idle`** — an oversized or leaking application pool.
+- **A meaningful number of `idle in transaction`** — a transaction management bug. This is the most damaging state: those sessions hold locks and prevent vacuum from cleaning rows newer than their snapshot.
+- **Mostly `active`** — genuine load, or a pile-up caused by slow queries.
+
+Break it down by client:
+
+```sql
+SELECT usename,
+       application_name,
+       client_addr,
+       state,
+       count(*)
+FROM pg_stat_activity
+GROUP BY 1, 2, 3, 4
+ORDER BY count(*) DESC;
+```
+
+`application_name` is worth setting in every service's connection string — it turns this query from guesswork into an answer. In a JDBC URL: `?ApplicationName=orders-api`; in `libpq`-based clients, the `application_name` parameter or the `PGAPPNAME` environment variable.
+
+Find the worst offenders:
+
+```sql
+SELECT pid,
+       usename,
+       application_name,
+       state,
+       now() - state_change AS idle_for,
+       now() - xact_start   AS xact_age,
+       left(query, 80)      AS last_query
+FROM pg_stat_activity
+WHERE state <> 'idle' OR now() - state_change > interval '5 minutes'
+ORDER BY xact_age DESC NULLS LAST
+LIMIT 20;
+```
+
+Note that superusers get `superuser_reserved_connections` slots (3 by default) held back for exactly this situation — so `psql` as a superuser usually still connects when applications cannot. PostgreSQL 16 added `reserved_connections` for a non-superuser role granted `pg_use_reserved_connections`, which is a good way to keep a monitoring account able to connect during an incident.
+
+## Step 2: Emergency Relief
+
+To free slots right now, cancel queries first — that ends the statement but keeps the session:
+
+```sql
+SELECT pg_cancel_backend(pid)
+FROM pg_stat_activity
+WHERE state = 'active'
+  AND now() - query_start > interval '5 minutes'
+  AND pid <> pg_backend_pid();
+```
+
+If that is not enough, terminate the sessions. Start with the ones stuck in a transaction doing nothing:
+
+```sql
+SELECT pg_terminate_backend(pid)
+FROM pg_stat_activity
+WHERE state = 'idle in transaction'
+  AND now() - state_change > interval '10 minutes'
+  AND pid <> pg_backend_pid();
+```
+
+Always exclude `pg_backend_pid()` so you do not kill your own session, and never terminate backends belonging to autovacuum or replication without knowing what they are doing.
+
+## Step 3: The Real Fixes
+
+### Fix 1: Stop Sessions Idling in Transactions
+
+Make the database enforce what the application should be doing. Since PostgreSQL 9.6:
+
+```sql
+ALTER SYSTEM SET idle_in_transaction_session_timeout = '60s';
+SELECT pg_reload_conf();
+```
+
+Any session that opens a transaction and then sits idle for a minute is terminated. This is safe — the transaction rolls back — and it converts a silent connection leak into a loud application error you can trace.
+
+PostgreSQL 14 added a companion for plain idle sessions:
+
+```sql
+ALTER SYSTEM SET idle_session_timeout = '30min';
+```
+
+Be careful with that one if your application pool expects long-lived connections; most pools reconnect transparently, but verify before enabling it in production.
+
+Set both per-role rather than globally when different services have different needs:
+
+```sql
+ALTER ROLE reporting SET idle_in_transaction_session_timeout = '5min';
+```
+
+The underlying bug is usually a framework that opens a transaction at the start of a request and holds it across an HTTP call to another service. Move the external call outside the transaction.
+
+### Fix 2: Size the Application Pool Correctly
+
+Most connection exhaustion is arithmetic. Twelve application instances × a pool of 50 = 600 connections against a server allowing 200. The pool maximum is a per-instance number, and autoscaling multiplies it.
+
+Total connections must satisfy:
+
+```
+instances × pool_max + background_jobs + admin_sessions < max_connections
+```
+
+Pool sizes should be small. A common starting point is `cores × 2 + effective_spindle_count`, which on a modern SSD-backed 8-core database server lands around 16–20 *in total*, not per instance. If you have 12 instances, each pool holding 4 connections is closer to right than 50.
+
+HikariCP:
+
+```properties
+spring.datasource.hikari.maximum-pool-size=5
+spring.datasource.hikari.minimum-idle=1
+spring.datasource.hikari.max-lifetime=1200000
+```
+
+node-postgres:
+
+```js
+const pool = new pg.Pool({ max: 5, idleTimeoutMillis: 30000 });
+```
+
+Small pools feel counter-intuitive — surely more connections means more concurrency? They do not, once the database is the bottleneck: requests queue either in your pool or inside PostgreSQL, and queuing in the pool is much cheaper.
+
+### Fix 3: Put PgBouncer In Front
+
+When you genuinely have many clients — serverless functions, hundreds of pods, a system with thousands of short-lived connections — a pooler is the answer. PgBouncer multiplexes thousands of client connections onto a few dozen server connections:
+
+```ini
+[databases]
+appdb = host=127.0.0.1 port=5432 dbname=appdb
+
+[pgbouncer]
+listen_port = 6432
+listen_addr = 0.0.0.0
+auth_type = scram-sha-256
+auth_file = /etc/pgbouncer/userlist.txt
+pool_mode = transaction
+max_client_conn = 5000
+default_pool_size = 25
+```
+
+`pool_mode = transaction` is what makes the ratio possible: a server connection is assigned to a client only for the duration of a transaction, then returned to the pool. Between transactions the client holds nothing.
+
+The trade-off is that session-scoped features stop working, because you may get a different backend for the next transaction. Session-level `SET` (use `SET LOCAL` instead), `LISTEN`/`NOTIFY`, session advisory locks, `WITH HOLD` cursors, and server-side prepared statements all need care. PgBouncer 1.21+ supports protocol-level prepared statements in transaction mode via `max_prepared_statements`, which resolves the most common complaint. Serverless platforms usually offer a managed pooler for the same reason — using it is not optional at that scale.
+
+### Fix 4: Raise max_connections — Deliberately
+
+Sometimes the answer really is a bigger limit, on a server with the RAM to back it:
+
+```sql
+ALTER SYSTEM SET max_connections = 300;
+```
+
+This requires a restart. Two things to remember. First, memory: budget for peak `work_mem` usage, since a single connection can allocate several multiples of it. Second, the lock table is sized as `max_locks_per_transaction × (max_connections + max_prepared_transactions)`, so raising `max_connections` also enlarges shared memory allocations at startup.
+
+## Preventing the Next Occurrence
+
+Alert on connection usage well before saturation:
+
+```sql
+SELECT round(100.0 * count(*) / current_setting('max_connections')::int, 1)
+         AS pct_used
+FROM pg_stat_activity;
+```
+
+Page at 80%. Separately, alert on any session `idle in transaction` for more than a minute — that one catches the bug class that causes most incidents, and it usually fires long before connections run out.
+
+Track the trend per `application_name` so that when the number climbs after a deploy, you know which service changed.
+
+Keeping `pg_stat_activity`, connection counts and slow queries visible in one place makes this much less painful during an incident. [Chat2DB](https://chat2db.ai/download) connects to PostgreSQL and twenty-plus other databases, keeps these diagnostic queries a click away, and lets you inspect a stuck session's last statement without hunting through logs.
