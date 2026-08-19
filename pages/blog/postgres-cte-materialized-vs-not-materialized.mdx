@@ -1,0 +1,295 @@
+---
+title: "Postgres CTE: MATERIALIZED vs NOT MATERIALIZED"
+description: "How Postgres 12 changed CTE optimization fences, when to use MATERIALIZED or NOT MATERIALIZED, and how to read EXPLAIN output to tell which behaviour you got."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: August 19, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# Postgres CTE: MATERIALIZED vs NOT MATERIALIZED
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="August 19, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+For eleven years, every common table expression in Postgres was an optimization fence. `WITH` meant "compute this completely, then use the result" — no predicate pushdown, no inlining, no negotiation. People exploited it deliberately to force a plan, and people were bitten by it constantly when a CTE they wrote for readability made their query ten times slower.
+
+Postgres 12 changed the default and added explicit keywords. If you have upgraded across that boundary, or inherited a codebase written on either side of it, understanding the change is worth the ten minutes.
+
+## The setup
+
+```sql
+CREATE TABLE orders (
+  id          bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  customer_id bigint NOT NULL,
+  amount      numeric(12,2) NOT NULL,
+  status      text   NOT NULL,
+  created_at  timestamptz NOT NULL DEFAULT now()
+);
+
+INSERT INTO orders (customer_id, amount, status, created_at)
+SELECT
+  1 + (random() * 100000)::bigint,
+  (random() * 1000)::numeric(12,2),
+  (ARRAY['paid','pending','refunded'])[1 + (floor(random() * 3))::int],
+  now() - (random() * interval '400 days')
+FROM generate_series(1, 5000000);
+
+CREATE INDEX orders_customer_idx ON orders (customer_id);
+CREATE INDEX orders_created_idx  ON orders (created_at);
+ANALYZE orders;
+```
+
+Five million rows, indexed on the two columns we will filter by.
+
+## The behaviour that changed
+
+Consider a query that wraps a table in a CTE and then filters it:
+
+```sql
+WITH recent AS (
+  SELECT * FROM orders WHERE created_at > now() - interval '30 days'
+)
+SELECT * FROM recent WHERE customer_id = 42;
+```
+
+**On Postgres 11 and earlier**, this executes in two distinct steps. The CTE runs first, materialising every order from the last thirty days into memory or a temp file — hundreds of thousands of rows. Only then does the outer query filter for `customer_id = 42`, throwing away almost all of that work. The `orders_customer_idx` index is never touched, because at the time the CTE runs, Postgres does not know you only want one customer.
+
+**On Postgres 12 and later**, the planner inlines the CTE. The query becomes equivalent to:
+
+```sql
+SELECT * FROM orders
+WHERE created_at > now() - interval '30 days'
+  AND customer_id = 42;
+```
+
+Now both predicates are available to the planner at once, and it can use an index scan on `customer_id` and check the date on the retrieved rows. The difference on a table this size is between milliseconds and seconds.
+
+## The inlining rules
+
+Postgres 12+ inlines a CTE automatically when **all** of these hold:
+
+1. It is referenced **exactly once** in the query.
+2. It is not recursive (`WITH RECURSIVE`).
+3. It has no side effects — no `INSERT`, `UPDATE`, `DELETE` or volatile functions.
+
+If a CTE is referenced twice, Postgres materialises it, on the reasonable assumption that computing it once beats computing it twice. If it contains a volatile function such as `random()` or `nextval()`, inlining could change how many times that function runs, so Postgres refuses.
+
+## The explicit keywords
+
+You can override the default in either direction.
+
+### NOT MATERIALIZED — force inlining
+
+```sql
+WITH recent AS NOT MATERIALIZED (
+  SELECT * FROM orders WHERE created_at > now() - interval '30 days'
+)
+SELECT r1.customer_id, count(*)
+FROM recent r1
+JOIN recent r2 ON r2.customer_id = r1.customer_id
+WHERE r1.customer_id = 42
+GROUP BY r1.customer_id;
+```
+
+Referenced twice, so the default would materialise. `NOT MATERIALIZED` forces inlining anyway, which is the right call here because the `customer_id = 42` filter is enormously selective — inlining it into both references costs far less than materialising the full thirty-day window once.
+
+`NOT MATERIALIZED` cannot override the hard rules: recursive CTEs and CTEs with side effects are still materialised regardless.
+
+### MATERIALIZED — force the fence
+
+```sql
+WITH expensive AS MATERIALIZED (
+  SELECT
+    customer_id,
+    sum(amount)          AS total,
+    count(*)             AS order_count,
+    percentile_cont(0.5) WITHIN GROUP (ORDER BY amount) AS median_amount
+  FROM orders
+  WHERE status = 'paid'
+  GROUP BY customer_id
+)
+SELECT * FROM expensive WHERE total > 10000 ORDER BY total DESC;
+```
+
+Here the CTE is referenced once, so Postgres 12+ would inline it by default. `MATERIALIZED` tells it not to. The percentile calculation is expensive and there is no way to push `total > 10000` into it usefully — the aggregate must complete before the filter can apply. Materialising makes the intent explicit and guards against a planner decision that reorders things unhelpfully.
+
+## Reading EXPLAIN to tell which you got
+
+The tell is a `CTE Scan` node.
+
+```sql
+EXPLAIN (ANALYZE, BUFFERS)
+WITH recent AS (
+  SELECT * FROM orders WHERE created_at > now() - interval '30 days'
+)
+SELECT * FROM recent WHERE customer_id = 42;
+```
+
+Inlined output has no CTE node at all — the predicates appear merged in a single scan:
+
+```
+Index Scan using orders_customer_idx on orders
+  Index Cond: (customer_id = 42)
+  Filter: (created_at > (now() - '30 days'::interval))
+```
+
+Materialised output shows the fence explicitly:
+
+```
+CTE Scan on recent  (actual rows=3 loops=1)
+  Filter: (customer_id = 42)
+  Rows Removed by Filter: 374218
+  CTE recent
+    ->  Seq Scan on orders  (actual rows=374221 loops=1)
+          Filter: (created_at > (now() - '30 days'::interval))
+```
+
+`Rows Removed by Filter: 374218` on a `CTE Scan` is the signature of the problem: the CTE produced 374,221 rows and the outer query discarded all but three of them.
+
+## When materialising is the right answer
+
+The Postgres 12 default is correct most of the time, but not always.
+
+**Aggregations followed by selective filters.** As in the `expensive` example above: the aggregate must run to completion anyway, so materialising costs nothing and keeps the plan predictable.
+
+**CTEs referenced multiple times where the underlying query is expensive.** This is the default behaviour, and you should leave it alone unless the outer filters are highly selective.
+
+**Volatile functions you want evaluated exactly once.**
+
+```sql
+WITH sample AS MATERIALIZED (
+  SELECT id, random() AS r FROM orders WHERE status = 'pending'
+)
+SELECT * FROM sample WHERE r < 0.01;
+```
+
+Postgres would materialise this anyway because of `random()`, but stating it removes any doubt for a future reader.
+
+**Breaking a planner misestimate.** Occasionally the planner's row estimate for an inlined subquery is badly wrong and produces a nested loop over millions of rows. Materialising forces it to work with a known row count. Treat this as a last resort — verify with `EXPLAIN ANALYZE` that the estimate really is the problem before reaching for it.
+
+## When to force inlining
+
+**Simple filters and projections used for readability.** A CTE that just renames columns or restricts a table should always inline.
+
+**Multi-reference CTEs where outer predicates are very selective**, as in the `NOT MATERIALIZED` example above.
+
+**Chained CTEs building up a query step by step.** This style reads well and, since Postgres 12, usually plans well too:
+
+```sql
+WITH paid AS NOT MATERIALIZED (
+  SELECT * FROM orders WHERE status = 'paid'
+),
+recent_paid AS NOT MATERIALIZED (
+  SELECT * FROM paid WHERE created_at > now() - interval '7 days'
+)
+SELECT customer_id, sum(amount)
+FROM recent_paid
+WHERE customer_id BETWEEN 1000 AND 2000
+GROUP BY customer_id;
+```
+
+Every predicate collapses into one scan. Written as nested subqueries this would be far harder to read for identical performance.
+
+## CTE versus subquery versus temp table
+
+Since Postgres 12, a single-reference CTE and an equivalent subquery plan identically. Choose on readability:
+
+```sql
+-- These produce the same plan on Postgres 12+
+WITH recent AS (SELECT * FROM orders WHERE created_at > now() - interval '1 day')
+SELECT count(*) FROM recent WHERE status = 'paid';
+
+SELECT count(*) FROM (
+  SELECT * FROM orders WHERE created_at > now() - interval '1 day'
+) recent
+WHERE status = 'paid';
+```
+
+A temp table is a different tool. It persists across statements in the session, can be indexed, and gets its own statistics — which matters when the intermediate result is large and you need the planner to reason about it accurately:
+
+```sql
+CREATE TEMP TABLE customer_totals AS
+SELECT customer_id, sum(amount) AS total
+FROM orders WHERE status = 'paid'
+GROUP BY customer_id;
+
+CREATE INDEX ON customer_totals (total);
+ANALYZE customer_totals;
+
+SELECT * FROM customer_totals WHERE total > 50000 ORDER BY total DESC LIMIT 100;
+```
+
+The `ANALYZE` is what a materialised CTE cannot give you. If the planner keeps misjudging an intermediate result, a temp table is often the real fix.
+
+## Recursive CTEs are always materialised
+
+`WITH RECURSIVE` is never inlined, and `NOT MATERIALIZED` on one is an error. This is inherent — the recursive term references the working table, which only exists because the CTE is being materialised iteratively.
+
+```sql
+CREATE TABLE categories (
+  id        bigint PRIMARY KEY,
+  parent_id bigint REFERENCES categories(id),
+  name      text NOT NULL
+);
+
+WITH RECURSIVE tree AS (
+  SELECT id, parent_id, name, 1 AS depth, name::text AS path
+  FROM categories WHERE parent_id IS NULL
+
+  UNION ALL
+
+  SELECT c.id, c.parent_id, c.name, t.depth + 1, t.path || ' > ' || c.name
+  FROM categories c
+  JOIN tree t ON c.parent_id = t.id
+  WHERE t.depth < 10          -- always bound the recursion
+)
+SELECT * FROM tree ORDER BY path;
+```
+
+The `depth < 10` guard matters. A cycle in the data — a category that is its own ancestor — produces infinite recursion without it. For untrusted hierarchies, track the visited path and stop on repeats:
+
+```sql
+WITH RECURSIVE tree AS (
+  SELECT id, parent_id, name, ARRAY[id] AS visited
+  FROM categories WHERE parent_id IS NULL
+
+  UNION ALL
+
+  SELECT c.id, c.parent_id, c.name, t.visited || c.id
+  FROM categories c
+  JOIN tree t ON c.parent_id = t.id
+  WHERE NOT c.id = ANY(t.visited)
+)
+SELECT * FROM tree;
+```
+
+Postgres 14 added `CYCLE` and `SEARCH` clauses that express this declaratively:
+
+```sql
+WITH RECURSIVE tree AS (
+  SELECT id, parent_id, name FROM categories WHERE parent_id IS NULL
+  UNION ALL
+  SELECT c.id, c.parent_id, c.name
+  FROM categories c JOIN tree t ON c.parent_id = t.id
+) CYCLE id SET is_cycle USING cycle_path
+SELECT * FROM tree WHERE NOT is_cycle;
+```
+
+## Upgrade checklist
+
+If you are moving from Postgres 11 or earlier to 12+:
+
+1. **Find CTEs relied on as fences.** Search for `WITH` in your codebase and look for cases where a comment or a commit message mentions forcing a plan.
+2. **Check queries that got slower after the upgrade.** Inlining is usually a win, but a CTE that was deliberately fencing a bad estimate may now plan worse. Adding `MATERIALIZED` restores the old behaviour exactly.
+3. **Be explicit in new code.** Writing `AS MATERIALIZED` or `AS NOT MATERIALIZED` documents the intent, and the query behaves the same regardless of which version it lands on.
+
+Comparing plans across both forms is the only reliable way to decide. [Chat2DB](https://chat2db.ai/download) shows execution plans as a readable tree with row counts and timings per node, which makes spotting a `CTE Scan` with a huge `Rows Removed by Filter` considerably quicker than reading nested text output.
+
+## Summary
+
+Before Postgres 12, every CTE was an optimization fence. From 12 onwards, a CTE that is referenced once, is not recursive and has no side effects gets inlined, letting predicates push down into it.
+
+Use `NOT MATERIALIZED` to force inlining when a multi-reference CTE has a highly selective outer filter. Use `MATERIALIZED` when the CTE performs an expensive aggregate that must complete anyway, when a volatile function should run exactly once, or when a planner misestimate needs bounding. Check `EXPLAIN` for a `CTE Scan` node with a large `Rows Removed by Filter` — that is the fence costing you.

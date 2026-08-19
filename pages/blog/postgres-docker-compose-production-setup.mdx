@@ -1,0 +1,401 @@
+---
+title: "PostgreSQL Docker Compose: A Production-Shaped Setup"
+description: "A PostgreSQL docker-compose.yml that holds up beyond localhost: named volumes, healthchecks, init scripts, tuning flags, backups and costly mistakes."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: August 19, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# PostgreSQL Docker Compose: A Production-Shaped Setup
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="August 19, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+The three-line `docker-compose.yml` that every tutorial opens with will start Postgres. It will also lose your data on the first `docker compose down`, let your application connect before the database is ready, and silently run with defaults tuned for a machine with 128 MB of RAM.
+
+This walks through a compose file that holds up beyond a laptop demo, explaining each part rather than just presenting it.
+
+## The minimal version, and what is wrong with it
+
+```yaml
+services:
+  db:
+    image: postgres
+    environment:
+      POSTGRES_PASSWORD: password
+    ports:
+      - "5432:5432"
+```
+
+Four problems, in descending order of severity:
+
+1. **No volume.** All data lives in the container's writable layer. `docker compose down` removes the container and the data with it.
+2. **`image: postgres`** with no tag means `latest`. A `docker compose pull` months later can jump a major version, and Postgres refuses to start on a data directory from an older major — with an error that looks like corruption if you do not know what you are reading.
+3. **No healthcheck.** Dependent services start as soon as the container starts, which is well before Postgres accepts connections.
+4. **A password in the file**, committed to version control.
+
+## The full version
+
+```yaml
+services:
+  db:
+    image: postgres:17-alpine
+    container_name: app-postgres
+    restart: unless-stopped
+
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_INITDB_ARGS: "--encoding=UTF8 --locale=C --data-checksums"
+      TZ: UTC
+
+    ports:
+      - "127.0.0.1:5432:5432"
+
+    volumes:
+      - db_data:/var/lib/postgresql/data
+      - ./initdb:/docker-entrypoint-initdb.d:ro
+      - ./backups:/backups
+
+    command:
+      - postgres
+      - -c
+      - shared_buffers=2GB
+      - -c
+      - effective_cache_size=6GB
+      - -c
+      - maintenance_work_mem=512MB
+      - -c
+      - work_mem=16MB
+      - -c
+      - max_connections=100
+      - -c
+      - random_page_cost=1.1
+      - -c
+      - shared_preload_libraries=pg_stat_statements
+      - -c
+      - log_min_duration_statement=1000
+
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+    shm_size: 256mb
+
+    deploy:
+      resources:
+        limits:
+          memory: 8G
+
+  app:
+    image: myapp:latest
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB}
+
+volumes:
+  db_data:
+```
+
+With a `.env` alongside it, excluded from git:
+
+```bash
+POSTGRES_DB=app
+POSTGRES_USER=app
+POSTGRES_PASSWORD=a-real-generated-password
+```
+
+Now the reasoning behind each decision.
+
+## Named volumes, not bind mounts
+
+```yaml
+volumes:
+  - db_data:/var/lib/postgresql/data     # named volume — correct
+# - ./pgdata:/var/lib/postgresql/data    # bind mount — avoid
+```
+
+A named volume is managed by Docker and preserves the ownership and permissions the `postgres` user inside the container expects. Bind-mounting a host directory frequently breaks on macOS and Windows, where the shared filesystem does not implement the ownership model or the fsync semantics Postgres relies on — `initdb` may fail outright, or worse, appear to work while not honouring durability guarantees.
+
+Bind mounts remain right for things Postgres only reads or writes occasionally: init scripts, backup output, custom config files.
+
+Manage the volume explicitly:
+
+```bash
+docker volume ls
+docker volume inspect myproject_db_data
+
+# Removes the volume — this deletes the database
+docker compose down -v
+```
+
+That `-v` is the flag to be careful with. `docker compose down` alone keeps the volume; `down -v` destroys it.
+
+## Pin the major version
+
+```yaml
+image: postgres:17-alpine
+```
+
+Pin at least the major version. Postgres stores data in a format specific to its major version and refuses to start when the binary and the data directory disagree:
+
+```
+FATAL: database files are incompatible with server
+DETAIL: The data directory was initialized by PostgreSQL version 16,
+        which is not compatible with this version 17.
+```
+
+Upgrading a major version is a `pg_dump`/`pg_restore` cycle or a `pg_upgrade` run — never something you want triggered by an unplanned `docker compose pull`.
+
+The `-alpine` variant is roughly a third the size. If you need locale support beyond C or ICU collations, use the Debian-based default instead.
+
+## Bind the published port to localhost
+
+```yaml
+ports:
+  - "127.0.0.1:5432:5432"
+```
+
+Plain `"5432:5432"` binds to all interfaces. On a cloud VM that publishes your database to the internet, and — this catches people — Docker writes its own iptables rules that bypass UFW, so a host firewall that looks correct will not stop it.
+
+Prefixing `127.0.0.1:` restricts it to the host. Reach it remotely over an SSH tunnel:
+
+```bash
+ssh -L 5432:127.0.0.1:5432 user@server
+```
+
+Better still, if only other containers need access, publish nothing at all. Services on the same compose network reach Postgres at `db:5432` regardless of published ports.
+
+## The healthcheck and dependency ordering
+
+```yaml
+healthcheck:
+  test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+  interval: 10s
+  timeout: 5s
+  retries: 5
+  start_period: 30s
+```
+
+The `$$` is compose escaping: it passes a literal `$` through so the variable is expanded by the shell *inside* the container, where `POSTGRES_USER` is set, rather than by compose on the host.
+
+`start_period: 30s` matters on first boot — `initdb` plus any init scripts can take a while, and without a grace period the container gets marked unhealthy and restarted mid-initialisation.
+
+The dependency condition is what makes it useful:
+
+```yaml
+depends_on:
+  db:
+    condition: service_healthy
+```
+
+Plain `depends_on: [db]` only waits for the container to *start*. With `service_healthy`, dependents wait until `pg_isready` succeeds. This eliminates the "connection refused on first boot" retry loop that most applications carry.
+
+Do not rely on it exclusively, though. A database can restart later, so application-level connection retry is still required — the healthcheck just removes the predictable startup race.
+
+## Init scripts
+
+Anything in `/docker-entrypoint-initdb.d` runs on first start, in filename order, when the data directory is empty. `.sql`, `.sql.gz` and `.sh` files are all supported.
+
+```sql
+-- initdb/01-extensions.sql
+CREATE EXTENSION IF NOT EXISTS pg_stat_statements;
+CREATE EXTENSION IF NOT EXISTS pg_trgm;
+```
+
+```sql
+-- initdb/02-schema.sql
+CREATE TABLE users (
+  id         bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  email      citext UNIQUE NOT NULL,
+  created_at timestamptz NOT NULL DEFAULT now()
+);
+```
+
+```bash
+#!/bin/bash
+# initdb/03-readonly-user.sh
+set -e
+psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB" <<-EOSQL
+  CREATE ROLE readonly WITH LOGIN PASSWORD '${READONLY_PASSWORD}';
+  GRANT CONNECT ON DATABASE $POSTGRES_DB TO readonly;
+  GRANT USAGE ON SCHEMA public TO readonly;
+  GRANT SELECT ON ALL TABLES IN SCHEMA public TO readonly;
+  ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT ON TABLES TO readonly;
+EOSQL
+```
+
+The trap: **these run once and never again**. Add a table to `02-schema.sql` after the first start and nothing happens — no error, no warning. Init scripts are for bootstrapping a fresh environment; ongoing schema changes belong in a migration tool.
+
+To force a re-run during development:
+
+```bash
+docker compose down -v && docker compose up -d
+```
+
+## Tuning via command flags
+
+The default `shared_buffers` is 128 MB regardless of how much memory the host has. Passing `-c` flags is the cleanest way to override without mounting a config file:
+
+```yaml
+command:
+  - postgres
+  - -c
+  - shared_buffers=2GB
+  - -c
+  - effective_cache_size=6GB
+```
+
+Reasonable starting points for a dedicated database container:
+
+| Setting | Value | Why |
+| --- | --- | --- |
+| `shared_buffers` | 25% of container memory | Postgres's own page cache |
+| `effective_cache_size` | 50–75% of memory | A planner hint, not an allocation |
+| `maintenance_work_mem` | 5–10% of memory | Speeds `VACUUM` and index builds |
+| `work_mem` | 8–32 MB | **Per sort node**, not per connection |
+| `max_connections` | 100 or lower | Use a pooler beyond that |
+| `random_page_cost` | 1.1 | Correct for SSDs; the 4.0 default assumes spinning disks |
+
+`work_mem` deserves care: it applies per sort or hash operation, and a single complex query can use several simultaneously. Multiply it by `max_connections` and by a few operations per query before deciding.
+
+Cap container memory too, so Postgres cannot take the host down:
+
+```yaml
+deploy:
+  resources:
+    limits:
+      memory: 8G
+```
+
+And raise shared memory — the 64 MB Docker default causes `could not resize shared memory segment` errors during parallel queries:
+
+```yaml
+shm_size: 256mb
+```
+
+For extensive tuning, the [PostgreSQL config calculator](https://chat2db.ai/tools/postgres-config-calculator) generates a full parameter set from your RAM, cores and workload type. The [Docker Compose PostgreSQL generator](https://chat2db.ai/tools/docker-compose-postgres-generator) produces the compose file itself with these options already wired up.
+
+## Backups
+
+A volume is not a backup. Run `pg_dump` on a schedule:
+
+```bash
+#!/bin/bash
+# backup.sh
+set -euo pipefail
+STAMP=$(date +%Y%m%d-%H%M%S)
+docker compose exec -T db \
+  pg_dump -U "$POSTGRES_USER" -d "$POSTGRES_DB" -Fc \
+  > "./backups/app-${STAMP}.dump"
+
+# Keep 14 days
+find ./backups -name 'app-*.dump' -mtime +14 -delete
+```
+
+`-T` disables TTY allocation, which matters when running from cron. `-Fc` produces the custom format — compressed, and restorable selectively:
+
+```bash
+# Full restore
+docker compose exec -T db \
+  pg_restore -U "$POSTGRES_USER" -d "$POSTGRES_DB" --clean --if-exists < backup.dump
+
+# One table
+docker compose exec -T db \
+  pg_restore -U "$POSTGRES_USER" -d "$POSTGRES_DB" -t users < backup.dump
+```
+
+Test the restore path periodically. An untested backup is a hypothesis.
+
+## Extension images
+
+Swap the base image when you need extensions that are not bundled:
+
+```yaml
+# Vector search
+image: pgvector/pgvector:pg17
+
+# Geospatial
+image: postgis/postgis:17-3.4-alpine
+
+# Time series
+image: timescale/timescaledb:latest-pg17
+```
+
+Each still requires `CREATE EXTENSION` in an init script — the image supplies the binaries, not the activation.
+
+## Development conveniences
+
+pgAdmin, waiting for a healthy database:
+
+```yaml
+  pgadmin:
+    image: dpage/pgadmin4:latest
+    restart: unless-stopped
+    environment:
+      PGADMIN_DEFAULT_EMAIL: admin@example.com
+      PGADMIN_DEFAULT_PASSWORD: ${PGADMIN_PASSWORD}
+      PGADMIN_CONFIG_SERVER_MODE: "False"
+    ports:
+      - "127.0.0.1:5050:80"
+    volumes:
+      - pgadmin_data:/var/lib/pgadmin
+    depends_on:
+      db:
+        condition: service_healthy
+
+volumes:
+  db_data:
+  pgadmin_data:
+```
+
+For a desktop client instead, [Chat2DB](https://chat2db.ai/download) connects to the published port on Windows, macOS and Linux, and handles the other databases in your compose file too.
+
+## Everyday commands
+
+```bash
+docker compose up -d
+docker compose ps                      # health status is shown here
+docker compose logs -f db
+docker compose exec db psql -U app -d app
+
+# Watch active queries
+docker compose exec db psql -U app -d app \
+  -c "SELECT pid, state, wait_event, left(query,60) FROM pg_stat_activity WHERE state <> 'idle'"
+
+docker compose restart db              # config changes needing a restart
+docker compose down                    # stop, keep data
+docker compose down -v                 # stop, DELETE data
+```
+
+## The mistakes worth avoiding
+
+**Bind-mounting the data directory.** Breaks on macOS and Windows; use a named volume.
+
+**Using `image: postgres` untagged.** An unplanned major upgrade means downtime and a migration.
+
+**Publishing on `0.0.0.0`.** Docker's iptables rules bypass UFW, so your firewall will not save you.
+
+**Expecting init scripts to re-run.** They run once, on an empty data directory, silently skipped thereafter.
+
+**Leaving `shared_buffers` at 128 MB.** The default is sized for a machine far smaller than yours.
+
+**Treating the volume as a backup.** Run `pg_dump` on a schedule and test restores.
+
+**Forgetting `shm_size`.** Parallel queries fail with shared memory errors under the 64 MB default.
+
+## Summary
+
+A Postgres compose file that holds up needs six things: a named volume for data, a pinned major version, a healthcheck with `service_healthy` dependencies, credentials in a `.env` file, tuning flags sized to the container, and a scheduled `pg_dump` going somewhere off the host.
+
+Init scripts bootstrap a fresh environment and never run again — migrations belong in a migration tool. And bind the published port to `127.0.0.1` unless you have a specific reason not to, because Docker's networking will happily route around your firewall.

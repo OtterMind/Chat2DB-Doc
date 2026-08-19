@@ -1,0 +1,264 @@
+---
+title: "Postgres View vs Materialized View: When to Use Each"
+description: "Compare Postgres views, materialized views and plain tables: what each stores, what they cost to query and refresh, and how to pick the right one."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: August 19, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# Postgres View vs Materialized View: When to Use Each
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="August 19, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+A view and a materialized view look almost identical in DDL — one extra keyword separates them — but they behave nothing alike. A view is a saved query that runs every time you touch it. A materialized view is a saved *result*, stored on disk, that goes stale the moment the underlying data changes. Picking the wrong one gives you either a dashboard that takes 40 seconds to load, or numbers that are quietly six hours out of date.
+
+This guide walks through what each one actually stores, how they perform, where a plain table beats both, and how to decide.
+
+## Setting up a test schema
+
+Everything below runs against this schema. It is small enough to paste into a scratch database and big enough to show the difference.
+
+```sql
+CREATE TABLE customers (
+  id      bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  name    text NOT NULL,
+  country text NOT NULL,
+  tier    text NOT NULL DEFAULT 'standard'
+);
+
+CREATE TABLE orders (
+  id          bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  customer_id bigint NOT NULL REFERENCES customers(id),
+  amount      numeric(12,2) NOT NULL,
+  status      text NOT NULL,
+  created_at  timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE INDEX ON orders (customer_id);
+CREATE INDEX ON orders (created_at);
+```
+
+Fill it with enough rows that the difference is visible rather than theoretical:
+
+```sql
+INSERT INTO customers (name, country, tier)
+SELECT
+  'Customer ' || g,
+  (ARRAY['US','DE','JP','BR','IN'])[1 + (g % 5)],
+  (ARRAY['standard','pro','enterprise'])[1 + (g % 3)]
+FROM generate_series(1, 50000) AS g;
+
+INSERT INTO orders (customer_id, amount, status, created_at)
+SELECT
+  1 + (random() * 49999)::bigint,
+  (random() * 500)::numeric(12,2),
+  (ARRAY['paid','pending','refunded'])[1 + (floor(random() * 3))::int],
+  now() - (random() * interval '365 days')
+FROM generate_series(1, 3000000);
+
+ANALYZE customers;
+ANALYZE orders;
+```
+
+That is three million orders across fifty thousand customers — a realistic size for the kind of aggregate that tempts people into materializing.
+
+## What a view actually is
+
+A view stores no data at all. It stores a parsed query tree. When you select from it, Postgres rewrites your query by substituting the view definition inline, then plans the combined result as a single query.
+
+```sql
+CREATE VIEW customer_revenue AS
+SELECT
+  c.id,
+  c.name,
+  c.country,
+  count(o.id)            AS order_count,
+  coalesce(sum(o.amount), 0) AS lifetime_value
+FROM customers c
+LEFT JOIN orders o
+  ON o.customer_id = c.id
+ AND o.status = 'paid'
+GROUP BY c.id, c.name, c.country;
+```
+
+Query it and Postgres aggregates three million rows, every single time:
+
+```sql
+EXPLAIN ANALYZE
+SELECT * FROM customer_revenue WHERE country = 'DE';
+```
+
+The important detail is that `WHERE country = 'DE'` is **pushed down into** the view. Postgres does not build the whole result and then filter it; the planner folds your predicate into the underlying scan. That is why a view over a well-indexed table is often perfectly fast — you are not paying for rows you did not ask for.
+
+Where views fall down is aggregation that cannot be pushed down. The `GROUP BY` above has to run before the outer filter can apply to grouped columns, so a query filtering on `lifetime_value > 1000` reads everything regardless.
+
+### Views are always current
+
+Because the query runs on every access, a view can never be stale. That is its single biggest advantage, and it is not a small one — it removes an entire category of "why does the dashboard disagree with the admin panel" bugs.
+
+## What a materialized view actually is
+
+A materialized view runs its query once, at creation, and writes the result to a physical relation on disk. Subsequent queries read those stored rows like a table.
+
+```sql
+CREATE MATERIALIZED VIEW customer_revenue_mv AS
+SELECT
+  c.id,
+  c.name,
+  c.country,
+  count(o.id)            AS order_count,
+  coalesce(sum(o.amount), 0) AS lifetime_value
+FROM customers c
+LEFT JOIN orders o
+  ON o.customer_id = c.id
+ AND o.status = 'paid'
+GROUP BY c.id, c.name, c.country;
+```
+
+Now the aggregate cost is paid once instead of per query. On the dataset above, the initial build takes seconds; reading from it afterwards is a scan of fifty thousand rows.
+
+Crucially, you can index a materialized view, which you cannot meaningfully do to a plain view:
+
+```sql
+CREATE UNIQUE INDEX customer_revenue_mv_id_idx
+  ON customer_revenue_mv (id);
+
+CREATE INDEX customer_revenue_mv_country_idx
+  ON customer_revenue_mv (country);
+
+CREATE INDEX customer_revenue_mv_ltv_idx
+  ON customer_revenue_mv (lifetime_value DESC);
+```
+
+That last index is the whole point. `ORDER BY lifetime_value DESC LIMIT 20` against the view re-aggregates three million rows and sorts the result. Against the indexed materialized view it is an index scan returning twenty rows.
+
+### The cost: it is stale immediately
+
+The moment a new order lands, the materialized view is wrong. Postgres does not track this for you and will not warn you. You refresh it explicitly:
+
+```sql
+REFRESH MATERIALIZED VIEW customer_revenue_mv;
+```
+
+This takes an `ACCESS EXCLUSIVE` lock, which blocks every reader for the duration of the rebuild. On a user-facing table that is usually unacceptable, which is why the concurrent variant exists:
+
+```sql
+REFRESH MATERIALIZED VIEW CONCURRENTLY customer_revenue_mv;
+```
+
+`CONCURRENTLY` requires a unique index on the materialized view — the one we created above. It lets readers keep querying during the refresh, at the cost of being noticeably slower overall because Postgres builds the new result and then computes a row-by-row diff.
+
+## The three-way comparison
+
+| | View | Materialized view | Table |
+| --- | --- | --- | --- |
+| Stores data | No | Yes | Yes |
+| Always current | Yes | No — needs refresh | Depends on writes |
+| Can be indexed | Not directly | Yes | Yes |
+| Query cost | Full underlying query | Read stored rows | Read stored rows |
+| Write cost | None | Refresh cost | Normal DML cost |
+| Disk usage | Zero | Size of result set | Size of data |
+| Can be written to | Sometimes, with rules or triggers | No | Yes |
+| Survives restart | Definition only | Data and definition | Data and definition |
+
+### Materialized view vs table
+
+This one confuses people, because a materialized view *is* physically a table plus a stored query. The differences that matter in practice:
+
+- You cannot `INSERT`, `UPDATE` or `DELETE` a materialized view. The only way to change its contents is `REFRESH`, which rebuilds all of it.
+- A materialized view remembers how to rebuild itself. A table populated by an ETL job depends on that job existing somewhere else.
+- `REFRESH` is all-or-nothing. If you need to update just yesterday's partition of a rollup, a real table with a scheduled incremental `INSERT ... ON CONFLICT` is the right tool — a materialized view has no incremental mode.
+
+That last point is the honest limit of materialized views in Postgres. There is no built-in incremental maintenance. If your rollup covers years of data and only the last day ever changes, rebuilding the whole thing every hour is wasteful, and a summary table with an incremental upsert will beat it comfortably:
+
+```sql
+CREATE TABLE daily_revenue (
+  day     date NOT NULL,
+  country text NOT NULL,
+  revenue numeric(14,2) NOT NULL,
+  PRIMARY KEY (day, country)
+);
+
+INSERT INTO daily_revenue (day, country, revenue)
+SELECT
+  date_trunc('day', o.created_at)::date,
+  c.country,
+  sum(o.amount)
+FROM orders o
+JOIN customers c ON c.id = o.customer_id
+WHERE o.status = 'paid'
+  AND o.created_at >= current_date - 1
+GROUP BY 1, 2
+ON CONFLICT (day, country)
+DO UPDATE SET revenue = EXCLUDED.revenue;
+```
+
+## How to decide
+
+Work through these in order.
+
+**Use a plain view when** the query is cheap once your indexes are right, or when correctness matters more than latency. Views also earn their keep purely as an abstraction: hiding a five-table join behind a name, or exposing a filtered subset of a table for row-level access control. A view that exists only to stop people rewriting the same join is a good view even if it saves no time.
+
+**Use a materialized view when** all of these hold: the query is genuinely expensive, the result set is much smaller than the input, and your users can tolerate data that is minutes or hours old. Reporting dashboards, search indexes and leaderboards all fit. Anything where a user performs an action and expects to see it reflected immediately does not.
+
+**Use a table when** you need incremental updates, writes, or retention rules that differ from the source. Rollups that only ever change at the tail belong here.
+
+A common and effective pattern is to combine them: a materialized view for the heavy aggregate, and a thin view on top that joins it to live data for the small part that must be current.
+
+```sql
+CREATE VIEW customer_dashboard AS
+SELECT
+  mv.id,
+  mv.name,
+  mv.country,
+  mv.lifetime_value,          -- from the materialized view, refreshed hourly
+  recent.pending_count        -- computed live, always current
+FROM customer_revenue_mv mv
+LEFT JOIN LATERAL (
+  SELECT count(*) AS pending_count
+  FROM orders o
+  WHERE o.customer_id = mv.id
+    AND o.status = 'pending'
+) recent ON true;
+```
+
+## Operational details worth knowing
+
+**A materialized view is empty until built.** `CREATE MATERIALIZED VIEW ... WITH NO DATA` creates the definition without running the query, which is useful in migrations where you want to build it out of band. Querying it before the first refresh raises an error rather than returning zero rows.
+
+**Check staleness explicitly.** Postgres does not record when a materialized view was last refreshed, so track it yourself:
+
+```sql
+CREATE TABLE mv_refresh_log (
+  mv_name      text PRIMARY KEY,
+  refreshed_at timestamptz NOT NULL
+);
+```
+
+Update that row inside the same transaction as the refresh, and your dashboard can display "as of 14:05" instead of implying the number is live.
+
+**Dropping the source cascades.** `DROP TABLE orders` fails while a view or materialized view depends on it. `DROP TABLE orders CASCADE` silently takes the views with it. Check dependencies first:
+
+```sql
+SELECT dependent.relname, dependent.relkind
+FROM pg_depend d
+JOIN pg_rewrite r    ON r.oid = d.objid
+JOIN pg_class dependent ON dependent.oid = r.ev_class
+JOIN pg_class source    ON source.oid = d.refobjid
+WHERE source.relname = 'orders'
+  AND dependent.relname <> 'orders';
+```
+
+**Altering a view's columns is restrictive.** `CREATE OR REPLACE VIEW` can add columns at the end but cannot remove or reorder them, or change their types. Anything more invasive means dropping and recreating, which cascades to dependent objects.
+
+If you are comparing plans across views and materialized views regularly, [Chat2DB](https://chat2db.ai/download) shows query results and execution plans side by side and can generate the aggregate SQL from a plain-language description, which shortens the loop between "this dashboard is slow" and "here is the rollup that fixes it".
+
+## Summary
+
+A view is a stored query: always fresh, zero storage, and no help at all when the underlying query is expensive. A materialized view is a stored result: fast to read, indexable, and stale until you refresh it. A table is what you reach for when the rollup needs incremental updates that `REFRESH` cannot express.
+
+Start with a view. Move to a materialized view only when you have measured the query and confirmed staleness is acceptable. Move to a table when full rebuilds start costing more than the queries they were meant to save.

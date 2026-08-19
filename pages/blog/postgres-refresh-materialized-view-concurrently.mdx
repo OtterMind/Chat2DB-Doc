@@ -1,0 +1,307 @@
+---
+title: "REFRESH MATERIALIZED VIEW CONCURRENTLY in Postgres"
+description: "How REFRESH MATERIALIZED VIEW CONCURRENTLY works, the unique index it needs, why it is slower, and how to schedule refreshes without blocking readers."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: August 19, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# REFRESH MATERIALIZED VIEW CONCURRENTLY in Postgres
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="August 19, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+The first time a materialized view refresh takes down your dashboard, you learn something the documentation states plainly but nobody reads until it hurts: a plain `REFRESH MATERIALIZED VIEW` takes an `ACCESS EXCLUSIVE` lock. Every reader blocks until the rebuild finishes. If that rebuild takes ninety seconds, your API returns timeouts for ninety seconds.
+
+`REFRESH MATERIALIZED VIEW CONCURRENTLY` solves that, with conditions attached. This guide covers what those conditions are, what the concurrent path actually does under the hood, why it is slower in wall-clock terms, and how to schedule it safely.
+
+## The problem, demonstrated
+
+Build a materialized view over a reasonably large table:
+
+```sql
+CREATE TABLE events (
+  id         bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  user_id    bigint NOT NULL,
+  event_type text   NOT NULL,
+  payload    jsonb  NOT NULL DEFAULT '{}',
+  created_at timestamptz NOT NULL DEFAULT now()
+);
+
+INSERT INTO events (user_id, event_type, created_at)
+SELECT
+  1 + (random() * 100000)::bigint,
+  (ARRAY['view','click','purchase','signup'])[1 + (floor(random() * 4))::int],
+  now() - (random() * interval '90 days')
+FROM generate_series(1, 5000000);
+
+CREATE MATERIALIZED VIEW user_activity AS
+SELECT
+  user_id,
+  count(*)                                        AS event_count,
+  count(*) FILTER (WHERE event_type = 'purchase') AS purchases,
+  max(created_at)                                 AS last_seen
+FROM events
+GROUP BY user_id;
+```
+
+Now open two sessions. In the first:
+
+```sql
+REFRESH MATERIALIZED VIEW user_activity;
+```
+
+In the second, while that runs:
+
+```sql
+SELECT * FROM user_activity WHERE user_id = 42;
+```
+
+The second session hangs. Confirm what it is waiting on from a third session:
+
+```sql
+SELECT pid, wait_event_type, wait_event, state,
+       left(query, 60) AS query
+FROM pg_stat_activity
+WHERE state <> 'idle';
+```
+
+You will see the `SELECT` in `Lock` / `relation` wait state. This is not a slow query — it is a blocked one.
+
+## The fix and its one requirement
+
+```sql
+REFRESH MATERIALIZED VIEW CONCURRENTLY user_activity;
+```
+
+Run this against the view as created above and Postgres refuses:
+
+```
+ERROR:  cannot refresh materialized view "public.user_activity" concurrently
+HINT:  Create a unique index with no WHERE clause on one or more columns of the materialized view.
+```
+
+The concurrent path works by computing the new result, diffing it against the current contents, and applying only the differences. To diff two row sets it needs a stable way to match a new row to an old row. That is what the unique index provides.
+
+```sql
+CREATE UNIQUE INDEX user_activity_user_id_idx
+  ON user_activity (user_id);
+```
+
+The requirements on that index are specific:
+
+- It must be **unique**.
+- It must be a **plain** index — no `WHERE` clause, so no partial indexes.
+- It must cover columns of the materialized view, and those columns must be genuinely unique across every row.
+
+If your view has no naturally unique column, build one from the grouping columns:
+
+```sql
+CREATE UNIQUE INDEX daily_stats_pk
+  ON daily_stats (day, country, product_id);
+```
+
+A multi-column unique index is fine. What is not fine is a view where duplicates exist — the index creation itself will fail, which is a useful signal that your `GROUP BY` is not as unique as you assumed.
+
+With the index in place, the refresh runs and readers keep working:
+
+```sql
+REFRESH MATERIALIZED VIEW CONCURRENTLY user_activity;
+```
+
+## What concurrent refresh actually does
+
+Understanding the mechanism explains every one of its trade-offs. Postgres:
+
+1. Creates a temporary relation and runs the view's defining query into it. **This is the full query — nothing is skipped.**
+2. Diffs the temporary relation against the existing materialized view, using the unique index to match rows.
+3. Applies the differences as ordinary `INSERT`, `UPDATE` and `DELETE` operations inside a transaction.
+4. Drops the temporary relation.
+
+Two consequences follow directly.
+
+**It is slower, not faster.** You pay for the full query *plus* a diff *plus* row-level DML. On a view where most rows change every cycle, concurrent refresh can take two to three times as long as the plain form. What you buy with that time is availability, not throughput.
+
+**It generates WAL proportional to the changes.** A plain refresh replaces the whole relation. A concurrent refresh writes individual row changes, which means more WAL, more work for replication, and more for autovacuum to clean up afterwards. On a view where nearly everything changes, that is a lot of dead tuples:
+
+```sql
+SELECT relname, n_live_tup, n_dead_tup, last_autovacuum
+FROM pg_stat_user_tables
+WHERE relname = 'user_activity';
+```
+
+If `n_dead_tup` climbs steadily between refreshes, tune autovacuum for that relation specifically:
+
+```sql
+ALTER MATERIALIZED VIEW user_activity SET (
+  autovacuum_vacuum_scale_factor = 0.05,
+  autovacuum_vacuum_cost_delay   = 0
+);
+```
+
+**It still takes a lock — just a weaker one.** Concurrent refresh acquires `EXCLUSIVE`, which permits `SELECT` but blocks other writes to the materialized view, including a second concurrent refresh. Two overlapping refresh jobs will queue, not run in parallel.
+
+## Preventing overlapping refreshes
+
+The failure mode nobody plans for: a refresh scheduled every five minutes that starts taking six minutes. Jobs pile up, each waiting on the last, and the queue grows without bound.
+
+An advisory lock is the clean fix, because it is non-blocking and released automatically when the session ends:
+
+```sql
+CREATE OR REPLACE FUNCTION refresh_user_activity()
+RETURNS boolean
+LANGUAGE plpgsql
+AS $$
+BEGIN
+  -- 1234567 is an arbitrary but fixed key for this particular job
+  IF NOT pg_try_advisory_lock(1234567) THEN
+    RAISE NOTICE 'refresh already running, skipping';
+    RETURN false;
+  END IF;
+
+  REFRESH MATERIALIZED VIEW CONCURRENTLY user_activity;
+
+  PERFORM pg_advisory_unlock(1234567);
+  RETURN true;
+EXCEPTION
+  WHEN OTHERS THEN
+    PERFORM pg_advisory_unlock(1234567);
+    RAISE;
+END;
+$$;
+```
+
+Note the exception handler. Without it, an error mid-refresh leaves the advisory lock held for the life of the session, and every subsequent run silently skips.
+
+## Scheduling it
+
+With `pg_cron` installed, scheduling lives in the database:
+
+```sql
+CREATE EXTENSION IF NOT EXISTS pg_cron;
+
+SELECT cron.schedule(
+  'refresh-user-activity',
+  '*/15 * * * *',
+  $$SELECT refresh_user_activity()$$
+);
+```
+
+Check on it:
+
+```sql
+SELECT jobid, jobname, schedule, active FROM cron.job;
+
+SELECT jobid, status, return_message, start_time, end_time
+FROM cron.job_run_details
+ORDER BY start_time DESC
+LIMIT 10;
+```
+
+Without `pg_cron` — which managed services sometimes do not offer — a systemd timer or any external scheduler calling `psql` works equally well:
+
+```bash
+psql "$DATABASE_URL" -c "SELECT refresh_user_activity()"
+```
+
+## Tracking freshness
+
+Postgres records nothing about when a materialized view was last refreshed. Track it yourself so consumers can display it honestly:
+
+```sql
+CREATE TABLE mv_refresh_log (
+  mv_name        text PRIMARY KEY,
+  refreshed_at   timestamptz NOT NULL,
+  duration_ms    integer     NOT NULL,
+  rows_after     bigint
+);
+```
+
+Fold it into the refresh function:
+
+```sql
+CREATE OR REPLACE FUNCTION refresh_user_activity()
+RETURNS boolean
+LANGUAGE plpgsql
+AS $$
+DECLARE
+  started  timestamptz := clock_timestamp();
+  row_cnt  bigint;
+BEGIN
+  IF NOT pg_try_advisory_lock(1234567) THEN
+    RETURN false;
+  END IF;
+
+  REFRESH MATERIALIZED VIEW CONCURRENTLY user_activity;
+
+  SELECT count(*) INTO row_cnt FROM user_activity;
+
+  INSERT INTO mv_refresh_log (mv_name, refreshed_at, duration_ms, rows_after)
+  VALUES (
+    'user_activity',
+    clock_timestamp(),
+    extract(milliseconds FROM clock_timestamp() - started)::integer,
+    row_cnt
+  )
+  ON CONFLICT (mv_name) DO UPDATE
+    SET refreshed_at = EXCLUDED.refreshed_at,
+        duration_ms  = EXCLUDED.duration_ms,
+        rows_after   = EXCLUDED.rows_after;
+
+  PERFORM pg_advisory_unlock(1234567);
+  RETURN true;
+EXCEPTION
+  WHEN OTHERS THEN
+    PERFORM pg_advisory_unlock(1234567);
+    RAISE;
+END;
+$$;
+```
+
+Note `clock_timestamp()` rather than `now()`. Inside a transaction `now()` returns the transaction start time, so it would report a duration of zero.
+
+## Common errors and what they mean
+
+**`cannot refresh materialized view concurrently`** — no qualifying unique index. Create one; check it has no `WHERE` clause.
+
+**`could not create unique index ... Key (id)=(7) is duplicated`** — your view produces duplicate rows for the intended key. Fix the query, usually by adding the missing column to the `GROUP BY`.
+
+**`materialized view "x" has not been populated`** — the view was created `WITH NO DATA`. The first refresh must be non-concurrent, because there is nothing to diff against:
+
+```sql
+REFRESH MATERIALIZED VIEW user_activity;              -- first time
+REFRESH MATERIALIZED VIEW CONCURRENTLY user_activity; -- thereafter
+```
+
+**Refresh appears to hang** — check for a lock conflict rather than assuming it is slow:
+
+```sql
+SELECT blocked.pid  AS blocked_pid,
+       blocking.pid AS blocking_pid,
+       left(blocked.query, 50)  AS blocked_query,
+       left(blocking.query, 50) AS blocking_query
+FROM pg_stat_activity blocked
+JOIN pg_stat_activity blocking
+  ON blocking.pid = ANY(pg_blocking_pids(blocked.pid))
+WHERE cardinality(pg_blocking_pids(blocked.pid)) > 0;
+```
+
+## When to skip concurrent refresh
+
+Concurrent refresh is the right default for anything user-facing, but not universally:
+
+- **Nightly batch windows.** If nobody queries the view at 03:00, the plain refresh is faster and produces far less WAL.
+- **Views where most rows change.** The diff cost approaches the cost of rebuilding, and you carry the bloat as well. Measure both before committing.
+- **Views that are cheap to rebuild.** If the whole refresh takes 200 ms, an `ACCESS EXCLUSIVE` lock for 200 ms is not worth engineering around.
+- **Very large views with tail-only changes.** Neither refresh mode is right. Use an incremental rollup table with `INSERT ... ON CONFLICT DO UPDATE` instead — Postgres has no incremental materialized view maintenance built in.
+
+When you are iterating on refresh timings and lock behaviour across several views, having plans, `pg_stat_activity` and results in one place helps. [Chat2DB](https://chat2db.ai/download) runs on Windows, macOS and Linux and can generate the monitoring SQL above from a plain-language prompt, which is faster than looking up the `pg_blocking_pids` incantation each time.
+
+## Summary
+
+`REFRESH MATERIALIZED VIEW CONCURRENTLY` trades throughput for availability: readers keep working, but the refresh runs the full query, diffs it, and applies row-level changes, so it takes longer and produces more WAL and more dead tuples. It requires a plain unique index covering genuinely unique columns, and the first refresh of a `WITH NO DATA` view must be non-concurrent.
+
+Wrap it in an advisory lock so overlapping schedules skip rather than queue, log the refresh time so consumers can show real freshness, and keep an eye on dead tuples. When most rows change every cycle, stop refreshing and build an incremental rollup table instead.

@@ -1,0 +1,326 @@
+---
+title: "Debezium Postgres CDC: A Practical Setup Guide"
+description: "Set up change data capture from PostgreSQL with Debezium: wal_level, publications, replication slots, connector config and production failure modes."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: August 19, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# Debezium Postgres CDC: A Practical Setup Guide
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="August 19, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+Change data capture reads your database's write-ahead log and turns every insert, update and delete into an event stream. Done well, it replaces a pile of dual-writes and polling jobs with one reliable source of truth. Done badly, it fills your disk with WAL segments and takes the primary down.
+
+Debezium is the standard open-source CDC platform, and Postgres is its best-supported source. This guide covers the actual configuration, the parts that are easy to get wrong, and the operational monitoring you need before pointing it at anything important.
+
+## How it works
+
+Postgres has logical replication built in. A **replication slot** marks a position in the WAL and guarantees Postgres retains everything from that point forward until the consumer confirms it has processed it. A **publication** declares which tables are included. A logical decoding plugin translates raw WAL records into a readable change format.
+
+Debezium connects as a replication client, reads the decoded stream, and publishes events to Kafka — or, with Debezium Server, to Kinesis, Pulsar, Redis Streams or an HTTP endpoint.
+
+The guarantee that matters: a slot holds WAL until acknowledged. That is what makes CDC reliable across consumer restarts, and it is also the mechanism by which a forgotten slot fills your disk. More on that below.
+
+## Configuring Postgres
+
+### 1. Set wal_level
+
+```sql
+SHOW wal_level;   -- default is 'replica'
+```
+
+```
+# postgresql.conf
+wal_level = logical
+max_replication_slots = 10
+max_wal_senders = 10
+```
+
+`wal_level = logical` requires a restart. The other two are also restart-only. Set them all at once.
+
+On RDS, set `rds.logical_replication = 1` in the parameter group and reboot. On Cloud SQL, enable the `cloudsql.logical_decoding` flag. Both handle the underlying settings for you.
+
+### 2. Create a replication user
+
+Give it the minimum it needs:
+
+```sql
+CREATE ROLE debezium WITH LOGIN REPLICATION PASSWORD 'strong-password-here';
+
+GRANT CONNECT ON DATABASE app TO debezium;
+GRANT USAGE ON SCHEMA public TO debezium;
+GRANT SELECT ON ALL TABLES IN SCHEMA public TO debezium;
+
+-- So future tables are readable without re-granting
+ALTER DEFAULT PRIVILEGES IN SCHEMA public
+  GRANT SELECT ON TABLES TO debezium;
+```
+
+`SELECT` is needed for the initial snapshot; `REPLICATION` for the stream. On RDS, grant `rds_replication` instead of the `REPLICATION` attribute:
+
+```sql
+GRANT rds_replication TO debezium;
+```
+
+### 3. Create a publication
+
+Debezium can create one itself, but that requires superuser and gives you a publication for every table — rarely what you want. Create it explicitly:
+
+```sql
+CREATE PUBLICATION debezium_pub FOR TABLE public.orders, public.customers;
+
+-- Add a table later
+ALTER PUBLICATION debezium_pub ADD TABLE public.products;
+
+-- Inspect
+SELECT * FROM pg_publication;
+SELECT * FROM pg_publication_tables WHERE pubname = 'debezium_pub';
+```
+
+Publications only replicate DML. Schema changes are not propagated — you handle those separately, covered below.
+
+### 4. Set REPLICA IDENTITY
+
+This is the step most often skipped, and it silently degrades your events.
+
+By default, a table's replica identity is its primary key, so update and delete events carry only the key in their "before" image. If you need the full previous row — and most consumers do, for building a proper changelog or computing diffs — set full replica identity:
+
+```sql
+ALTER TABLE orders REPLICA IDENTITY FULL;
+```
+
+Check what you have:
+
+```sql
+SELECT
+  c.relname,
+  CASE c.relreplident
+    WHEN 'd' THEN 'default (primary key)'
+    WHEN 'n' THEN 'nothing'
+    WHEN 'f' THEN 'full'
+    WHEN 'i' THEN 'index'
+  END AS replica_identity
+FROM pg_class c
+JOIN pg_namespace n ON n.oid = c.relnamespace
+WHERE n.nspname = 'public' AND c.relkind = 'r'
+ORDER BY c.relname;
+```
+
+`FULL` writes the entire old row into the WAL on every update, which increases WAL volume meaningfully on wide tables. Weigh that against the consumer's needs rather than defaulting to it everywhere.
+
+A table with **no** primary key and `REPLICA IDENTITY NOTHING` — the default in that case — cannot be updated or deleted at all while it is in a publication. Postgres raises `cannot update table ... because it does not have a replica identity`. Either add a primary key or use `REPLICA IDENTITY FULL`.
+
+## The connector configuration
+
+A Debezium Postgres connector for Kafka Connect:
+
+```json
+{
+  "name": "orders-connector",
+  "config": {
+    "connector.class": "io.debezium.connector.postgresql.PostgresConnector",
+    "database.hostname": "postgres.internal",
+    "database.port": "5432",
+    "database.user": "debezium",
+    "database.password": "${file:/opt/secrets.properties:db_password}",
+    "database.dbname": "app",
+
+    "topic.prefix": "app",
+    "plugin.name": "pgoutput",
+    "slot.name": "debezium_orders",
+    "publication.name": "debezium_pub",
+    "publication.autocreate.mode": "disabled",
+
+    "table.include.list": "public.orders,public.customers",
+    "snapshot.mode": "initial",
+
+    "heartbeat.interval.ms": "10000",
+    "heartbeat.action.query": "INSERT INTO debezium_heartbeat (ts) VALUES (now()) ON CONFLICT (id) DO UPDATE SET ts = now()",
+
+    "tombstones.on.delete": "true",
+    "decimal.handling.mode": "string",
+    "time.precision.mode": "connect",
+
+    "transforms": "unwrap",
+    "transforms.unwrap.type": "io.debezium.transforms.ExtractNewRecordState",
+    "transforms.unwrap.drop.tombstones": "false",
+    "transforms.unwrap.delete.handling.mode": "rewrite"
+  }
+}
+```
+
+The settings that matter most:
+
+**`plugin.name": "pgoutput"`** — use the built-in logical decoding plugin. `wal2json` and `decoderbufs` require installing a shared library on the server; `pgoutput` ships with Postgres 10+ and needs nothing extra.
+
+**`publication.autocreate.mode": "disabled"`** — pairs with the publication you created manually. The default, `all_tables`, needs superuser and captures everything.
+
+**`decimal.handling.mode": "string"`** — the default encodes `numeric` as base64 bytes plus a scale, which is technically correct and universally annoying downstream. `string` keeps precision and is readable. `double` loses precision on large values, so avoid it for money.
+
+**`heartbeat.interval.ms`** — critical, and explained next.
+
+## The failure mode that matters: WAL growth
+
+This is the one that causes incidents.
+
+A replication slot holds WAL until the consumer confirms it. Debezium only confirms a position when it emits an event. If your publication covers a low-traffic table while the *database* is busy, Debezium reads and discards changes for tables it does not care about, never advancing its confirmed position — and Postgres retains every WAL segment since the slot was created.
+
+Disk fills. The primary stops accepting writes.
+
+`heartbeat.interval.ms` fixes it: Debezium periodically emits a heartbeat and advances the slot. The `heartbeat.action.query` variant additionally writes to a table that *is* in the publication, which guarantees a real WAL record for Debezium to acknowledge — necessary when the database is genuinely idle.
+
+```sql
+CREATE TABLE debezium_heartbeat (
+  id serial PRIMARY KEY,
+  ts timestamptz NOT NULL DEFAULT now()
+);
+INSERT INTO debezium_heartbeat (id, ts) VALUES (1, now());
+ALTER PUBLICATION debezium_pub ADD TABLE public.debezium_heartbeat;
+```
+
+Monitor slot lag continuously — this belongs in your alerting, not in a runbook:
+
+```sql
+SELECT
+  slot_name,
+  active,
+  pg_size_pretty(
+    pg_wal_lsn_diff(pg_current_wal_lsn(), confirmed_flush_lsn)
+  ) AS retained_wal,
+  pg_size_pretty(
+    pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn)
+  ) AS restart_lag
+FROM pg_replication_slots;
+```
+
+Alert when `retained_wal` exceeds a few gigabytes, and treat an inactive slot as an incident:
+
+```sql
+SELECT slot_name, active, active_pid
+FROM pg_replication_slots
+WHERE NOT active;
+```
+
+An inactive slot is one whose consumer has gone away while the slot remains — WAL accumulates with nothing draining it. If a connector is decommissioned, drop its slot explicitly:
+
+```sql
+SELECT pg_drop_replication_slot('debezium_orders');
+```
+
+Postgres 13+ offers a safety valve that caps retention at the cost of breaking the slot rather than the database:
+
+```
+max_slot_wal_keep_size = 10GB
+```
+
+Past that, Postgres invalidates the slot. The connector must then re-snapshot, which is disruptive but far better than a full disk.
+
+## Event shape
+
+A Debezium change event, unwrapped, looks like this:
+
+```json
+{
+  "before": null,
+  "after": {
+    "id": 1001,
+    "customer_id": 42,
+    "amount": "199.99",
+    "status": "paid",
+    "created_at": 1755590400000
+  },
+  "source": {
+    "version": "2.7.0",
+    "connector": "postgresql",
+    "db": "app",
+    "schema": "public",
+    "table": "orders",
+    "lsn": 24023128,
+    "txId": 564
+  },
+  "op": "c",
+  "ts_ms": 1755590400123
+}
+```
+
+`op` is `c` for create, `u` for update, `d` for delete, `r` for a snapshot read. Deletes carry the old row in `before` and `null` in `after`, followed by a tombstone record — a null-valued message with the same key — that tells Kafka log compaction the key can be dropped.
+
+`source.lsn` is the deduplication key. Debezium guarantees at-least-once delivery, so consumers must be idempotent: on connector restart you may see events you have already processed. Track the highest applied LSN per key and discard anything older.
+
+## Schema changes
+
+Publications replicate data, not DDL. When you add a column, Debezium picks up the new schema on the next change event, and the Kafka Connect schema version increments. Consumers reading with a schema registry handle that automatically if the change is compatible.
+
+Which changes are safe:
+
+- **Adding a nullable column** — backward compatible, consumers ignore it until updated.
+- **Dropping a column** — breaks consumers expecting it. Deploy consumer changes first.
+- **Renaming a column** — appears as a drop plus an add. Treat as a breaking change.
+- **Changing a column type** — usually breaking. Add a new column, backfill, migrate readers, drop the old one.
+
+Rename `TRUNCATE` handling too: by default Debezium does not capture truncates. Add `"skipped.operations": "none"` and include `truncate` in the publication's `publish` parameter if you need them:
+
+```sql
+ALTER PUBLICATION debezium_pub SET (publish = 'insert,update,delete,truncate');
+```
+
+## Snapshots
+
+`snapshot.mode` controls what happens on first start:
+
+- **`initial`** (default) — snapshot all included tables, then stream. Correct for most cases.
+- **`never`** — stream only from the current position. Use when the target already has the data.
+- **`initial_only`** — snapshot and stop. Useful for one-off backfills.
+- **`when_needed`** — snapshot if the stored offset is no longer valid, for example after slot invalidation.
+
+The default snapshot takes a brief `ACCESS SHARE` lock on each table — it does not block reads or writes, only DDL. On very large tables, incremental snapshots avoid a long single transaction:
+
+```json
+{
+  "signal.data.collection": "public.debezium_signal",
+  "incremental.snapshot.chunk.size": "10000"
+}
+```
+
+```sql
+CREATE TABLE debezium_signal (
+  id   varchar(42) PRIMARY KEY,
+  type varchar(32) NOT NULL,
+  data varchar(2048)
+);
+
+-- Trigger an incremental snapshot of one table
+INSERT INTO debezium_signal (id, type, data)
+VALUES (
+  gen_random_uuid()::text,
+  'execute-snapshot',
+  '{"data-collections": ["public.orders"], "type": "incremental"}'
+);
+```
+
+Incremental snapshots run in chunks alongside normal streaming, so they can be paused, resumed and run against a live system without a long-lived transaction holding back vacuum.
+
+## A pre-production checklist
+
+1. `wal_level = logical`, with `max_replication_slots` and `max_wal_senders` sized for every slot you plan plus headroom.
+2. A dedicated replication role with `SELECT` and `REPLICATION` only.
+3. An explicit publication listing exactly the tables you want.
+4. `REPLICA IDENTITY` deliberately chosen per table, and verified.
+5. `heartbeat.interval.ms` set, with a heartbeat table in the publication.
+6. Alerting on slot retained WAL size and on inactive slots.
+7. `max_slot_wal_keep_size` set as a backstop.
+8. Idempotent consumers keyed on LSN.
+9. A documented procedure for dropping a decommissioned slot.
+
+Inspecting slots, publications and replica identity during setup means a lot of catalog queries. [Chat2DB](https://chat2db.ai/download) connects to Postgres alongside twenty-plus other databases and can generate these catalog queries from a description, which is quicker than looking up `pg_replication_slots` column names each time.
+
+## Summary
+
+Debezium CDC on Postgres rests on three server-side pieces — `wal_level = logical`, a publication naming your tables, and a replication slot — plus a deliberate `REPLICA IDENTITY` choice per table.
+
+The operational risk that matters is WAL retention. A slot holds WAL until its consumer acknowledges, so configure heartbeats, alert on slot lag and inactive slots, and set `max_slot_wal_keep_size` so an abandoned slot degrades into a re-snapshot rather than a full disk. Everything else is tuning.

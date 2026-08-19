@@ -1,0 +1,277 @@
+---
+title: "PostgreSQL Major Version Upgrade: pg_upgrade Guide"
+description: "Upgrade PostgreSQL to a new major version with pg_upgrade or logical replication: pre-checks, extensions, the statistics gap and rollback planning."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: August 19, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# PostgreSQL Major Version Upgrade: pg_upgrade Guide
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="August 19, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+Minor Postgres upgrades are boring: stop, swap binaries, start. Major upgrades are not, because the on-disk format changes between major versions and the new binary will refuse to start against the old data directory.
+
+You have three routes, and choosing correctly is most of the work. This guide covers all three, the pre-flight checks worth running, and the one post-upgrade step that causes more "the upgrade broke performance" reports than anything else.
+
+## Confirm what you are running
+
+```sql
+SELECT version();
+SHOW server_version_num;   -- e.g. 160004 = 16.4
+```
+
+Postgres versions each get five years of support. Running an unsupported version means no security patches, so upgrades are not optional indefinitely — they are just deferrable.
+
+## The three routes
+
+| Method | Downtime | Complexity | When to use |
+| --- | --- | --- | --- |
+| `pg_dump` / `pg_restore` | Hours on large databases | Low | Under ~50 GB, or when you want a clean rebuild |
+| `pg_upgrade --link` | Minutes | Medium | The default for most systems |
+| Logical replication | Seconds (a failover) | High | When minutes of downtime is too much |
+
+### Route 1: dump and restore
+
+Simplest, slowest, and it rebuilds everything cleanly — which incidentally removes all bloat.
+
+```bash
+# Always dump with the NEW version's pg_dump
+/usr/lib/postgresql/18/bin/pg_dump \
+  -h localhost -p 5432 -U postgres \
+  -d app -Fc -f app.dump
+
+/usr/lib/postgresql/18/bin/pg_restore \
+  -h localhost -p 5433 -U postgres \
+  -d app --jobs=4 app.dump
+```
+
+Two details. Use the **new** version's `pg_dump` — it understands the old format and emits SQL the new server accepts. And `--jobs` parallelises restore, which matters because index builds dominate the time.
+
+Globals — roles, tablespaces — are not in a per-database dump:
+
+```bash
+/usr/lib/postgresql/18/bin/pg_dumpall --globals-only -f globals.sql
+psql -p 5433 -U postgres -f globals.sql
+```
+
+Forgetting this produces a restore that fails on every `GRANT` to a role that does not exist yet.
+
+### Route 2: pg_upgrade
+
+The standard approach. It converts the system catalogs in place and, with `--link`, hard-links the data files instead of copying them — which makes runtime nearly independent of database size.
+
+Install both versions side by side:
+
+```bash
+sudo apt install postgresql-18
+sudo systemctl stop postgresql
+```
+
+Run the check first. It is non-destructive and catches most problems:
+
+```bash
+sudo -u postgres /usr/lib/postgresql/18/bin/pg_upgrade \
+  --old-datadir=/var/lib/postgresql/16/main \
+  --new-datadir=/var/lib/postgresql/18/main \
+  --old-bindir=/usr/lib/postgresql/16/bin \
+  --new-bindir=/usr/lib/postgresql/18/bin \
+  --old-options='-c config_file=/etc/postgresql/16/main/postgresql.conf' \
+  --new-options='-c config_file=/etc/postgresql/18/main/postgresql.conf' \
+  --check
+```
+
+Then the real run:
+
+```bash
+sudo -u postgres /usr/lib/postgresql/18/bin/pg_upgrade \
+  --old-datadir=/var/lib/postgresql/16/main \
+  --new-datadir=/var/lib/postgresql/18/main \
+  --old-bindir=/usr/lib/postgresql/16/bin \
+  --new-bindir=/usr/lib/postgresql/18/bin \
+  --link \
+  --jobs=4
+```
+
+**Understand `--link` before using it.** Hard-linking means old and new clusters share the same data files. Once the new cluster starts and writes, the old cluster is unusable — your rollback is a restore from backup, not "start the old one again". Without `--link`, files are copied: you keep a working old cluster at the cost of double the disk and a much longer run.
+
+For a first upgrade on important data, run without `--link` if you have the disk. The rollback option is worth the time.
+
+`pg_upgrade` writes a `delete_old_cluster.sh` script. Do not run it until you have verified the new cluster properly — with `--link`, running it while things are still in doubt removes your only remaining copy.
+
+### Route 3: logical replication
+
+Near-zero downtime, at the cost of real complexity. Set up the new version as a logical replica, let it catch up, then switch traffic.
+
+On the old (publisher) server:
+
+```sql
+ALTER SYSTEM SET wal_level = 'logical';   -- requires restart
+CREATE PUBLICATION upgrade_pub FOR ALL TABLES;
+```
+
+On the new (subscriber) server, load the schema first — logical replication copies data, not DDL:
+
+```bash
+pg_dump -h old-server -U postgres -d app --schema-only -f schema.sql
+psql -h new-server -U postgres -d app -f schema.sql
+```
+
+```sql
+CREATE SUBSCRIPTION upgrade_sub
+  CONNECTION 'host=old-server dbname=app user=repl password=secret'
+  PUBLICATION upgrade_pub;
+```
+
+Watch it catch up:
+
+```sql
+-- On the publisher
+SELECT
+  slot_name,
+  pg_size_pretty(pg_wal_lsn_diff(pg_current_wal_lsn(), confirmed_flush_lsn)) AS lag
+FROM pg_replication_slots;
+
+-- On the subscriber
+SELECT subname, received_lsn, latest_end_lsn FROM pg_stat_subscription;
+```
+
+The catch that surprises people: **logical replication does not copy sequence values**. After cutover, every sequence on the new server sits at its initial value, and the first insert collides with an existing primary key. Advance them as part of the switchover:
+
+```sql
+-- Run on the OLD server to generate the statements
+SELECT format(
+  'SELECT setval(%L, %s);',
+  schemaname || '.' || sequencename,
+  last_value
+)
+FROM pg_sequences
+WHERE last_value IS NOT NULL;
+```
+
+Execute the output on the new server after stopping writes to the old one.
+
+## Pre-flight checks
+
+Run these days before, not on the night.
+
+**Read the release notes for every version you are crossing.** Going from 15 to 18 means reading three sets. The incompatibilities section is short and occasionally contains something that affects you.
+
+**Inventory extensions.** They must exist on the new server at a compatible version before `pg_upgrade` runs:
+
+```sql
+SELECT extname, extversion FROM pg_extension ORDER BY extname;
+```
+
+Extensions with compiled shared libraries — PostGIS, TimescaleDB, pgvector — usually need upgrading in a specific order relative to the server. PostGIS in particular has its own documented procedure; skipping it produces a cluster that starts but has broken geometry functions.
+
+**Find deprecated types and removed features.** `abstime`, `reltime` and `tinterval` were removed in 12; `WITH OIDS` in 12; `password_encryption = 'md5'` is deprecated in favour of `scram-sha-256`:
+
+```sql
+SELECT c.relname, a.attname, t.typname
+FROM pg_attribute a
+JOIN pg_class c ON c.oid = a.attrelid
+JOIN pg_type t  ON t.oid = a.atttypid
+JOIN pg_namespace n ON n.oid = c.relnamespace
+WHERE t.typname IN ('abstime','reltime','tinterval')
+  AND n.nspname NOT IN ('pg_catalog','information_schema');
+```
+
+**Check authentication methods.** If `pg_hba.conf` still uses `md5`, plan the move to `scram-sha-256` — it requires every client to re-set its password:
+
+```sql
+SELECT rolname, rolpassword IS NOT NULL AS has_password
+FROM pg_authid WHERE rolcanlogin;
+
+SHOW password_encryption;
+```
+
+**Drop replication slots.** `pg_upgrade` refuses to run with active slots on versions before 17. Note their definitions first so you can recreate them.
+
+**Take a verified backup.** Not "we have nightly backups" — an actual restore test onto separate hardware.
+
+## The step everyone forgets: statistics
+
+`pg_upgrade` does not carry over the planner's statistics. The new cluster starts with none, so the planner makes uninformed guesses and query plans can be dramatically worse. This is the single most common cause of "the upgrade destroyed our performance" — and it is entirely avoidable.
+
+`pg_upgrade` generates a script for this. **Run it immediately after starting the new cluster**, before letting production traffic in:
+
+```bash
+sudo -u postgres /usr/lib/postgresql/18/bin/vacuumdb \
+  --all --analyze-in-stages --jobs=4
+```
+
+`--analyze-in-stages` runs three passes of increasing accuracy, so usable statistics exist within seconds rather than after a full analyze of every table. Follow with a complete pass once traffic is stable:
+
+```bash
+sudo -u postgres vacuumdb --all --analyze --jobs=4
+```
+
+Postgres 18 improved this — `pg_upgrade` can now carry most planner statistics across — but running `analyze-in-stages` anyway costs little and removes the risk entirely.
+
+## Post-upgrade checklist
+
+```sql
+-- 1. Confirm the version
+SELECT version();
+
+-- 2. Update extensions to the versions the new server ships
+SELECT extname, extversion FROM pg_extension;
+-- ALTER EXTENSION pg_stat_statements UPDATE;
+
+-- 3. Look for invalid indexes
+SELECT c.relname
+FROM pg_index i
+JOIN pg_class c ON c.oid = i.indexrelid
+WHERE NOT i.indisvalid;
+
+-- 4. Look for unvalidated constraints
+SELECT conrelid::regclass, conname
+FROM pg_constraint
+WHERE NOT convalidated;
+
+-- 5. Confirm statistics exist
+SELECT relname, last_analyze, last_autoanalyze
+FROM pg_stat_user_tables
+WHERE last_analyze IS NULL AND last_autoanalyze IS NULL;
+```
+
+Then, over the following days:
+
+- **Compare query performance against a pre-upgrade baseline.** If you captured `pg_stat_statements` output before the upgrade, diff the top queries by total time. Without a baseline you are guessing.
+- **Re-tune `postgresql.conf` if defaults changed.** `pg_upgrade` copies your old config, but new versions sometimes add settings or change defaults worth adopting.
+- **Recreate replication slots and rebuild replicas.** Physical replicas cannot be upgraded in place; rebuild them from the upgraded primary.
+- **Keep the old cluster until you are confident.** Only then run `delete_old_cluster.sh`.
+
+## Rollback planning
+
+Be honest about what each route gives you.
+
+- **`pg_upgrade --link`** — no rollback. The old cluster's files are shared with the new one. Restoring from backup is the only path.
+- **`pg_upgrade` without `--link`** — the old cluster is intact. Stop the new one, start the old one. Fast, provided nothing wrote to the new cluster that you need.
+- **Dump and restore** — the source database is untouched throughout. Best rollback story of the three.
+- **Logical replication** — set up replication back the other way before cutover and you can fail back, though this adds real complexity.
+
+Whichever you choose, write the rollback procedure down and time-box the decision. "We will figure it out if something goes wrong" at 02:00 is how a two-hour window becomes a two-day incident.
+
+## A worked plan for a typical upgrade
+
+For a few-hundred-gigabyte database with a tolerable maintenance window:
+
+1. **Two weeks out** — read release notes; inventory extensions; test the upgrade on a restored copy of production; measure how long it actually takes.
+2. **One week out** — capture a `pg_stat_statements` baseline; confirm client drivers support the new version; agree the rollback procedure.
+3. **Day before** — take and verify a full backup; drop replication slots; announce the window.
+4. **During** — stop applications; run `pg_upgrade --check`; run `pg_upgrade`; start the new cluster; run `vacuumdb --all --analyze-in-stages`; smoke-test; restore traffic.
+5. **After** — full `ANALYZE`; compare against the baseline; rebuild replicas; keep the old cluster a week.
+
+Comparing `pg_stat_statements` before and after is the check that tells you whether the upgrade actually went well. [Chat2DB](https://chat2db.ai/download) connects to both clusters at once, so you can run the same diagnostic query against each and compare results side by side without juggling two terminal sessions.
+
+## Summary
+
+Pick your route by tolerable downtime: dump and restore under 50 GB, `pg_upgrade` for most systems, logical replication when minutes are too many. Run `pg_upgrade --check` days in advance — it is free and catches most problems.
+
+Understand that `--link` trades your rollback for speed. And run `vacuumdb --all --analyze-in-stages` before letting traffic in, because a cluster with no statistics plans badly, and that is what most post-upgrade performance complaints actually are.

@@ -1,0 +1,395 @@
+---
+title: "Postgres JSONB Operators and Functions: A Reference"
+description: "A working reference for Postgres JSONB operators and functions: arrow operators, containment, JSONPath, jsonb_set, and which ones an index can use."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: August 19, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# Postgres JSONB Operators and Functions: A Reference
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="August 19, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+Postgres has two arrow operators that differ by one character, three ways to ask whether a key exists, and a containment operator that behaves differently from all of them. Getting these wrong produces queries that work on your test data and fall over in production — or worse, queries that return the right answer while silently ignoring every index you built.
+
+This is a working reference, organised by what you are trying to do rather than by operator symbol.
+
+## The test data
+
+```sql
+CREATE TABLE products (
+  id    bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  name  text NOT NULL,
+  attrs jsonb NOT NULL DEFAULT '{}'
+);
+
+INSERT INTO products (name, attrs) VALUES
+('Laptop Pro 14',  '{"brand":"Acme","price":1899.00,"specs":{"ram_gb":16,"cpu":"M3"},"tags":["laptop","portable"],"in_stock":true}'),
+('Desk Lamp',      '{"brand":"Lumen","price":49.99,"specs":{"watts":9},"tags":["lighting","desk"],"in_stock":true}'),
+('Mechanical Kbd', '{"brand":"Acme","price":129.00,"specs":{"switches":"brown","keys":87},"tags":["keyboard","desk"],"in_stock":false}'),
+('Monitor 27',     '{"brand":"ViewCo","price":399.00,"specs":{"panel":"IPS","hz":144},"tags":["display"],"discount":null}');
+```
+
+## Extracting values: the arrow operators
+
+The single most common source of confusion. Both operators do the same lookup; they differ only in return type.
+
+```sql
+SELECT
+  attrs -> 'brand'   AS as_jsonb,   -- "Acme"  (jsonb, quoted)
+  attrs ->> 'brand'  AS as_text     -- Acme    (text, unquoted)
+FROM products
+WHERE name = 'Laptop Pro 14';
+```
+
+`->` returns `jsonb`. `->>` returns `text`. The rule that follows from this: **use `->` to keep navigating, use `->>` when you have arrived.**
+
+```sql
+-- Navigate two levels, then extract as text
+SELECT name, attrs -> 'specs' ->> 'cpu' AS cpu
+FROM products
+WHERE attrs -> 'specs' ? 'cpu';
+```
+
+Both operators also take integers to index into arrays, with negative values counting from the end:
+
+```sql
+SELECT
+  attrs -> 'tags' -> 0    AS first_tag_jsonb,   -- "laptop"
+  attrs -> 'tags' ->> 0   AS first_tag_text,    -- laptop
+  attrs -> 'tags' ->> -1  AS last_tag           -- portable
+FROM products
+WHERE name = 'Laptop Pro 14';
+```
+
+### Path operators for deep access
+
+Chaining arrows gets unwieldy. `#>` and `#>>` take a text array path and follow it in one step:
+
+```sql
+SELECT
+  attrs #> '{specs,ram_gb}'   AS as_jsonb,   -- 16
+  attrs #>> '{specs,ram_gb}'  AS as_text     -- 16
+FROM products
+WHERE name = 'Laptop Pro 14';
+```
+
+Array indices work in paths too, as strings:
+
+```sql
+SELECT attrs #>> '{tags,0}' AS first_tag FROM products;
+```
+
+Missing paths return `NULL` rather than raising an error, which is usually what you want but does mean typos fail silently.
+
+### Casting extracted values
+
+`->>` always returns text, so comparisons need a cast — and the cast direction matters for performance:
+
+```sql
+-- Works, but cannot use a plain index on the column
+SELECT name FROM products
+WHERE (attrs ->> 'price')::numeric > 100;
+
+-- Casting the literal instead keeps things comparable as jsonb
+SELECT name FROM products
+WHERE attrs -> 'price' > '100'::jsonb;
+```
+
+Be careful with the second form: jsonb comparison follows jsonb's own ordering rules, not numeric ordering, across mixed types. For numeric comparisons the explicit `::numeric` cast is clearer and safer; make it indexable with an expression index, covered below.
+
+## Testing for existence
+
+Three operators, all using `?`, all requiring **text** operands rather than jsonb:
+
+```sql
+-- Does this top-level key exist?
+SELECT name FROM products WHERE attrs ? 'discount';
+
+-- Do ANY of these keys exist?
+SELECT name FROM products WHERE attrs ?| array['discount','warranty'];
+
+-- Do ALL of these keys exist?
+SELECT name FROM products WHERE attrs ?& array['brand','price'];
+```
+
+Two traps here.
+
+**`?` only looks at the top level.** `attrs ? 'ram_gb'` returns false for every row, because `ram_gb` lives inside `specs`. Navigate first:
+
+```sql
+SELECT name FROM products WHERE attrs -> 'specs' ? 'ram_gb';
+```
+
+**A key with a JSON `null` value still exists.** The Monitor row has `"discount": null`, so `attrs ? 'discount'` is true for it. To distinguish a missing key from an explicit null:
+
+```sql
+SELECT
+  name,
+  attrs ? 'discount'                       AS key_exists,
+  attrs -> 'discount' IS NULL              AS sql_null,        -- key missing
+  attrs -> 'discount' = 'null'::jsonb      AS json_null        -- key present, null value
+FROM products;
+```
+
+This distinction bites hardest in `WHERE` clauses. `attrs ->> 'discount' IS NULL` is true both when the key is absent and when its value is JSON null — usually not what you meant.
+
+When applied to a jsonb **array**, `?` tests for a matching string element rather than a key:
+
+```sql
+SELECT name FROM products WHERE attrs -> 'tags' ? 'desk';
+```
+
+## Containment: the operator that uses indexes best
+
+`@>` asks "does the left side contain the right side?" It is the workhorse of JSONB querying because a GIN index accelerates it directly.
+
+```sql
+-- Rows where brand is Acme
+SELECT name FROM products WHERE attrs @> '{"brand":"Acme"}';
+
+-- Multiple conditions in one containment check
+SELECT name FROM products WHERE attrs @> '{"brand":"Acme","in_stock":true}';
+
+-- Nested containment works naturally
+SELECT name FROM products WHERE attrs @> '{"specs":{"cpu":"M3"}}';
+
+-- Array containment: does tags include "desk"?
+SELECT name FROM products WHERE attrs @> '{"tags":["desk"]}';
+```
+
+Containment semantics are structural, not fuzzy. `'{"a":1}'::jsonb @> '{"a":1,"b":2}'` is false — the right side has more than the left contains. The reverse, `'{"a":1,"b":2}'::jsonb @> '{"a":1}'`, is true.
+
+One asymmetry worth memorising: at the top level, a jsonb array contains a bare scalar, but nested arrays do not:
+
+```sql
+SELECT '["a","b"]'::jsonb @> '"a"'::jsonb;      -- true
+SELECT '[["a","b"]]'::jsonb @> '["a"]'::jsonb;  -- false
+```
+
+`<@` is containment reversed: `a <@ b` is `b @> a`.
+
+## Indexing, and which operators benefit
+
+This is where the operator you chose starts to matter for performance.
+
+```sql
+CREATE INDEX products_attrs_gin ON products USING GIN (attrs);
+```
+
+The default GIN opclass (`jsonb_ops`) supports `@>`, `?`, `?|`, `?&`, `@?` and `@@`. It does **not** support `->` or `->>` comparisons — a query written with `->>` will ignore this index entirely and sequential-scan.
+
+```sql
+-- Uses the GIN index
+EXPLAIN ANALYZE SELECT * FROM products WHERE attrs @> '{"brand":"Acme"}';
+
+-- Does NOT use it — sequential scan
+EXPLAIN ANALYZE SELECT * FROM products WHERE attrs ->> 'brand' = 'Acme';
+```
+
+That single difference explains most "my JSONB index does nothing" reports. Rewrite equality lookups as containment.
+
+The `jsonb_path_ops` opclass builds a smaller, faster index but supports only `@>` and the path operators:
+
+```sql
+CREATE INDEX products_attrs_path_gin
+  ON products USING GIN (attrs jsonb_path_ops);
+```
+
+Choose it when containment is all you query with, which is common.
+
+For a single hot field, an expression B-tree index beats GIN and supports ranges and sorting:
+
+```sql
+CREATE INDEX products_price_idx
+  ON products (((attrs ->> 'price')::numeric));
+
+-- Now this uses the index
+EXPLAIN ANALYZE
+SELECT name FROM products
+WHERE (attrs ->> 'price')::numeric BETWEEN 100 AND 500
+ORDER BY (attrs ->> 'price')::numeric;
+```
+
+The expression in the query must match the index expression exactly, parentheses included.
+
+## JSONPath: `@?` and `@@`
+
+For conditions containment cannot express — inequalities, in particular — Postgres 12 added SQL/JSON path support.
+
+```sql
+-- Does any matching path exist?
+SELECT name FROM products
+WHERE attrs @? '$.specs.ram_gb ? (@ > 8)';
+
+-- Does the path predicate evaluate to true?
+SELECT name FROM products
+WHERE attrs @@ '$.price > 300';
+
+-- Filter inside arrays
+SELECT name FROM products
+WHERE attrs @? '$.tags[*] ? (@ == "desk")';
+```
+
+Both are GIN-indexable with the default opclass. `jsonb_path_query` returns the matched values rather than a boolean:
+
+```sql
+SELECT name, jsonb_path_query(attrs, '$.specs.*') AS spec_value
+FROM products;
+
+-- With a filter
+SELECT name, jsonb_path_query_array(attrs, '$.tags[*] ? (@ starts with "d")')
+FROM products;
+```
+
+## Modifying JSONB
+
+JSONB values are immutable; every "modification" produces a new value you then assign.
+
+```sql
+-- Set or replace a nested value
+UPDATE products
+SET attrs = jsonb_set(attrs, '{specs,ram_gb}', '32')
+WHERE name = 'Laptop Pro 14';
+
+-- Fourth argument controls whether missing keys are created (default true)
+UPDATE products
+SET attrs = jsonb_set(attrs, '{warranty_years}', '2', true)
+WHERE attrs ->> 'brand' = 'Acme';
+```
+
+`jsonb_set` replaces `null` inputs with `null` output — if `attrs` were ever NULL the whole column becomes NULL. Guard with `coalesce(attrs, '{}'::jsonb)`.
+
+`jsonb_set_lax` (Postgres 13+) handles JSON nulls explicitly:
+
+```sql
+UPDATE products
+SET attrs = jsonb_set_lax(attrs, '{discount}', NULL, true, 'delete_key')
+WHERE name = 'Monitor 27';
+```
+
+Merging with `||` is shallow — nested objects are replaced wholesale, not merged:
+
+```sql
+SELECT '{"a":{"x":1,"y":2}}'::jsonb || '{"a":{"x":9}}'::jsonb;
+-- {"a": {"x": 9}}   -- y is gone
+```
+
+Deleting uses `-` for keys and array elements, `#-` for paths:
+
+```sql
+-- Delete one key
+UPDATE products SET attrs = attrs - 'discount'
+WHERE name = 'Monitor 27';
+
+-- Delete several keys at once
+UPDATE products SET attrs = attrs - array['in_stock','discount']
+WHERE name = 'Desk Lamp';
+
+-- Delete at a nested path
+UPDATE products SET attrs = attrs #- '{specs,watts}'
+WHERE name = 'Desk Lamp';
+
+-- Drop the first element of an array
+UPDATE products SET attrs = jsonb_set(attrs, '{tags}', (attrs -> 'tags') - 0)
+WHERE name = 'Mechanical Kbd';
+```
+
+## Expanding and aggregating
+
+Turn JSONB into rows:
+
+```sql
+-- Object to key/value rows
+SELECT p.name, kv.key, kv.value
+FROM products p, jsonb_each(p.attrs -> 'specs') AS kv;
+
+-- Values as text
+SELECT p.name, kv.key, kv.value
+FROM products p, jsonb_each_text(p.attrs -> 'specs') AS kv;
+
+-- Array to rows
+SELECT p.name, tag
+FROM products p, jsonb_array_elements_text(p.attrs -> 'tags') AS tag;
+
+-- Just the keys
+SELECT DISTINCT k FROM products, jsonb_object_keys(attrs) AS k;
+```
+
+`jsonb_array_elements` on a non-array raises an error, so guard mixed data with `jsonb_typeof`:
+
+```sql
+SELECT p.name, tag
+FROM products p,
+LATERAL jsonb_array_elements_text(
+  CASE WHEN jsonb_typeof(p.attrs -> 'tags') = 'array'
+       THEN p.attrs -> 'tags'
+       ELSE '[]'::jsonb END
+) AS tag;
+```
+
+Build JSONB from rows:
+
+```sql
+SELECT jsonb_agg(jsonb_build_object('name', name, 'price', attrs -> 'price'))
+FROM products;
+
+SELECT jsonb_object_agg(name, attrs -> 'price') FROM products;
+
+SELECT jsonb_pretty(jsonb_build_object(
+  'count', count(*),
+  'brands', jsonb_agg(DISTINCT attrs ->> 'brand')
+))
+FROM products;
+```
+
+`to_jsonb` converts a whole row, and `jsonb_populate_record` goes the other way into a typed record — useful at API boundaries.
+
+## Quick reference
+
+| Operator | Returns | Purpose | GIN-indexable |
+| --- | --- | --- | --- |
+| `->` | jsonb | Get key or array element | No |
+| `->>` | text | Get key or element as text | No |
+| `#>` | jsonb | Get by path | No |
+| `#>>` | text | Get by path as text | No |
+| `?` | boolean | Top-level key or array string exists | Yes |
+| `?\|` | boolean | Any of these keys exist | Yes |
+| `?&` | boolean | All of these keys exist | Yes |
+| `@>` | boolean | Contains | Yes |
+| `<@` | boolean | Is contained by | Yes |
+| `@?` | boolean | JSONPath match exists | Yes |
+| `@@` | boolean | JSONPath predicate is true | Yes |
+| `\|\|` | jsonb | Concatenate / shallow merge | n/a |
+| `-` | jsonb | Delete key or element | n/a |
+| `#-` | jsonb | Delete at path | n/a |
+
+## Practical guidance
+
+**Write filters as `@>` wherever possible.** It is the operator GIN indexes best, and it expresses multi-key conditions in one clause.
+
+**Use `->>` for projection, not for filtering.** Selecting a value as text in the `SELECT` list is free; filtering on it costs you the index.
+
+**Add expression indexes for hot scalar fields**, especially anything you sort by or range-scan.
+
+**Do not put everything in JSONB.** Columns you filter on in most queries belong as real columns with real types and real constraints. JSONB is for the genuinely variable tail of your schema. Postgres 17 added generated columns over JSONB, which lets you promote a hot field without changing writers:
+
+```sql
+ALTER TABLE products
+  ADD COLUMN price numeric
+  GENERATED ALWAYS AS ((attrs ->> 'price')::numeric) STORED;
+
+CREATE INDEX ON products (price);
+```
+
+When you are exploring an unfamiliar JSONB column, [Chat2DB](https://app.chat2db.ai) renders nested values as an expandable tree instead of one long line, and can generate the containment and JSONPath queries above from a description of what you are looking for.
+
+## Summary
+
+`->` keeps you in jsonb, `->>` gives you text, and `#>` / `#>>` do the same by path. `?` tests top-level keys only and treats JSON null as present. `@>` is the containment operator and the one your GIN index actually accelerates, so prefer it for filtering. `@?` and `@@` cover the inequality cases containment cannot express, and are indexable too.
+
+For modification, remember that `jsonb_set` needs a null guard and `||` merges only one level deep. And when a JSONB field becomes central to your queries, promote it to a generated column rather than indexing around it forever.
