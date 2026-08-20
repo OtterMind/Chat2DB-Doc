@@ -1,0 +1,191 @@
+---
+title: "PostgreSQL Point-in-Time Recovery: A Practical Guide"
+description: "Set up PostgreSQL PITR with WAL archiving and pg_basebackup, then restore to an exact moment before a bad deploy using recovery_target_time and restore_command."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: August 20, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# PostgreSQL Point-in-Time Recovery: A Practical Guide
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="August 20, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+A nightly `pg_dump` answers one question: what did the database look like at 2 a.m.? Point-in-time recovery answers a better one: what did it look like at 14:37:12, one second before the migration that dropped the wrong column?
+
+PITR combines a base backup with a continuous archive of write-ahead log files. Restore the base backup, replay WAL up to the moment you choose, stop. This guide covers the setup, the restore, and the details that decide whether the restore works when you actually need it.
+
+## How PITR works
+
+Every change PostgreSQL makes is written to WAL before it touches a data file. A base backup is a physical copy of the data directory taken while the server runs. If you keep every WAL segment produced since that backup, you can replay them in order and reconstruct the database at any instant in between.
+
+Three pieces are required:
+
+1. `archive_mode` turned on, so completed WAL segments are copied somewhere durable.
+2. A base backup taken after archiving started.
+3. Enough retained WAL to bridge from the backup to your recovery target.
+
+Miss any one and you have a backup, but not point-in-time recovery.
+
+## Step 1: turn on WAL archiving
+
+In `postgresql.conf` on the primary:
+
+```ini
+wal_level = replica
+archive_mode = on
+archive_command = 'test ! -f /mnt/wal_archive/%f && cp %p /mnt/wal_archive/%f'
+archive_timeout = 300
+```
+
+`%p` is the path of the segment to archive and `%f` is the file name to write. The `test ! -f` guard refuses to overwrite an existing archive file, which is deliberate: a silent overwrite destroys your recovery chain.
+
+`archive_timeout = 300` forces a WAL switch every five minutes even on an idle database. Without it, a quiet system may leave the last transactions sitting in an unarchived segment for hours, and those are exactly the transactions you would want back.
+
+`archive_mode` and `wal_level` need a restart. Afterwards, check that archiving is actually succeeding:
+
+```sql
+SELECT archived_count,
+       last_archived_wal,
+       last_archived_time,
+       failed_count,
+       last_failed_wal
+FROM pg_stat_archiver;
+```
+
+A rising `failed_count` means the command is broken and WAL is piling up in `pg_wal`. PostgreSQL retries forever rather than deleting unarchived segments, so a broken `archive_command` eventually fills the disk. Alert on this.
+
+For real deployments, replace `cp` with something that writes to object storage and verifies the write, or use a purpose-built tool. `pgbackrest` and `wal-g` both handle compression, encryption, retention and parallel restore, and both are far better than a shell one-liner once the database is large.
+
+## Step 2: take a base backup
+
+```bash
+pg_basebackup \
+  --host=10.0.0.10 \
+  --username=replicator \
+  --pgdata=/backups/base_2026-08-20 \
+  --format=tar \
+  --gzip \
+  --wal-method=stream \
+  --checkpoint=fast \
+  --progress
+```
+
+`--format=tar --gzip` produces `base.tar.gz` and `pg_wal.tar.gz`, which are easy to ship off the machine. `--wal-method=stream` includes the WAL generated during the backup itself, so the archive alone is a consistent starting point.
+
+Record two things alongside every backup: the time it finished, and the WAL file it started from. You need both to reason about what a given backup can recover to.
+
+## Step 3: perform the recovery
+
+Say a bad migration ran at 14:37:30 on 20 August and you want the state just before it.
+
+**Stop the damaged server and preserve it.** Do not restore over a data directory you have not copied first — if the restore goes wrong, that directory is your only remaining evidence.
+
+```bash
+sudo systemctl stop postgresql
+sudo mv /var/lib/postgresql/17/main /var/lib/postgresql/17/main.broken
+sudo -u postgres mkdir -p /var/lib/postgresql/17/main
+sudo chmod 700 /var/lib/postgresql/17/main
+```
+
+**Restore the base backup:**
+
+```bash
+sudo -u postgres tar -xzf /backups/base_2026-08-20/base.tar.gz \
+  -C /var/lib/postgresql/17/main
+```
+
+**Write the recovery settings** into `postgresql.conf` (or `postgresql.auto.conf`):
+
+```ini
+restore_command = 'cp /mnt/wal_archive/%f %p'
+recovery_target_time = '2026-08-20 14:37:29+00'
+recovery_target_action = 'pause'
+```
+
+Then create the file that tells PostgreSQL this is a recovery, not a normal start:
+
+```bash
+sudo -u postgres touch /var/lib/postgresql/17/main/recovery.signal
+```
+
+`recovery.signal` means "recover to the target and then become a normal server". `standby.signal` means "keep following forever". Using the wrong one is the most common mistake in a first PITR attempt.
+
+**Start the server:**
+
+```bash
+sudo systemctl start postgresql
+```
+
+Watch the log. You will see it fetch segments one by one, then:
+
+```
+LOG:  recovery stopping before commit of transaction 918273, time 2026-08-20 14:37:30
+LOG:  pausing at the end of recovery
+```
+
+## Step 4: verify before you commit to it
+
+`recovery_target_action = 'pause'` is the reason to prefer this workflow. The database is up and readable but frozen at the target, so you can check whether you picked the right moment:
+
+```sql
+SELECT pg_is_in_recovery();          -- true, still paused
+SELECT count(*) FROM orders WHERE created_at > '2026-08-20 14:00';
+SELECT * FROM schema_migrations ORDER BY applied_at DESC LIMIT 5;
+```
+
+Connect read-only and inspect the tables that were damaged. A GUI client such as [Chat2DB](https://chat2db.ai/download) is handy here because you can browse the recovered schema and compare it against the live system in another tab before making an irreversible decision.
+
+If you overshot, stop the server, adjust `recovery_target_time` and start again from the base backup. If it looks right, finish:
+
+```sql
+SELECT pg_wal_replay_resume();
+```
+
+Recovery ends, `recovery.signal` is removed, and the server is writable. Confirm with `SELECT pg_is_in_recovery();` returning false.
+
+## Recovery targets other than time
+
+`recovery_target_time` is the intuitive one, but it is not always the most precise.
+
+| Setting | Recovers to |
+| --- | --- |
+| `recovery_target_time` | A timestamp |
+| `recovery_target_xid` | Just before a specific transaction ID |
+| `recovery_target_lsn` | An exact WAL position |
+| `recovery_target_name` | A label set earlier with `pg_create_restore_point()` |
+| `recovery_target = 'immediate'` | The earliest consistent point in the base backup |
+
+If you know a migration ran in one transaction, `recovery_target_xid` is sharper than guessing at a clock time, especially since the application's clock and the database's may differ. And before any risky change, this costs nothing:
+
+```sql
+SELECT pg_create_restore_point('before_v42_migration');
+```
+
+Then recovery is simply `recovery_target_name = 'before_v42_migration'` — no timestamp arithmetic under pressure.
+
+## Timelines, briefly
+
+When recovery completes, PostgreSQL increments the timeline ID and writes a `.history` file to the archive. This prevents a restored server from overwriting WAL that belongs to the original line of history. It also means you can recover from a recovery: if the first attempt targeted the wrong moment, the second can still reach any point on the original timeline, because those segments were never touched.
+
+If you restore an older backup and want to follow a specific branch, set `recovery_target_timeline` explicitly. The default `latest` is usually right.
+
+## The part most teams skip
+
+An untested backup is a hypothesis. Schedule a restore rehearsal — quarterly is a reasonable minimum — and measure two numbers:
+
+- **How long the restore takes.** For a 500 GB database, extracting the base backup and replaying a week of WAL can be hours. That number is your real recovery time objective, and it is usually much larger than people assume.
+- **Whether every dependency exists.** Extensions must be installed on the restore host, the PostgreSQL major version must match the backup, and file system permissions must be `700` on the data directory or the server refuses to start.
+
+Also enforce retention deliberately. WAL accumulates indefinitely unless something removes it:
+
+```bash
+pg_archivecleanup /mnt/wal_archive 000000010000000000000042
+```
+
+That deletes every segment older than the one named — typically the earliest segment your oldest retained base backup needs. Automate it, verify it, and keep at least two full base backups so a corrupt one does not leave you with nothing.
+
+Set up correctly, PITR turns "we lost a day of data" into "we lost ninety seconds". That difference is worth the afternoon it takes to configure.

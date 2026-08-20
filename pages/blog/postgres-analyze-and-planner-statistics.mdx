@@ -1,0 +1,201 @@
+---
+title: "Postgres ANALYZE and Planner Statistics Explained"
+description: "How ANALYZE builds PostgreSQL planner statistics, how to read pg_stats, when to raise default_statistics_target, and how to fix bad row estimates."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: August 20, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# Postgres ANALYZE and Planner Statistics Explained
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="August 20, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+A query that ran in 40 milliseconds yesterday takes 90 seconds today. Nothing was deployed, the indexes are all there, and the data grew by 2%. The usual culprit is not the query — it is what the planner believes about the data.
+
+PostgreSQL's planner is a cost model fed by statistics. When those statistics are accurate, it picks good plans; when they are stale or too coarse, it picks a nested loop expecting 3 rows and gets 3 million. `ANALYZE` is how you keep them accurate.
+
+## What ANALYZE collects
+
+`ANALYZE` reads a random sample of a table — by default 300 × `default_statistics_target` rows, which is 30,000 rows — and stores summary information in `pg_statistic`, readable through the `pg_stats` view.
+
+```sql
+ANALYZE orders;                     -- one table
+ANALYZE orders (status, created_at); -- specific columns
+ANALYZE;                            -- everything in the database
+VACUUM ANALYZE orders;              -- cleanup and stats together
+```
+
+It takes only a `SHARE UPDATE EXCLUSIVE` lock, so it does not block reads or writes. Running it is safe at any time.
+
+For each column it records four things that drive planning decisions:
+
+- **`null_frac`** — the fraction of NULLs, so `WHERE col IS NULL` can be estimated.
+- **`n_distinct`** — the number of distinct values. A positive number is an absolute count; a negative number between -1 and 0 is a ratio of the row count, used when distinctness scales with table size. `-1` means every value is unique.
+- **Most common values** — `most_common_vals` and `most_common_freqs`, a list of the frequent values and how often each appears.
+- **A histogram** — `histogram_bounds`, dividing the remaining values into equal-frequency buckets for range estimation.
+
+Look at a real column:
+
+```sql
+SELECT attname,
+       null_frac,
+       n_distinct,
+       most_common_vals,
+       most_common_freqs
+FROM pg_stats
+WHERE tablename = 'orders'
+  AND attname = 'status';
+```
+
+```
+ attname |          status
+---------+--------------------------
+ null_frac         | 0
+ n_distinct        | 4
+ most_common_vals  | {shipped,paid,pending,cancelled}
+ most_common_freqs | {0.612,0.271,0.0983,0.0187}
+```
+
+From this the planner estimates `WHERE status = 'cancelled'` as 1.87% of the table. If `orders` has 10 million rows, that is 187,000 — enough to prefer a sequential scan over an index. For `status = 'pending'`, close to 1 million, definitely a sequential scan. Both decisions follow directly from those frequencies.
+
+## Recognising a statistics problem
+
+Run `EXPLAIN ANALYZE` and compare the estimated and actual row counts:
+
+```sql
+EXPLAIN (ANALYZE, BUFFERS)
+SELECT * FROM orders WHERE status = 'pending' AND region = 'EU';
+```
+
+```
+Nested Loop  (cost=0.86..48.21 rows=1 width=84) (actual time=0.04..2841.77 rows=482913 loops=1)
+```
+
+`rows=1` versus `rows=482913` is the diagnosis. The planner chose a nested loop because it expected one row on the inner side; with half a million, the loop executes half a million times. Fixing the estimate fixes the plan — there is nothing wrong with the nested loop itself.
+
+As a rule of thumb, an estimate within 10× of reality is fine. Beyond 100× off, the plan shape is probably wrong.
+
+Check when statistics were last refreshed:
+
+```sql
+SELECT relname,
+       n_live_tup,
+       n_mod_since_analyze,
+       last_analyze,
+       last_autoanalyze
+FROM pg_stat_user_tables
+ORDER BY n_mod_since_analyze DESC
+LIMIT 10;
+```
+
+A large `n_mod_since_analyze` relative to `n_live_tup` means the statistics no longer describe the table. Comparing plans before and after `ANALYZE` — easy to do side by side in a client such as [Chat2DB](https://chat2db.ai/download), which renders execution plans as a readable tree — usually settles the question in a minute.
+
+## Autoanalyze and when it is not enough
+
+Autovacuum runs `ANALYZE` automatically when enough rows change:
+
+```
+threshold = autovacuum_analyze_threshold
+          + autovacuum_analyze_scale_factor × reltuples
+```
+
+With the defaults (50 and 0.1), a 10-million-row table needs a million modifications before autoanalyze fires. Three situations regularly slip through that:
+
+**Immediately after a bulk load.** Statistics reflect the pre-load table until autoanalyze catches up. If a migration or import is followed by queries, `ANALYZE` explicitly:
+
+```sql
+COPY orders FROM '/tmp/orders.csv' CSV HEADER;
+ANALYZE orders;
+```
+
+**Right after a major version upgrade.** `pg_upgrade` does not carry statistics across, so the new cluster starts with none. This is the single most common cause of "the upgrade destroyed our performance". Run `vacuumdb --all --analyze-in-stages` immediately after the upgrade — it does three passes of increasing accuracy so basic statistics exist within seconds.
+
+**On rapidly growing time-series tables.** A table where today's rows are all newer than any sampled value gives the planner a histogram whose upper bound is in the past. It then estimates `WHERE created_at > now() - interval '1 hour'` as almost no rows. Lower the scale factor for those tables:
+
+```sql
+ALTER TABLE events SET (autovacuum_analyze_scale_factor = 0.01);
+```
+
+## Raising the statistics target
+
+`default_statistics_target` controls both the sample size and how many most-common-values and histogram buckets are stored. The default of 100 works for most columns and is too coarse for skewed ones.
+
+Raise it for a specific column rather than globally:
+
+```sql
+ALTER TABLE orders ALTER COLUMN customer_id SET STATISTICS 1000;
+ANALYZE orders;
+```
+
+The change takes effect only after the next `ANALYZE`. Good candidates are columns with heavy skew, many distinct values, or a long tail — `customer_id`, `tenant_id`, `product_sku`. The cost is a longer `ANALYZE` and slightly more planning time, both usually negligible next to one bad plan.
+
+Check whether `n_distinct` is even close to right, since a bad estimate here poisons every join estimate involving the column:
+
+```sql
+SELECT n_distinct FROM pg_stats
+WHERE tablename = 'orders' AND attname = 'customer_id';
+
+SELECT count(DISTINCT customer_id) FROM orders;
+```
+
+If sampling gets it badly wrong — common when distinct values cluster physically — override it:
+
+```sql
+ALTER TABLE orders ALTER COLUMN customer_id SET (n_distinct = 50000);
+ANALYZE orders;
+```
+
+This is a manual assertion, so revisit it as the table grows. A negative value expresses a ratio instead: `-0.5` means half the rows are distinct, which scales automatically.
+
+## Correlated columns: extended statistics
+
+The planner assumes columns are independent. Multiply two selectivities together and you get the combined estimate — correct for unrelated columns, badly wrong for related ones.
+
+Classic example: a `city` and `country` column. `city = 'Paris'` might be 0.1% of rows and `country = 'France'` 2%, so the planner estimates 0.002% for both. In reality, nearly every Paris row is in France, so the true selectivity is 0.1% — a 50× underestimate.
+
+`CREATE STATISTICS` teaches the planner about the relationship:
+
+```sql
+CREATE STATISTICS orders_geo (dependencies, ndistinct)
+  ON city, country FROM orders;
+
+ANALYZE orders;
+```
+
+Three kinds are available:
+
+- **`dependencies`** — functional dependencies, where one column's value implies another's. This is the one that fixes the city/country case.
+- **`ndistinct`** — the number of distinct combinations, which improves `GROUP BY` estimates across several columns.
+- **`mcv`** — most common combinations of values, the most detailed and most useful when specific pairings dominate.
+
+Inspect what was collected:
+
+```sql
+SELECT stxname, stxkeys, stxddependencies
+FROM pg_statistic_ext
+JOIN pg_statistic_ext_data ON oid = stxoid;
+```
+
+From PostgreSQL 14 onward you can also build statistics on expressions, which fixes estimates for functional predicates:
+
+```sql
+CREATE STATISTICS orders_month ON date_trunc('month', created_at) FROM orders;
+ANALYZE orders;
+```
+
+Without it, `WHERE date_trunc('month', created_at) = '2026-08-01'` falls back to a fixed default guess, regardless of how the data is actually distributed.
+
+## A working checklist
+
+- After any bulk load, migration or major upgrade, run `ANALYZE` before trusting query times.
+- When a plan looks wrong, compare estimated and actual rows in `EXPLAIN ANALYZE` before changing anything else.
+- Lower `autovacuum_analyze_scale_factor` on large or fast-growing tables.
+- Raise `SET STATISTICS` on skewed, high-cardinality columns rather than raising it globally.
+- Add extended statistics when two columns in the same `WHERE` clause are correlated.
+- Re-check assumptions after schema or data-distribution changes; statistics tuning is not a one-time task.
+
+Most "the planner is being stupid" reports turn out to be the planner reasoning correctly from bad information. Fix the information first.

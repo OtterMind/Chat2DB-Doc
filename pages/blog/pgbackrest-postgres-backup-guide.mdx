@@ -1,0 +1,219 @@
+---
+title: "pgBackRest Tutorial: PostgreSQL Backups Done Properly"
+description: "Configure pgBackRest for PostgreSQL: repository setup, WAL archiving, full and incremental backups, S3 storage, retention policies and point-in-time restores."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: August 20, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# pgBackRest Tutorial: PostgreSQL Backups Done Properly
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="August 20, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+Hand-rolled PostgreSQL backups start as a `pg_basebackup` in cron and an `archive_command` that copies WAL to a directory. They work until the database grows, and then the full backup takes six hours, nobody has verified a restore in a year, and the archive directory has quietly filled the disk.
+
+pgBackRest exists to replace that script. It does parallel compressed backups, incremental and differential backups, checksums on every file, retention policies, encryption, and restores directly to a point in time — with a command set small enough to memorise.
+
+## Install and lay out the repository
+
+pgBackRest is packaged for most distributions and available from the PGDG repositories:
+
+```bash
+sudo apt install pgbackrest      # Debian / Ubuntu
+sudo dnf install pgbackrest      # RHEL / Rocky / Fedora
+```
+
+The most important design decision comes first: **where the repository lives**. Putting it on the same machine as the database is the mistake that turns a disk failure into data loss. Use a dedicated backup host or object storage.
+
+Create the directories and set ownership on the repository host:
+
+```bash
+sudo mkdir -p /var/lib/pgbackrest
+sudo chmod 750 /var/lib/pgbackrest
+sudo chown postgres:postgres /var/lib/pgbackrest
+```
+
+## Configure pgbackrest.conf
+
+The config file is `/etc/pgbackrest/pgbackrest.conf`. A minimal local-repository setup looks like this:
+
+```ini
+[global]
+repo1-path=/var/lib/pgbackrest
+repo1-retention-full=2
+repo1-retention-diff=4
+repo1-bundle=y
+repo1-block=y
+process-max=4
+log-level-console=info
+log-level-file=detail
+start-fast=y
+
+[global:archive-push]
+compress-level=3
+
+[app]
+pg1-path=/var/lib/postgresql/17/main
+pg1-port=5432
+```
+
+The `[app]` section defines a **stanza** — pgBackRest's name for one PostgreSQL cluster and its backups. You will pass `--stanza=app` to every command.
+
+A few settings earn their place:
+
+- `process-max=4` parallelises compression and transfer. On a machine with spare cores this is the single biggest speed win; set it to roughly half your core count.
+- `repo1-retention-full=2` keeps two full backups and everything needed to restore from them, expiring the rest automatically.
+- `start-fast=y` issues an immediate checkpoint instead of waiting for a spread one, so backups begin promptly.
+- `repo1-bundle=y` packs small files together, which dramatically speeds up backups of databases with thousands of tiny relations.
+
+For S3-compatible object storage, swap the repository block:
+
+```ini
+[global]
+repo1-type=s3
+repo1-path=/pgbackrest
+repo1-s3-bucket=my-pg-backups
+repo1-s3-endpoint=s3.us-east-1.amazonaws.com
+repo1-s3-region=us-east-1
+repo1-s3-key=AKIA...
+repo1-s3-key-secret=...
+repo1-retention-full=4
+repo1-cipher-type=aes-256-cbc
+repo1-cipher-pass=a-long-random-passphrase
+```
+
+Encryption is client-side: pgBackRest encrypts before upload, so the storage provider never sees plaintext. Store that passphrase somewhere you will still have it after losing the database host — without it the backups are unreadable.
+
+## Point PostgreSQL at pgBackRest
+
+In `postgresql.conf`:
+
+```ini
+archive_mode = on
+archive_command = 'pgbackrest --stanza=app archive-push %p'
+wal_level = replica
+max_wal_senders = 3
+```
+
+`archive_mode` and `wal_level` require a restart. Then create the stanza and verify:
+
+```bash
+sudo -u postgres pgbackrest --stanza=app stanza-create
+sudo -u postgres pgbackrest --stanza=app check
+```
+
+`check` is the command to trust. It forces a WAL segment switch, confirms the segment lands in the repository, and validates that the configuration on both ends agrees. If `check` passes, archiving genuinely works — which is more than a green cron job tells you.
+
+## Taking backups
+
+```bash
+# Full: copies everything
+sudo -u postgres pgbackrest --stanza=app --type=full backup
+
+# Differential: changes since the last full
+sudo -u postgres pgbackrest --stanza=app --type=diff backup
+
+# Incremental: changes since the last backup of any type
+sudo -u postgres pgbackrest --stanza=app --type=incr backup
+```
+
+A workable schedule for a mid-sized database: a full backup weekly, a differential daily, and incrementals every few hours. Differentials keep restores simple, because a restore needs only the last full plus one differential plus any incrementals after it — not a chain of seven days of increments.
+
+Inspect what you have:
+
+```bash
+sudo -u postgres pgbackrest --stanza=app info
+```
+
+```
+stanza: app
+    status: ok
+    cipher: aes-256-cbc
+
+    db (current)
+        wal archive min/max (17): 000000010000000000000021/00000001000000000000004F
+
+        full backup: 20260818-020000F
+            timestamp start/stop: 2026-08-18 02:00:00 / 2026-08-18 02:11:43
+            database size: 142.3GB, database backup size: 142.3GB
+            repo1: backup set size: 31.7GB, backup size: 31.7GB
+
+        incr backup: 20260820-020000F_20260820-140000I
+            timestamp start/stop: 2026-08-20 14:00:00 / 2026-08-20 14:01:22
+            database size: 143.1GB, database backup size: 1.2GB
+            repo1: backup set size: 31.9GB, backup size: 260MB
+```
+
+Two things to read here. The backup label encodes lineage: `F` is a full, `D` a differential, `I` an incremental, and the prefix names its parent. And "backup size" versus "backup set size" shows compression at work — 142 GB of database in 32 GB of repository is typical with the default compression.
+
+## Restoring
+
+The plain restore replaces the data directory with the latest backup:
+
+```bash
+sudo systemctl stop postgresql
+sudo -u postgres pgbackrest --stanza=app --delta restore
+sudo systemctl start postgresql
+```
+
+`--delta` compares checksums and copies only files that differ, which turns a multi-hour restore into minutes when the existing directory is mostly intact. It is the flag to reach for when recovering from a partial failure rather than a bare machine.
+
+For point-in-time recovery, name the target:
+
+```bash
+sudo systemctl stop postgresql
+sudo -u postgres pgbackrest --stanza=app \
+  --delta \
+  --type=time \
+  --target='2026-08-20 14:37:29+00' \
+  --target-action=pause \
+  restore
+sudo systemctl start postgresql
+```
+
+pgBackRest picks the right backup set, writes `restore_command` and the recovery target into `postgresql.auto.conf`, and creates `recovery.signal` for you. With `--target-action=pause` the server stops at the target and waits, so you can inspect the data before committing:
+
+```sql
+SELECT pg_is_in_recovery();
+SELECT count(*) FROM orders WHERE created_at::date = '2026-08-20';
+SELECT * FROM schema_migrations ORDER BY applied_at DESC LIMIT 3;
+```
+
+Query the paused instance with any client — connecting with [Chat2DB](https://app.chat2db.ai) lets you keep the recovered database and production side by side while you decide. When satisfied:
+
+```sql
+SELECT pg_wal_replay_resume();
+```
+
+To restore a single table rather than the whole cluster, restore to a scratch directory on a spare port with `--pg1-path`, start it there, and `pg_dump` the table across. pgBackRest restores clusters, not individual relations.
+
+## Verification and retention
+
+Retention runs automatically from the `repo1-retention-*` settings, expiring backups and the WAL they no longer need. To run it on demand:
+
+```bash
+sudo -u postgres pgbackrest --stanza=app expire
+```
+
+Verify repository integrity — every file checksum, every WAL segment present — with:
+
+```bash
+sudo -u postgres pgbackrest --stanza=app verify
+```
+
+Run `verify` on a schedule. It catches bit rot and missing segments while you still have another backup to fall back on.
+
+None of this replaces an actual restore rehearsal. Once a quarter, restore the newest backup onto a spare host, start it, run a handful of application queries, and write down how long it took. That number is your real recovery time objective.
+
+## Common failures and their causes
+
+- **`unable to find primary cluster`** — the stanza's `pg1-path` or `pg1-port` does not match the running server. Compare with `SHOW data_directory;`.
+- **`archive-push` failing, `pg_wal` growing** — usually repository permissions or a full disk on the backup host. Check `pg_stat_archiver` for `failed_count` and read `/var/log/pgbackrest/`.
+- **`WAL segment ... was not archived before timeout`** — archiving cannot keep up with write volume. Raise `process-max` in `[global:archive-push]` and enable `archive-async=y`.
+- **Restore starts but recovery never ends** — the target is beyond the newest archived WAL. Check the `wal archive min/max` line in `info` against your target time.
+
+The pattern behind all four is the same: pgBackRest reports problems loudly, but only if someone reads the logs. Wire `check` and `verify` into monitoring, and the backups will be there the day you need them.

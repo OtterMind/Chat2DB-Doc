@@ -1,0 +1,202 @@
+---
+title: "Fix: no pg_hba.conf entry for host in PostgreSQL"
+description: "Why PostgreSQL rejects a connection with no pg_hba.conf entry for host, how to order the rules, and how to fix it for Docker, SSL and replication."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: August 20, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# Fix: no pg_hba.conf entry for host in PostgreSQL
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="August 20, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+```
+FATAL:  no pg_hba.conf entry for host "172.18.0.4", user "app", database "appdb", no encryption
+```
+
+This error is PostgreSQL telling you something precise: the TCP connection arrived and the server understood it, but no rule in `pg_hba.conf` matches this combination of source address, user, database and connection type. It is a configuration gap, not a password problem — a wrong password produces a different message entirely.
+
+The error line contains everything needed to fix it. This guide covers how to read it, how the matching rules work, and the specific cases that trip people up.
+
+## Read the error first
+
+Every field in the message is a column you must match:
+
+| In the error | Matches this column |
+| --- | --- |
+| `host "172.18.0.4"` | ADDRESS |
+| `user "app"` | USER |
+| `database "appdb"` | DATABASE |
+| `no encryption` / `SSL on` | TYPE (`host`, `hostssl`, `hostnossl`) |
+
+The last one is the field people skip. `no encryption` means the client connected without SSL, so a `hostssl` rule will never match it, no matter how correct the address is.
+
+## How pg_hba.conf matching works
+
+The file is a list of rules, evaluated **top to bottom, first match wins**. Crucially, "first match" means the first rule matching type, database, user and address — and once one matches, its authentication method is used and **no further rules are considered**. If that method rejects you, the connection fails; PostgreSQL does not continue looking for a rule that would have let you in.
+
+That single behaviour explains most confusing `pg_hba.conf` problems.
+
+The format:
+
+```
+# TYPE  DATABASE   USER   ADDRESS         METHOD
+local   all        all                    peer
+host    all        all    127.0.0.1/32    scram-sha-256
+host    all        all    ::1/128         scram-sha-256
+```
+
+- **TYPE** — `local` for Unix sockets, `host` for TCP with or without SSL, `hostssl` for SSL only, `hostnossl` for non-SSL only.
+- **DATABASE** — a name, a comma-separated list, `all`, or `replication` for physical replication connections.
+- **USER** — a role name, `all`, or `+groupname` for members of a role.
+- **ADDRESS** — CIDR notation, a host name, `samenet`, or blank for `local`.
+- **METHOD** — `scram-sha-256`, `md5`, `peer`, `trust`, `cert`, `ldap` and others.
+
+## Fixing the common cases
+
+### An application connecting over TCP
+
+Find the file — it is not always where you expect:
+
+```sql
+SHOW hba_file;
+```
+
+Add a rule that covers your app's subnet:
+
+```
+# TYPE  DATABASE   USER   ADDRESS          METHOD
+host    appdb      app    10.0.1.0/24      scram-sha-256
+```
+
+Then reload. This does not restart the server or drop connections:
+
+```sql
+SELECT pg_reload_conf();
+```
+
+Confirm the file was actually read — PostgreSQL 10 and later expose the parsed rules, which is far better than guessing:
+
+```sql
+SELECT line_number, type, database, user_name, address, auth_method, error
+FROM pg_hba_file_rules
+ORDER BY line_number;
+```
+
+Any row with a non-null `error` is a syntax problem, and a syntactically broken file means your new rule is not active even though `pg_reload_conf()` returned successfully.
+
+### The server is not listening at all
+
+If the error is `connection refused` rather than `no pg_hba.conf entry`, the problem is earlier: PostgreSQL is only bound to localhost. That is `postgresql.conf`, not `pg_hba.conf`:
+
+```ini
+listen_addresses = '*'
+```
+
+This one requires a restart. The two settings are a pair — `listen_addresses` decides who can reach the server, `pg_hba.conf` decides who may authenticate — and fixing one without the other is a common source of an hour lost.
+
+### Docker and Kubernetes
+
+Containers get addresses from a private network, and that address changes when the container restarts. The error names a host like `172.18.0.4` that appears nowhere in your configuration because it did not exist when you wrote it.
+
+Match the network, not the container:
+
+```
+host    all    all    172.16.0.0/12    scram-sha-256
+```
+
+That covers the whole Docker bridge range. In Kubernetes, use the pod CIDR for the cluster. Do not fall back to `0.0.0.0/0` with `trust` — that is a database open to anyone who can route to it, and it is a genuinely dangerous shortcut that tends to outlive the debugging session that introduced it.
+
+The official `postgres` image reads `POSTGRES_HOST_AUTH_METHOD` at first initialisation, which is a cleaner way to configure a development container than editing the file inside it.
+
+### Replication connections
+
+Physical replication connects to a pseudo-database named `replication`. `all` in the DATABASE column does **not** cover it:
+
+```
+# This does NOT allow replication
+host    all            replicator   10.0.0.11/32   scram-sha-256
+
+# This does
+host    replication    replicator   10.0.0.11/32   scram-sha-256
+```
+
+Logical replication is the opposite: `CREATE SUBSCRIPTION` connects to a real database, so it needs a rule naming that database, not `replication`.
+
+```
+host    appdb    replicator   10.0.0.11/32   scram-sha-256
+```
+
+If you are setting up replication from scratch, the [PostgreSQL replication config generator](https://chat2db.ai/tools/postgres-replication-config-generator) emits the correct HBA line for whichever mode you pick, along with the matching server settings.
+
+### SSL required, or refused
+
+```
+FATAL:  no pg_hba.conf entry for host "10.0.1.5", user "app", database "appdb", SSL off
+```
+
+`SSL off` with a `hostssl`-only configuration means the client did not negotiate TLS. Either fix the client — `sslmode=require` in the connection string, or the equivalent setting in your GUI — or add a `host` rule, which accepts both.
+
+To require encryption for remote clients while allowing local ones, order matters:
+
+```
+host      all   all   127.0.0.1/32   scram-sha-256
+hostssl   all   all   10.0.0.0/8     scram-sha-256
+```
+
+### Ordering mistakes
+
+This is the subtle one. Given:
+
+```
+host    all            all          0.0.0.0/0      reject
+host    replication    replicator   10.0.0.11/32   scram-sha-256
+```
+
+the replication rule is dead. The first line matches every TCP connection and rejects it, and matching stops there. Specific rules must come before general ones:
+
+```
+host    replication    replicator   10.0.0.11/32   scram-sha-256
+host    appdb          app          10.0.1.0/24    scram-sha-256
+host    all            all          0.0.0.0/0      reject
+```
+
+The same trap catches `trust` rules left over from installation. A broad `host all all 0.0.0.0/0 trust` near the top silently overrides every careful rule below it.
+
+### peer authentication on the local socket
+
+```
+psql: FATAL:  Peer authentication failed for user "app"
+```
+
+Different message, related cause. `peer` compares your operating system user name to the requested database role. Running `psql -U app` as the `ubuntu` user fails, because the names differ. Three ways out: connect as the matching OS user (`sudo -u postgres psql`), connect over TCP with `-h 127.0.0.1` so a `host` rule applies instead, or change the `local` rule to `scram-sha-256` and give the role a password.
+
+## A safe workflow for editing the file
+
+Locking yourself out of a remote database is easy and unpleasant. This sequence avoids it:
+
+1. **Back it up.** `sudo cp /etc/postgresql/17/main/pg_hba.conf{,.bak}`
+2. **Keep a psql session open.** An existing connection survives a reload, so you have a way back in if the new rules are wrong.
+3. **Add the specific rule above the general ones.**
+4. **Reload, do not restart.** `SELECT pg_reload_conf();`
+5. **Verify the parse.** Query `pg_hba_file_rules` and check for errors.
+6. **Test from the real client**, not from the server itself — a rule that works for `127.0.0.1` says nothing about `10.0.1.5`.
+
+For step 6, a GUI client such as [Chat2DB](https://chat2db.ai/download) is convenient because it reports the server's exact error text rather than a wrapped message, which tells you immediately whether the remaining problem is the HBA rule, the password, or SSL.
+
+## Quick reference
+
+| Symptom | Cause | Fix |
+| --- | --- | --- |
+| `no pg_hba.conf entry ... no encryption` | No matching rule, client not using SSL | Add a `host` rule for the client's CIDR |
+| `no pg_hba.conf entry ... SSL off` | Only `hostssl` rules match | Enable SSL on the client or add a `host` rule |
+| `connection refused` | Server not listening externally | `listen_addresses = '*'`, restart |
+| Replication client rejected | Rule uses `all`, not `replication` | Add a `replication` database rule |
+| New rule has no effect | An earlier rule matched first | Move the specific rule above the general one |
+| `Peer authentication failed` | OS user does not match role name | Connect over TCP or switch the method |
+
+Almost every instance of this error is one of those six. Read the four fields in the message, find the rule that should match them, and check nothing above it matched first.

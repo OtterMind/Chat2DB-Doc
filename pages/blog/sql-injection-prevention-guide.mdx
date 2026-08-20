@@ -1,0 +1,235 @@
+---
+title: "SQL Injection Prevention: A Practical Developer Guide"
+description: "How to prevent SQL injection attacks with prepared statements, allow-listed identifiers and least-privilege database roles, with examples in five languages."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: August 20, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# SQL Injection Prevention: A Practical Developer Guide
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="August 20, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+SQL injection has been the same bug for twenty-five years, and it is still in the OWASP Top 10. Not because it is hard to prevent — the fix is well understood and cheap — but because there is always one query somewhere that was built with string concatenation, and one is enough.
+
+This guide covers what actually makes a query injectable, the one technique that reliably fixes it, and the cases where that technique does not apply and you need a different answer.
+
+## What makes a query injectable
+
+Injection happens when data becomes code. Consider a login handler:
+
+```python
+sql = f"SELECT id FROM users WHERE email = '{email}' AND password_hash = '{pw}'"
+cur.execute(sql)
+```
+
+The developer intended `email` to be a value. But the value is spliced into the SQL text before the database ever sees it, so the database has no way to know which characters came from the developer and which came from the request. Given an email of:
+
+```
+' OR 1=1 --
+```
+
+the database receives:
+
+```sql
+SELECT id FROM users WHERE email = '' OR 1=1 --' AND password_hash = '...'
+```
+
+The `--` comments out the password check and `OR 1=1` matches every row. Nothing was exploited; the database did exactly what the text said.
+
+More damaging variants follow the same shape. A `UNION SELECT` reads tables the endpoint was never meant to expose. A stacked statement — `'; DROP TABLE sessions; --` — runs a second command where the driver permits it. And blind injection extracts data one bit at a time through boolean or timing differences, with no error messages required:
+
+```
+' AND (SELECT substr(password_hash,1,1) FROM users WHERE id=1) = 'a' --
+```
+
+That last one matters because it defeats the common instinct to fix injection by hiding error messages. Hiding errors makes the attack slower, not impossible.
+
+## The fix: send code and data separately
+
+Prepared statements solve injection structurally. The query text goes to the database first and is parsed into an execution plan with placeholders. The values are sent afterwards, on a separate channel, and are bound into the plan as typed data. There is no parsing step left for them to influence — a value containing `' OR 1=1 --` is compared as a literal seventeen-character string against the email column, and matches nothing.
+
+That is the whole idea. Everything below is the same idea in different syntax.
+
+**Python (psycopg):**
+
+```python
+cur.execute(
+    "SELECT id FROM users WHERE email = %s AND status = %s",
+    (email, status),
+)
+```
+
+Note the tuple as a second argument. `cur.execute(sql % params)` looks similar and is completely unsafe — the formatting happens in Python, before the driver is involved.
+
+**Java (JDBC):**
+
+```java
+String sql = "SELECT id FROM users WHERE email = ? AND status = ?";
+try (PreparedStatement ps = conn.prepareStatement(sql)) {
+    ps.setString(1, email);
+    ps.setString(2, status);
+    try (ResultSet rs = ps.executeQuery()) {
+        while (rs.next()) { /* ... */ }
+    }
+}
+```
+
+**Node.js (node-postgres):**
+
+```js
+const { rows } = await client.query(
+  'SELECT id FROM users WHERE email = $1 AND status = $2',
+  [email, status]
+);
+```
+
+**PHP (PDO):**
+
+```php
+$stmt = $pdo->prepare(
+    'SELECT id FROM users WHERE email = :email AND status = :status'
+);
+$stmt->execute(['email' => $email, 'status' => $status]);
+```
+
+Set `PDO::ATTR_EMULATE_PREPARES` to `false` when you create the connection. With emulation on, PDO builds the final SQL string itself rather than using the server's protocol — usually safe, but it reintroduces a quoting layer you do not need.
+
+**Go (database/sql):**
+
+```go
+rows, err := db.Query(
+    "SELECT id FROM users WHERE email = $1 AND status = $2",
+    email, status,
+)
+```
+
+If you are auditing an existing codebase, a static check helps find the leftovers. The free [SQL injection checker](https://chat2db.ai/tools/sql-injection-checker) scans a snippet for f-strings, template literals, `fmt.Sprintf` and concatenation around SQL keywords, and shows the parameterized rewrite for your driver.
+
+## Why escaping is not the answer
+
+The tempting alternative is to sanitise the input — strip quotes, escape backslashes, reject the word `DROP`. This fails in several ways at once, and it is worth being specific about why:
+
+- **Unquoted contexts.** `WHERE id = 5` has no quotes to escape. Injecting `5 OR 1=1` needs no special characters at all, so quote escaping does nothing.
+- **Character set confusion.** Historically, multi-byte encodings allowed a crafted byte sequence to consume the escaping backslash, freeing the quote that followed. Correct escaping requires knowing the connection's exact charset.
+- **Second-order injection.** A value stored safely today may be read back tomorrow and concatenated into a new query. The escaping happened at the wrong boundary.
+- **Blocklists are guesses.** Rejecting `UNION` breaks a user named "Union Carbide", and `UN/**/ION` or `uNiOn` slips past anyway.
+
+Input validation is still worth doing — reject an email that is not an email — but as a data-quality measure, not a security boundary. The security boundary is the parameter.
+
+## The case parameters cannot cover: identifiers
+
+You can bind values. You cannot bind table names, column names, `ORDER BY` targets, or the `ASC`/`DESC` direction, because those change the parsed structure of the query and the plan is built before values arrive.
+
+This is where injection survives in otherwise careful codebases:
+
+```python
+# Unsafe, even though every value is parameterized
+sql = f"SELECT * FROM orders ORDER BY {sort_column} {direction} LIMIT %s"
+```
+
+The fix is an allow-list. Never pass the user's string through; use it to look up a string you wrote:
+
+```python
+SORT_COLUMNS = {
+    "date":   "created_at",
+    "total":  "total_amount",
+    "status": "status",
+}
+DIRECTIONS = {"asc": "ASC", "desc": "DESC"}
+
+column = SORT_COLUMNS.get(sort_key)
+direction = DIRECTIONS.get(direction_key, "ASC")
+if column is None:
+    raise ValueError("invalid sort column")
+
+sql = f"SELECT * FROM orders ORDER BY {column} {direction} LIMIT %s"
+cur.execute(sql, (limit,))
+```
+
+The f-string is still there, but every value it can interpolate is a constant from your own dictionary. An unknown key raises instead of building a query.
+
+Inside PostgreSQL functions, `format()` with `%I` quotes an identifier correctly:
+
+```sql
+CREATE OR REPLACE FUNCTION rows_in(tbl regclass)
+RETURNS bigint AS $$
+DECLARE n bigint;
+BEGIN
+  EXECUTE format('SELECT count(*) FROM %I', tbl) INTO n;
+  RETURN n;
+END;
+$$ LANGUAGE plpgsql;
+```
+
+The `regclass` type is doing real work here: it only accepts identifiers that resolve to an existing relation, so an arbitrary string is rejected before `format()` runs.
+
+## Dynamic SQL inside the database
+
+Stored procedures are not automatically safe. This one is injectable despite living in the database:
+
+```sql
+-- Vulnerable
+CREATE FUNCTION find_users(pattern text) RETURNS SETOF users AS $$
+BEGIN
+  RETURN QUERY EXECUTE
+    'SELECT * FROM users WHERE name LIKE ''' || pattern || '''';
+END;
+$$ LANGUAGE plpgsql;
+```
+
+`EXECUTE` with concatenation has exactly the same problem as concatenation in the application. Use `USING` to bind:
+
+```sql
+-- Safe
+CREATE FUNCTION find_users(pattern text) RETURNS SETOF users AS $$
+BEGIN
+  RETURN QUERY EXECUTE
+    'SELECT * FROM users WHERE name LIKE $1'
+    USING pattern;
+END;
+$$ LANGUAGE plpgsql;
+```
+
+The same applies to `sp_executesql` in SQL Server and `EXECUTE IMMEDIATE ... USING` in Oracle. Every mature database offers a bind mechanism for dynamic SQL; the concatenating form is the legacy path.
+
+## Defence in depth
+
+Parameters stop the injection. These limit what a missed one can do:
+
+**Least privilege.** The application role should own nothing and be granted only what it uses:
+
+```sql
+CREATE ROLE app_user LOGIN PASSWORD 'change-me';
+GRANT CONNECT ON DATABASE appdb TO app_user;
+GRANT USAGE ON SCHEMA public TO app_user;
+GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO app_user;
+REVOKE CREATE ON SCHEMA public FROM app_user;
+```
+
+A read-only reporting endpoint should use a role with only `SELECT`. Injection through it then cannot write anything.
+
+**Disable multi-statement queries.** Many drivers refuse stacked statements by default; make sure yours does, so `'; DROP TABLE sessions; --` cannot append a second command.
+
+**Set statement timeouts.** `SET statement_timeout = '5s'` caps time-based blind injection and slow `UNION` probes.
+
+**Generic error responses.** Return "invalid credentials", not the driver's exception text. Error messages that echo SQL turn blind injection into ordinary injection.
+
+**Row-level security** for multi-tenant data, so a leaked query still cannot cross tenant boundaries.
+
+**Log and review the SQL your application actually sends.** ORMs generate queries you did not write, and raw-SQL escape hatches accumulate. Reading the real statements — through query logs, `pg_stat_statements`, or a client like [Chat2DB](https://chat2db.ai/download) that can explain a query and its plan — is how you find the one endpoint that never got converted.
+
+## A review checklist
+
+- Every value in every query arrives as a bound parameter, not as text.
+- Every identifier that varies is looked up in a hard-coded allow-list.
+- `EXECUTE` inside functions uses `USING`, never `||`.
+- The application role cannot create, drop, or read tables it does not use.
+- Statement timeouts and generic error pages are in place.
+- A grep for `f"SELECT`, `"SELECT " +`, `` `SELECT ${ `` and `Sprintf("SELECT` returns nothing.
+
+The last item is the one to automate. Injection does not usually come back through a clever bypass; it comes back through a new endpoint written in a hurry.

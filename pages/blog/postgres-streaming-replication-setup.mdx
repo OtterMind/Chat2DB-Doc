@@ -1,0 +1,211 @@
+---
+title: "PostgreSQL Streaming Replication Setup: Step by Step"
+description: "Set up PostgreSQL streaming replication from scratch: primary config, pg_hba.conf, replication slots, pg_basebackup, synchronous commit and failover checks."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: August 20, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# PostgreSQL Streaming Replication Setup: Step by Step
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="August 20, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+Streaming replication is the foundation of nearly every PostgreSQL high-availability setup. The primary writes changes to its write-ahead log, a walsender process ships those WAL records over a TCP connection, and a walreceiver on the standby applies them. The result is a byte-for-byte copy of the whole cluster that you can read from and promote when the primary dies.
+
+The mechanics are simpler than the documentation makes them look. This guide walks through a complete setup on PostgreSQL 12 or later, where the old `recovery.conf` file no longer exists and recovery settings live in `postgresql.conf`.
+
+## What streaming replication actually copies
+
+A physical standby replays WAL, so it copies everything in the cluster: all databases, all tables, all users, all sequences. You cannot replicate a single table this way, and you cannot write to the standby. Those constraints are also the source of its strengths — there is no per-table bookkeeping, replication lag is usually milliseconds, and a promoted standby is an exact replacement for the primary.
+
+If you need a subset of tables or a writable target, you want logical replication instead.
+
+## Step 1: prepare the primary
+
+Three things need to be true on the primary before a standby can connect: WAL must contain enough information, the server must allow walsender connections, and a role must exist to make them.
+
+Edit `postgresql.conf`:
+
+```ini
+listen_addresses = '*'
+wal_level = replica
+max_wal_senders = 5
+max_replication_slots = 5
+wal_keep_size = 512MB
+hot_standby = on
+```
+
+`wal_level = replica` is the default in modern versions, but check it — a cluster restored from old settings may still be on `minimal`, which produces WAL that a standby cannot use. `max_wal_senders` needs one slot per standby plus a couple of spare for `pg_basebackup` and monitoring. All four of those settings require a restart, so make the changes together.
+
+Now create the replication role. It needs the `REPLICATION` attribute and `LOGIN`, but no other privileges — a replication connection never runs ordinary SQL:
+
+```sql
+CREATE ROLE replicator WITH REPLICATION LOGIN PASSWORD 'a-strong-password';
+```
+
+Finally, authorise the standby in `pg_hba.conf`. Physical replication connects to a pseudo-database literally called `replication`, which is why a normal `host all all` line does not cover it:
+
+```
+# TYPE  DATABASE        USER            ADDRESS             METHOD
+host    replication     replicator      10.0.0.11/32        scram-sha-256
+```
+
+Put that line above any broader rule, because `pg_hba.conf` is evaluated top to bottom and the first match wins. Reload with `SELECT pg_reload_conf();`.
+
+If you would rather not hand-assemble these blocks, the free [PostgreSQL replication config generator](https://chat2db.ai/tools/postgres-replication-config-generator) produces all of them — primary config, HBA line, role SQL, base backup command and monitoring queries — from your host names and version.
+
+## Step 2: create a replication slot
+
+A slot tells the primary "do not recycle WAL that this standby has not received yet". Without one, a standby that is offline longer than `wal_keep_size` allows comes back to find the WAL it needs is gone, and you have to rebuild it from scratch.
+
+```sql
+SELECT pg_create_physical_replication_slot('standby1_slot');
+```
+
+The trade-off is real and worth stating plainly: an inactive slot retains WAL forever. If you decommission a standby and forget its slot, `pg_wal` grows until the disk fills and the primary shuts down. Monitor it:
+
+```sql
+SELECT slot_name,
+       active,
+       wal_status,
+       pg_size_pretty(
+         pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn)
+       ) AS retained_wal
+FROM pg_replication_slots;
+```
+
+Drop anything you no longer need with `SELECT pg_drop_replication_slot('old_slot');`.
+
+## Step 3: clone the primary with pg_basebackup
+
+On the standby, stop PostgreSQL and empty the data directory. This is destructive — be certain you are on the right host.
+
+```bash
+sudo systemctl stop postgresql
+sudo -u postgres rm -rf /var/lib/postgresql/17/main/*
+```
+
+Then take the base backup:
+
+```bash
+sudo -u postgres PGPASSWORD='a-strong-password' \
+  pg_basebackup \
+    --host=10.0.0.10 \
+    --port=5432 \
+    --username=replicator \
+    --pgdata=/var/lib/postgresql/17/main \
+    --wal-method=stream \
+    --checkpoint=fast \
+    --slot=standby1_slot \
+    --write-recovery-conf \
+    --progress
+```
+
+Two flags do the important work. `--wal-method=stream` opens a second connection that streams WAL generated *during* the backup, so the copy is consistent without depending on WAL archives. `--write-recovery-conf` appends `primary_conninfo` and `primary_slot_name` to `postgresql.auto.conf` and creates the `standby.signal` file, which is what actually puts the server into standby mode on startup.
+
+For a large database, add `--max-rate=100M` to keep the copy from saturating the network link the application is using.
+
+## Step 4: review the standby settings
+
+Open `postgresql.auto.conf` on the standby and check what `pg_basebackup` wrote:
+
+```ini
+primary_conninfo = 'host=10.0.0.10 port=5432 user=replicator password=a-strong-password application_name=standby1'
+primary_slot_name = 'standby1_slot'
+```
+
+Add `application_name` if it is missing — synchronous replication identifies standbys by that name, and it makes `pg_stat_replication` readable. In `postgresql.conf`, one setting is worth turning on for read replicas:
+
+```ini
+hot_standby_feedback = on
+```
+
+This tells the primary which rows the standby's queries still need, so autovacuum will not remove them and cancel long-running reporting queries with the classic `canceling statement due to conflict with recovery` error. The cost is that a slow query on the standby can now delay cleanup on the primary — acceptable for a reporting replica, less so if the standby runs hours-long analytics.
+
+Start the server:
+
+```bash
+sudo systemctl start postgresql
+```
+
+## Step 5: verify it works
+
+On the primary, one row should appear per connected standby:
+
+```sql
+SELECT application_name,
+       state,
+       sync_state,
+       pg_wal_lsn_diff(sent_lsn, replay_lsn) AS replay_lag_bytes
+FROM pg_stat_replication;
+```
+
+`state` should be `streaming`. If it is `catchup`, the standby is still replaying the backlog and you should watch the lag shrink.
+
+On the standby:
+
+```sql
+SELECT pg_is_in_recovery();                             -- true
+SELECT now() - pg_last_xact_replay_timestamp() AS lag;  -- seconds behind
+```
+
+Then prove it end to end. Create a table on the primary and read it on the standby:
+
+```sql
+-- primary
+CREATE TABLE replication_check (id int, noted_at timestamptz DEFAULT now());
+INSERT INTO replication_check (id) VALUES (1);
+```
+
+```sql
+-- standby, a moment later
+SELECT * FROM replication_check;
+```
+
+Trying to write on the standby returns `cannot execute INSERT in a read-only transaction`, which confirms you are talking to the replica and not accidentally to the primary. Browsing both servers side by side in a client such as [Chat2DB](https://chat2db.ai/download) makes this check quick, since you can keep two connections open and compare the same query on each.
+
+## Synchronous replication, if you need it
+
+By default, replication is asynchronous: the primary commits, then ships WAL. A crash can lose the last few transactions. To make commits wait for a standby, set on the primary:
+
+```ini
+synchronous_commit = on
+synchronous_standby_names = 'FIRST 1 (standby1, standby2)'
+```
+
+`FIRST 1` means a commit returns once any one of the listed standbys has confirmed. The levels differ in how far the standby must get:
+
+| synchronous_commit | Standby must have |
+| --- | --- |
+| `remote_write` | Written WAL to its OS cache |
+| `on` | Flushed WAL to disk |
+| `remote_apply` | Applied WAL, so reads there see the commit |
+
+`remote_apply` is the only level that guarantees a read-your-writes experience on the replica, and it is also the slowest. The danger with synchronous replication is availability, not speed: if the only synchronous standby goes down, commits on the primary block until it returns or you change the setting. Always list at least two standbys, or be ready to run `ALTER SYSTEM SET synchronous_standby_names = ''; SELECT pg_reload_conf();` under pressure.
+
+## Promoting the standby
+
+When the primary is gone, promote:
+
+```bash
+sudo -u postgres pg_ctl promote -D /var/lib/postgresql/17/main
+```
+
+The `standby.signal` file is removed, recovery ends, and the server becomes writable. Confirm with `SELECT pg_is_in_recovery();` — it should now return false.
+
+The part teams skip is what happens to the old primary. It cannot simply be restarted as a standby, because it may contain transactions the new primary never received. Use `pg_rewind` to rewind it to the divergence point, or rebuild it with a fresh `pg_basebackup`. Whichever you choose, rehearse it in staging before you need it at 3 a.m.
+
+## A short checklist
+
+- `wal_level = replica`, `max_wal_senders` sized for your standbys, restart applied.
+- Replication role created, `pg_hba.conf` line for the `replication` database, config reloaded.
+- Physical slot created and monitored for retained WAL.
+- `pg_basebackup` with `--wal-method=stream` and `--write-recovery-conf`.
+- `pg_stat_replication` shows `streaming`, and a test row travels from primary to standby.
+- Failover, including recovery of the old primary, tested in staging.
+
+Get those six right and streaming replication is one of the most dependable pieces of PostgreSQL you will run.

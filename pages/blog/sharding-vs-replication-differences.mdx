@@ -1,0 +1,159 @@
+---
+title: "Sharding vs Replication: What Each One Actually Solves"
+description: "Sharding splits data across nodes to scale writes; replication copies it to survive failure and scale reads. How they differ and when to use each."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: August 20, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# Sharding vs Replication: What Each One Actually Solves
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="August 20, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+Sharding and replication both spread a database across multiple machines, which is why they get discussed together and confused constantly. They solve opposite problems.
+
+**Replication copies the same data to more machines.** Every node holds a full copy. It buys you fault tolerance and read capacity.
+
+**Sharding splits different data across machines.** Each node holds a distinct slice. It buys you write capacity and storage beyond one machine.
+
+If your database is falling over because too many people are reading, sharding will not help. If it is falling over because writes exceed what one server can absorb, replication will not help. Diagnosing which is which is most of the work.
+
+## Replication in practice
+
+A replicated cluster has one primary that accepts writes and one or more replicas that receive a stream of changes. In PostgreSQL that stream is WAL; in MySQL it is the binary log.
+
+Set up, verified and monitored, this gives you three things:
+
+**Failure survival.** When the primary dies, promote a replica. Your recovery time is however long promotion and DNS or proxy reconfiguration take, rather than however long restoring a backup takes.
+
+**Read scaling.** Point reporting queries, analytics and read-heavy endpoints at replicas. A read-heavy application can often absorb 10× growth this way with no code changes beyond routing.
+
+**Geographic locality.** A replica in another region serves local reads with local latency.
+
+What it does not give you is write capacity. Every write still lands on the primary, and every replica must apply every write, so adding replicas adds work rather than removing it. A cluster with ten replicas has exactly the same write ceiling as one with none.
+
+It also introduces replication lag. Asynchronous replicas are behind by milliseconds normally and by much more under load, which produces the classic bug: a user updates their profile, the next page reads from a replica, and the change appears to have vanished. Handle it by routing reads-after-writes to the primary, or by using synchronous replication for the paths that need it — at a latency cost on every commit.
+
+Checking lag is a routine you want to be able to run without thinking:
+
+```sql
+-- PostgreSQL, on the primary
+SELECT application_name,
+       state,
+       sync_state,
+       pg_wal_lsn_diff(sent_lsn, replay_lsn) AS lag_bytes
+FROM pg_stat_replication;
+
+-- PostgreSQL, on the replica
+SELECT now() - pg_last_xact_replay_timestamp() AS lag_seconds;
+```
+
+```sql
+-- MySQL, on the replica
+SHOW REPLICA STATUS\G
+-- read Seconds_Behind_Source and Replica_SQL_Running
+```
+
+## Sharding in practice
+
+Sharding partitions rows across independent databases by a **shard key**. Users 1–1,000,000 live on shard A, 1,000,001–2,000,000 on shard B, and so on. Each shard is a normal database that knows nothing about the others.
+
+This scales writes linearly in the best case, and it removes the single-machine limit on data volume. Those are real benefits and there is no other way to get them.
+
+The costs are substantial, and worth being blunt about:
+
+**Cross-shard queries become application code.** `SELECT count(*) FROM orders WHERE status = 'pending'` has to run on every shard and be summed by the application. A join between tables on different shards is not a join at all — it is two queries and a merge you write yourself.
+
+**Transactions stop being atomic across shards.** Moving money between two accounts on different shards requires two-phase commit or a saga pattern. Both are considerably harder than `BEGIN; ... COMMIT;`.
+
+**Rebalancing is a project.** If one shard becomes a hotspot — a single enormous tenant, a celebrity user — moving data between shards while the system runs is a serious engineering effort.
+
+**The shard key is nearly permanent.** Choosing user ID and then discovering most queries filter by organisation means every query hits every shard. Changing it later means re-sharding the entire dataset.
+
+The key choice deserves real analysis. Good keys distribute evenly and match how you query. `tenant_id` works well for B2B SaaS because almost every query is scoped to one tenant. A hash of user ID distributes evenly but destroys range queries. A timestamp guarantees a hotspot, because all new writes land on the newest shard.
+
+## Side by side
+
+| | Replication | Sharding |
+| --- | --- | --- |
+| Data per node | Full copy | One slice |
+| Scales reads | Yes | Yes |
+| Scales writes | No | Yes |
+| Scales storage | No | Yes |
+| Survives node loss | Yes, by design | No — losing a shard loses that data |
+| Cross-node queries | Not needed | Application-level fan-out |
+| Transactions | Normal | Distributed, or restricted to one shard |
+| Operational cost | Moderate | High |
+| Reversible | Yes | Barely |
+
+The last row is the one to weigh most heavily. You can remove a replica in an afternoon. Un-sharding a production system is a migration measured in quarters.
+
+## Most real systems use both
+
+Sharding without replication means any single machine failure permanently loses a slice of your data. So production sharded systems replicate each shard:
+
+```
+Shard A: primary + 2 replicas   (users 1M–2M)
+Shard B: primary + 2 replicas   (users 2M–3M)
+Shard C: primary + 2 replicas   (users 3M–4M)
+```
+
+Each shard is its own replicated cluster with its own failover. Nine machines, three write endpoints, full redundancy. This is what MongoDB's sharded clusters, Vitess for MySQL and Citus for PostgreSQL all build.
+
+## The order to try things
+
+Sharding is where teams jump too early. The steps before it are cheaper, reversible, and frequently sufficient:
+
+1. **Fix the queries and indexes.** A missing index on a hot table routinely costs more than an entire additional server. Find the worst offenders first:
+
+   ```sql
+   -- PostgreSQL
+   SELECT calls,
+          round(mean_exec_time::numeric, 2) AS avg_ms,
+          round(total_exec_time::numeric / 1000, 1) AS total_s,
+          left(query, 70) AS query
+   FROM pg_stat_statements
+   ORDER BY total_exec_time DESC
+   LIMIT 20;
+   ```
+
+   Reading those plans in a client that visualises them — [Chat2DB](https://app.chat2db.ai) renders `EXPLAIN ANALYZE` output as a tree with timings — turns this from an afternoon into twenty minutes.
+
+2. **Add connection pooling.** PgBouncer or ProxySQL in front of the database often removes a bottleneck people mistake for a capacity limit.
+
+3. **Cache what is read repeatedly.** Redis in front of the hottest queries can absorb an order of magnitude of read traffic.
+
+4. **Scale up.** Doubling CPU and RAM is a maintenance window. Sharding is a quarter of engineering time. Modern single instances handle far more than most estimates assume — hundreds of thousands of transactions per second on good hardware.
+
+5. **Add read replicas.** If reads dominate — and for most applications they do — this is where the ceiling lifts.
+
+6. **Partition within one database.** PostgreSQL declarative partitioning and MySQL partitioning split a table into pieces on the *same* server. Queries stay ordinary SQL, transactions stay atomic, and you get much of the maintenance benefit — dropping an old partition instead of a slow bulk `DELETE`, and smaller indexes per partition.
+
+   ```sql
+   CREATE TABLE events (
+     id         bigserial,
+     created_at timestamptz NOT NULL,
+     payload    jsonb
+   ) PARTITION BY RANGE (created_at);
+
+   CREATE TABLE events_2026_08 PARTITION OF events
+     FOR VALUES FROM ('2026-08-01') TO ('2026-09-01');
+   ```
+
+7. **Then shard**, if writes genuinely exceed what one primary can take, or the dataset exceeds what one machine can store.
+
+## Deciding quickly
+
+Ask what is actually saturated:
+
+- **Read queries are slow, writes are fine** → replicas.
+- **The primary's CPU is pinned by writes** → shard, or partition and optimise first.
+- **The dataset no longer fits on one machine** → shard.
+- **An outage would be unacceptable** → replication, regardless of anything else.
+- **You are not sure** → measure. Look at write throughput, replication lag, disk growth rate and the top queries by total time before choosing an architecture.
+
+Replication is something almost every production database should have. Sharding is something you should be able to justify with a specific number.

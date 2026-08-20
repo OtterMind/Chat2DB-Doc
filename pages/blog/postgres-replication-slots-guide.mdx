@@ -1,0 +1,177 @@
+---
+title: "Postgres Replication Slots: Create, Monitor and Drop"
+description: "How PostgreSQL replication slots work, why they fill your disk, how to monitor retained WAL, and how to safely drop a replication slot that is blocking cleanup."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: August 20, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# Postgres Replication Slots: Create, Monitor and Drop
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="August 20, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+Replication slots solve a genuine problem and create a new one. The problem they solve: a standby that falls behind may need WAL segments the primary has already recycled, which breaks replication permanently. The problem they create: a slot that no consumer is reading keeps WAL forever, and `pg_wal` grows until the disk is full and PostgreSQL shuts down.
+
+Most teams meet slots for the first time during that second scenario. This guide covers both ends — how to use slots properly, and how to diagnose and clear one that is eating your disk.
+
+## What a slot is
+
+A replication slot is a small piece of persistent server state that records how far a particular consumer has read. The primary refuses to remove any WAL newer than that position, and for logical slots it also refuses to vacuum away row versions the decoder still needs.
+
+There are two kinds:
+
+- **Physical slots** are used by streaming replicas. They track a WAL position only.
+- **Logical slots** are used by logical replication and change-data-capture tools such as Debezium. They also hold an output plugin and a snapshot of catalog state.
+
+The key property in both cases is durability. Unlike `wal_keep_size`, which is a best-effort buffer, a slot is a hard guarantee — and a hard guarantee with no consumer is just a leak.
+
+## Creating slots
+
+A physical slot is usually created by hand before you clone the standby:
+
+```sql
+SELECT pg_create_physical_replication_slot('standby1_slot');
+```
+
+Then reference it from the standby, either through `pg_basebackup --slot=standby1_slot --write-recovery-conf` or directly in `postgresql.conf`:
+
+```ini
+primary_slot_name = 'standby1_slot'
+```
+
+Logical slots are normally created for you. `CREATE SUBSCRIPTION` makes one on the publisher automatically, named after the subscription. You only create one manually when an external consumer will read it:
+
+```sql
+SELECT pg_create_logical_replication_slot('debezium_slot', 'pgoutput');
+```
+
+`pgoutput` is the built-in plugin shipped with PostgreSQL; `wal2json` and `test_decoding` are common alternatives. Note that a logical slot requires `wal_level = logical`, which needs a restart.
+
+Both slot types require `max_replication_slots` to be large enough. If it is not, creation fails with `all replication slots are in use`, and raising it means another restart — size it generously up front, since unused slot entries cost essentially nothing.
+
+## Monitoring: the query to keep
+
+This is the single most useful query about slots, and it is worth putting on a dashboard:
+
+```sql
+SELECT slot_name,
+       slot_type,
+       database,
+       active,
+       active_pid,
+       wal_status,
+       pg_size_pretty(
+         pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn)
+       ) AS retained_wal
+FROM pg_replication_slots
+ORDER BY pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn) DESC;
+```
+
+Read it column by column:
+
+- `active = false` means nothing is consuming this slot right now. For a slot that should have a live standby, that is an alert.
+- `retained_wal` is how much WAL the primary is holding because of this slot. Compare it to the free space on the `pg_wal` filesystem.
+- `wal_status` is the summary judgement. `reserved` is healthy. `extended` means the slot has gone past `max_wal_size` but WAL is still available. `unreserved` means the required WAL is at risk of removal. `lost` means it is gone and the slot is dead — the consumer must be rebuilt.
+
+For logical slots, add a second check, because logical slots hold back vacuum as well as WAL:
+
+```sql
+SELECT slot_name,
+       confirmed_flush_lsn,
+       age(catalog_xmin) AS catalog_xmin_age
+FROM pg_replication_slots
+WHERE slot_type = 'logical';
+```
+
+A large and growing `catalog_xmin_age` means dead tuples are accumulating cluster-wide because the slot pins an old snapshot. That shows up as table bloat far away from the replicated tables themselves, which makes it a genuinely confusing failure to diagnose.
+
+Setting `max_slot_wal_keep_size` gives you a safety valve:
+
+```ini
+max_slot_wal_keep_size = 50GB
+```
+
+Above that, PostgreSQL will invalidate the slot rather than keep filling the disk. You lose the replica and have to rebuild it — but the primary stays up, which is almost always the trade you want.
+
+## Dropping a slot
+
+To drop a slot, first confirm nothing is using it:
+
+```sql
+SELECT slot_name, active, active_pid
+FROM pg_replication_slots
+WHERE slot_name = 'standby1_slot';
+```
+
+If `active` is false, drop it directly:
+
+```sql
+SELECT pg_drop_replication_slot('standby1_slot');
+```
+
+If it is active you will get `replication slot "standby1_slot" is active for PID 12345`. PostgreSQL is protecting a live consumer. Do not reach for the terminate function until you know what that PID is — it may be a healthy standby you are about to break. Check it:
+
+```sql
+SELECT pid, client_addr, application_name, state, backend_start
+FROM pg_stat_replication
+WHERE pid = 12345;
+```
+
+If it really is a decommissioned consumer that will not disconnect:
+
+```sql
+SELECT pg_terminate_backend(12345);
+SELECT pg_drop_replication_slot('standby1_slot');
+```
+
+For a slot created by a subscription, drop it from the subscriber side instead so the two ends stay consistent:
+
+```sql
+DROP SUBSCRIPTION app_sub;
+```
+
+If the publisher is already unreachable, that command hangs trying to clean up the remote slot. Detach the slot first, then drop:
+
+```sql
+ALTER SUBSCRIPTION app_sub DISABLE;
+ALTER SUBSCRIPTION app_sub SET (slot_name = NONE);
+DROP SUBSCRIPTION app_sub;
+```
+
+Then remove the orphaned slot on the publisher by hand when it comes back.
+
+## The disk-is-full emergency
+
+When `pg_wal` has filled the partition, the order of operations matters:
+
+1. **Find the culprit.** Run the monitoring query above. Usually one slot has a `retained_wal` figure dwarfing the others.
+2. **Decide whether the consumer is coming back.** A standby you plan to fix is worth waiting for; a slot from a CDC pipeline that was decommissioned three months ago is not.
+3. **Drop the dead slot.** WAL is not freed instantly — it is removed at the next checkpoint. Force one with `CHECKPOINT;` and watch the directory shrink.
+4. **Never delete files from `pg_wal` by hand.** Removing a segment the server still needs corrupts the cluster beyond repair. The slot is the correct lever.
+
+If the disk is so full that PostgreSQL will not start, the usual escape is to temporarily mount extra space or move the WAL archive elsewhere, start the server, then drop the slot properly.
+
+## Slots versus wal_keep_size
+
+You can run streaming replication without slots by keeping a fixed amount of WAL:
+
+```ini
+wal_keep_size = 2GB
+```
+
+This caps the risk — the primary never retains more than 2 GB regardless of what the standby is doing — but it is a gamble on the standby never being offline longer than 2 GB of write traffic takes to produce. On a busy system that might be ten minutes.
+
+A reasonable default for most deployments: use a slot, set `max_slot_wal_keep_size` to a value your disk can absorb, and alert on `active = false` for any slot older than a few minutes. You get the guarantee where it helps and a circuit breaker where it hurts.
+
+## Everyday habits that prevent slot incidents
+
+- Name slots after their consumer (`standby1_slot`, `debezium_orders`) so an orphan is identifiable months later.
+- Add "drop the replication slot" to the runbook for decommissioning any replica or CDC pipeline.
+- Alert on retained WAL size, not just disk usage — retained WAL gives you hours of warning, disk usage gives you minutes.
+- Check `pg_replication_slots` after every failover, since promoting a standby often leaves the old topology's slots behind.
+
+Keeping an eye on this is easy enough to fold into a routine: pin the monitoring query as a saved query in a client like [Chat2DB](https://app.chat2db.ai) and run it whenever replication behaves oddly. Slots are excellent infrastructure right up until nobody is watching them.

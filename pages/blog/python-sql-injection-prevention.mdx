@@ -1,0 +1,257 @@
+---
+title: "How to Prevent SQL Injection in Python"
+description: "Prevent SQL injection in Python with psycopg, sqlite3, MySQL and SQLAlchemy: parameter styles, safe identifiers, ORM pitfalls and how to audit an app."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: August 20, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# How to Prevent SQL Injection in Python
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="August 20, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+Python makes string building so pleasant that it makes SQL injection easy. An f-string reads better than a parameter tuple, and it works perfectly in development, where nobody's name contains an apostrophe.
+
+This guide covers the specific Python patterns that are unsafe, the correct form for each major driver, and the two places where parameters do not help.
+
+## The unsafe patterns
+
+All four of these produce the same vulnerability. They are worth recognising on sight, because a code review that only looks for f-strings will miss the other three:
+
+```python
+# 1. f-string
+cur.execute(f"SELECT * FROM users WHERE email = '{email}'")
+
+# 2. % formatting applied in Python
+cur.execute("SELECT * FROM users WHERE email = '%s'" % email)
+
+# 3. .format()
+cur.execute("SELECT * FROM users WHERE email = '{}'".format(email))
+
+# 4. concatenation
+cur.execute("SELECT * FROM users WHERE email = '" + email + "'")
+```
+
+In every case the final SQL string exists in Python before the driver sees it, so the driver has no opportunity to distinguish data from code. An email of `' OR 1=1 --` returns every user.
+
+The trap in the second example deserves attention: `%s` is also psycopg's placeholder. The difference is not the marker, it is who does the substitution. Written with `%` in Python, the value is interpolated by the interpreter. Passed as a second argument, it is bound by the driver.
+
+```python
+# Unsafe — Python interpolates
+cur.execute("SELECT * FROM users WHERE email = '%s'" % email)
+
+# Safe — the driver binds
+cur.execute("SELECT * FROM users WHERE email = %s", (email,))
+```
+
+Note that the safe form has no quotes around `%s`. The driver adds whatever the value's type requires; quoting it yourself produces a syntax error or, worse, breaks the binding.
+
+## The right form for each driver
+
+Python's DB-API defines five parameter styles, and drivers differ. Getting this wrong produces confusing errors, so it is worth a table:
+
+| Driver | Database | Style | Placeholder |
+| --- | --- | --- | --- |
+| psycopg 2 / 3 | PostgreSQL | `pyformat` | `%s` |
+| sqlite3 | SQLite | `qmark` | `?` |
+| mysql-connector-python | MySQL | `format` | `%s` |
+| PyMySQL | MySQL | `pyformat` | `%s` |
+| pyodbc | SQL Server | `qmark` | `?` |
+| oracledb | Oracle | `named` | `:name` |
+
+Any driver reports its own style at runtime:
+
+```python
+import sqlite3
+print(sqlite3.paramstyle)   # 'qmark'
+```
+
+**psycopg (PostgreSQL):**
+
+```python
+cur.execute(
+    "SELECT id, email FROM users WHERE status = %s AND created_at > %s",
+    (status, since),
+)
+```
+
+Named parameters work too, and are easier to read when a query has many:
+
+```python
+cur.execute(
+    """
+    SELECT id, email FROM users
+    WHERE status = %(status)s
+      AND created_at > %(since)s
+    """,
+    {"status": status, "since": since},
+)
+```
+
+**sqlite3:**
+
+```python
+cur.execute(
+    "SELECT id, email FROM users WHERE status = ? AND created_at > ?",
+    (status, since),
+)
+```
+
+A tuple of one needs the trailing comma — `(email,)`, not `(email)`. Without it Python passes a string, the driver iterates its characters, and you get "incorrect number of bindings".
+
+**Bulk inserts** should use `executemany`, which binds each row rather than building one enormous statement:
+
+```python
+rows = [("alice@example.com", "active"), ("bob@example.com", "pending")]
+cur.executemany(
+    "INSERT INTO users (email, status) VALUES (%s, %s)",
+    rows,
+)
+```
+
+**IN clauses** are the case people most often abandon parameters for, because you cannot bind a list to a single placeholder in most drivers. In psycopg, use an array and `= ANY`:
+
+```python
+cur.execute(
+    "SELECT id, email FROM users WHERE id = ANY(%s)",
+    (user_ids,),          # a Python list becomes a PostgreSQL array
+)
+```
+
+Elsewhere, generate the right number of placeholders from the length of the list — never from its contents:
+
+```python
+placeholders = ", ".join(["?"] * len(user_ids))
+cur.execute(
+    f"SELECT id, email FROM users WHERE id IN ({placeholders})",
+    user_ids,
+)
+```
+
+The f-string here interpolates only `?` characters, so there is nothing attacker-controlled in the query text.
+
+## Composing SQL safely with psycopg
+
+When the query structure itself must vary, psycopg provides `psycopg.sql` (`psycopg2.sql` in the older release), which builds SQL from typed fragments instead of raw strings:
+
+```python
+from psycopg import sql
+
+query = sql.SQL("SELECT {fields} FROM {table} WHERE {key} = %s").format(
+    fields=sql.SQL(", ").join([sql.Identifier("id"), sql.Identifier("email")]),
+    table=sql.Identifier("users"),
+    key=sql.Identifier("status"),
+)
+cur.execute(query, (status,))
+```
+
+`sql.Identifier` quotes and escapes as an identifier, so a table name containing a quote becomes a (nonexistent) quoted table name rather than injected SQL. This is the correct tool for genuinely dynamic table or column names — but pair it with an allow-list anyway, since a validly quoted identifier can still point at a table the user should not reach.
+
+## Identifiers still need an allow-list
+
+Parameters bind values. They cannot bind a column name or a sort direction, because those change the parsed structure of the statement:
+
+```python
+# Unsafe: sort_by comes from a query string
+sql_text = f"SELECT * FROM orders ORDER BY {sort_by} {direction}"
+```
+
+Look the input up instead of passing it through:
+
+```python
+SORT_COLUMNS = {
+    "date":   "created_at",
+    "total":  "total_amount",
+    "status": "status",
+}
+DIRECTIONS = {"asc": "ASC", "desc": "DESC"}
+
+column = SORT_COLUMNS.get(request.args.get("sort", "date"))
+direction = DIRECTIONS.get(request.args.get("dir", "asc"))
+if column is None or direction is None:
+    abort(400)
+
+cur.execute(
+    f"SELECT * FROM orders WHERE user_id = %s ORDER BY {column} {direction} LIMIT %s",
+    (user_id, limit),
+)
+```
+
+The f-string survives, but every value it can produce is a constant you wrote. That distinction — interpolating your own constants versus interpolating user input — is the whole of safe dynamic SQL.
+
+`LIMIT` and `OFFSET`, by contrast, *are* values and should be bound. Passing them through an f-string after an `int()` cast works, but binding is simpler and cannot be forgotten.
+
+## ORMs: safe by default, with escape hatches
+
+SQLAlchemy and Django both parameterize normal queries. These are safe regardless of what `email` contains:
+
+```python
+# SQLAlchemy ORM
+session.query(User).filter(User.email == email).all()
+
+# Django ORM
+User.objects.filter(email=email)
+```
+
+The risk is in the raw-SQL escape hatches. In SQLAlchemy, `text()` with an f-string is injectable, and modern versions require `text()` for raw strings precisely to make this visible:
+
+```python
+from sqlalchemy import text
+
+# Unsafe
+session.execute(text(f"SELECT * FROM users WHERE email = '{email}'"))
+
+# Safe
+session.execute(
+    text("SELECT * FROM users WHERE email = :email"),
+    {"email": email},
+)
+```
+
+In Django, the equivalents are `raw()` and `extra()`:
+
+```python
+# Unsafe
+User.objects.raw(f"SELECT * FROM users WHERE email = '{email}'")
+
+# Safe
+User.objects.raw("SELECT * FROM users WHERE email = %s", [email])
+```
+
+`.extra()` deserves a specific warning: its `where`, `select` and `order_by` arguments are inserted as SQL fragments, and it has been a recurring source of injection reports. Django's own documentation discourages it; prefer `filter()`, `annotate()` and `RawSQL` with parameters.
+
+One more Django-specific trap: `QuerySet.order_by()` accepts a field name from the request, and while Django validates it against the model, `extra(order_by=...)` does not.
+
+## Auditing an existing codebase
+
+Start with grep. These four patterns find most real problems:
+
+```bash
+grep -rnE 'execute\(\s*f["\x27]' --include='*.py' .
+grep -rnE 'execute\(.*["\x27]\s*%\s*' --include='*.py' .
+grep -rnE 'execute\(.*\.format\(' --include='*.py' .
+grep -rnE 'execute\(.*["\x27]\s*\+' --include='*.py' .
+```
+
+Then check the ORM escape hatches:
+
+```bash
+grep -rn 'objects.raw\|\.extra(\|text(f"\|text(f\x27' --include='*.py' .
+```
+
+For anything the grep flags, paste the snippet into the [SQL injection checker](https://chat2db.ai/tools/sql-injection-checker) to see the parameterized rewrite for your driver, then fix it at the source.
+
+Two further steps make the audit stick. Add `bandit` to CI — its `B608` check flags hardcoded SQL expressions, and it catches new occurrences at review time rather than in a quarterly sweep. And read the SQL your application actually sends: enable `log_statement = 'all'` on a staging database, exercise the app, and look at what arrives. Queries produced by an ORM chain rarely look the way you expect, and reviewing them in a client such as [Chat2DB](https://app.chat2db.ai) — where you can run `EXPLAIN` on the real statement — often turns up both security and performance problems in the same pass.
+
+## Summary
+
+- Pass values as the second argument to `execute()`. Never format them into the string, by any mechanism.
+- Do not put quotes around a placeholder; the driver handles quoting.
+- Use `= ANY(%s)` for lists in PostgreSQL, or generate placeholders from `len()` elsewhere.
+- Allow-list identifiers — columns, tables, sort directions — because they cannot be bound.
+- Use `psycopg.sql.Identifier` when a name genuinely must be dynamic.
+- Treat `raw()`, `extra()` and `text()` as the places to review first.

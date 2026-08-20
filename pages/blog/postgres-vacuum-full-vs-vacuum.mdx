@@ -1,0 +1,181 @@
+---
+title: "VACUUM FULL vs VACUUM in Postgres: Which to Run"
+description: "The difference between VACUUM and VACUUM FULL in PostgreSQL, when bloat actually needs a rewrite, and how to reclaim disk space without an exclusive table lock."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: August 20, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# VACUUM FULL vs VACUUM in Postgres: Which to Run
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="August 20, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+A table is taking 40 GB for 8 GB of live rows, someone finds `VACUUM FULL` in a search result, runs it in production, and the application stops for twenty minutes. This is one of the most reliable ways to cause an outage with a command that sounds like routine maintenance.
+
+The two commands share a name and almost nothing else. Understanding the difference — and knowing the third option that is usually the right one — takes about ten minutes and prevents that outage.
+
+## Why bloat exists at all
+
+PostgreSQL uses multi-version concurrency control. An `UPDATE` does not modify a row in place; it writes a new version and marks the old one as dead. A `DELETE` only marks. Old versions have to stick around until no running transaction could still need them, which is what lets readers and writers avoid blocking each other.
+
+The consequence is that a table's file grows past the size of its live data. That leftover space is bloat. Some bloat is normal and healthy — it is reused. The problem is bloat that never gets reused because it accumulated faster than cleanup ran.
+
+## What plain VACUUM does
+
+`VACUUM` scans the table, finds dead tuples that no transaction can see, and marks their space as reusable in the free space map. Future inserts and updates fill those gaps.
+
+```sql
+VACUUM orders;
+VACUUM (VERBOSE, ANALYZE) orders;   -- also refresh planner statistics
+```
+
+Three properties matter:
+
+- **It takes only a `SHARE UPDATE EXCLUSIVE` lock.** Reads, inserts, updates and deletes all continue. It conflicts only with other maintenance — another `VACUUM`, `ALTER TABLE`, `CREATE INDEX`.
+- **It usually does not shrink the file.** Space is marked free for PostgreSQL to reuse, not returned to the operating system. The exception is trailing empty pages at the end of the table, which `VACUUM` will truncate away.
+- **It runs automatically.** Autovacuum triggers it based on the number of changed rows, which for most tables is enough.
+
+`VACUUM` also advances the transaction ID freeze horizon, which is the reason it is not optional. Skip it long enough and the cluster shuts down to prevent transaction ID wraparound.
+
+For steady-state operation, plain `VACUUM` is the correct answer and you should mostly be tuning autovacuum rather than running it by hand.
+
+## What VACUUM FULL does
+
+`VACUUM FULL` is a completely different operation. It writes an entirely new copy of the table containing only live rows, rebuilds every index on it, then swaps the new files in and deletes the old ones.
+
+```sql
+VACUUM FULL orders;
+```
+
+The result is a perfectly compact table with the space returned to the file system. The costs:
+
+- **It takes an `ACCESS EXCLUSIVE` lock** for the whole operation. Every query against the table — including `SELECT` — blocks. On a 100 GB table this can be hours.
+- **It needs free disk space** roughly equal to the live data plus indexes, because both copies exist simultaneously. Running it to fix a full disk can make the disk fuller.
+- **It blocks behind existing transactions.** The lock request queues, and while it queues, every new query queues behind it too. A single long-running `SELECT` can turn `VACUUM FULL` into a full table outage before the rewrite even begins.
+
+That last point is the one that surprises people. The command does not just take a lock when it starts; it stalls all traffic to the table from the moment it asks for one.
+
+## Measure the bloat first
+
+Before running anything, find out whether there is a real problem. The `pgstattuple` extension gives an exact answer:
+
+```sql
+CREATE EXTENSION IF NOT EXISTS pgstattuple;
+
+SELECT table_len,
+       tuple_count,
+       pg_size_pretty(tuple_len) AS live_data,
+       dead_tuple_count,
+       pg_size_pretty(dead_tuple_len) AS dead_data,
+       round(free_percent::numeric, 1) AS free_pct
+FROM pgstattuple('orders');
+```
+
+`pgstattuple` scans the whole table, so on a very large one use `pgstattuple_approx` instead. As a rough guide: under 20% free space is normal, 20–40% is worth investigating, and above 50% on a table that is not constantly churning suggests autovacuum is not keeping up.
+
+Check the dead tuple count and when maintenance last ran:
+
+```sql
+SELECT relname,
+       n_live_tup,
+       n_dead_tup,
+       round(n_dead_tup * 100.0 / NULLIF(n_live_tup + n_dead_tup, 0), 1) AS dead_pct,
+       last_vacuum,
+       last_autovacuum,
+       autovacuum_count
+FROM pg_stat_user_tables
+WHERE n_dead_tup > 10000
+ORDER BY n_dead_tup DESC;
+```
+
+If `last_autovacuum` is null or weeks old on a busy table, the fix is autovacuum configuration, not a one-off rewrite. Rewriting a table whose cleanup is broken just means doing it again next month.
+
+Keeping this query somewhere you can run it quickly — a saved query in a client like [Chat2DB](https://app.chat2db.ai) works well — makes bloat something you notice rather than something you discover during an incident.
+
+## The third option: pg_repack
+
+`pg_repack` does what `VACUUM FULL` does — a full rewrite that returns space to the file system — but online. It builds the new copy while the table stays available, tracks concurrent changes with triggers, applies them to the copy, and takes a brief exclusive lock only for the final swap.
+
+```bash
+sudo apt install postgresql-17-repack     # or the matching version
+```
+
+```sql
+CREATE EXTENSION pg_repack;
+```
+
+```bash
+pg_repack --table=public.orders --dbname=appdb --jobs=4
+```
+
+The trade-offs are honest ones: it needs roughly double the table's disk space during the operation, the table must have a primary key or a unique non-partial index on a `NOT NULL` column, and there is a short lock at the end. In exchange, the application keeps running.
+
+For most production systems this is the right tool. `VACUUM FULL` is for maintenance windows and for tables nobody is using.
+
+## Choosing
+
+| Situation | Command |
+| --- | --- |
+| Routine dead-tuple cleanup | Autovacuum, or plain `VACUUM` |
+| Stats look stale after a bulk load | `VACUUM ANALYZE` |
+| 60% bloat, production traffic, cannot take downtime | `pg_repack` |
+| 60% bloat, scheduled maintenance window | `VACUUM FULL` |
+| Deleted 90% of a table, want the disk back now, table unused | `VACUUM FULL` |
+| Emptying a table entirely | `TRUNCATE` |
+| Index bloat only, table is fine | `REINDEX INDEX CONCURRENTLY` |
+
+`TRUNCATE` deserves a mention because it is often overlooked: deleting every row with `DELETE` leaves a table-sized hole that then needs a rewrite, while `TRUNCATE` drops the file outright and is nearly instant.
+
+Index-only bloat is also more common than people expect, since B-trees fragment under heavy update patterns. From PostgreSQL 12 onward:
+
+```sql
+REINDEX INDEX CONCURRENTLY orders_created_at_idx;
+REINDEX TABLE CONCURRENTLY orders;
+```
+
+The `CONCURRENTLY` form avoids blocking writes, which the plain form does not.
+
+## Stopping bloat from coming back
+
+A rewrite is a symptom fix. The causes are usually one of these:
+
+**Autovacuum thresholds scale badly on large tables.** The default `autovacuum_vacuum_scale_factor = 0.2` means a table must accumulate 20% dead rows before cleanup starts. On a 100-million-row table that is 20 million dead tuples. Lower it per table:
+
+```sql
+ALTER TABLE orders SET (
+  autovacuum_vacuum_scale_factor = 0.02,
+  autovacuum_vacuum_threshold = 1000,
+  autovacuum_analyze_scale_factor = 0.01
+);
+```
+
+**Autovacuum is throttled too aggressively.** The cost-delay settings limit its I/O. On modern SSD-backed systems the defaults are conservative:
+
+```sql
+ALTER SYSTEM SET autovacuum_vacuum_cost_limit = 2000;
+ALTER SYSTEM SET autovacuum_naptime = '30s';
+SELECT pg_reload_conf();
+```
+
+**Something is holding an old transaction open.** This is the most common cause of bloat that no amount of tuning fixes. `VACUUM` cannot remove any row version newer than the oldest running transaction, so one forgotten `BEGIN` in a psql session blocks cleanup across the entire database:
+
+```sql
+SELECT pid,
+       state,
+       now() - xact_start AS xact_age,
+       left(query, 60) AS query
+FROM pg_stat_activity
+WHERE xact_start IS NOT NULL
+ORDER BY xact_start
+LIMIT 10;
+```
+
+Anything in `idle in transaction` for hours is the problem. Set `idle_in_transaction_session_timeout = '10min'` so the database ends them itself.
+
+**An abandoned replication slot.** A logical slot with no consumer pins `catalog_xmin` and prevents cleanup cluster-wide. Check `pg_replication_slots` for slots where `active` is false.
+
+Fix the cause and bloat stabilises on its own — which is the point, because the best `VACUUM FULL` is the one you never have to schedule.
