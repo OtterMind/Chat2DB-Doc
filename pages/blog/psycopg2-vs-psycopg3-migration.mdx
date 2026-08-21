@@ -1,0 +1,241 @@
+---
+title: "psycopg2 vs psycopg3: Differences and Migration"
+description: "psycopg2 vs psycopg3 compared: psycopg2-binary vs psycopg[binary], server-side binding, async support, pools, and a migration checklist."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: August 21, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# psycopg2 vs psycopg3: Differences and Migration
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="August 21, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+If you write Python against PostgreSQL, you have almost certainly used psycopg2. It has been the de facto Postgres driver for well over a decade, and an enormous amount of production code depends on it. psycopg3 is its successor, written by the same maintainer (Daniele Varrazzo), and it is a genuine redesign rather than a version bump: server-side parameter binding, first-class asyncio support, a modern connection pool, and a much faster `executemany`. This article walks through the differences that actually matter in code, and then gives you a concrete migration checklist.
+
+One naming point up front, because it trips up almost everyone: **psycopg3 is published on PyPI simply as `psycopg`**. There is no `psycopg3` package. `pip install psycopg` gets you version 3; `pip install psycopg2` gets you version 2. The import names follow the same pattern: `import psycopg` for the new driver, `import psycopg2` for the old one. Both can be installed side by side in the same virtual environment, which makes incremental migration practical.
+
+## Project history in one minute
+
+psycopg2 is a C extension wrapping libpq, first released in 2006. It is stable and fast, but its architecture makes some things structurally hard: it binds parameters client-side (the driver interpolates values into the SQL string before sending it), and its blocking C internals mean asyncio support never landed in a usable form.
+
+psycopg3 started in 2020 as a rewrite. The core is pure Python talking to libpq, with an optional C accelerator module for performance. That layering is what makes the async support, pipeline mode, and static typing possible. The project reached 1.0 (as `psycopg` 3.0) in late 2021 and has been the recommended driver for new projects since; Django 4.2+, SQLAlchemy 2.0+, and most modern frameworks support it natively. psycopg2 is in maintenance mode: it still receives fixes and builds for new Python versions, but new features go into psycopg3.
+
+## Installation: psycopg2 vs psycopg2-binary vs psycopg[binary]
+
+This is the second most common source of confusion. psycopg2 ships two PyPI packages:
+
+- `psycopg2` — source distribution. Compiles against your local libpq, so you need `pg_config`, a C compiler, and Postgres dev headers installed. Recommended for production because it links your system's libpq and OpenSSL.
+- `psycopg2-binary` — precompiled wheels with libpq and libssl bundled in. Zero build dependencies, great for development and CI, but the psycopg2 docs themselves warn against it in production because the bundled libssl can conflict with other libraries in the same process.
+
+psycopg3 replaces that split with pip extras on a single package:
+
+```bash
+# psycopg2 family
+pip install psycopg2          # builds from source, needs pg_config
+pip install psycopg2-binary   # prebuilt wheel, bundled libpq
+
+# psycopg3 family (the package is just "psycopg")
+pip install psycopg           # pure Python, uses whatever libpq is on the system
+pip install "psycopg[binary]" # prebuilt wheel with bundled libpq (like psycopg2-binary)
+pip install "psycopg[c]"      # compiles the C accelerator against local libpq
+pip install "psycopg[binary,pool]"  # binary + the psycopg_pool package
+```
+
+The pure `pip install psycopg` variant needs a libpq shared library available at runtime but requires no compilation at all. For most applications, `psycopg[binary]` is the pragmatic default, and `psycopg[c]` is what you deploy when you control the base image and want maximum speed with your system's libpq.
+
+## Connecting: mostly the same, with one important behavioral change
+
+Connection strings are unchanged — both drivers accept libpq keyword/value DSNs, URIs, and keyword arguments:
+
+```python
+# psycopg2
+import psycopg2
+conn = psycopg2.connect("host=db.internal dbname=orders user=app password=s3cret")
+
+# psycopg3
+import psycopg
+conn = psycopg.connect("host=db.internal dbname=orders user=app password=s3cret")
+# or: psycopg.connect("postgresql://app:s3cret@db.internal/orders")
+```
+
+The behavioral trap is the context manager. In psycopg2, `with conn:` commits or rolls back the transaction **but leaves the connection open**, which surprises people in the other direction. In psycopg3, `with psycopg.connect(...) as conn:` commits/rolls back **and closes the connection** when the block exits. If your psycopg2 code reuses a connection across several `with conn:` blocks, that pattern breaks after migration — switch to explicit `conn.commit()` calls or restructure around one block per connection lifetime.
+
+## Server-side binding replaces client-side interpolation
+
+This is the deepest change. psycopg2 renders queries client-side: it converts your `%s` parameters to SQL literals, splices them into the query string, and sends one final string to the server. You could even see the result with `cursor.mogrify()`.
+
+psycopg3 uses the PostgreSQL extended query protocol: the query text with placeholders and the parameter values travel to the server separately, and the server binds them. Your code usually looks identical:
+
+```python
+cur.execute(
+    "SELECT id, email FROM customers WHERE signup_date >= %s AND plan = %s",
+    (date(2026, 1, 1), "pro"),
+)
+```
+
+But the consequences differ:
+
+- `cursor.mogrify()` is gone from the default cursor — there is no client-rendered string to show. If you depended on it (usually for logging or building `COPY` payloads), psycopg3 offers `psycopg.ClientCursor`, which restores client-side binding and `mogrify()` as an explicit opt-in compatibility tool.
+- You cannot send **multiple statements in one `execute()` call** when parameters are used; the extended protocol allows exactly one statement per call. `cur.execute("DELETE FROM a WHERE id=%s; DELETE FROM b WHERE id=%s", ...)` worked in psycopg2 and raises in psycopg3.
+- Some commands that cannot take bound parameters server-side (certain `SET` forms, `NOTIFY`, DDL with parameterized values) need rewriting, typically with the `psycopg.sql` composition module — which, happily, has the same API as `psycopg2.sql`.
+- Placeholders are stricter: `%s` and `%(name)s` only, and every value goes through a real protocol-level binding, which eliminates a whole class of subtle quoting bugs.
+
+Server-side binding also means the server sees the same query text every time with different parameters, which improves plan caching and makes tools that read `pg_stat_statements` far more useful.
+
+## executemany and pipeline mode
+
+psycopg2's `executemany()` is famously slow — it is essentially a Python loop over `execute()`, one network round trip per row. The community workaround was `psycopg2.extras.execute_values()` or `execute_batch()`.
+
+psycopg3 fixed the real problem. Its `executemany()` prepares the statement once and, on version 3.1+, uses libpq **pipeline mode** to stream all the parameter sets without waiting for individual round trips:
+
+```python
+rows = [(u["email"], u["plan"]) for u in incoming_users]
+cur.executemany(
+    "INSERT INTO customers (email, plan) VALUES (%s, %s)",
+    rows,
+)
+```
+
+No helper imports, no `VALUES` template tricks — the naive code is now the fast code. You can also open a pipeline explicitly with `conn.pipeline()` to batch heterogeneous statements. If your codebase is littered with `execute_values`, migration is a chance to delete it.
+
+## Native async support
+
+psycopg2 has no asyncio story; the best you could do was green-thread integration through the low-level `wait_callback` hook. psycopg3 ships async as a first-class parallel API — same names, `Async` prefix:
+
+```python
+import asyncio
+import psycopg
+
+async def main():
+    async with await psycopg.AsyncConnection.connect(
+        "postgresql://app@db.internal/orders"
+    ) as conn:
+        async with conn.cursor() as cur:
+            await cur.execute("SELECT count(*) FROM invoices WHERE status = %s", ("open",))
+            (open_invoices,) = await cur.fetchone()
+            print(open_invoices)
+
+asyncio.run(main())
+```
+
+Because the sync and async APIs mirror each other, teams can migrate the blocking code first and adopt async selectively where it pays off (typically high-concurrency web handlers doing short queries).
+
+## Row factories replace cursor factories
+
+Getting dict rows in psycopg2 meant a cursor factory from `psycopg2.extras`. psycopg3 generalizes this into row factories, configurable per connection or per cursor:
+
+```python
+# psycopg2
+from psycopg2.extras import RealDictCursor
+cur = conn.cursor(cursor_factory=RealDictCursor)
+
+# psycopg3
+from psycopg.rows import dict_row, class_row
+conn = psycopg.connect(dsn, row_factory=dict_row)   # every cursor returns dicts
+
+# or map straight into a dataclass
+from dataclasses import dataclass
+
+@dataclass
+class Customer:
+    id: int
+    email: str
+
+cur = conn.cursor(row_factory=class_row(Customer))
+cur.execute("SELECT id, email FROM customers LIMIT 2")
+print(cur.fetchall())
+```
+
+Sample output:
+
+```text
+[Customer(id=1, email='ana@example.com'), Customer(id=2, email='ben@example.com')]
+```
+
+`class_row`, `namedtuple_row`, and `dict_row` cover nearly everything `psycopg2.extras` did, with better typing support.
+
+## COPY got a real API
+
+psycopg2 exposed `copy_from`, `copy_to`, and `copy_expert`, all file-object based and fussy about formats. psycopg3 replaces them with a context manager that can write Python objects row by row, with proper type adaptation:
+
+```python
+with cur.copy("COPY customers (email, plan) FROM STDIN") as copy:
+    for record in [("cara@example.com", "free"), ("dev@example.com", "pro")]:
+        copy.write_row(record)
+```
+
+Reading works symmetrically with `copy.rows()`. This is both faster and dramatically less error-prone than hand-formatting TSV for `copy_from`. After a bulk load like this, it is worth eyeballing the data — you can inspect the resulting table and run ad hoc queries in Chat2DB, a free AI-assisted database client (https://chat2db.ai/download, or the web version at https://app.chat2db.ai), which is quicker than writing throwaway verification scripts.
+
+## Connection pools: psycopg_pool vs psycopg2.pool
+
+`psycopg2.pool` (`SimpleConnectionPool`, `ThreadedConnectionPool`) is minimal: no connection health checks, no timeouts, no background reconnection. psycopg3 moves pooling into a separate, actively developed package, `psycopg_pool`:
+
+```python
+from psycopg_pool import ConnectionPool
+
+pool = ConnectionPool(
+    "postgresql://app@db.internal/orders",
+    min_size=4,
+    max_size=16,
+    max_lifetime=1800,
+)
+
+with pool.connection() as conn:      # checked out, and returned automatically
+    conn.execute("UPDATE invoices SET status = 'sent' WHERE id = %s", (42,))
+```
+
+You get connection checks on checkout, stats, an `AsyncConnectionPool` twin, and correct behavior when the database restarts — all things `psycopg2.pool` never had.
+
+## When staying on psycopg2 is fine
+
+Migration is not mandatory. Reasonable cases for staying put:
+
+- A stable legacy service with no async needs and no `executemany` hot paths; psycopg2 still gets maintenance releases.
+- Dependencies that pin psycopg2 (older Django, Airflow providers, internal libraries using `psycopg2.extras` heavily).
+- Code that fundamentally relies on client-side rendering semantics and multi-statement `execute()` calls, where the rewrite cost outweighs the benefit today.
+
+For anything new, or anything touching asyncio, start with psycopg3.
+
+## Step-by-step migration checklist
+
+1. **Install side by side**: add `psycopg[binary]` (or `[c]`) without removing psycopg2, and migrate module by module.
+2. **Swap imports**: `import psycopg2` becomes `import psycopg`; `psycopg2.sql` becomes `psycopg.sql` (same API).
+3. **Fix connection context managers**: anywhere you reuse a connection across `with conn:` blocks, add explicit `commit()` or restructure, because `with` now closes the connection.
+4. **Split multi-statement executes** into one `execute()` per statement.
+5. **Remove `mogrify()`** or switch those cursors to `psycopg.ClientCursor` temporarily.
+6. **Replace `psycopg2.extras`**: `RealDictCursor` becomes `row_factory=dict_row`; `execute_values`/`execute_batch` become plain `executemany()`; `Json` adaptation is built in (`psycopg.types.json.Jsonb`).
+7. **Rewrite COPY calls** from `copy_from`/`copy_expert` to `cursor.copy()` with `write_row()`.
+8. **Swap pools**: `psycopg2.pool.ThreadedConnectionPool` becomes `psycopg_pool.ConnectionPool` with `pool.connection()`.
+9. **Run your test suite against a real Postgres**, not mocks — the differences here are protocol-level and mocks will happily lie to you.
+
+A representative before/after:
+
+```python
+# before (psycopg2)
+import psycopg2
+from psycopg2.extras import RealDictCursor, execute_values
+
+conn = psycopg2.connect(DSN)
+with conn:
+    with conn.cursor(cursor_factory=RealDictCursor) as cur:
+        execute_values(cur, "INSERT INTO events (name, payload) VALUES %s", rows)
+        cur.execute("SELECT * FROM events WHERE name = %s", ("signup",))
+        data = cur.fetchall()
+conn.close()
+
+# after (psycopg3)
+import psycopg
+from psycopg.rows import dict_row
+
+with psycopg.connect(DSN, row_factory=dict_row) as conn:
+    with conn.cursor() as cur:
+        cur.executemany("INSERT INTO events (name, payload) VALUES (%s, %s)", rows)
+        cur.execute("SELECT * FROM events WHERE name = %s", ("signup",))
+        data = cur.fetchall()
+```
+
+The migration is mostly mechanical, and the payoff — a fast `executemany`, real async, a competent pool, and cleaner semantics — is immediate. For most teams a service can be moved over in an afternoon plus a careful test run.

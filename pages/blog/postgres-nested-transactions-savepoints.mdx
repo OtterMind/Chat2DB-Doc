@@ -1,0 +1,178 @@
+---
+title: "Postgres Nested Transactions with Savepoints"
+description: "Postgres has no true nested transactions—use SAVEPOINT and ROLLBACK TO instead. Full examples, PL/pgSQL exception blocks, and subtransaction pitfalls."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: August 21, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# Postgres Nested Transactions with Savepoints
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="August 21, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+Developers arriving from application frameworks often expect `BEGIN` to nest: open an outer transaction, open an inner one inside it, roll back just the inner one. Postgres does not work that way — there is no true nested transaction — but it offers something close enough for almost every practical purpose: savepoints, which create subtransactions inside a single top-level transaction. Used deliberately, they give you partial rollback and in-transaction error recovery. Used carelessly — usually by an ORM wrapping every statement in one — they become a well-documented performance trap. This article covers the whole territory: what happens when you nest `BEGIN`, the full savepoint command set, error recovery, PL/pgSQL exception blocks, driver-level emulation, and the subtransaction overhead you need to know about before you scale.
+
+## There Is No Nested BEGIN
+
+Try to nest transactions naively and Postgres tells you exactly what it thinks:
+
+```sql
+BEGIN;
+INSERT INTO orders (customer_id, total) VALUES (42, 99.90);
+BEGIN;
+```
+
+```text
+WARNING:  there is already a transaction in progress
+```
+
+That inner `BEGIN` is not an error — it is a no-op with a warning. This matters more than it looks: a subsequent `COMMIT` or `ROLLBACK` ends the **outer** (only) transaction. Code that assumed the inner `COMMIT` merely closed an inner scope has actually committed everything, and the outer "transaction" the caller believes it still holds no longer exists. This mismatch between expectation and behavior is the root cause of a whole genre of "my rollback didn't roll anything back" bugs in hand-rolled transaction helpers.
+
+What Postgres gives you instead is **subtransactions**, exposed through three SQL commands: `SAVEPOINT`, `ROLLBACK TO SAVEPOINT`, and `RELEASE SAVEPOINT`. A savepoint marks a point within the current transaction that you can later roll back to, undoing everything after the mark while keeping the transaction itself alive.
+
+## SAVEPOINT, ROLLBACK TO, RELEASE: A Worked Example
+
+Here is a complete, runnable session modeling an order import where one line item may fail validation but the rest of the batch should survive:
+
+```sql
+CREATE TABLE orders (
+  id          bigserial PRIMARY KEY,
+  customer_id bigint NOT NULL,
+  total       numeric(10,2) NOT NULL CHECK (total >= 0)
+);
+
+BEGIN;
+
+INSERT INTO orders (customer_id, total) VALUES (101, 250.00);  -- ok
+
+SAVEPOINT before_risky_row;
+
+INSERT INTO orders (customer_id, total) VALUES (102, -30.00);  -- violates CHECK
+```
+
+```text
+ERROR:  new row for relation "orders" violates check constraint "orders_total_check"
+DETAIL:  Failing row contains (2, 102, -30.00).
+```
+
+Without a savepoint, the whole transaction would now be doomed. With one, we recover:
+
+```sql
+ROLLBACK TO SAVEPOINT before_risky_row;   -- undo just the failed insert
+
+INSERT INTO orders (customer_id, total) VALUES (102, 30.00);   -- corrected
+
+RELEASE SAVEPOINT before_risky_row;       -- optional: merge into parent
+
+COMMIT;
+
+SELECT customer_id, total FROM orders ORDER BY id;
+```
+
+```text
+ customer_id | total
+-------------+--------
+         101 | 250.00
+         102 |  30.00
+```
+
+The semantics to internalize:
+
+- `ROLLBACK TO SAVEPOINT x` undoes all data changes made after `x` was established, but the transaction remains open and usable — and the savepoint `x` still exists, so you can retry and roll back to it again.
+- `RELEASE SAVEPOINT x` "commits" the subtransaction into its parent — its changes now stand or fall with the outer transaction. Nothing is durable until the top-level `COMMIT`. Releasing also frees the subtransaction's resources, which matters for the performance discussion below.
+- Savepoints nest: establishing `SAVEPOINT b` after `SAVEPOINT a` creates a deeper level; rolling back to `a` destroys `b` and everything after `a`. Reusing a savepoint name shadows the older one of the same name.
+
+One subtlety: `ROLLBACK TO SAVEPOINT` undoes *data* changes but not every side effect. Sequences are the classic example — the `bigserial` above consumed an id for the failed row, so ids may have gaps. Advisory locks acquired with the non-`_xact` variants also survive.
+
+## Recovering from Errors: "current transaction is aborted"
+
+Savepoints are the only SQL-level answer to one of the most common Postgres stumbling blocks. After any error inside a transaction, Postgres puts the transaction into an aborted state and refuses all further work:
+
+```sql
+BEGIN;
+INSERT INTO orders (customer_id, total) VALUES (103, 10.00);
+SELECT 1/0;                                   -- ERROR: division by zero
+SELECT count(*) FROM orders;
+```
+
+```text
+ERROR:  current transaction is aborted, commands ignored until end of transaction block
+```
+
+At this point your only options are `ROLLBACK` (losing the first insert too) — unless you had a savepoint in place before the failing statement, in which case `ROLLBACK TO SAVEPOINT` resurrects the transaction. This differs from databases like Oracle, which roll back only the failed statement automatically; Postgres makes you opt in to statement-level recovery, and savepoints are the opt-in mechanism. It is exactly why psql's `ON_ERROR_ROLLBACK on` setting and many drivers create a hidden savepoint before each statement: they are simulating statement-level rollback on top of savepoints. A convenient way to build intuition here is to step through a transaction interactively — open a session in Chat2DB (a free AI database client, https://chat2db.ai/download, web version at https://app.chat2db.ai), disable autocommit, and watch how the session responds to each command after an induced error.
+
+## Subtransactions in PL/pgSQL: BEGIN ... EXCEPTION
+
+Inside PL/pgSQL you never write `SAVEPOINT` — the language gives you the same machinery through exception blocks. Every `BEGIN ... EXCEPTION ... END` block silently establishes a subtransaction on entry; if an exception is caught, Postgres rolls back to that implicit savepoint before running the handler:
+
+```sql
+CREATE OR REPLACE FUNCTION import_order(p_customer bigint, p_total numeric)
+RETURNS text
+LANGUAGE plpgsql AS $$
+BEGIN
+  BEGIN                               -- implicit savepoint here
+    INSERT INTO orders (customer_id, total) VALUES (p_customer, p_total);
+    RETURN 'inserted';
+  EXCEPTION
+    WHEN check_violation THEN         -- rolled back to the savepoint
+      INSERT INTO import_errors (customer_id, reason)
+      VALUES (p_customer, 'invalid total ' || p_total);
+      RETURN 'quarantined';
+  END;
+END;
+$$;
+```
+
+The key consequence: a block with an `EXCEPTION` clause is *not free*, even when no exception is ever raised, because the subtransaction must be set up either way. A block without an `EXCEPTION` clause costs nothing extra. So the standard advice is to keep exception blocks tight around the statements that can actually fail, and never to wrap the body of a function called millions of times per minute in a reflexive catch-all handler. A loop that executes an exception block per row creates one subtransaction per row — this is the same load pattern as the ORM problem below, just spelled differently.
+
+## Driver-Level Emulation: psycopg and SQLAlchemy
+
+Most application stacks expose "nested transactions" as an API, and under the hood it is savepoints all the way down. In psycopg 3, nesting `with connection.transaction():` blocks issues `SAVEPOINT` for the inner levels:
+
+```python
+with conn.transaction():                    # BEGIN
+    insert_order(conn, 101, 250.00)
+    try:
+        with conn.transaction():            # SAVEPOINT "_pg3_1"
+            insert_order(conn, 102, -30.00) # fails
+    except errors.CheckViolation:
+        pass                                # inner block: ROLLBACK TO SAVEPOINT
+    insert_order(conn, 102, 30.00)
+# outer block exits: COMMIT
+```
+
+SQLAlchemy spells it explicitly with `begin_nested()`:
+
+```python
+with session.begin():
+    session.add(order_a)
+    savepoint = session.begin_nested()      # SAVEPOINT
+    try:
+        session.add(bad_order)
+        session.flush()
+    except IntegrityError:
+        savepoint.rollback()                # ROLLBACK TO SAVEPOINT
+    session.add(fixed_order)
+```
+
+Django's `transaction.atomic()` behaves the same way when nested: the outermost block is a real transaction and each inner block is a savepoint. This layering is genuinely useful, but it also means frameworks can generate savepoints at a rate no human would write by hand — one per ORM operation in some configurations — which leads directly to the last section.
+
+## Performance Pitfalls: When Subtransactions Bite
+
+Each savepoint that performs a write gets its own transaction ID. That has two costs that only show up at scale, and both are notorious enough to have their own war stories at large Postgres shops.
+
+**The 64-subtransaction cache overflow.** Each backend caches up to 64 subtransaction XIDs (`PGPROC_MAX_CACHED_SUBXIDS`) in shared memory, where other sessions can check them cheaply during visibility checks. If a single transaction accumulates more than 64 open (unreleased) subtransactions, the backend is marked "suboverflowed," and now *every other session* that needs to check row visibility against it must instead look up parent XIDs in the `pg_subtrans` SLRU — a small, disk-backed buffer area with its own locks. Under concurrency this degrades sharply: you will see `SubtransSLRU` and `SubtransBuffer` wait events pile up in `pg_stat_activity`, and throughput on completely unrelated queries drops. The failure mode is especially ugly on hot-standby replicas, where long-running transactions with many subtransactions on the primary can degrade read performance fleet-wide.
+
+Triggering it is easier than it sounds: a batch job that loops `SAVEPOINT sp; ...; RELEASE sp` is fine (released subtransactions leave the cache), but a job that opens savepoints without releasing, a deeply nested set of `atomic()` blocks, or a PL/pgSQL loop with an exception block that keeps state past 64 levels of nesting all cross the line inside one transaction.
+
+**XID consumption.** Every writing subtransaction burns a transaction ID from the same 32-bit space that drives wraparound autovacuum. An ORM configured to wrap each statement in a savepoint can multiply your XID burn rate several-fold, pulling anti-wraparound vacuums forward and adding pressure you paid nothing to acquire. Related trap: `SELECT ... FOR UPDATE` on a row previously touched by a subtransaction forces extra multixact bookkeeping — the combination of savepoints plus row locks is a known bad mix on hot rows.
+
+Practical guidance: use savepoints where you actually need partial rollback; `RELEASE` them promptly; keep exception blocks out of per-row hot paths; check whether your framework is silently emitting `SAVEPOINT` per statement (turn on `log_statement = 'all'` briefly and look); and treat sustained `SubtransSLRU` waits as a signal to redesign, not to tune.
+
+## Takeaways
+
+Postgres will never honor a nested `BEGIN` — it warns and moves on, and the next `COMMIT` ends the only transaction you have. Savepoints are the real mechanism: `SAVEPOINT` to mark, `ROLLBACK TO SAVEPOINT` to recover from errors without abandoning the transaction, `RELEASE` to merge and free resources. PL/pgSQL exception blocks and ORM "nested transaction" APIs are the same feature wearing different syntax. They are cheap in ones and twos, and expensive in thousands — respect the 64-subtransaction cache limit and your XID budget, and savepoints will stay the useful tool they were designed to be.

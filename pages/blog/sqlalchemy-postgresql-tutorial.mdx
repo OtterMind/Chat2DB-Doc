@@ -1,0 +1,275 @@
+---
+title: "SQLAlchemy with PostgreSQL: A Practical Tutorial"
+description: "A hands-on SQLAlchemy PostgreSQL tutorial: 2.x engines, Mapped models, JSONB and ARRAY types, ON CONFLICT upserts, and pooling in Python."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: August 21, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# SQLAlchemy with PostgreSQL: A Practical Tutorial
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="August 21, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+SQLAlchemy is the most widely used database toolkit in Python, and PostgreSQL is the database it pairs with best: the `sqlalchemy.dialects.postgresql` module exposes JSONB, arrays, native UUIDs, and `ON CONFLICT` upserts as first-class Python constructs. This tutorial builds a small but realistic project — customers and orders — using **SQLAlchemy 2.x style only**. If you have seen older tutorials full of `session.query(User).filter_by(...)` and classes inheriting from a bare `declarative_base()`, set them aside; the 2.0 API is cleaner, fully type-annotated, and what all new code should use.
+
+Everything below runs against a stock PostgreSQL 15+ with `pip install "sqlalchemy>=2.0" "psycopg[binary]"`.
+
+## Connecting: create_engine and driver URLs
+
+An engine is the starting point for everything. It holds the connection pool and the dialect, and you create exactly one per database per process:
+
+```python
+from sqlalchemy import create_engine
+
+# psycopg2 driver
+engine = create_engine("postgresql+psycopg2://app:s3cret@localhost:5432/shopdb")
+
+# psycopg3 driver (the modern choice; PyPI package is "psycopg")
+engine = create_engine("postgresql+psycopg://app:s3cret@localhost:5432/shopdb")
+```
+
+The URL scheme picks the driver: `postgresql+psycopg2://` uses psycopg2, `postgresql+psycopg://` uses psycopg3. A bare `postgresql://` currently defaults to psycopg2, so be explicit — it saves confusion when both drivers are installed. If your password contains special characters like `@` or `/`, URL-encode it, or build the URL programmatically with `sqlalchemy.URL.create()` to avoid quoting bugs entirely.
+
+Two keyword arguments are worth knowing on day one:
+
+```python
+engine = create_engine(
+    "postgresql+psycopg://app:s3cret@localhost:5432/shopdb",
+    echo=True,          # log every SQL statement to stdout
+    pool_pre_ping=True, # test connections before use; survives DB restarts
+)
+```
+
+`echo=True` is the single best learning tool SQLAlchemy has: every ORM operation prints the exact SQL and bound parameters it produced, so you always know what the abstraction is doing.
+
+## Engine vs Session: who does what
+
+The division of labor confuses newcomers, so let's pin it down. The **engine** manages connections and executes SQL; it is long-lived and thread-safe, and creating it does not actually open a connection — the first real query does. The **Session** is a short-lived unit-of-work object built on top of the engine: it tracks the objects you load and modify, batches your changes, and flushes them inside a transaction when you commit. A Session is deliberately cheap to create and is *not* thread-safe, which is why the rule of thumb is one engine per process and one Session per request, task, or unit of work. Core-level work (bulk SQL, DDL, analytics queries) can use `engine.connect()` directly and skip the ORM entirely; ORM work goes through a Session. The standard pattern is a context manager so the Session always closes and returns its connection to the pool:
+
+```python
+from sqlalchemy.orm import Session
+
+with Session(engine) as session:
+    ...        # do ORM work
+    session.commit()
+```
+
+In larger applications you will usually see a module-level factory instead — `SessionLocal = sessionmaker(engine)` — so that web handlers or background jobs can call `SessionLocal()` without importing the engine everywhere. It produces exactly the same Session objects; it is a convenience, not a different mechanism. One more thing worth internalizing early: the Session batches your changes and only sends SQL on *flush*, which happens automatically before queries and at commit. That means `session.add(obj)` does nothing on the wire by itself, and errors like a unique-constraint violation surface at commit time, not at add time — a frequent surprise when debugging.
+
+## Declarative models with Mapped and mapped_column
+
+SQLAlchemy 2.0 models are ordinary annotated Python classes. `Mapped[...]` declares the Python type, and `mapped_column()` carries column-level details. Optionality is inferred: `Mapped[str]` produces `NOT NULL`, `Mapped[str | None]` produces a nullable column.
+
+```python
+import uuid
+from datetime import datetime
+from sqlalchemy import ForeignKey, String, func
+from sqlalchemy.dialects.postgresql import ARRAY, JSONB, UUID
+from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
+
+
+class Base(DeclarativeBase):
+    pass
+
+
+class Customer(Base):
+    __tablename__ = "customers"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    email: Mapped[str] = mapped_column(String(255), unique=True)
+    tags: Mapped[list[str]] = mapped_column(ARRAY(String), default=list)
+    preferences: Mapped[dict] = mapped_column(JSONB, default=dict)
+    created_at: Mapped[datetime] = mapped_column(server_default=func.now())
+
+    orders: Mapped[list["Order"]] = relationship(back_populates="customer")
+
+
+class Order(Base):
+    __tablename__ = "orders"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    customer_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("customers.id"))
+    status: Mapped[str] = mapped_column(String(20), default="pending")
+    total_cents: Mapped[int]
+
+    customer: Mapped[Customer] = relationship(back_populates="orders")
+```
+
+Note the PostgreSQL-specific imports: `UUID(as_uuid=True)` gives you real `uuid.UUID` objects instead of strings, `ARRAY(String)` maps to `text[]`, and `JSONB` maps to the binary JSON type you actually want for indexing (plain `JSON` in Postgres is little more than validated text).
+
+## Creating the tables
+
+For a tutorial or a test suite, `create_all` emits the DDL directly:
+
+```python
+Base.metadata.create_all(engine)
+```
+
+With `echo=True` you will see the generated `CREATE TABLE` statements, including `email VARCHAR(255)`, `preferences JSONB`, and the foreign key. In a real project you would manage schema changes with Alembic instead, but `create_all` is perfect for getting started. To sanity-check what actually landed in the database, you can inspect the schema visually in Chat2DB, a free AI database client (https://chat2db.ai/download, web version at https://app.chat2db.ai) — seeing the column types Postgres actually created is a good habit when you are learning how `Mapped` annotations translate to DDL.
+
+## Insert, select, update, delete in 2.0 syntax
+
+The 2.0 style has one universal shape: build a statement, then `session.execute()` (or `session.scalars()`) it.
+
+**Insert** via the ORM is just adding objects:
+
+```python
+with Session(engine) as session:
+    ana = Customer(
+        email="ana@example.com",
+        tags=["beta", "newsletter"],
+        preferences={"theme": "dark", "currency": "USD"},
+    )
+    session.add(ana)
+    session.add(Order(customer=ana, status="paid", total_cents=4999))
+    session.commit()
+```
+
+Note the difference from raw SQL habits: you did not write an INSERT for the order or fill in `customer_id` by hand. Assigning `customer=ana` wires the foreign key through the relationship, and the Session figures out the correct insert order (customer first, then order) at flush time. The generated UUID primary key is populated on the object after commit, so `ana.id` is immediately usable.
+
+**Select** uses the `select()` construct. `session.scalars()` is the convenience for "give me model instances, not row tuples":
+
+```python
+from sqlalchemy import select
+
+with Session(engine) as session:
+    stmt = (
+        select(Customer)
+        .where(Customer.email.like("%@example.com"))
+        .order_by(Customer.created_at.desc())
+        .limit(10)
+    )
+    for customer in session.scalars(stmt):
+        print(customer.email, customer.tags)
+```
+
+Sample output:
+
+```text
+ana@example.com ['beta', 'newsletter']
+```
+
+JSONB and array columns are queryable with natural operators — this is where the Postgres dialect shines:
+
+```python
+dark_mode_users = session.scalars(
+    select(Customer).where(Customer.preferences["theme"].astext == "dark")
+).all()
+
+beta_users = session.scalars(
+    select(Customer).where(Customer.tags.contains(["beta"]))
+).all()
+```
+
+**Update and delete** come in two flavors. Loaded-object style: mutate the instance and commit. Bulk style: `update()`/`delete()` statements that run entirely in the database, no objects loaded:
+
+```python
+from sqlalchemy import update, delete
+
+with Session(engine) as session:
+    session.execute(
+        update(Order)
+        .where(Order.status == "pending", Order.total_cents == 0)
+        .values(status="cancelled")
+    )
+    session.execute(delete(Order).where(Order.status == "cancelled"))
+    session.commit()
+```
+
+The bulk forms are what you want for "update ten thousand rows" — one SQL statement instead of ten thousand tracked objects.
+
+## Relationships and joins
+
+The `relationship()` pairs declared on the models give you object-graph navigation (`order.customer.email`) and drive joins in queries. To filter across tables, `select().join()` follows the foreign key automatically:
+
+```python
+stmt = (
+    select(Customer.email, func.sum(Order.total_cents).label("lifetime_cents"))
+    .join(Customer.orders)
+    .where(Order.status == "paid")
+    .group_by(Customer.email)
+    .order_by(func.sum(Order.total_cents).desc())
+)
+for email, cents in session.execute(stmt):
+    print(f"{email}: ${cents / 100:.2f}")
+```
+
+One performance note that will save you real pain: accessing `customer.orders` lazily inside a loop triggers one query per customer — the classic N+1 problem. When you know you will touch the relationship, load it eagerly:
+
+```python
+from sqlalchemy.orm import selectinload
+
+customers = session.scalars(
+    select(Customer).options(selectinload(Customer.orders))
+).all()
+```
+
+`selectinload` fetches all the related orders in a second single query, which is almost always the right default for collections.
+
+## Upserts with ON CONFLICT
+
+Postgres's `INSERT ... ON CONFLICT` is exposed through the dialect-specific `insert()`. This is the idiomatic "insert or update" and it beats any select-then-insert dance because it is atomic:
+
+```python
+from sqlalchemy.dialects.postgresql import insert as pg_insert
+
+stmt = pg_insert(Customer).values(
+    email="ana@example.com",
+    tags=["beta", "newsletter", "vip"],
+    preferences={"theme": "light"},
+)
+stmt = stmt.on_conflict_do_update(
+    index_elements=[Customer.email],
+    set_={"tags": stmt.excluded.tags, "preferences": stmt.excluded.preferences},
+)
+
+with Session(engine) as session:
+    session.execute(stmt)
+    session.commit()
+```
+
+`stmt.excluded` refers to the row that would have been inserted — the same `EXCLUDED` pseudo-table you would use in raw SQL. There is also `on_conflict_do_nothing(index_elements=[...])` for idempotent inserts, which is exactly what you want in event-ingestion pipelines that may replay messages. Two practical details: the conflict target must match an actual unique constraint or index (here the unique `email` column), or Postgres rejects the statement; and because this is a Core statement executed through the Session, any `Customer` objects already loaded in that Session are not updated in memory — expire or re-select them if you need the fresh values afterward.
+
+## Connection pooling settings that matter
+
+The engine pools connections automatically, but the defaults deserve tuning for anything long-running:
+
+```python
+engine = create_engine(
+    "postgresql+psycopg://app:s3cret@localhost:5432/shopdb",
+    pool_size=10,        # persistent connections kept open (default 5)
+    max_overflow=20,     # extra connections allowed under burst load (default 10)
+    pool_pre_ping=True,  # cheap liveness check on checkout
+    pool_recycle=1800,   # replace connections older than 30 min
+)
+```
+
+`pool_pre_ping=True` is the one to remember: it issues a trivial round trip before handing a connection to your code, so a database failover or restart produces a transparent reconnect instead of a stack trace on the next query. `pool_recycle` protects you from network gear and proxies (pgbouncer, cloud NAT) that silently drop idle TCP connections. Keep `pool_size * workers` comfortably under the server's `max_connections`.
+
+## A brief note on async
+
+SQLAlchemy 2.x has a parallel asyncio API. Install `asyncpg` and use `create_async_engine`:
+
+```python
+from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+
+engine = create_async_engine("postgresql+asyncpg://app:s3cret@localhost:5432/shopdb")
+SessionLocal = async_sessionmaker(engine)
+
+async def paid_orders() -> list[Order]:
+    async with SessionLocal() as session:
+        result = await session.scalars(select(Order).where(Order.status == "paid"))
+        return list(result)
+```
+
+The statement-building layer — `select()`, `insert()`, models, relationships — is identical; only execution becomes `await`-ed. `postgresql+psycopg://` also supports the async engine if you prefer one driver for both modes. Start with the sync API while learning; the async layer is a mechanical translation once the 2.0 patterns are in your fingers.
+
+## Where to go from here
+
+You now have the full working vocabulary for SQLAlchemy against PostgreSQL in 2026: one engine per process, short-lived sessions, `Mapped`/`mapped_column` models, statement-style CRUD, dialect types for JSONB/ARRAY/UUID, `on_conflict_do_update` for upserts, and a properly tuned pool. Next steps that pay off quickly: add Alembic for migrations, put a GIN index on any JSONB column you query (`Index("ix_prefs", Customer.preferences, postgresql_using="gin")`), and leave `echo=True` on in development until reading the emitted SQL feels boring — that is the point at which SQLAlchemy stops being magic and starts being a tool you trust.

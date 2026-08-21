@@ -1,0 +1,240 @@
+---
+title: "Postgres ON DELETE CASCADE: How It Works"
+description: "How Postgres ON DELETE CASCADE works, with runnable foreign key examples, performance pitfalls, and when to prefer RESTRICT or soft deletes."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: August 21, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# Postgres ON DELETE CASCADE: How It Works
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="August 21, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+`ON DELETE CASCADE` is one of those Postgres features that is either exactly right or quietly dangerous, with very little middle ground. Used well, it keeps child rows from becoming orphans without any application code. Used carelessly, a single `DELETE` on a parent table can silently wipe out rows three tables away — and do it slowly, if the foreign key columns are not indexed.
+
+This article covers all five referential actions with runnable examples, multi-level cascade chains, how to find out what a delete will actually touch before you run it, the classic unindexed-FK performance trap, when a soft delete is the better design, and how to inspect and change the actions on existing constraints.
+
+## The Five Referential Actions
+
+When you declare a foreign key, you can tell Postgres what to do to child rows when the referenced parent row is deleted. Let's build a small schema to experiment with:
+
+```sql
+CREATE TABLE customers (
+    id    bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    email text NOT NULL UNIQUE
+);
+
+CREATE TABLE orders (
+    id          bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    customer_id bigint NOT NULL,
+    total_cents integer NOT NULL,
+    CONSTRAINT orders_customer_id_fkey
+        FOREIGN KEY (customer_id) REFERENCES customers (id)
+);
+
+INSERT INTO customers (email) VALUES ('alice@example.com');
+INSERT INTO orders (customer_id, total_cents) VALUES (1, 4999);
+```
+
+### NO ACTION (the default)
+
+With no `ON DELETE` clause you get `NO ACTION`: deleting a referenced parent fails.
+
+```sql
+DELETE FROM customers WHERE id = 1;
+```
+
+```
+ERROR:  update or delete on table "customers" violates foreign key
+        constraint "orders_customer_id_fkey" on table "orders"
+DETAIL:  Key (id)=(1) is still referenced from table "orders".
+```
+
+### RESTRICT
+
+`RESTRICT` produces the same error, and in a plain single-statement delete it behaves identically to `NO ACTION`. The difference is timing: `NO ACTION` checks can be deferred to the end of the transaction if the constraint is declared `DEFERRABLE`, which lets you delete a parent and re-point or delete its children within the same transaction. `RESTRICT` is checked immediately and can never be deferred. If you want "refuse, no exceptions," say `RESTRICT`; if you might need transaction-level flexibility later, the default `NO ACTION` is the more permissive choice.
+
+### CASCADE
+
+`CASCADE` deletes the children along with the parent:
+
+```sql
+ALTER TABLE orders DROP CONSTRAINT orders_customer_id_fkey;
+ALTER TABLE orders ADD CONSTRAINT orders_customer_id_fkey
+    FOREIGN KEY (customer_id) REFERENCES customers (id) ON DELETE CASCADE;
+
+DELETE FROM customers WHERE id = 1;
+-- DELETE 1
+
+SELECT count(*) FROM orders;
+ count
+-------
+     0
+```
+
+No error, no warning, and the command tag only reports the one parent row. The cascaded child deletes happen inside the same statement but are not reflected in the `DELETE 1` count — a detail that has fooled plenty of people reviewing application logs.
+
+### SET NULL
+
+`SET NULL` keeps the child row but nulls out the referencing column, which therefore must be nullable:
+
+```sql
+CREATE TABLE support_tickets (
+    id          bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    assignee_id bigint REFERENCES employees (id) ON DELETE SET NULL,
+    subject     text NOT NULL
+);
+```
+
+Delete an employee and their tickets survive, unassigned. This fits "the relationship is optional" cases. Since PostgreSQL 15 you can even null only a subset of columns of a multicolumn foreign key with `SET NULL (column_name)`.
+
+### SET DEFAULT
+
+`SET DEFAULT` re-points the child at the column's default value — which must itself exist in the parent table, or the very next delete fails:
+
+```sql
+CREATE TABLE articles (
+    id        bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    author_id bigint NOT NULL DEFAULT 1
+        REFERENCES authors (id) ON DELETE SET DEFAULT,
+    title     text NOT NULL
+);
+```
+
+The usual pattern is a sentinel row like a "Deleted User" author with `id = 1`. It works, but the hidden dependency on that sentinel row existing makes this the least-used action in practice.
+
+## Multi-Level Cascade Chains
+
+Cascades compose. If `order_items` references `orders` with `ON DELETE CASCADE`, and `orders` references `customers` the same way, deleting a customer deletes their orders, which deletes those orders' items:
+
+```sql
+CREATE TABLE order_items (
+    id       bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    order_id bigint NOT NULL REFERENCES orders (id) ON DELETE CASCADE,
+    sku      text NOT NULL,
+    qty      integer NOT NULL
+);
+
+DELETE FROM customers WHERE id = 42;
+-- also deletes 42's orders, and all items on those orders
+```
+
+The chain stops the moment it hits a constraint with a different action. If `shipments` references `orders` with the default `NO ACTION` and a shipment exists, the whole delete — customer, orders, items — rolls back with a foreign key violation. That is actually a useful safety property: one `RESTRICT`/`NO ACTION` link anywhere in the graph acts as a brake on the entire cascade.
+
+## Finding Out What a Delete Will Cascade To
+
+Before deleting from a central table in an unfamiliar schema, you want the dependency map. This query lists every foreign key pointing at a table, with its delete action:
+
+```sql
+SELECT conrelid::regclass AS child_table,
+       conname,
+       pg_get_constraintdef(oid) AS definition,
+       confdeltype
+FROM   pg_constraint
+WHERE  contype = 'f'
+AND    confrelid = 'customers'::regclass;
+```
+
+```
+ child_table |         conname          |                          definition                           | confdeltype
+-------------+--------------------------+---------------------------------------------------------------+-------------
+ orders      | orders_customer_id_fkey  | FOREIGN KEY (customer_id) REFERENCES customers(id) ON DELETE CASCADE | c
+```
+
+The `confdeltype` codes are `a` for NO ACTION, `r` for RESTRICT, `c` for CASCADE, `n` for SET NULL, and `d` for SET DEFAULT. To walk the whole chain, re-run the query against each child table that came back with `c`, or wrap it in a recursive CTE. A dry run inside a transaction is the other reliable technique: `BEGIN`, run the `DELETE`, count rows in the suspected child tables, then `ROLLBACK`. For a visual answer, Chat2DB — a free AI database client at https://chat2db.ai — can diagram foreign key relationships across a schema, which makes multi-level cascade paths obvious at a glance instead of something you reconstruct query by query.
+
+## The Performance Trap: Unindexed Foreign Key Columns
+
+Postgres automatically indexes the *referenced* side of a foreign key (it must be a primary key or unique constraint), but it does **not** create an index on the *referencing* column. Cascaded deletes look up children by that referencing column, so without an index, every parent row you delete triggers a sequential scan of the child table.
+
+You can see the cost in `EXPLAIN ANALYZE` — cascade work shows up as trigger time:
+
+```sql
+EXPLAIN ANALYZE DELETE FROM customers WHERE id = 42;
+```
+
+```
+ Delete on customers  (cost=0.42..8.44 rows=0 width=0)
+                      (actual time=0.153..0.154 rows=0 loops=1)
+   ...
+ Trigger for constraint orders_customer_id_fkey: time=4820.113 calls=1
+ Execution Time: 4820.508 ms
+```
+
+Nearly five seconds, almost all of it spent in the foreign key trigger scanning `orders`. The fix is a plain index on the referencing column:
+
+```sql
+CREATE INDEX CONCURRENTLY orders_customer_id_idx ON orders (customer_id);
+```
+
+After that, the same delete runs in milliseconds. As a rule: any foreign key column involved in `CASCADE`, `SET NULL`, or frequent parent deletes should be indexed. You can find unindexed FK columns by joining `pg_constraint` against `pg_index` and checking whether any index's leading columns cover the constraint's `conkey`.
+
+Also remember the locking side: a cascaded delete takes row locks in every affected child table. Long cascade chains on busy tables are a recipe for lock contention, which is one more argument for keeping chains short.
+
+## CASCADE vs Soft Delete
+
+Whether to cascade at all is a design decision, not just a syntax one.
+
+CASCADE fits *composition*: the child has no meaning without the parent. Order items without an order, comment votes without a comment, rows in a per-user settings table — if the parent is gone, the children are garbage, and cascade is the cleanest way to collect it.
+
+CASCADE is wrong for *association with independent value*, and especially wrong where you have audit or financial obligations. Deleting a customer should almost never physically destroy their invoices. In those domains, teams use soft deletes: a `deleted_at timestamptz` column, `UPDATE ... SET deleted_at = now()` instead of `DELETE`, and filtered queries (typically backed by partial indexes like `WHERE deleted_at IS NULL`). The tradeoffs are real on both sides. Soft deletes preserve history and make "undo" trivial, but every query must remember the filter, unique constraints need partial-index workarounds, and the referential integrity of "deleted" data is on you. Hard deletes with CASCADE keep the database honest and small, but recovery means restoring from backup. A common hybrid: soft-delete the aggregates users care about (customers, projects), and let a periodic purge job hard-delete old soft-deleted parents, at which point CASCADE cleans up the tree in one statement.
+
+## ON UPDATE Actions, Briefly
+
+The same five actions exist for `ON UPDATE`, firing when the parent's *key value* changes. `ON UPDATE CASCADE` rewrites child foreign keys to follow the new value, which is handy if you reference natural keys like a country code or username. With surrogate keys (`GENERATED ... AS IDENTITY`, sequences, UUIDs) the referenced value never changes, so the default `NO ACTION` is fine and `ON UPDATE` clauses are rarely worth specifying.
+
+## Changing an Existing Constraint's Action
+
+There is no `ALTER CONSTRAINT ... ON DELETE ...` for this in released versions; you drop and re-add inside one transaction so there is no unprotected window:
+
+```sql
+BEGIN;
+ALTER TABLE orders DROP CONSTRAINT orders_customer_id_fkey;
+ALTER TABLE orders ADD CONSTRAINT orders_customer_id_fkey
+    FOREIGN KEY (customer_id) REFERENCES customers (id)
+    ON DELETE RESTRICT
+    NOT VALID;
+COMMIT;
+
+ALTER TABLE orders VALIDATE CONSTRAINT orders_customer_id_fkey;
+```
+
+The `NOT VALID` / `VALIDATE` pair matters on big tables: adding the constraint `NOT VALID` skips the full-table verification scan and needs only a short lock, and `VALIDATE CONSTRAINT` afterward checks existing rows while holding a much weaker lock. New writes are enforced from the moment the `NOT VALID` constraint exists.
+
+## Inspecting Foreign Key Actions
+
+In `psql`, table description shows actions on both sides of each relationship:
+
+```
+\d orders
+...
+Foreign-key constraints:
+    "orders_customer_id_fkey" FOREIGN KEY (customer_id)
+        REFERENCES customers(id) ON DELETE CASCADE
+Referenced by:
+    TABLE "order_items" CONSTRAINT "order_items_order_id_fkey"
+        FOREIGN KEY (order_id) REFERENCES orders(id) ON DELETE CASCADE
+```
+
+Programmatically, `information_schema.referential_constraints` exposes the rules in portable form:
+
+```sql
+SELECT constraint_name, delete_rule, update_rule
+FROM   information_schema.referential_constraints
+WHERE  constraint_schema = 'public';
+
+      constraint_name       | delete_rule | update_rule
+----------------------------+-------------+-------------
+ orders_customer_id_fkey    | CASCADE     | NO ACTION
+ order_items_order_id_fkey  | CASCADE     | NO ACTION
+```
+
+For Postgres-specific detail (deferrability, exact column mapping), `pg_constraint` with `pg_get_constraintdef(oid)` is the source of truth, as shown earlier.
+
+## Summary
+
+`ON DELETE CASCADE` is the right default for true parent-child composition, provided every referencing column in the chain is indexed and you know how far the chain reaches. Prefer `RESTRICT` or the default `NO ACTION` at the boundaries of important data so a stray delete fails loudly instead of propagating, use `SET NULL` for optional relationships, and reach for soft deletes where history is an obligation rather than a preference. Before any large delete on a table you did not design, map the foreign keys pointing at it — the two catalog queries above, or one schema diagram, will tell you exactly what is about to disappear.

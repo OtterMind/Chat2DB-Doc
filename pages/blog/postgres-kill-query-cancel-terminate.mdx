@@ -1,0 +1,179 @@
+---
+title: "Kill a Postgres Query: Cancel vs Terminate"
+description: "Find and kill long running queries in Postgres with pg_stat_activity, pg_cancel_backend, and pg_terminate_backend—and why kill -9 is dangerous."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: August 21, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# Kill a Postgres Query: Cancel vs Terminate
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="August 21, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+Sooner or later every Postgres operator gets paged for the same reason: a query has been running for forty minutes, it is holding a lock half the application is queued behind, and someone needs it gone right now. Postgres gives you two server-side functions for this — `pg_cancel_backend()` and `pg_terminate_backend()` — and they behave very differently. Picking the wrong one is usually harmless, but reaching past both of them to `kill -9` can take down your entire cluster. This article walks through the whole workflow: finding the offending backend, choosing cancel versus terminate, clearing every connection off a database before a `DROP DATABASE`, and configuring timeouts so you get paged less often in the first place.
+
+## Show Running Queries with pg_stat_activity
+
+Everything starts with `pg_stat_activity`, the system view that exposes one row per server process. Before you can kill anything you need its `pid`, and you want enough context to be sure you are killing the right thing. Here is the query I keep pinned for incidents:
+
+```sql
+SELECT pid,
+       usename,
+       datname,
+       state,
+       wait_event_type,
+       wait_event,
+       now() - query_start AS query_age,
+       now() - xact_start  AS xact_age,
+       left(query, 60)     AS query
+FROM pg_stat_activity
+WHERE state <> 'idle'
+  AND pid <> pg_backend_pid()
+ORDER BY query_start;
+```
+
+Sample output during a real incident looks something like this:
+
+```text
+  pid  | usename |  datname  |        state        | wait_event_type | wait_event |    query_age    |                     query
+-------+---------+-----------+---------------------+-----------------+------------+-----------------+----------------------------------------------
+ 41273 | etl     | warehouse | active              | IO              | DataFileRead | 00:42:17.90112 | INSERT INTO order_facts SELECT o.id, o.cust
+ 41991 | app     | warehouse | active              | Lock            | relation     | 00:41:58.11539 | ALTER TABLE orders ADD COLUMN priority int
+ 42410 | app     | warehouse | idle in transaction |                 |              | 00:00:03.20981 | SELECT * FROM customers WHERE id = $1
+```
+
+A few columns deserve careful reading:
+
+- `state` — `active` means the backend is executing a query right now. `idle in transaction` means it ran something, opened a transaction, and is now doing nothing while still holding locks and pinning the xmin horizon. Long-lived `idle in transaction` sessions are often worse than slow queries: they block vacuum and hold row locks silently.
+- `wait_event_type` and `wait_event` — `Lock` / `relation` tells you the backend is blocked waiting for a table lock, not burning CPU. Killing a blocked query rarely helps; you want to find and kill whatever is blocking it. On Postgres 9.6+ you can ask directly with `SELECT pg_blocking_pids(41991);`.
+- `query_start` versus `xact_start` — the age of the current statement versus the age of the whole transaction. A transaction that has been open for an hour but whose current statement started two seconds ago is an application-side problem (usually a connection pool leaking transactions), not a slow query.
+
+Note that `query` shows the most recent statement even for idle sessions, which trips people up: an `idle in transaction` row showing a `SELECT` means that `SELECT` already finished and the app simply never committed. Also, by default `query` is truncated at 1024 bytes (`track_activity_query_size`), so raise that setting if your ORM generates monster statements.
+
+To zero in on long running queries specifically, filter on age:
+
+```sql
+SELECT pid, now() - query_start AS runtime, query
+FROM pg_stat_activity
+WHERE state = 'active'
+  AND now() - query_start > interval '5 minutes'
+ORDER BY runtime DESC;
+```
+
+If you prefer not to hand-type these under pressure, Chat2DB — a free AI database client — lets you run and inspect these queries in a grid, and you can ask its AI to generate the exact `pg_stat_activity` filter you need; grab it at https://chat2db.ai/download or use the web version at https://app.chat2db.ai.
+
+## pg_cancel_backend vs pg_terminate_backend
+
+Once you have a PID, you have two options, and the difference matters.
+
+### pg_cancel_backend: cancel the query, keep the session
+
+```sql
+SELECT pg_cancel_backend(41273);
+```
+
+This sends `SIGINT` to the backend process. The currently running statement is interrupted and the client receives:
+
+```text
+ERROR:  canceling statement due to user request
+```
+
+The connection itself survives. If the backend was inside an explicit transaction, that transaction is now in an aborted state and the client must issue `ROLLBACK` before doing anything else. Cancel is the polite option and should be your default: the application keeps its connection, the pool does not have to rebuild anything, and the interruption looks like an ordinary query error the app can handle.
+
+The important limitation: cancel only interrupts an executing statement. It does nothing useful against an `idle in transaction` session, because there is no statement to cancel — the session just keeps sitting on its locks.
+
+### pg_terminate_backend: kill the whole connection
+
+```sql
+SELECT pg_terminate_backend(42410);
+```
+
+This sends `SIGTERM`. The backend rolls back any open transaction, releases its locks, and exits. The client sees:
+
+```text
+FATAL:  terminating connection due to administrator command
+server closed the connection unexpectedly
+```
+
+Use terminate when cancel is not enough: idle-in-transaction sessions, a backend stuck in an uninterruptible section that ignores cancel, a runaway connection from a decommissioned service, or a two-phase mess you just need cleared. The cost is that the application loses its connection; well-behaved pools reconnect transparently, but you should expect a small blip of errors.
+
+Both functions return `true` if the signal was sent — not if it was acted on. A backend stuck in a long uninterruptible kernel call (e.g., blocked on NFS I/O) can ignore both signals for a while; check `pg_stat_activity` again after a few seconds rather than assuming success. Both functions require superuser, membership in `pg_signal_backend`, or ownership of the target session's role — on managed services like RDS you also have `rds_superuser` wrappers that amount to the same thing.
+
+## Killing All Connections to a Database
+
+The classic scenario: you want to `DROP DATABASE staging` (or restore over it) and get:
+
+```text
+ERROR:  database "staging" is being accessed by other users
+DETAIL:  There are 3 other sessions using the database.
+```
+
+The traditional fix is to terminate every backend attached to that database, then drop it quickly before the app reconnects:
+
+```sql
+SELECT pg_terminate_backend(pid)
+FROM pg_stat_activity
+WHERE datname = 'staging'
+  AND pid <> pg_backend_pid();
+
+DROP DATABASE staging;
+```
+
+The `pid <> pg_backend_pid()` guard keeps you from terminating your own session, which would be mildly embarrassing mid-incident. You may also want to `REVOKE CONNECT ON DATABASE staging FROM PUBLIC;` first so the connection pool cannot race you and reconnect between the two statements.
+
+On Postgres 13 and newer, skip the choreography entirely:
+
+```sql
+DROP DATABASE staging WITH (FORCE);
+```
+
+`WITH (FORCE)` terminates the remaining sessions for you (assuming you have permission to signal them) and then drops the database in one step. It still fails if someone holds a prepared transaction on the database, but for the everyday "CI keeps a connection open" case it is the clean answer.
+
+## Prevention: statement_timeout and Friends
+
+Killing queries by hand is an incident response, not a strategy. Postgres has settings that make entire classes of these pages disappear.
+
+`statement_timeout` aborts any statement that runs longer than the limit:
+
+```sql
+-- per role: the reporting user may run long, the web app may not
+ALTER ROLE app_web SET statement_timeout = '30s';
+ALTER ROLE reporting SET statement_timeout = '15min';
+```
+
+The failing client sees `ERROR: canceling statement due to statement timeout`. Resist setting this globally in `postgresql.conf` at a small value — it also applies to maintenance sessions, and you do not want a timeout killing your `CREATE INDEX CONCURRENTLY` at 95%. Per-role or per-session scoping is the sane pattern.
+
+`idle_in_transaction_session_timeout` is the one most shops actually need. It terminates sessions that sit inside an open transaction doing nothing:
+
+```sql
+ALTER SYSTEM SET idle_in_transaction_session_timeout = '10min';
+SELECT pg_reload_conf();
+```
+
+This directly kills the "developer opened a transaction in a psql window and went to lunch" problem, along with leaked transactions from crashed app workers. Since these sessions block `VACUUM` from reclaiming dead rows across the whole cluster, a timeout here protects more than just lock throughput. Related knobs worth knowing: `lock_timeout` (give up waiting for a lock instead of queueing forever — essential for DDL in migrations) and, on Postgres 14+, `idle_session_timeout` for connections that are idle outside any transaction.
+
+## Why kill -9 on a Backend PID Is Dangerous
+
+Every backend row in `pg_stat_activity` corresponds to a real operating system process, so it is tempting to ssh to the box and use the tools you know. `kill -SIGTERM <pid>` from the shell is actually equivalent to `pg_terminate_backend` and is safe. `kill -9` (`SIGKILL`) is a different animal, and you should treat it as a last resort with a known blast radius.
+
+`SIGKILL` cannot be caught, so the backend dies without running any cleanup: no rollback, no lock release, no detach from shared memory. The postmaster notices that a child died while attached to shared memory and must assume shared state — buffer pool, lock tables, transaction status — may be corrupted. Its only safe move is to terminate **every** backend and run crash recovery. In the log you will see:
+
+```text
+LOG:  server process (PID 41273) was terminated by signal 9: Killed
+LOG:  terminating any other active server processes
+LOG:  all server processes terminated; reinitializing
+LOG:  database system was not properly shut down; automatic recovery in progress
+LOG:  redo starts at 2A/8F0125E0
+```
+
+In other words: you tried to kill one query and instead restarted the whole cluster. Every connection drops, and the database is unavailable until WAL replay finishes — seconds if you are lucky, minutes if checkpoints are spread out and the workload was write-heavy. `kill -9` on the postmaster itself is even worse, since it can leave orphaned backends holding shared memory and prevent a clean restart.
+
+The only time `SIGKILL` on a backend is defensible is when the process is truly wedged in unkillable state, ignoring `SIGTERM` for minutes, and you have consciously decided that a full restart with crash recovery is better than the current outage. At that point you are choosing to restart Postgres — do it with your eyes open, not by accident.
+
+## Summary
+
+The playbook, in order: find the PID and context in `pg_stat_activity`, paying attention to `state`, `wait_event`, and query age; try `pg_cancel_backend()` first because it preserves the connection; escalate to `pg_terminate_backend()` for idle-in-transaction sessions or stubborn backends; use `DROP DATABASE ... WITH (FORCE)` on PG13+ instead of hand-rolled connection sweeps; and configure `statement_timeout` plus `idle_in_transaction_session_timeout` so the pager stays quiet. Keep `kill -9` out of the playbook entirely — a signal that skips cleanup on one backend costs you crash recovery on the whole cluster.

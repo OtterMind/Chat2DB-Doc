@@ -1,0 +1,152 @@
+---
+title: "Postgres sslmode Explained: disable to verify-full"
+description: "What each postgres sslmode value actually protects against, why the prefer default is weak, sslrootcert setup, and checking pg_stat_ssl."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: August 21, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# Postgres sslmode Explained: disable to verify-full
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="August 21, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+Every PostgreSQL client library that builds on libpq — psql, psycopg, most language drivers — accepts an `sslmode` connection parameter with six possible values. Most engineers pick one by copy-paste and move on, which is how production systems end up "using SSL" while remaining trivially interceptable. The six modes are not a smooth dial from "less secure" to "more secure"; they split into three distinct security postures, and the difference between `require` and `verify-full` is precisely the difference between stopping a passive eavesdropper and stopping an active man-in-the-middle. This article walks through what each mode actually guarantees, how to configure certificates, how to prove your current connection is encrypted, and what the common failure messages mean.
+
+## The threat model in two sentences
+
+There are two attackers to care about. A **passive eavesdropper** reads traffic on the wire (compromised switch, cloud network tap, coffee-shop Wi-Fi) — any real TLS encryption defeats them. An **active man-in-the-middle (MITM)** intercepts your TCP connection and presents its own TLS certificate, decrypting and re-encrypting traffic in both directions — only *certificate verification* defeats them, because encryption to an attacker's key is worthless. Keep those two columns in mind; every sslmode value is a position on that grid.
+
+## The six sslmode values
+
+**`disable`** — never use SSL. Plaintext on the wire, including your password (with `password` auth; SCRAM at least avoids sending the cleartext secret, but your data still travels unencrypted). Acceptable only for localhost or a genuinely trusted private network, and even then Unix sockets are usually the better answer.
+
+**`allow`** — try plaintext first; upgrade to SSL only if the server insists (via `pg_hba.conf` rejecting non-SSL connections). This mode exists for compatibility and has no real security rationale: you get encryption only when the server forces it. Protects against nothing by itself.
+
+**`prefer`** — try SSL first; silently fall back to plaintext if the server does not support it. **This is the default**, and it is weaker than it sounds, for two reasons. First, the fallback is silent: if SSL negotiation fails, you get an unencrypted connection with no warning, so a network position that can break the SSL handshake can downgrade you. Second, even when SSL is negotiated, `prefer` performs **no certificate verification** — a MITM presenting any self-signed certificate is accepted. `prefer` gives you opportunistic encryption against a purely passive attacker and nothing more.
+
+**`require`** — refuse plaintext; SSL is mandatory. But certificates are still **not verified** (with one historical wrinkle: if a root CA file exists at the default location, libpq treats `require` like `verify-ca` for backward compatibility — do not rely on this). `require` reliably defeats eavesdropping but not MITM. It is the floor for anything crossing a network you do not own, not the ceiling.
+
+**`verify-ca`** — SSL is mandatory, and the server's certificate must chain to a CA in your `sslrootcert` file. This defeats a MITM *unless* the attacker can obtain any certificate from that same CA. With a private CA that issues only your database certificates, `verify-ca` is solid. With a public CA bundle, it is weak: anyone can buy a certificate from a public CA for a hostname they control, and `verify-ca` will accept it because hostname checking is skipped.
+
+**`verify-full`** — everything `verify-ca` does, plus the certificate's Common Name or Subject Alternative Name must match the hostname you connected to. This is full TLS as your browser does it: encryption plus authentication of the specific server. **`verify-full` is the only mode that defeats an active MITM in the general case**, and it should be your default for any connection leaving the machine.
+
+The summary table:
+
+```text
+sslmode      encrypted?        stops eavesdropping?   stops MITM?
+disable      never             no                     no
+allow        only if forced    no                     no
+prefer       usually           mostly (downgradable)  no
+require      always            yes                    no
+verify-ca    always            yes                    only with a private CA
+verify-full  always            yes                    yes
+```
+
+## Certificates: sslrootcert, sslcert, sslkey
+
+Three parameters control the certificate machinery:
+
+- **`sslrootcert`** — path to the CA certificate(s) used to verify the *server*. Required (in practice) for `verify-ca`/`verify-full`. Default location: `~/.postgresql/root.crt` on Linux/macOS, `%APPDATA%\postgresql\root.crt` on Windows.
+- **`sslcert`** and **`sslkey`** — a *client* certificate and private key, used only when the server demands client-certificate authentication (`clientcert=verify-full` in `pg_hba.conf`, or the `cert` auth method). Defaults: `~/.postgresql/postgresql.crt` and `~/.postgresql/postgresql.key`. libpq refuses a key file that is group- or world-readable, so `chmod 0600` it.
+
+Since **PostgreSQL 16**, libpq accepts the special value `sslrootcert=system`, which verifies against the operating system's trusted CA store instead of a file. If your server presents a certificate from a public CA (Let's Encrypt, or a managed provider that uses one), this removes the whole download-the-CA-bundle dance:
+
+```bash
+psql "host=db.example.com dbname=shopdb user=app sslmode=verify-full sslrootcert=system"
+```
+
+One caution: `sslrootcert=system` plus `verify-ca` would accept any publicly issued certificate, which is nearly meaningless — with the system store, always use `verify-full`.
+
+## Checking whether your connection is actually encrypted
+
+Do not guess; ask the server. psql prints the SSL status in its startup banner:
+
+```text
+$ psql "host=db.example.com dbname=shopdb user=app sslmode=verify-full"
+psql (16.4)
+SSL connection (protocol: TLSv1.3, cipher: TLS_AES_256_GCM_SHA384, compression: off)
+shopdb=>
+```
+
+From any client, `pg_stat_ssl` reports per-backend SSL state; join it with your own backend PID:
+
+```sql
+SELECT s.ssl, s.version, s.cipher
+FROM pg_stat_ssl s
+WHERE s.pid = pg_backend_pid();
+```
+
+```text
+ ssl | version |         cipher
+-----+---------+------------------------
+ t   | TLSv1.3 | TLS_AES_256_GCM_SHA384
+```
+
+If `ssl` is `f`, you are talking plaintext regardless of what your connection string claims — usually a `prefer` fallback or a connection pooler terminating TLS in front of a plaintext hop. This query is also a handy audit: run it without the `WHERE` clause (as a superuser) to see which connected clients are unencrypted. A GUI client makes this kind of spot check painless — for example, you can run the `pg_stat_ssl` query in Chat2DB, a free AI database client (https://chat2db.ai/download, or https://app.chat2db.ai in the browser), and check the encryption state of every session in one grid.
+
+## sslmode in URIs vs keyword/value DSNs
+
+libpq accepts both syntaxes everywhere, and the SSL parameters ride along as query parameters or keywords respectively:
+
+```bash
+# URI form
+psql "postgresql://app:s3cret@db.example.com:5432/shopdb?sslmode=verify-full&sslrootcert=/etc/ssl/certs/company-ca.pem"
+
+# keyword/value DSN form
+psql "host=db.example.com port=5432 dbname=shopdb user=app sslmode=verify-full sslrootcert=/etc/ssl/certs/company-ca.pem"
+```
+
+In Python, psycopg passes these straight through, either embedded in the DSN or as keyword arguments:
+
+```python
+import psycopg
+
+conn = psycopg.connect(
+    host="db.example.com",
+    dbname="shopdb",
+    user="app",
+    password="s3cret",
+    sslmode="verify-full",
+    sslrootcert="/etc/ssl/certs/company-ca.pem",
+)
+with conn.cursor() as cur:
+    cur.execute("SELECT ssl, version FROM pg_stat_ssl WHERE pid = pg_backend_pid()")
+    print(cur.fetchone())   # (True, 'TLSv1.3')
+```
+
+JDBC is the odd one out historically, but modern pgJDBC (42.2.5+) understands the same `sslmode` values:
+
+```java
+String url = "jdbc:postgresql://db.example.com:5432/shopdb"
+           + "?sslmode=verify-full"
+           + "&sslrootcert=/etc/ssl/certs/company-ca.pem";
+Connection conn = DriverManager.getConnection(url, "app", "s3cret");
+```
+
+Note that pgJDBC's legacy `ssl=true` parameter alone behaves like `verify-full` in modern drivers — stricter than libpq's default — which is why Java apps often hit certificate errors that psql, defaulting to `prefer`, silently sails past. That asymmetry is a feature, not a bug; fix the certificates rather than downgrading the Java side.
+
+## Common errors and what they actually mean
+
+**`SSL error: certificate verify failed`** — you asked for `verify-ca`/`verify-full` and the server's certificate does not chain to your `sslrootcert` (wrong CA file, missing intermediate certificate in the server's chain, or expired certificate). With `verify-full` it can also mean the chain is fine but the hostname does not match the certificate — connecting by IP address when the certificate names a DNS hostname is the classic case.
+
+**`root certificate file "/home/deploy/.postgresql/root.crt" does not exist`** — you asked for a verifying mode but libpq found no CA file at the default path and you did not pass `sslrootcert`. Supply the path, or on PG16+ clients use `sslrootcert=system` if the server cert is publicly issued.
+
+**`server does not support SSL, but SSL was required`** — the server was built without SSL or has `ssl = off` in `postgresql.conf`. Fix the server (`ssl = on`, plus `ssl_cert_file`/`ssl_key_file`), don't downgrade the client.
+
+**`private key file "postgresql.key" has group or world access`** — client-cert auth with a key file whose permissions are too open; `chmod 0600` it.
+
+**`no pg_hba.conf entry for host ..., SSL off`** — the server's `pg_hba.conf` uses `hostssl` rules, so plaintext connections have no matching entry. Your client fell back to (or asked for) non-SSL; raise the client's sslmode.
+
+## What managed providers typically require
+
+The pattern across managed Postgres is "TLS required, verification your job":
+
+- **Amazon RDS / Aurora** supports TLS and can enforce it (`rds.force_ssl = 1`, default on newer engine versions). Server certificates are signed by AWS-operated CAs, so `verify-full` requires downloading the regional or global bundle (`global-bundle.pem`) and passing it as `sslrootcert`.
+- **Supabase** requires or strongly encourages SSL depending on the connection path (direct vs pooler) and provides a downloadable CA certificate per project for `verify-full`.
+- **Neon** requires TLS on all connections — `sslmode=require` is the minimum that will connect, their certificates are publicly issued, and their docs recommend `verify-full` with the system CA store (`sslrootcert=system` on PG16+ clients, or channel binding as an additional protection).
+
+The common trap with every provider is stopping at `sslmode=require` because it is the first value that connects without a certificate file. That gets you encryption against eavesdroppers but leaves you open to an active MITM. The finish line is always the same: obtain the provider's CA (or use the system store when certificates are publicly issued), set `sslmode=verify-full`, and confirm with `pg_stat_ssl`. It is usually a two-line change to a connection string, and it is the difference between a connection that is merely scrambled and one that is actually authenticated.

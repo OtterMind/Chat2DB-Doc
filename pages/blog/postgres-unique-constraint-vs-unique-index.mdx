@@ -1,0 +1,229 @@
+---
+title: "Postgres Unique Constraint vs Unique Index"
+description: "Learn the difference between a Postgres unique constraint and a unique index, when each is required, and the exact SQL syntax to create both."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: August 21, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# Postgres Unique Constraint vs Unique Index
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="August 21, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+Ask three Postgres developers how to make a column unique and you will get two answers: `ALTER TABLE ... ADD CONSTRAINT ... UNIQUE` and `CREATE UNIQUE INDEX`. Both reject duplicate rows, both are enforced by the same B-tree machinery, and in the simple case they are practically interchangeable. That is exactly why the distinction trips people up: the two features overlap almost completely, but each one can do a few things the other cannot, and picking the wrong one occasionally costs you a painful migration later.
+
+This article walks through what each object actually is, how a unique constraint is implemented under the hood, the capabilities exclusive to each side, how NULLs behave (including the PG15 `NULLS NOT DISTINCT` option), and finishes with a practical decision guide.
+
+## What a Unique Constraint Is
+
+A unique constraint is a logical rule attached to a table, recorded in the system catalog `pg_constraint`. It declares, at the schema level, "no two rows may have the same value in these columns."
+
+```sql
+CREATE TABLE users (
+    id    bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    email text NOT NULL
+);
+
+ALTER TABLE users
+    ADD CONSTRAINT users_email_key UNIQUE (email);
+```
+
+You can also declare it inline at table creation time:
+
+```sql
+CREATE TABLE users (
+    id    bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    email text NOT NULL UNIQUE
+);
+```
+
+Violating it produces the familiar error:
+
+```
+ERROR:  duplicate key value violates unique constraint "users_email_key"
+DETAIL:  Key (email)=(alice@example.com) already exists.
+```
+
+Because a constraint is part of the table definition, it participates in things that operate on the logical schema: foreign keys can point at it, `pg_dump` emits it as an `ALTER TABLE` statement, and tools that read `information_schema.table_constraints` will see it.
+
+## What a Unique Index Is
+
+A unique index is a physical access structure with a uniqueness flag. You create it directly:
+
+```sql
+CREATE UNIQUE INDEX users_email_uniq ON users (email);
+```
+
+Functionally, inserts and updates hit exactly the same enforcement path: when a new index entry would collide with an existing one, the insert fails. The error message is nearly identical, which is a hint about what is going on underneath:
+
+```
+ERROR:  duplicate key value violates unique constraint "users_email_uniq"
+```
+
+Note that Postgres says "unique constraint" even though you only created an index. From the executor's perspective there is no difference at enforcement time.
+
+## Under the Hood: Every Unique Constraint Is a Unique Index
+
+When you add a unique constraint, Postgres silently builds a unique B-tree index to enforce it. The constraint is the catalog entry; the index is the mechanism. You can see both in `psql`:
+
+```
+\d users
+                Table "public.users"
+ Column |  Type  | Collation | Nullable | Default
+--------+--------+-----------+----------+---------
+ id     | bigint |           | not null | generated always as identity
+ email  | text   |           | not null |
+Indexes:
+    "users_pkey" PRIMARY KEY, btree (id)
+    "users_email_key" UNIQUE CONSTRAINT, btree (email)
+```
+
+The `UNIQUE CONSTRAINT` label marks an index that is owned by a constraint. A standalone `CREATE UNIQUE INDEX` shows up as just `UNIQUE` instead. You can confirm the linkage in the catalogs:
+
+```sql
+SELECT conname, conindid::regclass AS backing_index
+FROM   pg_constraint
+WHERE  conrelid = 'users'::regclass AND contype = 'u';
+
+     conname     | backing_index
+-----------------+-----------------
+ users_email_key | users_email_key
+```
+
+So the honest answer to "constraint or index?" is: a unique constraint is a unique index plus a catalog entry. The interesting question is what that extra catalog entry buys you, and what you give up by having it.
+
+## What Only a Unique Index Can Do
+
+The `CREATE UNIQUE INDEX` statement exposes the full power of the index machinery, and three features matter in practice.
+
+### Partial Unique Indexes
+
+A constraint applies to every row; an index can apply to a subset via a `WHERE` clause. The classic use case is soft deletes: emails must be unique among live rows, but a deleted account should not block re-registration.
+
+```sql
+CREATE UNIQUE INDEX users_email_active_uniq
+    ON users (email)
+    WHERE deleted_at IS NULL;
+```
+
+Now two rows can share `alice@example.com` as long as at most one of them has `deleted_at IS NULL`. There is no constraint syntax for this; if you need conditional uniqueness, a partial unique index is the only tool.
+
+### Expression Indexes
+
+Uniqueness on a computed value is another index-only feature. Case-insensitive email uniqueness is the canonical example:
+
+```sql
+CREATE UNIQUE INDEX users_email_lower_uniq
+    ON users (lower(email));
+```
+
+With this in place, `Alice@Example.com` and `alice@example.com` collide. A unique constraint can only reference plain columns, so `ADD CONSTRAINT ... UNIQUE (lower(email))` is a syntax error. (An alternative on modern Postgres is a nondeterministic case-insensitive collation, but the expression index remains the most common pattern.)
+
+### Building Without Blocking Writes
+
+`ALTER TABLE ... ADD CONSTRAINT UNIQUE` takes an `ACCESS EXCLUSIVE` lock on the table for the duration of the index build. On a large, busy table that means blocked writes and reads for minutes. `CREATE UNIQUE INDEX CONCURRENTLY` builds the index without blocking normal traffic:
+
+```sql
+CREATE UNIQUE INDEX CONCURRENTLY users_email_uniq ON users (email);
+```
+
+It takes longer, cannot run inside a transaction block, and leaves an `INVALID` index behind if it fails (which you must drop and retry), but it is the only safe way to add uniqueness to a hot production table. As we will see below, you can promote the result to a constraint afterward, so you do not have to choose between safety and semantics.
+
+## What Only a Unique Constraint Can Do
+
+The catalog entry has real value; three features depend on it.
+
+### Being the Target of a Foreign Key
+
+A foreign key must reference a set of columns whose uniqueness is guaranteed. The documented, portable targets are a primary key or a unique constraint; Postgres will also accept a plain, non-partial unique index on the exact columns, but a partial or expression index never qualifies, because it does not guarantee uniqueness for every row. If a table's columns will be referenced by other tables, declare a constraint:
+
+```sql
+ALTER TABLE users ADD CONSTRAINT users_email_key UNIQUE (email);
+
+CREATE TABLE newsletter_subscriptions (
+    id    bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    email text NOT NULL REFERENCES users (email)
+);
+```
+
+### ON CONFLICT ON CONSTRAINT
+
+The upsert clause `ON CONFLICT` can infer an arbiter from a column list (`ON CONFLICT (email)`), and that inference actually works against plain unique indexes too, including partial ones with a matching `WHERE` clause. But the explicit named form requires a constraint:
+
+```sql
+INSERT INTO users (email)
+VALUES ('alice@example.com')
+ON CONFLICT ON CONSTRAINT users_email_key
+DO UPDATE SET email = EXCLUDED.email;
+```
+
+Naming the constraint makes the statement robust against someone adding a second unique index that would confuse inference, which some teams prefer in migration-heavy codebases.
+
+### DEFERRABLE Checking
+
+Only constraints can be deferred to commit time. This matters when you need to swap unique values within a transaction, for example reordering rows in a `position` column:
+
+```sql
+ALTER TABLE playlist_tracks
+    ADD CONSTRAINT playlist_tracks_pos_key
+    UNIQUE (playlist_id, position) DEFERRABLE INITIALLY IMMEDIATE;
+
+BEGIN;
+SET CONSTRAINTS playlist_tracks_pos_key DEFERRED;
+UPDATE playlist_tracks SET position = 2 WHERE id = 10;  -- temporarily collides
+UPDATE playlist_tracks SET position = 1 WHERE id = 11;
+COMMIT;  -- uniqueness checked here
+```
+
+With a plain unique index, the first `UPDATE` would fail immediately. There is no `CREATE UNIQUE INDEX ... DEFERRABLE`. One caveat: a deferrable unique constraint cannot serve as an `ON CONFLICT` arbiter or a foreign key target, so do not sprinkle `DEFERRABLE` on by default.
+
+## NULL Behavior and NULLS NOT DISTINCT
+
+By default, both forms treat NULLs as distinct from each other, following the SQL standard's reasoning that NULL equals nothing, not even another NULL. That means a unique column can hold many NULL rows:
+
+```sql
+INSERT INTO users (email) VALUES (NULL), (NULL), (NULL);  -- all succeed
+```
+
+This surprises people coming from SQL Server, where a unique index allows only one NULL. Since PostgreSQL 15 you can opt into that behavior explicitly, and the syntax exists on both sides:
+
+```sql
+-- Constraint form
+ALTER TABLE users
+    ADD CONSTRAINT users_phone_key UNIQUE NULLS NOT DISTINCT (phone);
+
+-- Index form
+CREATE UNIQUE INDEX users_phone_uniq ON users (phone) NULLS NOT DISTINCT;
+```
+
+With `NULLS NOT DISTINCT`, the second NULL insert fails with a duplicate key error. Use it when NULL genuinely means "one shared unknown" rather than "not applicable for this row."
+
+## Promoting an Index to a Constraint
+
+The two features are not mutually exclusive, and the bridge between them is one of the most useful commands for production migrations:
+
+```sql
+CREATE UNIQUE INDEX CONCURRENTLY users_email_uniq ON users (email);
+
+ALTER TABLE users
+    ADD CONSTRAINT users_email_key UNIQUE USING INDEX users_email_uniq;
+```
+
+The second statement adopts the existing index as the enforcement mechanism for a new constraint, without rebuilding anything, and only needs a brief lock. Postgres renames the index to match the constraint name and emits a `NOTICE` telling you so. Restrictions: the index must be a plain B-tree on columns (no expressions), non-partial, and unique. This two-step dance gives you the concurrency of `CREATE INDEX CONCURRENTLY` and the semantics of a constraint, and it should be your default pattern for adding uniqueness to any table with real traffic.
+
+When you are auditing which uniqueness rules exist and whether they are constraints or bare indexes, scanning `pg_constraint` and `pg_indexes` by hand gets tedious across dozens of tables. Chat2DB, a free AI database client, renders a table's constraints and indexes side by side in its schema view and can generate the corresponding DDL for you — you can download it at https://chat2db.ai/download or use the web version at https://app.chat2db.ai.
+
+## Practical Decision Guide
+
+Here is the rule of thumb that holds up in real schemas:
+
+- **Default choice: unique constraint.** It documents intent in the schema, appears in `information_schema`, can be referenced by foreign keys, works with `ON CONFLICT ON CONSTRAINT`, and can be made deferrable later. When plain column uniqueness is what you want, express it as a constraint.
+- **Use a bare unique index when you need index-only features.** Conditional uniqueness (`WHERE deleted_at IS NULL`), computed uniqueness (`lower(email)`), or covering extras like `INCLUDE` columns all force your hand — and that is fine, because enforcement is identical.
+- **On large production tables, always build with `CONCURRENTLY` first**, then attach a constraint with `UNIQUE USING INDEX` if constraint semantics matter for that column.
+- **Reach for `NULLS NOT DISTINCT` (PG15+)** when your domain requires at most one NULL, instead of faking it with a partial index on `IS NULL`.
+
+The mental model to keep: the index is the engine, the constraint is the contract. Every unique constraint carries an engine with it; a bare index is an engine without a contract. Most of the time you want both, which is exactly what the constraint gives you — but when the contract's vocabulary is too small to express your rule, drop down to the index and lose nothing in enforcement.

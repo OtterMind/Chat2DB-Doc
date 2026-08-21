@@ -1,0 +1,175 @@
+---
+title: "Postgres timestamp vs timestamptz: Which to Use"
+description: "Postgres timestamp with time zone vs timestamp without time zone: storage, conversion rules, AT TIME ZONE gotchas, and when each type is right."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: August 21, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# Postgres timestamp vs timestamptz: Which to Use
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="August 21, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+Few schema decisions cause more slow-burning pain than picking the wrong timestamp type. Postgres offers `timestamp without time zone` (the SQL default, often just written `timestamp`) and `timestamp with time zone` (`timestamptz`), and the names mislead almost everyone: neither type stores a time zone. The real difference is how values are interpreted on the way in and out. Get it wrong and you ship bugs that only appear when a server moves regions, a developer in another office runs a report, or daylight saving time flips. This article explains what each type actually stores, how conversion works, the `AT TIME ZONE` double-application trap, and how to migrate a column safely.
+
+## What Each Type Actually Stores
+
+Both types occupy exactly 8 bytes: a 64-bit integer counting microseconds from the Postgres epoch (2000-01-01). There is no per-row time zone field anywhere. You can verify the sizes yourself:
+
+```sql
+SELECT typname, typlen
+FROM pg_type
+WHERE typname IN ('timestamp', 'timestamptz');
+```
+
+```text
+   typname   | typlen
+-------------+--------
+ timestamp   |      8
+ timestamptz |      8
+```
+
+The difference is semantic:
+
+- `timestamptz` stores an **absolute instant** — a specific point on the global timeline, internally normalized to UTC. "The moment the payment cleared."
+- `timestamp` stores a **wall-clock reading** — year, month, day, hour, minute, second, with no opinion about where on Earth that clock was. "The clock said 09:00."
+
+Since storage cost is identical, the choice is purely about semantics, and this framing answers most design questions immediately: events that happened at a real instant (orders, logins, log lines, sensor readings) want `timestamptz`; abstract calendar times detached from any zone want `timestamp`.
+
+## Input and Output Conversion, and the TimeZone Setting
+
+Every Postgres session has a `TimeZone` setting — from `postgresql.conf`, the client's `PGTZ` environment variable, a role-level `ALTER ROLE ... SET timezone`, or an explicit `SET timezone`. For `timestamptz`, this setting drives conversion in both directions:
+
+- **On input**, a literal with an offset is converted to UTC using that offset. A literal *without* an offset is assumed to be in the session's `TimeZone`, then converted to UTC.
+- **On output**, the stored UTC instant is converted back to the session's `TimeZone` and displayed with an offset suffix.
+
+For plain `timestamp`, no conversion happens in either direction — offsets in input literals are silently **ignored**, which is one of the nastiest behaviors in the whole area:
+
+```sql
+CREATE TABLE payments (
+  id          bigserial PRIMARY KEY,
+  captured_at    timestamptz,
+  captured_local timestamp
+);
+
+SET timezone = 'America/New_York';
+
+INSERT INTO payments (captured_at, captured_local)
+VALUES ('2026-08-21 09:00:00+02', '2026-08-21 09:00:00+02');
+
+SELECT captured_at, captured_local FROM payments;
+```
+
+```text
+      captured_at       |   captured_local
+------------------------+---------------------
+ 2026-08-21 03:00:00-04 | 2026-08-21 09:00:00
+```
+
+The `timestamptz` column understood `+02`, stored `07:00 UTC`, and displays it as `03:00` New York time. The `timestamp` column threw the `+02` away without so much as a warning and kept a bare `09:00`. Now change the session zone:
+
+```sql
+SET timezone = 'Asia/Tokyo';
+SELECT captured_at, captured_local FROM payments;
+```
+
+```text
+      captured_at       |   captured_local
+------------------------+---------------------
+ 2026-08-21 16:00:00+09 | 2026-08-21 09:00:00
+```
+
+Same stored bytes, different display for `timestamptz`; the `timestamp` never moves. This is exactly why `timestamptz` comparisons are trustworthy across clients in different zones while `timestamp` comparisons are only meaningful if every writer agreed — by unenforceable convention — on which zone the values represent. When you are debugging this kind of issue, it helps to flip `SET timezone` back and forth interactively; Chat2DB, a free AI database client (https://chat2db.ai/download, or in the browser at https://app.chat2db.ai), keeps per-connection sessions so you can compare the same row rendered under two zones side by side.
+
+## AT TIME ZONE and the Double-Application Gotcha
+
+`AT TIME ZONE` converts between the two types, and its direction depends on the input type — this is the part worth memorizing:
+
+- `timestamptz AT TIME ZONE 'zone'` → returns `timestamp`: "what did the wall clock in this zone read at this instant?"
+- `timestamp AT TIME ZONE 'zone'` → returns `timestamptz`: "this wall-clock reading happened in this zone; give me the instant."
+
+```sql
+SELECT timestamptz '2026-08-21 07:00:00+00' AT TIME ZONE 'America/New_York';
+-- 2026-08-21 03:00:00            (a timestamp: NY wall clock)
+
+SELECT timestamp '2026-08-21 03:00:00' AT TIME ZONE 'America/New_York';
+-- 2026-08-21 07:00:00+00         (a timestamptz, shown here in UTC)
+```
+
+The classic gotcha is applying `AT TIME ZONE` to a `timestamptz` and displaying the result while the session zone is not UTC. The operator strips the zone (producing a `timestamp`), and people then apply it *again* to "fix" the output, shifting the value twice:
+
+```sql
+SET timezone = 'America/New_York';
+
+-- WRONG: the inner AT TIME ZONE already produced NY wall time as a plain
+-- timestamp; the outer one now reinterprets that wall time as NY *input*
+-- and converts back — then display shifts it again.
+SELECT (captured_at AT TIME ZONE 'America/New_York') AT TIME ZONE 'America/New_York'
+FROM payments;
+```
+
+The correct habits: to *display* an instant in a specific zone, apply `AT TIME ZONE` exactly once and treat the result as a plain wall-clock value; to *interpret* user input from a known zone, apply it exactly once in the other direction. If you find yourself writing it twice for the same value, one of them is wrong. Also prefer full zone names (`'Europe/Berlin'`) over abbreviations (`'CEST'`): full names apply DST rules correctly across the year, abbreviations are fixed offsets.
+
+## Why timestamptz Is Almost Always Right
+
+For anything that records "when something happened," `timestamptz` should be the default, and it is worth stating why concretely:
+
+- **Correct comparisons and ordering.** Two instants compare on the global timeline regardless of who inserted them. With `timestamp`, a row written by a server in `UTC` and one written by a cron job whose environment leaked `America/Chicago` interleave nonsensically.
+- **DST safety.** With naive timestamps, `02:30` on a spring-forward day does not exist and `01:30` on a fall-back day happens twice. `timestamptz` arithmetic across those boundaries stays coherent because the underlying value is a UTC instant.
+- **Interval math works.** `timestamptz + interval '1 day'` respects the session zone's DST transitions; subtracting two `timestamptz` values gives a true elapsed duration.
+- **It fails loudly instead of silently.** As shown above, `timestamp` discards explicit offsets from clients. `timestamptz` honors them.
+
+A common objection — "we store everything in UTC anyway, so `timestamp` is fine" — undersells the risk. That works only while every writer and reader honors the convention forever. One misconfigured container image with a local `TZ`, one ORM that renders local datetimes, and you have corrupted data that is indistinguishable from good data. `timestamptz` makes the database enforce the convention instead of the team wiki.
+
+### When Plain timestamp Is the Right Call
+
+The legitimate use case is **calendar-local** data: times that are defined by a wall clock and deliberately independent of any instant. A hotel chain's "check-in from 15:00" applies at 15:00 local in every property. A recurring meeting "every Monday 09:00" must not shift when DST changes. Future scheduled events are the subtle case: "the concert is 2027-06-01 20:00 in Berlin" is best kept as a plain `timestamp` **plus** a `zone` text column (`'Europe/Berlin'`), because time zone rules change — governments really do abolish DST — and if you eagerly converted to a UTC instant using today's rules, a rule change silently moves your event. Store the wall time and the zone name, and compute the instant at query time with `starts_local AT TIME ZONE zone`.
+
+## now(), CURRENT_TIMESTAMP, and clock_timestamp()
+
+All the common "current time" functions return `timestamptz`, but they differ in *which* moment:
+
+```sql
+BEGIN;
+SELECT now(), current_timestamp, statement_timestamp(), clock_timestamp();
+SELECT pg_sleep(2);
+SELECT now() = clock_timestamp() AS same_moment;  -- false
+COMMIT;
+```
+
+`now()` and `CURRENT_TIMESTAMP` are identical: the start of the **current transaction**, frozen for the transaction's duration so that every row touched by one transaction gets the same value. `statement_timestamp()` is the start of the current statement. `clock_timestamp()` is the actual wall clock and advances during a single statement — use it for measuring elapsed time inside a `DO` block or for row-by-row timing, never for "created_at" defaults where transaction consistency is a feature. Sticking `DEFAULT now()` on a `timestamptz` column remains the standard, correct pattern.
+
+## date_trunc and Time Zones
+
+Truncating a `timestamptz` to a day is zone-dependent — "which day" depends on where midnight is. By default `date_trunc` uses the session zone, and since Postgres 12 you can pass the zone explicitly, which is the right way to write per-locale rollups:
+
+```sql
+SELECT date_trunc('day', captured_at, 'America/New_York') AS ny_day,
+       count(*)
+FROM payments
+GROUP BY 1
+ORDER BY 1;
+```
+
+Without the third argument, the same query returns different groupings depending on each client's `TimeZone` setting — a classic source of "the dashboard and my psql disagree" tickets.
+
+## Migrating Between the Types
+
+Converting a column is straightforward, but you must tell Postgres what zone the old naive values were recorded in, via `USING`:
+
+```sql
+-- Old timestamp values were written as UTC wall clock:
+ALTER TABLE payments
+  ALTER COLUMN captured_local TYPE timestamptz
+  USING captured_local AT TIME ZONE 'UTC';
+```
+
+If the legacy convention was a local zone, name it (`AT TIME ZONE 'America/New_York'`) and Postgres applies historical DST rules per value. Omitting `USING` also works syntactically but interprets values in the *session* zone at migration time — rarely what you want and dependent on who runs the migration. Beware that on large tables this `ALTER` rewrites the whole table under an `ACCESS EXCLUSIVE` lock; for big, hot tables the usual dance is to add a new `timestamptz` column, backfill in batches, install a sync trigger, then swap. Going the other direction (`timestamptz` → `timestamp`) uses the same `USING ... AT TIME ZONE 'zone'` clause to pick which wall clock to freeze.
+
+## The Short Version
+
+Both types cost 8 bytes, and neither stores a zone. `timestamptz` stores a UTC instant and converts at the session boundary; `timestamp` stores an uninterpreted wall-clock reading and ignores offsets on input. Default to `timestamptz` for anything that happened or will happen at a real moment; reserve `timestamp` (paired with an explicit zone column) for calendar-local and future scheduled times; apply `AT TIME ZONE` exactly once per conversion; and always write a `USING` clause when you migrate. Follow those rules and time zone bugs stop being a recurring line item in your incident reviews.
