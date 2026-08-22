@@ -1,0 +1,363 @@
+---
+title: "Postgres Recursive CTE: WITH RECURSIVE Explained"
+description: "Postgres recursive CTE guide: WITH RECURSIVE anatomy, how iteration really works, org chart, BOM and graph examples with CYCLE/SEARCH, plus perf tips."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: August 22, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# Postgres Recursive CTE: WITH RECURSIVE Explained
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="August 22, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+A Postgres recursive CTE is the standard way to walk hierarchical or graph-shaped data in SQL: org charts, category trees, bill-of-materials explosions, dependency graphs, "give me every row reachable from here" questions. The syntax is `WITH RECURSIVE`, and although the keyword says *recursive*, what PostgreSQL actually does is iterate over a working table until nothing new comes out. Once you understand that mechanism, every recursive CTE example in this article becomes predictable, and the classic failure modes (infinite loops, type mismatch errors, surprising duplicates) become easy to avoid.
+
+All SQL below runs on PostgreSQL 14 through 17. Where a feature is version-specific (the `CYCLE` and `SEARCH` clauses arrived in PostgreSQL 14) it is called out explicitly.
+
+## Anatomy of a WITH RECURSIVE query
+
+Every recursive CTE has the same three parts:
+
+```sql
+WITH RECURSIVE cte_name (col1, col2, ...) AS (
+    -- 1. anchor member (non-recursive term): the starting rows
+    SELECT ...
+    UNION ALL            -- 2. UNION or UNION ALL
+    -- 3. recursive member: references cte_name and produces the next rows
+    SELECT ... FROM cte_name JOIN ... 
+)
+SELECT * FROM cte_name;
+```
+
+1. **Anchor member** — an ordinary query that returns the seed rows (the root of a tree, the starting node of a graph, the number 1). It must not reference the CTE itself.
+2. **`UNION ALL` or `UNION`** — joins the anchor and recursive halves and, as we will see, decides whether duplicates are eliminated.
+3. **Recursive member** — a query that references the CTE by name. Each reference to the CTE sees only the rows produced by the *previous* step, not the whole accumulated result.
+
+A few grammar points that trip people up:
+
+- `RECURSIVE` is written once after `WITH`, and then applies to every CTE in that `WITH` list. You can mix recursive and non-recursive CTEs in one statement.
+- The recursive member may reference the CTE only once, not inside a subquery, not on the nullable side of an outer join, and it cannot use aggregates, `DISTINCT`, `GROUP BY`, `ORDER BY`, `LIMIT` or `OFFSET` over the recursive reference. PostgreSQL reports these as errors such as `recursive reference to query "t" must not appear within a subquery`.
+- The column **types are fixed by the anchor member**. If the anchor returns `varchar(50)` and the recursive member produces unbounded `varchar`, you get `recursive query "t" column 3 has type character varying(50) in non-recursive term but type character varying overall`. The fix is to cast in the anchor (`name::text`, `ARRAY[id]::int[]`).
+
+## How evaluation actually works (it is iteration, not recursion)
+
+The PostgreSQL executor implements a recursive CTE with a node called **Recursive Union** and two scratch tables: a *working table* and an *intermediate table*. The algorithm is:
+
+1. Run the anchor member. Append its rows to the result and also put them in the working table.
+2. While the working table is not empty:
+   - Run the recursive member, with the self-reference replaced by the **working table** (this is what `WorkTable Scan` means in `EXPLAIN`).
+   - For `UNION` (without `ALL`), discard duplicate rows and rows already in the result. For `UNION ALL`, keep everything.
+   - Append the surviving rows to the result and to the intermediate table.
+   - Replace the working table with the intermediate table, then empty the intermediate table.
+
+So there is no call stack and no "return" up the tree. Each iteration processes one whole generation of rows in a set-oriented way, which is why a recursive CTE over a million-row adjacency list is usually fast when `parent_id` is indexed. It also means the recursive member cannot "see" siblings from earlier generations except through values you carry along in columns (depth, path, accumulated quantity), which is the pattern used everywhere below.
+
+You can see the machinery in a plan:
+
+```text
+CTE Scan on tree
+  CTE tree
+    ->  Recursive Union
+          ->  Index Scan using employees_pkey on employees       -- anchor
+          ->  Nested Loop                                         -- recursive member
+                ->  WorkTable Scan on tree
+                ->  Index Scan using employees_manager_id_idx on employees e
+```
+
+One consequence worth a single sentence here: a recursive CTE is always materialized; the `MATERIALIZED` / `NOT MATERIALIZED` keywords discussed in our separate article on Postgres CTE materialization have no effect on it.
+
+## Sample schema and data
+
+Run this once and every query in the article works as-is. Chat2DB, a free AI-powered SQL client (download at https://chat2db.ai/download or use the web version at https://app.chat2db.ai), is convenient for this because it shows the result grid and the `EXPLAIN` tree side by side.
+
+```sql
+CREATE TABLE employees (
+    id         int PRIMARY KEY,
+    name       text NOT NULL,
+    title      text NOT NULL,
+    manager_id int REFERENCES employees(id)
+);
+CREATE INDEX employees_manager_id_idx ON employees (manager_id);
+
+INSERT INTO employees VALUES
+ (1, 'Ada',    'CEO',            NULL),
+ (2, 'Grace',  'VP Engineering', 1),
+ (3, 'Linus',  'VP Sales',       1),
+ (4, 'Ken',    'Eng Manager',    2),
+ (5, 'Dennis', 'Eng Manager',    2),
+ (6, 'Barbara','Engineer',       4),
+ (7, 'Rob',    'Engineer',       4),
+ (8, 'Brian',  'Engineer',       5),
+ (9, 'Margaret','Account Exec',  3);
+
+CREATE TABLE parts (
+    id   int PRIMARY KEY,
+    name text NOT NULL
+);
+INSERT INTO parts VALUES
+ (1,'bicycle'),(2,'frame'),(3,'wheel'),(4,'spoke'),(5,'rim'),(6,'tire'),(7,'tube');
+
+-- bill of materials: assembly contains quantity x component
+CREATE TABLE bom (
+    assembly_id  int REFERENCES parts(id),
+    component_id int REFERENCES parts(id),
+    quantity     int NOT NULL,
+    PRIMARY KEY (assembly_id, component_id)
+);
+INSERT INTO bom VALUES
+ (1,2,1), (1,3,2),          -- bicycle = 1 frame + 2 wheels
+ (2,7,3),                   -- frame   = 3 tubes
+ (3,4,32),(3,5,1),(3,6,1);  -- wheel   = 32 spokes + 1 rim + 1 tire
+
+-- directed graph with a cycle 1 -> 2 -> 3 -> 1
+CREATE TABLE edges (
+    src int,
+    dst int,
+    PRIMARY KEY (src, dst)
+);
+INSERT INTO edges VALUES (1,2),(2,3),(3,1),(3,4),(4,5);
+```
+
+## Recursive CTE example 1: generating a number series
+
+The smallest possible example shows the mechanism with no tables at all:
+
+```sql
+WITH RECURSIVE n(x) AS (
+    VALUES (1)                      -- anchor: working table = {1}
+    UNION ALL
+    SELECT x + 1 FROM n WHERE x < 5 -- each pass reads the previous generation
+)
+SELECT x FROM n;
+```
+
+```text
+ x
+---
+ 1
+ 2
+ 3
+ 4
+ 5
+```
+
+The `WHERE x < 5` is the termination condition: on the pass where the working table contains `5`, the recursive member returns zero rows, the working table becomes empty, and iteration stops. In real code you would use `generate_series(1, 5)` for this, but the same shape is how you build date ranges with arbitrary step logic, running balances, or compound-interest projections.
+
+## Recursive CTE example 2: employee hierarchy with depth and path
+
+This is the canonical "org chart" query. We carry three extra columns through the recursion: the depth, an integer array of ids (handy for sorting and cycle checks), and a human-readable string path.
+
+```sql
+WITH RECURSIVE org AS (
+    SELECT id, name, title, manager_id,
+           0                       AS depth,
+           ARRAY[id]               AS id_path,
+           name::text              AS name_path    -- cast fixes the column type
+    FROM employees
+    WHERE manager_id IS NULL                        -- anchor: the root(s)
+    UNION ALL
+    SELECT e.id, e.name, e.title, e.manager_id,
+           o.depth + 1,
+           o.id_path || e.id,
+           o.name_path || ' > ' || e.name
+    FROM org o
+    JOIN employees e ON e.manager_id = o.id         -- children of the previous generation
+)
+SELECT repeat('  ', depth) || name AS tree, title, depth, name_path
+FROM org
+ORDER BY id_path;
+```
+
+```text
+ tree        | title          | depth | name_path
+-------------+----------------+-------+---------------------------------
+ Ada         | CEO            |     0 | Ada
+   Grace     | VP Engineering |     1 | Ada > Grace
+     Ken     | Eng Manager    |     2 | Ada > Grace > Ken
+       Barbara| Engineer      |     3 | Ada > Grace > Ken > Barbara
+       Rob   | Engineer       |     3 | Ada > Grace > Ken > Rob
+     Dennis  | Eng Manager    |     2 | Ada > Grace > Dennis
+       Brian | Engineer       |     3 | Ada > Grace > Dennis > Brian
+   Linus     | VP Sales       |     1 | Ada > Linus
+     Margaret| Account Exec   |     2 | Ada > Linus > Margaret
+```
+
+`ORDER BY id_path` gives depth-first order for free because integer arrays compare element by element. To walk **upward** instead (all managers of Brian) flip the join: anchor on `WHERE id = 8` and join `e.id = o.manager_id`. To get a subtree, anchor on the subtree root; to count reports per manager, wrap the CTE in `GROUP BY`.
+
+### SEARCH DEPTH FIRST / BREADTH FIRST (PostgreSQL 14+)
+
+PostgreSQL 14 added a `SEARCH` clause that generates the ordering column for you, so you do not need to maintain `id_path` by hand:
+
+```sql
+WITH RECURSIVE org AS (
+    SELECT id, name, manager_id FROM employees WHERE manager_id IS NULL
+    UNION ALL
+    SELECT e.id, e.name, e.manager_id
+    FROM org o JOIN employees e ON e.manager_id = o.id
+) SEARCH DEPTH FIRST BY id SET ord
+SELECT id, name FROM org ORDER BY ord;
+```
+
+`SEARCH BREADTH FIRST BY id SET ord` instead yields level-by-level order (all depth-1 rows, then depth-2, ...). The `ord` column is an internal composite/array value; you only ever use it in `ORDER BY`. Note that `SEARCH` does *not* stop cycles — it is purely about ordering.
+
+## Recursive CTE example 3: bill of materials explosion
+
+Here the value carried through the recursion is a multiplied quantity. A bicycle needs 2 wheels and each wheel needs 32 spokes, so the bicycle needs 64 spokes:
+
+```sql
+WITH RECURSIVE explode AS (
+    SELECT component_id, quantity, 1 AS level
+    FROM bom
+    WHERE assembly_id = 1                          -- start from 'bicycle'
+    UNION ALL
+    SELECT b.component_id,
+           x.quantity * b.quantity,                -- multiply down the tree
+           x.level + 1
+    FROM explode x
+    JOIN bom b ON b.assembly_id = x.component_id
+)
+SELECT p.name, SUM(x.quantity) AS total_qty, MIN(x.level) AS first_level
+FROM explode x
+JOIN parts p ON p.id = x.component_id
+GROUP BY p.name
+ORDER BY first_level, p.name;
+```
+
+```text
+  name  | total_qty | first_level
+--------+-----------+-------------
+ frame  |         1 |           1
+ wheel  |         2 |           1
+ rim    |         2 |           2
+ spoke  |        64 |           2
+ tire   |         2 |           2
+ tube   |         3 |           2
+```
+
+Note that the aggregate lives in the **outer** query, not inside the recursive member, which is where PostgreSQL would reject it.
+
+## Recursive CTE example 4: graph traversal with cycle detection
+
+Our `edges` table contains the loop 1 → 2 → 3 → 1. A naive traversal from node 1 would run forever (or until `work_mem`, disk and your patience run out), because with `UNION ALL` nothing ever stops the same edges being re-emitted.
+
+### The manual ARRAY approach (any version)
+
+Carry the visited path and refuse to follow an edge to a node already in it:
+
+```sql
+WITH RECURSIVE walk AS (
+    SELECT src, dst,
+           ARRAY[src, dst]          AS path,
+           false                    AS is_cycle
+    FROM edges
+    WHERE src = 1
+    UNION ALL
+    SELECT e.src, e.dst,
+           w.path || e.dst,
+           e.dst = ANY(w.path)      -- true when we are about to revisit a node
+    FROM walk w
+    JOIN edges e ON e.src = w.dst
+    WHERE NOT w.is_cycle            -- do not expand rows that closed a loop
+)
+SELECT * FROM walk;
+```
+
+```text
+ src | dst |   path    | is_cycle
+-----+-----+-----------+----------
+   1 |   2 | {1,2}     | f
+   2 |   3 | {1,2,3}   | f
+   3 |   1 | {1,2,3,1} | t
+   3 |   4 | {1,2,3,4} | f
+   4 |   5 | {1,2,3,4,5}| f
+```
+
+The row that closes the cycle is still emitted (flagged `t`), which is useful for reporting, but it is never expanded further. If you would rather hide it, add `WHERE NOT is_cycle` in the outer query. For composite keys, put a `ROW(a, b)` into the array or concatenate into text.
+
+### The CYCLE clause (PostgreSQL 14+)
+
+PostgreSQL 14 made this declarative:
+
+```sql
+WITH RECURSIVE walk AS (
+    SELECT src, dst FROM edges WHERE src = 1
+    UNION ALL
+    SELECT e.src, e.dst
+    FROM walk w JOIN edges e ON e.src = w.dst
+) CYCLE dst SET is_cycle USING path
+SELECT * FROM walk;
+```
+
+`CYCLE dst` tells PostgreSQL which column(s) identify a node; it adds `is_cycle` (boolean) and `path` (an array of `ROW(dst)` values) to the CTE, and stops expanding any row whose `dst` already appears in its path. The output mirrors the manual version, except `path` prints as `{(2),(3),(1)}`. You can customise the marker values with `CYCLE dst SET is_cycle TO 'Y' DEFAULT 'N' USING path`. `CYCLE` and `SEARCH` can be combined on the same CTE.
+
+## UNION vs UNION ALL in a recursive CTE
+
+The choice is not cosmetic:
+
+- **`UNION ALL`** keeps every row. It is cheaper (no hashing/sorting for dedup) and is what you want whenever each generated row is genuinely distinct, which is the case as soon as you carry a `depth` or `path` column.
+- **`UNION`** removes rows that duplicate anything already produced. For a *pure* reachability query (`SELECT dst FROM ...` with no depth or path column) this gives you built-in cycle protection: once node 1 has been output, a second arrival at node 1 is an exact duplicate, is discarded, and is therefore never expanded. The moment you add `depth` or `path`, the rows stop being duplicates and `UNION` no longer saves you, so do not rely on it as a safety net in hierarchy queries.
+
+A reachability-only query that terminates safely on cyclic data:
+
+```sql
+WITH RECURSIVE reach(node) AS (
+    SELECT 1
+    UNION                             -- dedup makes the cycle harmless
+    SELECT e.dst FROM reach r JOIN edges e ON e.src = r.node
+)
+SELECT node FROM reach ORDER BY node;   -- 1,2,3,4,5
+```
+
+## Infinite-loop protection and depth limits
+
+Defence in depth, in order of preference:
+
+1. **Carry and check a path** (or use `CYCLE`) when the data can legitimately contain loops.
+2. **Cap the depth** with `WHERE o.depth < 50` in the recursive member. Real hierarchies rarely exceed a couple of dozen levels; a hard cap turns a data bug into a truncated result instead of a runaway query.
+3. **Set `statement_timeout`** for the session or role running ad-hoc exploration: `SET statement_timeout = '30s';`.
+4. Do not rely on an outer `LIMIT`. It often works, because PostgreSQL only evaluates as many CTE rows as the parent fetches, but the documentation is explicit that this is not guaranteed once the outer query sorts, aggregates, or joins the CTE.
+
+## Performance tips for Postgres WITH RECURSIVE
+
+- **Index the join column.** Each iteration joins the working table to the base table on `parent_id` (or `manager_id`, `assembly_id`, `src`). Without an index that is one sequential scan per level. `CREATE INDEX ON employees (manager_id)` is the single biggest win. For upward walks the primary key already covers it.
+- **Filter in the anchor, not after.** `WHERE manager_id IS NULL` versus `WHERE id = 4` determines how many rows each generation carries. Start from the narrowest set you can.
+- **Keep the carried columns small.** Every column you select inside the CTE is stored for every row in every generation. Select keys and accumulators inside, and join back to the base table for `name`, `title`, etc. in the outer query.
+- **Prefer `UNION ALL`** unless you specifically need dedup; `UNION` adds a hash or sort per iteration.
+- **Watch `work_mem`.** The working/intermediate tables spill to disk when they exceed it; `EXPLAIN (ANALYZE, BUFFERS)` shows temp reads/writes if this is happening.
+- **Bound the depth** (see above) so a bad row cannot explode the working set.
+- Because the recursive CTE is always materialized, adding `MATERIALIZED` changes nothing; conversely, the planner cannot push outer-query predicates into it, so put selective filters inside the anchor or recursive member yourself.
+
+## Alternatives: adjacency list vs ltree vs closure table
+
+A recursive CTE over an **adjacency list** (`parent_id` column) is the simplest model: cheap writes, one index, and every read is a `WITH RECURSIVE`. It is the right default for trees that change often and are read at moderate depth.
+
+The **`ltree` extension** stores the full path as a label string (`ada.grace.ken.barbara`) with a GiST index, so "all descendants of Grace" is a single indexed `path <@ 'ada.grace'` lookup with no recursion. Reads are very fast; the cost is that moving a subtree rewrites every descendant's path.
+
+A **closure table** stores every ancestor/descendant pair explicitly. Subtree reads are a plain join; writes fan out to O(depth) rows per insert. It is worth it for read-heavy, deep hierarchies where you cannot install extensions.
+
+Rule of thumb: start with adjacency list plus recursive CTEs; move to `ltree` or a closure table only when profiling shows recursion itself, rather than a missing index, is the bottleneck.
+
+## Summary
+
+- `WITH RECURSIVE` = anchor member, `UNION [ALL]`, recursive member. Column types come from the anchor, so cast there.
+- PostgreSQL evaluates it iteratively with a working table; each pass sees only the previous generation, so carry `depth`, `path`, or accumulated quantities as columns.
+- Use `UNION ALL` plus an explicit path check or the PostgreSQL 14+ `CYCLE` clause to survive cyclic data; use `SEARCH DEPTH/BREADTH FIRST` for ordering.
+- Index the join column, filter in the anchor, cap depth, and keep carried columns narrow.
+
+## FAQ
+
+### Is a Postgres recursive CTE really recursive?
+
+No. The executor runs the anchor once, then repeatedly runs the recursive member against a working table containing only the previous pass's rows, until a pass produces nothing. It is breadth-wise iteration, which is why it handles large adjacency lists efficiently and why there is no recursion-depth stack to overflow.
+
+### How do I stop an infinite loop in WITH RECURSIVE?
+
+Carry an array path and add `WHERE NOT new_id = ANY(path)` (or a boolean flag as shown above), or on PostgreSQL 14+ append `CYCLE id SET is_cycle USING path` to the CTE. Add a depth cap such as `WHERE depth < 50` and a `statement_timeout` as a backstop. Plain `UNION` only helps when the rows carry no depth or path column.
+
+### When should I use UNION instead of UNION ALL in a recursive CTE?
+
+Use `UNION` only for pure reachability queries where a repeated node is an exact duplicate row and you want it discarded automatically. For hierarchy, path, or quantity roll-up queries, use `UNION ALL`: it is faster, and the dedup would not prevent loops anyway because every row is distinct.

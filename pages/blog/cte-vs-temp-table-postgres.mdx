@@ -1,0 +1,308 @@
+---
+title: "CTE vs Temp Table in Postgres: When to Use Which"
+description: "CTE vs temp table in Postgres: scope, optimizer inlining (MATERIALIZED), statistics, indexes, PgBouncer pitfalls, EXPLAIN shapes, and a decision checklist."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: August 22, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# CTE vs Temp Table in Postgres: When to Use Which
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="August 22, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+The "CTE vs temp table" question comes up in almost every PostgreSQL code review that involves a multi-step query. Both let you name an intermediate result and build on it, and both are often compared with a plain subquery, so "cte vs subquery vs temp table" is really one question with three answers. The short version: a CTE is a per-statement construct that the planner may inline or materialize, while a temp table is a real, session-scoped relation that you can index, analyze, and reuse across many statements. Which one is faster depends on how the optimizer treats it, whether statistics exist, and how many times the intermediate result is read. This article walks through the differences for PostgreSQL 14 through 17, shows the `EXPLAIN ANALYZE` shapes you should expect, and ends with a decision checklist.
+
+All examples use this small schema. You can run it in Chat2DB, a free AI-powered SQL client (download at https://chat2db.ai/download or use the web version at https://app.chat2db.ai), or in `psql`.
+
+```sql
+CREATE TABLE customers (
+  id      bigserial PRIMARY KEY,
+  region  text NOT NULL,
+  name    text NOT NULL
+);
+
+CREATE TABLE orders (
+  id          bigserial PRIMARY KEY,
+  customer_id bigint NOT NULL REFERENCES customers(id),
+  status      text   NOT NULL,
+  amount      numeric(12,2) NOT NULL,
+  created_at  timestamptz NOT NULL
+);
+
+INSERT INTO customers (region, name)
+SELECT (ARRAY['eu','us','apac'])[1 + (g % 3)], 'customer ' || g
+FROM generate_series(1, 10000) g;
+
+INSERT INTO orders (customer_id, status, amount, created_at)
+SELECT 1 + (random() * 9999)::int,
+       (ARRAY['paid','refunded','pending'])[1 + (random() * 2)::int],
+       round((random() * 500)::numeric, 2),
+       now() - (random() * interval '365 days')
+FROM generate_series(1, 1000000);
+
+CREATE INDEX ON orders (customer_id);
+CREATE INDEX ON orders (created_at);
+ANALYZE customers, orders;
+```
+
+## Definitions, scope, and lifetime
+
+### CTE (Common Table Expression)
+
+A CTE is introduced with `WITH` and exists only for the duration of the single statement it belongs to. It is not an object; nothing is created in the catalog, and there is nothing to drop.
+
+```sql
+WITH recent_paid AS (
+  SELECT customer_id, amount
+  FROM orders
+  WHERE status = 'paid'
+    AND created_at >= now() - interval '30 days'
+)
+SELECT c.region, sum(rp.amount) AS revenue
+FROM recent_paid rp
+JOIN customers c ON c.id = rp.customer_id
+GROUP BY c.region
+ORDER BY revenue DESC;
+```
+
+Once that statement finishes, `recent_paid` is gone. If the next statement needs the same intermediate result, it has to compute it again.
+
+### Temporary table
+
+A temp table is a real table in a per-session schema (`pg_temp_NNN`). It lives until the session ends, or until the end of the transaction if you ask for that with `ON COMMIT DROP`.
+
+```sql
+-- Lives for the whole session
+CREATE TEMP TABLE recent_paid AS
+SELECT customer_id, amount
+FROM orders
+WHERE status = 'paid'
+  AND created_at >= now() - interval '30 days';
+
+-- Lives only for the current transaction
+BEGIN;
+CREATE TEMP TABLE tmp_ids ON COMMIT DROP AS
+SELECT id FROM customers WHERE region = 'eu';
+-- ... use tmp_ids in several statements ...
+COMMIT;   -- tmp_ids is dropped here
+```
+
+`ON COMMIT DELETE ROWS` is a third option: the table structure survives, but rows are truncated at every commit. That is useful for a long-lived session that repeats the same batch shape.
+
+The key scope difference in one line: **a CTE is per-statement; a temp table is per-session (or per-transaction with `ON COMMIT DROP`)**, so only a temp table can be shared across multiple statements.
+
+## Optimizer behavior: inlining, MATERIALIZED, and statistics
+
+### CTEs since PostgreSQL 12
+
+Before PostgreSQL 12, every CTE was an optimization fence: it was always materialized into a tuplestore, and predicates from the outer query could not be pushed into it. That is where the old folklore "CTEs are slow in Postgres" comes from.
+
+Since PostgreSQL 12 the rule is:
+
+- A non-recursive CTE that has no side effects and is referenced exactly once is **inlined** into the outer query, exactly like a subquery. Predicates and join conditions can be pushed down and indexes can be used.
+- A CTE referenced more than once is **materialized** by default (computed once, read many times).
+- Recursive CTEs and data-modifying CTEs (`WITH ... AS (INSERT/UPDATE/DELETE ... RETURNING)`) are always executed once and never inlined.
+- You can override the default with `MATERIALIZED` or `NOT MATERIALIZED`.
+
+You can see the difference directly. With inlining, the plan shows no `CTE Scan` node and the `created_at` index is used:
+
+```sql
+EXPLAIN (ANALYZE, COSTS OFF)
+WITH recent AS (
+  SELECT customer_id, amount FROM orders
+  WHERE created_at >= now() - interval '7 days'
+)
+SELECT count(*) FROM recent WHERE customer_id = 42;
+```
+
+```text
+Aggregate (actual rows=1 loops=1)
+  ->  Bitmap Heap Scan on orders (actual rows=... loops=1)
+        Recheck Cond: (customer_id = 42)
+        Filter: (created_at >= (now() - '7 days'::interval))
+        ->  Bitmap Index Scan on orders_customer_id_idx
+```
+
+Force materialization and the shape changes: the CTE is computed in full, and the outer filter is applied to a `CTE Scan` after the fact:
+
+```sql
+EXPLAIN (ANALYZE, COSTS OFF)
+WITH recent AS MATERIALIZED (
+  SELECT customer_id, amount FROM orders
+  WHERE created_at >= now() - interval '7 days'
+)
+SELECT count(*) FROM recent WHERE customer_id = 42;
+```
+
+```text
+Aggregate (actual rows=1 loops=1)
+  CTE recent
+    ->  Index Scan using orders_created_at_idx on orders (actual rows=... loops=1)
+          Index Cond: (created_at >= (now() - '7 days'::interval))
+  ->  CTE Scan on recent (actual rows=... loops=1)
+        Filter: (customer_id = 42)
+        Rows Removed by Filter: ...
+```
+
+`MATERIALIZED` is still useful on purpose: when a CTE is expensive and used by several branches of a `UNION`, or when inlining produces a bad plan because a volatile function or a correlated reference gets re-evaluated. `NOT MATERIALIZED` is the opposite hint for a CTE referenced twice where you would rather pay the recomputation in exchange for predicate pushdown.
+
+Two details worth knowing: a materialized CTE lives in a tuplestore held in `work_mem` and spills to disk when larger, and the planner has only the inner query's estimates for it, so row counts for the outer join can be well off. There is no way to `ANALYZE` a CTE.
+
+### Temp tables: statistics, indexes, and storage
+
+A temp table behaves like a normal heap relation with a few specific properties:
+
+- **No statistics until you `ANALYZE` it.** Autovacuum cannot see into other sessions' temp tables, so nobody will do it for you. Without stats the planner assumes default row counts, which is a common cause of catastrophic nested loops over a temp table with a million rows.
+- **It can be indexed**, including partial and expression indexes, after the data is loaded.
+- **It is cached in `temp_buffers`** (per session, default 8MB), not in `shared_buffers`. Reads and writes still go through the backend's temporary relation files on disk when the data exceeds that setting. Raising `temp_buffers` for a session that does heavy temp-table work is legitimate, but it only takes effect before the first temp table access in that session.
+- **It is not WAL-logged**, so bulk loading a temp table is cheaper than loading a regular table, and it never touches replication traffic. The flip side is that temp tables are not crash safe and cannot be read on replicas.
+- **Creating one is a catalog operation.** Each `CREATE TEMP TABLE` inserts rows into `pg_class`, `pg_attribute`, `pg_type`, `pg_depend`, and so on, and dropping it leaves dead tuples behind. A job that creates thousands of temp tables per minute bloats the system catalogs and can make every query in the database slower until autovacuum catches up. Reuse one table with `ON COMMIT DELETE ROWS` or `TRUNCATE` instead of creating a fresh one per iteration.
+
+The canonical pattern is:
+
+```sql
+CREATE TEMP TABLE hot_customers AS
+SELECT customer_id, sum(amount) AS total
+FROM orders
+WHERE status = 'paid' AND created_at >= now() - interval '90 days'
+GROUP BY customer_id
+HAVING sum(amount) > 1000;
+
+CREATE INDEX ON hot_customers (customer_id);
+ANALYZE hot_customers;
+```
+
+After `ANALYZE`, a join from `orders` to `hot_customers` can use the index and gets correct row estimates:
+
+```sql
+EXPLAIN (ANALYZE, COSTS OFF)
+SELECT o.id, o.amount
+FROM orders o
+JOIN hot_customers h ON h.customer_id = o.customer_id
+WHERE o.status = 'refunded';
+```
+
+```text
+Hash Join (actual rows=... loops=1)
+  Hash Cond: (o.customer_id = h.customer_id)
+  ->  Seq Scan on orders o (actual rows=... loops=1)
+        Filter: (status = 'refunded')
+  ->  Hash (actual rows=... loops=1)
+        ->  Seq Scan on hot_customers h
+```
+
+Skip the `ANALYZE` and you may instead see a `Nested Loop` that assumes `hot_customers` holds a handful of rows.
+
+## Performance scenarios: temp table vs CTE Postgres plans
+
+### (a) Simple filter reused once: use a CTE
+
+If the intermediate result is used by exactly one consumer, a CTE costs nothing beyond readability. Since PG12 it is inlined, so the plan is identical to writing the subquery in the `FROM` clause. There is no catalog write, no `ANALYZE` step, and it works everywhere, including read-only replicas.
+
+### (b) Reused many times, joined to large tables, or needs an index: use a temp table
+
+When the same derived set is joined in three separate statements, or it has hundreds of thousands of rows that you then probe by key, a temp table wins. A materialized CTE is a flat tuplestore: every lookup is a `CTE Scan` with a filter, and it has no index and no statistics. A temp table with an index and fresh stats lets the planner pick index nested loops or a well-sized hash join.
+
+```sql
+BEGIN;
+CREATE TEMP TABLE eu_customers ON COMMIT DROP AS
+SELECT id FROM customers WHERE region = 'eu';
+CREATE INDEX ON eu_customers (id);
+ANALYZE eu_customers;
+
+-- Statement 1
+SELECT count(*) FROM orders o JOIN eu_customers e ON e.id = o.customer_id;
+-- Statement 2
+SELECT o.status, sum(o.amount) FROM orders o JOIN eu_customers e ON e.id = o.customer_id GROUP BY 1;
+-- Statement 3
+DELETE FROM orders o USING eu_customers e WHERE e.id = o.customer_id AND o.status = 'pending';
+COMMIT;
+```
+
+With a CTE you would have to repeat the `WHERE region = 'eu'` block in all three statements and recompute it three times.
+
+### (c) Recursion: CTE only
+
+Hierarchies, graph walks, and bill-of-materials explosions need `WITH RECURSIVE`. There is no temp-table equivalent short of writing a procedural loop.
+
+```sql
+CREATE TEMP TABLE org (id int PRIMARY KEY, parent_id int, title text);
+INSERT INTO org VALUES (1, NULL, 'CEO'), (2, 1, 'CTO'), (3, 2, 'Staff Eng'), (4, 1, 'CFO');
+
+WITH RECURSIVE chain AS (
+  SELECT id, parent_id, title, 1 AS depth FROM org WHERE id = 3
+  UNION ALL
+  SELECT o.id, o.parent_id, o.title, c.depth + 1
+  FROM org o JOIN chain c ON o.id = c.parent_id
+)
+SELECT * FROM chain ORDER BY depth;
+```
+
+```text
+ id | parent_id |   title   | depth
+----+-----------+-----------+-------
+  3 |         2 | Staff Eng |     1
+  2 |         1 | CTO       |     2
+  1 |           | CEO       |     3
+```
+
+### (d) Multi-step ETL inside a session: temp tables
+
+A load job that stages raw rows, deduplicates, enriches from reference tables, validates, and finally merges into the target is a sequence of statements, not one statement. Each stage's output should be a temp table (usually `ON COMMIT DROP` inside one transaction) so that you can index it, `ANALYZE` it, inspect row counts between steps, and keep each statement small enough to debug. Using one enormous chained CTE for this makes plans unreadable and gives you no place to put an index.
+
+## Subquery vs CTE: readability
+
+In PostgreSQL 12+ a single-reference CTE and a derived-table subquery produce the same plan, so the choice is stylistic. Prefer a CTE when the block has a name that carries meaning (`recent_paid`, `eu_customers`), when it is referenced twice, or when nesting would exceed one level. Prefer an inline subquery for a trivial `IN (SELECT ...)` or a one-line derived table. The one behavioral difference is that a CTE referenced twice is materialized by default while two identical subqueries are planned independently; use `NOT MATERIALIZED` if that matters.
+
+## Connection poolers: the PgBouncer temp table pitfall
+
+Temp tables are attached to a server connection. If you run PgBouncer in **transaction pooling** mode, each transaction (and each autocommit statement) may land on a different backend, so:
+
+- A temp table created in one transaction is usually **not visible** in the next one from the same client, and you get `relation "tmp_x" does not exist`.
+- If the pooler's `server_reset_query` (`DISCARD ALL` by default in session mode, but not run in transaction mode) is not applied, temp tables can leak into an unrelated client's next transaction, causing `relation already exists` errors or, worse, stale data.
+
+Safe patterns under transaction pooling: wrap the whole create-use-drop sequence in one explicit transaction and use `ON COMMIT DROP`, or switch to a CTE so there is no cross-statement state at all. The same caution applies to `SET`, prepared statements, and advisory locks. Session pooling mode does not have this problem.
+
+## Brief differences in SQL Server and MySQL
+
+- **SQL Server**: a CTE is always expanded inline (there is no `MATERIALIZED` hint), so a CTE referenced twice is evaluated twice. `#temp` tables have statistics and indexes; `@table` variables have no statistics and are planned as one row unless you use `OPTION (RECOMPILE)`. The "CTE vs temp table" tradeoff there is therefore even more tilted toward temp tables for reuse.
+- **MySQL**: CTEs arrived in 8.0 and derived tables may be merged or materialized by the optimizer. A notable restriction is that a `TEMPORARY` table cannot be referenced more than once in the same query (for example, self-joined), which is the opposite of the PostgreSQL situation. MySQL temp tables are not visible to other sessions either, and the pooler caveat applies equally.
+
+## Decision checklist
+
+| Question | Answer | Use |
+| --- | --- | --- |
+| Is the result needed in more than one statement? | Yes | Temp table |
+| Is it recursive? | Yes | CTE (`WITH RECURSIVE`) |
+| Referenced once, no special needs? | Yes | CTE (inlined, same as subquery) |
+| Referenced multiple times in one statement, small result? | Yes | CTE (materialized by default) |
+| Large result probed by key or joined to big tables? | Yes | Temp table + index + `ANALYZE` |
+| Running on a read replica or hot standby? | Yes | CTE (temp tables cannot be created there) |
+| Behind PgBouncer in transaction mode? | Yes | CTE, or temp table strictly inside one transaction |
+| Multi-step ETL with inspection between steps? | Yes | Temp table (`ON COMMIT DROP` or `DELETE ROWS`) |
+| Creating the object thousands of times per minute? | Yes | Avoid; reuse one temp table or use a CTE |
+
+## Summary
+
+- A CTE is per-statement and, since PostgreSQL 12, inlined when referenced once and side-effect free; use `MATERIALIZED` / `NOT MATERIALIZED` to override.
+- A temp table is per-session (or per-transaction with `ON COMMIT DROP`), can be indexed, has no statistics until `ANALYZE`, uses `temp_buffers`, skips WAL, and costs catalog writes to create.
+- Reach for a CTE for single-use filters, recursion, and anything that must work on replicas or behind a transaction-mode pooler; reach for a temp table when the result is reused across statements, is large, or needs an index.
+- Always `ANALYZE` a temp table before joining it to anything big.
+
+## FAQ
+
+### Is a CTE slower than a temp table in PostgreSQL?
+
+Not inherently. For a single reference, a CTE is inlined and plans exactly like a subquery, so there is nothing to be slower than. A CTE becomes the slower option when it is materialized and then scanned many times with selective filters, because the tuplestore has no index and no statistics. In that case a temp table with an index and `ANALYZE` usually wins.
+
+### Does a temp table write WAL?
+
+No. Temporary tables are not WAL-logged, which makes bulk loads into them cheaper than into regular tables and keeps them off replication. The cost is that they are not crash safe, cannot be created on standby servers, and still generate catalog writes when created and dropped.
+
+### Why does my temp table "not exist" in the next query?
+
+Almost always a connection pooler in transaction mode: the second query ran on a different server connection that never saw the `CREATE TEMP TABLE`. Either run the create and the use inside one explicit transaction (and prefer `ON COMMIT DROP`), or rewrite with a CTE.

@@ -1,0 +1,366 @@
+---
+title: "Postgres ILIKE: Case-Insensitive LIKE Explained"
+description: "Postgres ILIKE explained: syntax, % and _ wildcards, NOT ILIKE, escaping, pg_trgm indexes, citext, ICU collations, and when LOWER() LIKE is a better fit."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: August 22, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# Postgres ILIKE: Case-Insensitive LIKE Explained
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="August 22, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+`ILIKE` is the PostgreSQL-specific, case-insensitive version of `LIKE`. Plain `LIKE` in Postgres is always case-sensitive, so `name LIKE 'red%'` will not match `'Red Widget'`. Postgres ILIKE fixes that with one extra letter, but it also has consequences for indexing, Unicode behaviour, and portability that are easy to get wrong in production. This article walks through the `ILIKE` operator end to end: syntax and wildcards, escaping, the `~~*` operator it maps to, how it compares with `LOWER()`, `citext`, and case-insensitive collations, and how to make a `'%foo%'` ILIKE search fast with `pg_trgm`.
+
+All examples run on PostgreSQL 14 through 17. You can paste them into `psql` or into Chat2DB, a free AI-powered SQL client (download at https://chat2db.ai/download or use the web version at https://app.chat2db.ai), which also renders `EXPLAIN` output nicely.
+
+## Sample data
+
+Create a small table and fill it with `generate_series` so the query plans later in the article are meaningful:
+
+```sql
+CREATE TABLE products (
+  id    serial PRIMARY KEY,
+  name  text NOT NULL,
+  sku   text NOT NULL
+);
+
+INSERT INTO products (name, sku)
+SELECT (ARRAY['Red Widget', 'BLUE Gadget', 'green gizmo',
+              'Discount 50% Bundle', 'under_score item'])[1 + i % 5]
+       || ' #' || i,
+       'SKU-' || lpad(i::text, 6, '0')
+FROM generate_series(1, 200000) AS s(i);
+
+ANALYZE products;
+```
+
+That gives 200,000 rows with mixed-case names, plus a few rows containing a literal `%` and `_` so we can practise escaping.
+
+## Postgres ILIKE syntax and wildcards
+
+`ILIKE` uses exactly the same pattern language as `LIKE`:
+
+- `%` matches any sequence of zero or more characters.
+- `_` matches exactly one character.
+- Every other character matches itself, ignoring case.
+
+```sql
+-- Case-sensitive: returns only rows starting with capital R
+SELECT count(*) FROM products WHERE name LIKE 'red%';
+--  count
+-- -------
+--      0
+
+-- Case-insensitive
+SELECT count(*) FROM products WHERE name ILIKE 'red%';
+--  count
+-- -------
+--  40000
+
+-- Single-character wildcard: "gadget" or "Gadget" or "GADGET"
+SELECT name FROM products WHERE name ILIKE 'blue _adget%' LIMIT 2;
+--       name
+-- -----------------
+--  BLUE Gadget #2
+--  BLUE Gadget #7
+```
+
+A pattern without any wildcard behaves like a case-insensitive equality check: `name ILIKE 'red widget #1'` matches `'Red Widget #1'` and nothing else.
+
+### The `~~*` operator
+
+Under the hood `LIKE` is the operator `~~` and `ILIKE` is `~~*`. The asterisk is the same "ignore case" marker used by the regex operators `~` and `~*`. These two statements are identical to the planner:
+
+```sql
+SELECT count(*) FROM products WHERE name ILIKE '%widget%';
+SELECT count(*) FROM products WHERE name ~~* '%widget%';
+```
+
+You will mostly see `~~*` in `EXPLAIN` output and in `pg_operator`, but it is occasionally handy when you need to pass an operator name to something like `CREATE OPERATOR CLASS` or a generic query builder.
+
+### NOT ILIKE
+
+Negation works as expected, and maps to the operator `!~~*`:
+
+```sql
+SELECT count(*) FROM products WHERE name NOT ILIKE '%widget%';
+--  count
+-- -------
+--  160000
+```
+
+Remember that `NULL NOT ILIKE 'x'` is `NULL`, not true, so rows with a NULL `name` are excluded from both the `ILIKE` and the `NOT ILIKE` result. Add `OR name IS NULL` if you need them.
+
+### Escaping a literal % or _
+
+Because `%` and `_` are wildcards, searching for the text `50%` requires an escape character. The default escape character is a backslash:
+
+```sql
+-- Wrong: '50%' means "50 followed by anything"
+SELECT count(*) FROM products WHERE name ILIKE '%50%%';
+--  count
+-- -------
+--  40000   (plus any row whose number contains 50 ...)
+
+-- Right: \% is a literal percent sign
+SELECT count(*) FROM products WHERE name ILIKE '%50\%%';
+--  count
+-- -------
+--  40000
+
+-- Literal underscore
+SELECT count(*) FROM products WHERE name ILIKE 'under\_score%' LIMIT 1;
+--         name
+-- ---------------------
+--  under_score item #5
+```
+
+With `standard_conforming_strings = on` (the default since 9.1) a backslash in a normal string literal is just a backslash, so `'%50\%%'` is passed to `ILIKE` exactly as written. You can choose a different escape character with `ESCAPE`, or disable escaping entirely with `ESCAPE ''`:
+
+```sql
+SELECT count(*) FROM products WHERE name ILIKE '%50#%%' ESCAPE '#';
+SELECT count(*) FROM products WHERE name ILIKE '%50%%' ESCAPE '';  -- no escape char at all
+```
+
+If the pattern comes from user input, escape it in application code before interpolating into the pattern, for example `replace(replace(replace(input, '\', '\\'), '%', '\%'), '_', '\_')`, and then wrap it in `%...%`.
+
+## ILIKE vs LOWER() LIKE vs citext vs collations
+
+There are four common ways to get case-insensitive matching in PostgreSQL. They are not interchangeable.
+
+### ILIKE
+
+```sql
+SELECT * FROM products WHERE name ILIKE 'red widget%';
+```
+
+Pros: shortest to write, no schema changes, works with any `text` or `varchar` column. Cons: not portable, and a plain B-tree index on `name` cannot be used because the planner cannot turn a case-insensitive prefix into a range scan (more on that below).
+
+### LOWER(col) LIKE LOWER(pattern)
+
+```sql
+SELECT * FROM products WHERE lower(name) LIKE lower('Red Widget%');
+```
+
+This is the standard-SQL way and runs on every database. Its real advantage in Postgres is that you can build an expression index on `lower(name)` and get index-assisted prefix searches, which `ILIKE` alone cannot do. The downside is that you must remember to write `lower()` on both sides every time; forget it once and the query silently becomes case-sensitive. (`upper()` works equally well; just be consistent so one index serves all queries.)
+
+### The citext extension
+
+```sql
+CREATE EXTENSION IF NOT EXISTS citext;
+
+ALTER TABLE products ALTER COLUMN name TYPE citext;
+
+-- Now =, LIKE, and ~ are all case-insensitive on this column
+SELECT count(*) FROM products WHERE name LIKE 'red%';
+--  count
+-- -------
+--  40000
+```
+
+`citext` is a data type that behaves like `text` but compares case-insensitively for `=`, `LIKE`, regex matching, `ORDER BY`, and unique constraints. It is a good fit for columns such as emails and usernames where case must never matter. Internally it calls `lower()` on both values for every comparison, so it is never faster than `text`, and a B-tree index on a `citext` column effectively indexes `lower(name)`. Note that `LIKE` on `citext` is already case-insensitive, so `ILIKE` on a `citext` column adds nothing.
+
+### Nondeterministic ICU collations (PostgreSQL 12+)
+
+Since PostgreSQL 12 you can declare a collation that treats `'Red'` and `'red'` as equal:
+
+```sql
+CREATE COLLATION case_insensitive (
+  provider = icu,
+  locale = 'und-u-ks-level2',
+  deterministic = false
+);
+
+SELECT 'Red' = 'red' COLLATE case_insensitive;   -- t
+SELECT count(*) FROM products
+WHERE name = 'red widget #1' COLLATE case_insensitive;   -- 1
+```
+
+This gives true linguistic case-insensitivity (it also equates accented and unaccented characters if you use `ks-level1`), and it works with regular B-tree indexes for `=`, `IN`, and `ORDER BY`. The catch is that pattern matching is off limits:
+
+```sql
+SELECT count(*) FROM products
+WHERE name LIKE 'red%' COLLATE case_insensitive;
+-- ERROR:  nondeterministic collations are not supported for LIKE
+```
+
+Through PostgreSQL 17, `LIKE`, `ILIKE`, and the regex operators all raise this error on a nondeterministic collation. PostgreSQL 18 starts lifting the restriction for `LIKE`, but if you are on 14 to 17, collations solve equality and sorting, not wildcard search. Your server also needs to be built with ICU support (`SHOW icu_version;` errors if it is not).
+
+### Which one should you pick?
+
+- Ad-hoc reporting, admin tools, small tables: `ILIKE`.
+- Columns where case never matters and you want `=` and `UNIQUE` to ignore case: `citext` or a nondeterministic collation.
+- High-traffic prefix search ("starts with"): `lower(col) LIKE` plus an expression index.
+- High-traffic substring search ("contains"): `ILIKE` plus a `pg_trgm` index.
+
+## Postgres ILIKE performance and indexing
+
+### Why a B-tree index does not help
+
+Create an ordinary index and look at the plan:
+
+```sql
+CREATE INDEX products_name_idx ON products (name);
+
+EXPLAIN (ANALYZE, BUFFERS)
+SELECT count(*) FROM products WHERE name ILIKE 'red%';
+```
+
+```text
+Aggregate  (cost=4641.00..4641.01 rows=1 width=8) (actual time=...)
+  ->  Seq Scan on products  (cost=0.00..4541.00 rows=40000 width=0)
+        Filter: (name ~~* 'red%'::text)
+        Rows Removed by Filter: 160000
+```
+
+Two things block the index. First, a B-tree is ordered by the column's collation, and for a prefix scan the planner needs to rewrite `LIKE 'red%'` into `name >= 'red' AND name < 'ree'`. That rewrite is only valid when the collation sorts byte-wise (the `C` collation) or when the index uses `text_pattern_ops`; in a typical `en_US.UTF-8` database even plain `LIKE 'red%'` will seq-scan. Second, and more fundamentally, a case-insensitive prefix is not a single contiguous range: `Red`, `RED`, and `rEd` sit in different parts of the tree, so the planner gives up on range conversion for `ILIKE` as soon as the prefix contains a letter. A leading wildcard, as in `'%red%'`, has no prefix at all and can never use a B-tree in either case.
+
+### Prefix searches: text_pattern_ops on lower(col)
+
+For "starts with" queries, index the lowercased value with the pattern operator class and query with `lower()`:
+
+```sql
+CREATE INDEX products_lower_name_idx
+  ON products (lower(name) text_pattern_ops);
+
+EXPLAIN (ANALYZE, BUFFERS)
+SELECT count(*) FROM products WHERE lower(name) LIKE 'red%';
+```
+
+```text
+Aggregate
+  ->  Bitmap Heap Scan on products
+        Filter: (lower(name) ~~ 'red%'::text)
+        ->  Bitmap Index Scan on products_lower_name_idx
+              Index Cond: ((lower(name) ~>=~ 'red'::text) AND (lower(name) ~<~ 'ree'::text))
+```
+
+The `~>=~` and `~<~` operators in the plan are the byte-wise comparison operators provided by `text_pattern_ops`. Note that the query must use `lower(name) LIKE`, not `name ILIKE`; the planner matches expressions literally, and `ILIKE` will not be rewritten to use this index. If your database collation is already `C`, you can drop `text_pattern_ops` and a normal index on `lower(name)` works the same way.
+
+### Substring searches: pg_trgm GIN index
+
+For `'%foo%'` patterns the answer is the `pg_trgm` extension, which breaks strings into three-character "trigrams" and indexes those. Both GIN and GiST operator classes support `LIKE`, `ILIKE`, `~`, and `~*`; GIN is usually the better choice for read-heavy tables.
+
+```sql
+CREATE EXTENSION IF NOT EXISTS pg_trgm;
+
+CREATE INDEX products_name_trgm_idx
+  ON products USING gin (name gin_trgm_ops);
+
+EXPLAIN (ANALYZE, BUFFERS)
+SELECT count(*) FROM products WHERE name ILIKE '%gizmo%';
+```
+
+```text
+Aggregate
+  ->  Bitmap Heap Scan on products
+        Recheck Cond: (name ~~* '%gizmo%'::text)
+        Heap Blocks: exact=...
+        ->  Bitmap Index Scan on products_name_trgm_idx
+              Index Cond: (name ~~* '%gizmo%'::text)
+```
+
+The seq scan is gone; `ILIKE` itself is now the index condition. A few practical notes:
+
+- Trigram matching is inherently case-insensitive (`pg_trgm` lowercases before extracting trigrams), so the same index serves both `LIKE` and `ILIKE`.
+- The index is only useful when the pattern contains at least three consecutive non-wildcard characters. `ILIKE '%ab%'` will still be evaluated mostly by rechecking the heap.
+- The "Recheck Cond" line means the index returns candidate rows and Postgres re-applies the full pattern to each; that is normal and expected.
+- GIN indexes are larger and slower to update than B-trees. On write-heavy tables measure the impact, or use `USING gist (name gist_trgm_ops)` which updates faster but searches slower.
+- If you use `'Recheck Cond'`-heavy queries against `citext` columns, cast first: `USING gin ((name::text) gin_trgm_ops)`.
+
+### EXPLAIN before and after
+
+A quick way to compare is to run the same query with and without the index allowed:
+
+```sql
+SET enable_bitmapscan = off;  -- force the old plan
+EXPLAIN (ANALYZE) SELECT count(*) FROM products WHERE name ILIKE '%gizmo%';
+RESET enable_bitmapscan;
+EXPLAIN (ANALYZE) SELECT count(*) FROM products WHERE name ILIKE '%gizmo%';
+```
+
+On the 200,000-row sample you should see the seq scan reading every row versus a bitmap scan that touches only the pages containing matches. The exact timings depend on your hardware and cache state, so judge by `Rows Removed by Filter` and `Buffers` rather than milliseconds.
+
+## ILIKE with arrays and multiple patterns
+
+To match any of several patterns you can pass an array:
+
+```sql
+SELECT count(*) FROM products
+WHERE name ILIKE ANY (ARRAY['%widget%', '%gizmo%']);
+--  count
+-- -------
+--  80000
+
+-- ALL: every pattern must match
+SELECT count(*) FROM products
+WHERE name ILIKE ALL (ARRAY['%widget%', '%#1%']);
+```
+
+`ILIKE ANY` is convenient with parameterised queries because the whole list is a single bind parameter. Be aware that a GIN trigram index is not used for `ANY(array)` conditions; if the query must be indexed, either spell the conditions out with `OR` (the planner can combine them with a BitmapOr on the trigram index) or switch to a regex alternation, which `pg_trgm` does support:
+
+```sql
+SELECT count(*) FROM products WHERE name ~* '(widget|gizmo)';
+```
+
+## Unicode and locale caveats
+
+`ILIKE` folds case using the database's `LC_CTYPE` (or, for ICU databases, the ICU rules), the same as `lower()`. This matters in three situations:
+
+- In a `C` or `POSIX` locale only ASCII letters fold. `'ÄPFEL' ILIKE 'äpfel'` is false there, but true under `en_US.UTF-8` or `de_DE.UTF-8`.
+- Multi-character case mappings are ignored. The German `ß` does not match `SS`, and the Turkish dotted/dotless `i` pair follows whatever the locale says, which surprises people running a Turkish locale with English data.
+- `_` matches one character, not one byte. In a UTF-8 database a two-byte letter like `é` is matched by a single `_`.
+
+Run `SHOW lc_ctype;` and `SELECT datcollate, datctype FROM pg_database WHERE datname = current_database();` to confirm what your server is actually using before relying on non-ASCII behaviour.
+
+## SIMILAR TO and regex alternatives
+
+`SIMILAR TO` is the SQL-standard hybrid of `LIKE` and regular expressions. It has no case-insensitive variant in PostgreSQL, and it is implemented by translating the pattern to a regex, so there is little reason to use it. If you need more than `%` and `_`, go straight to POSIX regex:
+
+```sql
+-- Case-insensitive regex
+SELECT count(*) FROM products WHERE name ~* '^(red|blue) (widget|gadget)';
+
+-- Anchored, case-insensitive, exact word
+SELECT count(*) FROM products WHERE name ~* '\mgizmo\M';
+```
+
+`~*` is also indexable with `pg_trgm`, so the performance story is the same as for `ILIKE`. For very simple "contains" checks, `ILIKE` is easier to read and harder to get wrong (no metacharacters to escape besides `%` and `_`).
+
+## Portability: MySQL and SQL Server
+
+`ILIKE` is not part of the SQL standard. It exists in PostgreSQL and in Postgres-derived systems such as Amazon Redshift, CockroachDB, and Snowflake, but:
+
+- **MySQL / MariaDB**: plain `LIKE` is already case-insensitive for columns using a `_ci` collation (the default, e.g. `utf8mb4_0900_ai_ci`). To force case sensitivity you write `LIKE BINARY` or use a `_cs`/`_bin` collation. There is no `ILIKE`; writing it is a syntax error.
+- **SQL Server**: case sensitivity is decided by the column or database collation (`..._CI_AS` versus `..._CS_AS`). `LIKE` inherits it; you can override per query with `WHERE name COLLATE Latin1_General_CI_AS LIKE 'red%'`.
+- **Oracle / SQLite**: `LOWER(col) LIKE LOWER(pattern)` is the portable idiom; SQLite's `LIKE` is case-insensitive for ASCII only.
+
+If the same SQL must run on several engines, use `LOWER(col) LIKE LOWER(:pattern)`; in Postgres back it with the `lower(col)` expression index shown above.
+
+## Summary
+
+- Postgres `LIKE` is case-sensitive; `ILIKE` (operator `~~*`) is the case-insensitive version with the same `%` and `_` wildcards, negated as `NOT ILIKE`.
+- Escape literal `%` and `_` with a backslash, or choose your own character with `ESCAPE`.
+- A plain B-tree index never helps `ILIKE`. Use `lower(col)` with `text_pattern_ops` for prefix searches, and a `pg_trgm` GIN index for `'%substring%'` searches.
+- `citext` makes a column case-insensitive everywhere; nondeterministic ICU collations do the same for `=` and sorting but reject `LIKE`/`ILIKE` through PostgreSQL 17.
+- `ILIKE ANY(ARRAY[...])` is handy but not indexable; use `OR` or a `~*` regex alternation when speed matters.
+- For cross-database SQL, prefer `LOWER(col) LIKE LOWER(pattern)` since MySQL and SQL Server rely on collations and have no `ILIKE`.
+
+## FAQ
+
+### Is ILIKE slower than LIKE in PostgreSQL?
+
+Slightly, because each comparison lowercases both sides before matching, but the difference is dwarfed by whether an index is used. A `LIKE 'abc%'` on a `C`-collated or `text_pattern_ops` index can be orders of magnitude faster than an `ILIKE` that seq-scans. Fix indexing first; the constant-factor cost of case folding rarely matters.
+
+### Why does my ILIKE query not use the index I created?
+
+Most likely you created a normal B-tree on the column. The planner cannot express a case-insensitive prefix as a single range, and a leading `%` has no prefix at all. Create a `pg_trgm` GIN index (`USING gin (col gin_trgm_ops)`) for substring patterns, or an index on `lower(col) text_pattern_ops` and rewrite the query as `lower(col) LIKE 'abc%'` for prefix patterns. Run `EXPLAIN` to confirm the plan changed.
+
+### Can I make ILIKE handle accents, like matching "cafe" to "café"?
+
+Not with `ILIKE` alone, which only folds case. Use the `unaccent` extension on both sides (`unaccent(name) ILIKE unaccent('%cafe%')`, optionally with an expression index), or combine `pg_trgm` with `unaccent` for indexed fuzzy search. Nondeterministic ICU collations with `ks-level1` also equate accents, but only for equality and sorting, not for `LIKE`, through PostgreSQL 17.

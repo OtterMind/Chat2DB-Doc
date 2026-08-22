@@ -1,0 +1,359 @@
+---
+title: "Postgres GRANT USAGE ON SCHEMA, SELECT ON TABLES"
+description: "Postgres GRANT USAGE ON SCHEMA, GRANT SELECT ON ALL TABLES, ALTER DEFAULT PRIVILEGES and GRANT role TO user: build read-only and read-write roles."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: August 22, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# Postgres GRANT USAGE ON SCHEMA, SELECT ON TABLES
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="August 22, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+The most common PostgreSQL permission mistake looks like this: you run `GRANT SELECT ON ALL TABLES IN SCHEMA app TO reporting;`, the command succeeds, and the reporting user still gets `permission denied for schema app`. The missing piece is `GRANT USAGE ON SCHEMA`. In Postgres, privileges are layered: a role needs `CONNECT` on the database, then `USAGE` on the schema, and only then do table-level privileges such as `SELECT` mean anything. This article walks through that chain in practice: Postgres GRANT USAGE ON SCHEMA, GRANT SELECT ON ALL TABLES, `ALTER DEFAULT PRIVILEGES` for future tables, sequences and functions, and finally how to bundle it all into group roles with `GRANT role TO user`, verify it, and cleanly remove a role later.
+
+Everything below is accurate for PostgreSQL 14 through 17; version differences are called out where they matter. Database-level privileges (`CONNECT`, `CREATE`, `GRANT ALL ON DATABASE`) are covered in a separate article, [Postgres GRANT ALL PRIVILEGES ON DATABASE](/blog/postgres-grant-all-privileges-on-database), so we only touch them here where the chain requires it.
+
+## Why GRANT USAGE ON SCHEMA is required first
+
+A schema in PostgreSQL is a namespace, and `USAGE` is the privilege that allows a role to *look up* objects inside that namespace. Without `USAGE`, the role cannot resolve `app.orders` into a table at all, so any privilege it holds on the table itself is never even checked.
+
+You can reproduce this in a minute. Run the following as a superuser or the schema owner (you can paste it straight into Chat2DB, a free AI-powered SQL client, at https://app.chat2db.ai or after downloading from https://chat2db.ai/download):
+
+```sql
+CREATE SCHEMA app;
+CREATE TABLE app.orders (id bigserial PRIMARY KEY, total numeric(12,2));
+INSERT INTO app.orders (total) VALUES (10.50), (99.00);
+
+CREATE ROLE reporting LOGIN PASSWORD 'change-me';
+GRANT SELECT ON ALL TABLES IN SCHEMA app TO reporting;
+```
+
+Now connect as `reporting` and query the table:
+
+```text
+appdb=> SELECT * FROM app.orders;
+ERROR:  permission denied for schema app
+LINE 1: SELECT * FROM app.orders;
+                      ^
+```
+
+Note the wording: *for schema app*, not *for table orders*. Fix it with one statement:
+
+```sql
+GRANT USAGE ON SCHEMA app TO reporting;
+```
+
+```text
+appdb=> SELECT * FROM app.orders;
+ id | total
+----+-------
+  1 | 10.50
+  2 | 99.00
+(2 rows)
+```
+
+Two details worth knowing:
+
+- `USAGE` on a schema does not grant access to any object in it. It only lets the role find objects; each table, sequence and function still has its own ACL.
+- The `public` schema is special. `USAGE` on `public` is granted to the pseudo-role `PUBLIC` (every role) by default. Before PostgreSQL 15, `CREATE` on `public` was also granted to everyone; PG15 removed that default, so on a fresh 15+ cluster only the database owner can create objects in `public` unless you grant `CREATE` explicitly.
+
+The `CREATE` privilege on a schema is the other half: it allows creating new objects there. A read-only role never needs it.
+
+## GRANT SELECT ON ALL TABLES IN SCHEMA
+
+The `ALL TABLES IN SCHEMA` form expands, at execution time, to every table, view, materialized view, foreign table and partitioned table that currently exists in the schema:
+
+```sql
+GRANT SELECT ON ALL TABLES IN SCHEMA app TO reporting;
+```
+
+Because the expansion happens when the statement runs, it is a one-shot operation. A table created tomorrow will not be covered. That is the single most frequent follow-up complaint ("it worked last week, now the new table is denied") and it is exactly what `ALTER DEFAULT PRIVILEGES` solves in the next section.
+
+You can grant multiple privileges in one statement, and you can list several schemas:
+
+```sql
+GRANT SELECT, INSERT, UPDATE, DELETE
+  ON ALL TABLES IN SCHEMA app, billing
+  TO app_writer;
+```
+
+The per-table privileges available are `SELECT`, `INSERT`, `UPDATE`, `DELETE`, `TRUNCATE`, `REFERENCES`, `TRIGGER`, and since PostgreSQL 17, `MAINTAIN` (for `VACUUM`, `ANALYZE`, `REINDEX`, `REFRESH MATERIALIZED VIEW`, `CLUSTER`, `LOCK TABLE`). Remember that `UPDATE` and `DELETE` with a `WHERE` clause also require `SELECT` on the columns referenced, so a "write-only" role is rarely practical.
+
+## ALTER DEFAULT PRIVILEGES for future tables
+
+`ALTER DEFAULT PRIVILEGES` tells PostgreSQL: "whenever objects of this type are created in the future, automatically grant these privileges." The minimal form is:
+
+```sql
+ALTER DEFAULT PRIVILEGES IN SCHEMA app
+  GRANT SELECT ON TABLES TO reporting;
+```
+
+### The FOR ROLE gotcha
+
+Here is the part that bites almost everyone. Default privileges are stored **per creating role**. The statement above, run without `FOR ROLE`, records defaults for the role you are currently connected as. They apply only to objects *that same role* creates later. If your migrations run as `app_owner` but you ran `ALTER DEFAULT PRIVILEGES` as `postgres`, nothing happens when `app_owner` creates a table.
+
+Always be explicit about whose future objects you mean:
+
+```sql
+-- Tables created by app_owner in schema app will be readable by reporting
+ALTER DEFAULT PRIVILEGES FOR ROLE app_owner IN SCHEMA app
+  GRANT SELECT ON TABLES TO reporting;
+```
+
+You must either be `app_owner`, be a member of `app_owner`, or be a superuser to run that. If several roles create tables (a migration role, a couple of developers), you need one `ALTER DEFAULT PRIVILEGES ... FOR ROLE` per creator. The practical advice is to funnel all DDL through a single owner role so there is exactly one default-privilege entry to manage.
+
+Two more nuances:
+
+- Omitting `IN SCHEMA` makes the default apply to objects the role creates in *any* schema, which is broader than most people intend. Prefer the `IN SCHEMA` form.
+- Default privileges are evaluated at object creation. Changing them later never touches existing tables; for those you still need `GRANT ... ON ALL TABLES IN SCHEMA`.
+
+So the complete, durable pattern is always a pair: `GRANT ... ON ALL TABLES IN SCHEMA` for what exists, plus `ALTER DEFAULT PRIVILEGES FOR ROLE owner IN SCHEMA` for what comes next.
+
+## Building a read-only role step by step
+
+Use a `NOLOGIN` group role for the privilege bundle and separate login roles for people and services. This is the Postgres GRANT role TO user pattern, and it means you grant privileges once and manage membership afterward. Assume the database is `appdb`, the schema is `app`, and all DDL runs as `app_owner`.
+
+```sql
+-- 1. The group role that carries the privileges
+CREATE ROLE app_readonly NOLOGIN;
+
+-- 2. Database: allow connections (covered in detail in the sibling article)
+GRANT CONNECT ON DATABASE appdb TO app_readonly;
+
+-- 3. Schema: allow name resolution
+GRANT USAGE ON SCHEMA app TO app_readonly;
+
+-- 4. Existing tables, views, materialized views
+GRANT SELECT ON ALL TABLES IN SCHEMA app TO app_readonly;
+
+-- 5. Existing sequences (only needed if reports call currval()/last_value)
+GRANT SELECT ON ALL SEQUENCES IN SCHEMA app TO app_readonly;
+
+-- 6. Future tables and sequences created by app_owner
+ALTER DEFAULT PRIVILEGES FOR ROLE app_owner IN SCHEMA app
+  GRANT SELECT ON TABLES TO app_readonly;
+ALTER DEFAULT PRIVILEGES FOR ROLE app_owner IN SCHEMA app
+  GRANT SELECT ON SEQUENCES TO app_readonly;
+
+-- 7. Login roles, added as members
+CREATE ROLE alice LOGIN PASSWORD 'strong-password-here';
+GRANT app_readonly TO alice;
+```
+
+Step 7 is where the privileges actually reach a human. Because roles are `INHERIT` by default, `alice` can immediately use every privilege of `app_readonly` without any extra `SET ROLE`. Adding a second analyst is a single line: `GRANT app_readonly TO bob;`. Removing access is `REVOKE app_readonly FROM bob;` and no table ACL changes.
+
+If you want a quick sanity check without hand-writing these statements, the free Postgres GRANT Generator at https://chat2db.ai/tools/postgres-grant-generator produces this exact read-only and read-write scaffolding from a form.
+
+## Building a read-write role
+
+A read-write role needs three additional things beyond the read-only set: DML privileges on tables, `USAGE` on sequences so `INSERT` can call `nextval()`, and usually `EXECUTE` on functions.
+
+```sql
+CREATE ROLE app_readwrite NOLOGIN;
+
+GRANT CONNECT ON DATABASE appdb TO app_readwrite;
+GRANT USAGE ON SCHEMA app TO app_readwrite;
+
+-- Existing objects
+GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES    IN SCHEMA app TO app_readwrite;
+GRANT USAGE, SELECT                   ON ALL SEQUENCES IN SCHEMA app TO app_readwrite;
+GRANT EXECUTE                         ON ALL FUNCTIONS IN SCHEMA app TO app_readwrite;
+
+-- Future objects created by app_owner
+ALTER DEFAULT PRIVILEGES FOR ROLE app_owner IN SCHEMA app
+  GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO app_readwrite;
+ALTER DEFAULT PRIVILEGES FOR ROLE app_owner IN SCHEMA app
+  GRANT USAGE, SELECT ON SEQUENCES TO app_readwrite;
+ALTER DEFAULT PRIVILEGES FOR ROLE app_owner IN SCHEMA app
+  GRANT EXECUTE ON FUNCTIONS TO app_readwrite;
+
+CREATE ROLE api_service LOGIN PASSWORD 'service-password';
+GRANT app_readwrite TO api_service;
+```
+
+Deliberately left out: `TRUNCATE` (it bypasses row-level triggers and is rarely wanted from an application), `REFERENCES` and `TRIGGER` (DDL-adjacent), and `CREATE` on the schema. An application role should not be able to change the schema; that is the owner's job.
+
+### Sequences and USAGE for serial columns
+
+A `serial` or `bigserial` column is just an integer column with a default of `nextval('app.orders_id_seq'::regclass)`. Calling `nextval()` requires `USAGE` (or `UPDATE`) on the sequence. So a role with `INSERT` on the table but nothing on the sequence fails like this:
+
+```text
+appdb=> INSERT INTO app.orders (total) VALUES (5);
+ERROR:  permission denied for sequence orders_id_seq
+```
+
+The fix is `GRANT USAGE ON ALL SEQUENCES IN SCHEMA app TO app_readwrite;` plus the matching default-privilege line. The three sequence privileges are `USAGE` (`nextval`, `currval`), `SELECT` (`currval`, `lastval`, reading `last_value`), and `UPDATE` (`nextval`, `setval`).
+
+One subtle difference: identity columns (`GENERATED ALWAYS AS IDENTITY` / `BY DEFAULT AS IDENTITY`) evaluate `nextval` internally without the sequence privilege check, so `INSERT` on the table alone is enough. If you are on a schema that uses identity columns consistently, you may not see the error above, but granting sequence `USAGE` is still harmless and keeps explicit `nextval()` calls working.
+
+### Functions and EXECUTE
+
+By default, `EXECUTE` on every new function and procedure is granted to `PUBLIC`, so most application roles can already call functions. If your team has hardened that with `ALTER DEFAULT PRIVILEGES ... REVOKE EXECUTE ON FUNCTIONS FROM PUBLIC`, grant it back explicitly per role. `ALL FUNCTIONS IN SCHEMA` covers functions and aggregates; `ALL PROCEDURES` and `ALL ROUTINES` (functions plus procedures) are also accepted. For `SECURITY DEFINER` functions, remember that `EXECUTE` is the only thing the caller needs; the function body runs with the owner's privileges.
+
+## Group roles: INHERIT, NOINHERIT, SET ROLE, and PG16 grant options
+
+When you run `GRANT app_readonly TO alice`, Postgres records a membership in `pg_auth_members`. What that membership does depends on the `INHERIT` attribute:
+
+- `INHERIT` (the default): `alice` automatically holds every privilege of `app_readonly`, with no extra action.
+- `NOINHERIT`: `alice` holds the membership but not the privileges. To use them she must run `SET ROLE app_readonly;`, after which she acts as that role until `RESET ROLE;`.
+
+```sql
+CREATE ROLE dba_break_glass NOLOGIN;
+GRANT ALL ON ALL TABLES IN SCHEMA app TO dba_break_glass;
+
+CREATE ROLE carol LOGIN NOINHERIT PASSWORD '...';
+GRANT dba_break_glass TO carol;
+-- carol's session:
+--   SELECT * FROM app.orders;    -> permission denied
+--   SET ROLE dba_break_glass;
+--   SELECT * FROM app.orders;    -> works
+--   RESET ROLE;
+```
+
+`NOINHERIT` is a good fit for privileged roles that should be an explicit, auditable step rather than ambient. Note that membership is transitive: if `app_readonly` is itself a member of another role, `alice` inherits that too (subject to each hop's `INHERIT` setting).
+
+PostgreSQL 16 made membership more granular. The `INHERIT` and `SET` behaviours became options on the grant itself rather than only on the role:
+
+```sql
+-- PG16+: dave inherits privileges but may not SET ROLE to it
+GRANT app_readonly TO dave WITH INHERIT TRUE, SET FALSE;
+
+-- PG16+: erin can SET ROLE but gets nothing implicitly
+GRANT app_readwrite TO erin WITH INHERIT FALSE, SET TRUE;
+
+-- Either version: allow frank to grant the role onward
+GRANT app_readonly TO frank WITH ADMIN OPTION;
+```
+
+On PG16+ the role-level `INHERIT` attribute only supplies the default for new grants. Also new in 16: a role created by a non-superuser with `CREATEROLE` is automatically granted to its creator `WITH ADMIN OPTION`, and `CREATEROLE` no longer lets you grant memberships you do not hold yourself. Check `\du` (PG16: `\drg` for grant details) if behaviour differs from what you expect after an upgrade.
+
+## pg_read_all_data and pg_write_all_data (PG14+)
+
+If you need "read everything in this database" rather than "read schema app", PostgreSQL 14 added two predefined roles that remove the per-schema dance entirely:
+
+- `pg_read_all_data`: behaves as if it held `SELECT` on every table, view and sequence, and `USAGE` on every schema, including objects created in the future.
+- `pg_write_all_data`: behaves as if it held `INSERT`, `UPDATE` and `DELETE` on every table, view and sequence, plus `USAGE` on every schema. It does *not* include `SELECT`, so a writer normally gets both.
+
+```sql
+CREATE ROLE bi_reader LOGIN PASSWORD '...';
+GRANT pg_read_all_data TO bi_reader;
+
+CREATE ROLE etl_loader LOGIN PASSWORD '...';
+GRANT pg_read_all_data, pg_write_all_data TO etl_loader;
+```
+
+Caveats: these roles still require `CONNECT` on the database (granted to `PUBLIC` by default), they do not bypass row-level security unless the role also has `BYPASSRLS`, and they are cluster-wide in effect, so they are not a substitute for per-schema scoping when different tenants share a cluster. For a reporting user in a single-purpose database, though, `pg_read_all_data` is the shortest correct answer and it never goes stale.
+
+## Verifying privileges
+
+After granting, verify rather than assume. In `psql`:
+
+```text
+appdb=> \dp app.*
+                                   Access privileges
+ Schema |     name      |   type   |       Access privileges        | Column privileges | Policies
+--------+---------------+----------+--------------------------------+-------------------+----------
+ app    | orders        | table    | app_owner=arwdDxt/app_owner   +|                   |
+        |               |          | app_readonly=r/app_owner      +|                   |
+        |               |          | app_readwrite=arwd/app_owner   |                   |
+ app    | orders_id_seq | sequence | app_owner=rwU/app_owner       +|                   |
+        |               |          | app_readwrite=rU/app_owner     |                   |
+```
+
+Read ACL entries as `grantee=privileges/grantor`. Letters: `a` INSERT (append), `r` SELECT (read), `w` UPDATE (write), `d` DELETE, `D` TRUNCATE, `x` REFERENCES, `t` TRIGGER, `m` MAINTAIN (PG17), `U` USAGE, `X` EXECUTE, `C` CREATE, `c` CONNECT. An empty grantee means `PUBLIC`.
+
+Other useful views:
+
+```text
+\ddp                 -- default privileges, per owner role and schema
+\dn+ app             -- schema ACL (shows who has USAGE / CREATE)
+\du alice            -- role attributes and "Member of"
+\drg                 -- PG16+: membership grants with INHERIT/SET/ADMIN flags
+```
+
+From SQL, the standard views and privilege functions work from any client:
+
+```sql
+-- Which tables can reporting read?
+SELECT table_schema, table_name, privilege_type
+FROM information_schema.table_privileges
+WHERE grantee = 'app_readonly'
+ORDER BY 1, 2;
+
+-- Direct yes/no checks (these honour role inheritance)
+SELECT has_schema_privilege('alice', 'app', 'USAGE')         AS schema_usage,
+       has_table_privilege('alice', 'app.orders', 'SELECT')  AS table_select,
+       has_sequence_privilege('alice', 'app.orders_id_seq', 'USAGE') AS seq_usage;
+
+-- Who is a member of which group role?
+SELECT r.rolname AS member, g.rolname AS group_role, m.inherit_option, m.set_option
+FROM pg_auth_members m
+JOIN pg_roles r ON r.oid = m.member
+JOIN pg_roles g ON g.oid = m.roleid
+WHERE g.rolname LIKE 'app_%';   -- inherit_option/set_option exist on PG16+
+```
+
+`information_schema.table_privileges` only lists grants made to the queried role or through roles it is a member of, and it excludes owner privileges, so for a full picture `\dp` or `pg_class.relacl` is more complete.
+
+## REVOKE, DROP OWNED and REASSIGN OWNED when removing a role
+
+Revoking is the mirror image of granting:
+
+```sql
+REVOKE SELECT ON ALL TABLES IN SCHEMA app FROM reporting;
+REVOKE USAGE ON SCHEMA app FROM reporting;
+ALTER DEFAULT PRIVILEGES FOR ROLE app_owner IN SCHEMA app
+  REVOKE SELECT ON TABLES FROM reporting;
+```
+
+But when the goal is to delete the role, chasing each grant by hand is error-prone. `DROP ROLE` refuses to run while anything depends on the role:
+
+```text
+appdb=# DROP ROLE reporting;
+ERROR:  role "reporting" cannot be dropped because some objects depend on it
+DETAIL:  privileges for schema app
+privileges for table app.orders
+```
+
+The dependable sequence, which must be executed in **every database** where the role has grants or owns objects, is:
+
+```sql
+-- 1. Hand ownership of anything it owns to another role (tables, sequences, schemas...)
+REASSIGN OWNED BY reporting TO app_owner;
+
+-- 2. Revoke every privilege granted to it, and drop its default-privilege entries
+DROP OWNED BY reporting;
+
+-- 3. Now the cluster-wide role can go
+DROP ROLE reporting;
+```
+
+`REASSIGN OWNED` handles ownership only; `DROP OWNED` handles privileges (and, after step 1, there is nothing left for it to actually drop). Skipping step 1 would make `DROP OWNED` delete the role's tables, which is usually not what you want. If the role is a group role with members, `DROP ROLE` removes the memberships automatically; nothing needs revoking from `alice` first.
+
+## Key takeaways
+
+- Privileges are layered: `CONNECT` on the database, `USAGE` on the schema, then object privileges. `GRANT SELECT` without `GRANT USAGE ON SCHEMA` yields `permission denied for schema`.
+- `GRANT ... ON ALL TABLES IN SCHEMA` covers objects that exist now; `ALTER DEFAULT PRIVILEGES FOR ROLE owner IN SCHEMA` covers the future, and only for objects that owner creates. Always use both, and be explicit about `FOR ROLE`.
+- Writers need `USAGE` on sequences for `serial` columns and usually `EXECUTE` on functions.
+- Put privileges on `NOLOGIN` group roles and use `GRANT role TO user`; `INHERIT` makes them ambient, `NOINHERIT` plus `SET ROLE` makes them explicit. PG16 lets you set `INHERIT`/`SET` per grant.
+- `pg_read_all_data` / `pg_write_all_data` (PG14+) are the shortcut for database-wide access.
+- Verify with `\dp`, `\ddp`, `information_schema.table_privileges` and `has_schema_privilege()`; remove roles with `REASSIGN OWNED`, `DROP OWNED`, then `DROP ROLE`.
+
+## FAQ
+
+### Why does GRANT SELECT ON ALL TABLES still give "permission denied for schema"?
+
+Because the role lacks `USAGE` on the schema. Table privileges are only checked after the schema lookup succeeds, so run `GRANT USAGE ON SCHEMA schema_name TO role_name;` first. The error message tells you which layer failed: *for schema* means `USAGE`, *for table* means the table ACL, *for sequence* means `USAGE` on a sequence, and *for database* means `CONNECT`.
+
+### Why don't my ALTER DEFAULT PRIVILEGES apply to new tables?
+
+Almost always because the table was created by a different role than the one the defaults were recorded for. `ALTER DEFAULT PRIVILEGES` without `FOR ROLE` targets the current user; if migrations run as another role, add `FOR ROLE that_role`. Check what is recorded with `\ddp` in psql, and note that default privileges never retroactively affect existing tables.
+
+### Should I use pg_read_all_data or a custom read-only role?
+
+Use `pg_read_all_data` when the requirement really is "read everything in this database" and new schemas should be included automatically, for example a BI connection on a single-tenant database. Build a custom `NOLOGIN` group role with `GRANT USAGE ON SCHEMA` plus `GRANT SELECT ON ALL TABLES IN SCHEMA` and default privileges when access must be limited to specific schemas, or when you are on PostgreSQL 13 or older.

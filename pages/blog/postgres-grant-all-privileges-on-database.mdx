@@ -1,0 +1,314 @@
+---
+title: "Postgres GRANT ALL PRIVILEGES ON DATABASE to User"
+description: "Postgres GRANT ALL PRIVILEGES ON DATABASE only grants CONNECT, CREATE and TEMP, not tables. The full PostgreSQL grant all privileges recipe, with fixes."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: August 22, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# Postgres GRANT ALL PRIVILEGES ON DATABASE to User
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="August 22, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+Running `GRANT ALL PRIVILEGES ON DATABASE mydb TO myuser;` is the first thing almost everyone does when they create a new PostgreSQL user, and almost everyone is then surprised when that user still gets `ERROR: permission denied for table orders`. The command is not broken; it just does far less than its name suggests. In PostgreSQL, "Postgres grant all privileges on database to user" grants exactly three database-level privileges (CONNECT, CREATE, TEMP) and says nothing about schemas, tables, sequences, or functions. This article explains what `GRANT ALL PRIVILEGES` in Postgres actually covers, walks through the complete recipe that gives a user real access to the objects inside a database (including objects that do not exist yet), covers the PostgreSQL 15 change to the `public` schema, contrasts owner, superuser and grantee, and finishes with verification queries and the most common errors.
+
+All examples are valid for PostgreSQL 14 through 17; version-specific behaviour is called out where it matters.
+
+## What GRANT ALL PRIVILEGES ON DATABASE actually grants
+
+PostgreSQL privileges are attached to individual object types, and each object type has its own privilege list. For the *database* object there are only three:
+
+| Privilege | What it lets the role do |
+|---|---|
+| `CONNECT` | Open a session to this database (still subject to `pg_hba.conf`) |
+| `CREATE` | Create new **schemas** in the database (not tables) |
+| `TEMPORARY` / `TEMP` | Create temporary tables during a session |
+
+So this statement:
+
+```sql
+GRANT ALL PRIVILEGES ON DATABASE mydb TO app_user;
+```
+
+is exactly equivalent to:
+
+```sql
+GRANT CONNECT, CREATE, TEMPORARY ON DATABASE mydb TO app_user;
+```
+
+Nothing in it touches tables. Table privileges (`SELECT`, `INSERT`, `UPDATE`, `DELETE`, `TRUNCATE`, `REFERENCES`, `TRIGGER`) live on the table objects, and schema privileges (`USAGE`, `CREATE`) live on the schema objects. A role needs *both* `USAGE` on the schema and the relevant privilege on the table before a single `SELECT` succeeds. This layering is the root of the classic gotcha.
+
+### The classic gotcha
+
+```sql
+-- as a superuser
+CREATE ROLE app_user LOGIN PASSWORD 'S3cret!';
+GRANT ALL PRIVILEGES ON DATABASE mydb TO app_user;
+```
+
+```bash
+psql -U app_user -d mydb -c "SELECT count(*) FROM orders;"
+```
+
+```text
+ERROR:  permission denied for table orders
+```
+
+And by default on PostgreSQL 15 and newer, `CREATE TABLE` fails as well:
+
+```text
+ERROR:  permission denied for schema public
+LINE 1: CREATE TABLE t (id int);
+```
+
+The database grant worked. The user can connect and can create schemas. It just cannot read `public.orders` because nobody granted anything on the `public` schema or on the table.
+
+## The complete grant all privileges PostgreSQL recipe
+
+Below is the full sequence for giving `app_user` unrestricted access to everything in the `public` schema of `mydb`, now and in the future. Run it as a superuser or as the owner of the objects. You can paste it into psql, or run it in Chat2DB, a free AI-powered SQL client (download at https://chat2db.ai/download or use the web version at https://app.chat2db.ai), which is handy for checking the resulting privileges in the object tree afterwards.
+
+### Step 1: Create the role (user)
+
+```sql
+CREATE ROLE app_user LOGIN PASSWORD 'S3cret!';
+-- CREATE USER app_user PASSWORD 'S3cret!';  -- identical: CREATE USER implies LOGIN
+```
+
+`CREATE USER` is just `CREATE ROLE ... LOGIN`. Roles are cluster-wide, not per database, so the same `app_user` can be granted privileges in several databases.
+
+### Step 2: Grant database-level privileges
+
+```sql
+GRANT ALL PRIVILEGES ON DATABASE mydb TO app_user;
+-- CONNECT + CREATE (schemas) + TEMP
+```
+
+If you only want the user to be able to log in and use existing schemas, `GRANT CONNECT ON DATABASE mydb TO app_user;` is enough and is the more conservative choice.
+
+### Step 3: Grant schema privileges
+
+Connect to `mydb` first; schema and table grants are per database.
+
+```sql
+\c mydb
+GRANT USAGE, CREATE ON SCHEMA public TO app_user;
+-- or the shorthand:
+GRANT ALL ON SCHEMA public TO app_user;
+```
+
+`USAGE` lets the role look up objects inside the schema; `CREATE` lets it create new tables, views, sequences and functions there. Without `USAGE` every table grant in the schema is useless.
+
+### Step 4: Grant privileges on all existing objects
+
+```sql
+GRANT ALL PRIVILEGES ON ALL TABLES    IN SCHEMA public TO app_user;
+GRANT ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA public TO app_user;
+GRANT ALL PRIVILEGES ON ALL FUNCTIONS IN SCHEMA public TO app_user;
+-- PostgreSQL 11+: procedures and routines are separate keywords
+GRANT ALL PRIVILEGES ON ALL ROUTINES  IN SCHEMA public TO app_user;
+```
+
+`ON ALL TABLES` also covers views, materialized views, foreign tables and partitioned tables. The sequence grant matters more than people expect: a table with a `serial` or `identity` column needs `USAGE` on the backing sequence for `INSERT` to work, otherwise you get `permission denied for sequence orders_id_seq`.
+
+For a read-only reporting user you would instead do:
+
+```sql
+GRANT USAGE ON SCHEMA public TO report_user;
+GRANT SELECT ON ALL TABLES IN SCHEMA public TO report_user;
+GRANT SELECT ON ALL SEQUENCES IN SCHEMA public TO report_user;
+```
+
+### Step 5: ALTER DEFAULT PRIVILEGES for future objects
+
+`GRANT ... ON ALL TABLES IN SCHEMA` is a one-time snapshot. It expands to the tables that exist at the moment it runs. A table created tomorrow by a migration will not be covered, and `permission denied` will come back. `ALTER DEFAULT PRIVILEGES` fixes that by recording a rule that is applied automatically to new objects:
+
+```sql
+ALTER DEFAULT PRIVILEGES IN SCHEMA public
+    GRANT ALL PRIVILEGES ON TABLES TO app_user;
+ALTER DEFAULT PRIVILEGES IN SCHEMA public
+    GRANT ALL PRIVILEGES ON SEQUENCES TO app_user;
+ALTER DEFAULT PRIVILEGES IN SCHEMA public
+    GRANT ALL PRIVILEGES ON FUNCTIONS TO app_user;
+```
+
+One subtle but critical detail: default privileges apply only to objects created **by the role that ran the ALTER DEFAULT PRIVILEGES statement** (or by the role named in `FOR ROLE`). If your migrations run as `deploy_user` but you ran the statement above as `postgres`, the rule never fires. Either run it as the creating role, or name it explicitly:
+
+```sql
+ALTER DEFAULT PRIVILEGES FOR ROLE deploy_user IN SCHEMA public
+    GRANT SELECT ON TABLES TO report_user;
+```
+
+You need to be a member of `deploy_user` (or a superuser) to use `FOR ROLE deploy_user`.
+
+### The full script in one block
+
+```sql
+-- as superuser, connected to mydb
+CREATE ROLE app_user LOGIN PASSWORD 'S3cret!';
+GRANT ALL PRIVILEGES ON DATABASE mydb TO app_user;
+GRANT ALL ON SCHEMA public TO app_user;
+GRANT ALL PRIVILEGES ON ALL TABLES    IN SCHEMA public TO app_user;
+GRANT ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA public TO app_user;
+GRANT ALL PRIVILEGES ON ALL FUNCTIONS IN SCHEMA public TO app_user;
+ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON TABLES    TO app_user;
+ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON SEQUENCES TO app_user;
+ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON FUNCTIONS TO app_user;
+```
+
+If you have many schemas, repeat steps 3 to 5 per schema, or generate the statements from `information_schema.schemata`. If you would rather not type it by hand, the free Postgres GRANT Generator at https://chat2db.ai/tools/postgres-grant-generator builds this exact script from a role name, a schema list and a privilege level.
+
+## PostgreSQL 15+ and the public schema
+
+Through PostgreSQL 14, every database's `public` schema granted `CREATE` and `USAGE` to the pseudo-role `PUBLIC` (every role). That is why, on older versions, a freshly created login could run `CREATE TABLE` in `public` with no extra grants, and why the gotcha above only showed up on `SELECT`.
+
+PostgreSQL 15 changed this (CVE-2018-1058 hardening): `CREATE` on `public` is revoked from `PUBLIC`, and the schema is owned by the new `pg_database_owner` role instead of `postgres`. Only the database owner and superusers can create objects in `public` by default. `USAGE` is still granted to `PUBLIC`, so existing tables remain visible if their individual grants allow it.
+
+Practical consequences:
+
+```sql
+-- PG15+: allow a non-owner to create tables in public
+GRANT CREATE ON SCHEMA public TO app_user;
+
+-- or restore the pre-15 behaviour for everyone (not recommended on shared clusters)
+GRANT CREATE ON SCHEMA public TO PUBLIC;
+```
+
+Note that `pg_upgrade` and `pg_dump`/`pg_restore` preserve the *old* grants on an upgraded or restored database; the new default applies only to databases created on 15+ from `template1`. This is why the same script behaves differently in a fresh Docker container than on a long-lived server.
+
+## Owner vs superuser vs grantee
+
+Choosing between "make the user the owner" and "grant the user privileges" is the other big design decision.
+
+- **Superuser** (`CREATE ROLE x SUPERUSER`) bypasses all permission checks everywhere. Never use it for an application role; a SQL injection in that application is then a full cluster compromise.
+- **Owner** of an object holds all privileges on it implicitly, can `ALTER`, `DROP`, and `GRANT` it to others, and is the only non-superuser who can do those things. Ownership is per object; the database owner does not automatically own the tables inside it.
+- **Grantee** has exactly the privileges listed in the ACL and nothing more. It cannot drop or alter the object, cannot re-grant unless the grant carried `WITH GRANT OPTION`, and loses access if the grant is revoked.
+
+If `app_user` is the role that runs migrations and therefore creates every table, the simplest clean setup is to make it the owner and skip most of the grants:
+
+```sql
+ALTER DATABASE mydb OWNER TO app_user;
+ALTER SCHEMA public OWNER TO app_user;
+-- reassign everything currently owned by postgres inside mydb
+REASSIGN OWNED BY postgres TO app_user;   -- careful: affects all objects postgres owns in this DB
+```
+
+A more common production pattern is two roles: an `owner` role that owns the schema and runs migrations, and an `app_user` role that receives `SELECT/INSERT/UPDATE/DELETE` through `ALTER DEFAULT PRIVILEGES FOR ROLE owner`. That keeps DDL away from the application's connection string.
+
+## REVOKE: taking privileges back
+
+`REVOKE` mirrors `GRANT` syntax exactly:
+
+```sql
+REVOKE ALL PRIVILEGES ON DATABASE mydb FROM app_user;
+REVOKE ALL ON SCHEMA public FROM app_user;
+REVOKE ALL PRIVILEGES ON ALL TABLES IN SCHEMA public FROM app_user;
+REVOKE INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public FROM report_user;
+
+-- undo a default-privileges rule (must match the original FOR ROLE / IN SCHEMA)
+ALTER DEFAULT PRIVILEGES IN SCHEMA public REVOKE ALL ON TABLES FROM app_user;
+
+-- stop arbitrary roles from connecting to a sensitive database
+REVOKE CONNECT ON DATABASE mydb FROM PUBLIC;
+```
+
+That last line is worth knowing: by default `CONNECT` on every new database is granted to `PUBLIC`, so any role that passes `pg_hba.conf` can connect. Revoking it and granting `CONNECT` explicitly to the roles that need it is a cheap hardening step. Revoking privileges from a role that still owns objects does nothing; ownership is not a grant. To remove a role entirely you need `REASSIGN OWNED BY` / `DROP OWNED BY` first, then `DROP ROLE`.
+
+## Verifying grants
+
+### psql meta-commands
+
+```text
+\l            -- databases with their Access privileges column
+\dn+          -- schemas with ACLs
+\dp orders    -- (alias \z) table, view and sequence ACLs in the current schema
+\ddp          -- default privileges recorded by ALTER DEFAULT PRIVILEGES
+\du           -- roles and their attributes
+```
+
+Sample `\dp` output after the recipe above:
+
+```text
+                                   Access privileges
+ Schema |  Name  | Type  |       Access privileges       | Column privileges | Policies
+--------+--------+-------+-------------------------------+-------------------+----------
+ public | orders | table | postgres=arwdDxt/postgres    +|                   |
+        |        |       | app_user=arwdDxt/postgres     |                   |
+```
+
+The letters are `a`=INSERT, `r`=SELECT, `w`=UPDATE, `d`=DELETE, `D`=TRUNCATE, `x`=REFERENCES, `t`=TRIGGER (PostgreSQL 17 adds `m` for MAINTAIN); the part after `/` is the grantor. An empty ACL column means "owner has everything, nobody else has anything".
+
+### SQL functions and catalog views
+
+```sql
+-- does app_user have SELECT on public.orders? (includes privileges via role membership)
+SELECT has_table_privilege('app_user', 'public.orders', 'SELECT');
+
+SELECT has_schema_privilege('app_user', 'public', 'USAGE');
+SELECT has_database_privilege('app_user', 'mydb', 'CONNECT');
+SELECT has_sequence_privilege('app_user', 'public.orders_id_seq', 'USAGE');
+```
+
+```sql
+-- every explicit table grant for a role in a schema
+SELECT table_schema, table_name, privilege_type
+FROM   information_schema.role_table_grants
+WHERE  grantee = 'app_user'
+  AND  table_schema = 'public'
+ORDER  BY table_name, privilege_type;
+```
+
+```text
+ table_schema | table_name | privilege_type
+--------------+------------+----------------
+ public       | orders     | DELETE
+ public       | orders     | INSERT
+ public       | orders     | REFERENCES
+ public       | orders     | SELECT
+ public       | orders     | TRIGGER
+ public       | orders     | TRUNCATE
+ public       | orders     | UPDATE
+```
+
+`information_schema.role_table_grants` shows only direct grants (and those to roles the current user belongs to), not privileges inherited through ownership. The `has_*_privilege()` functions answer the question you actually care about: "will this query work?"
+
+## Common errors and fixes
+
+| Error | Cause | Fix |
+|---|---|---|
+| `permission denied for database mydb` | no `CONNECT` | `GRANT CONNECT ON DATABASE mydb TO u;` |
+| `permission denied for schema public` | no `USAGE` (reads) or no `CREATE` (DDL); typical on PG15+ | `GRANT USAGE, CREATE ON SCHEMA public TO u;` |
+| `permission denied for table t` | no table privilege even though the database grant succeeded | `GRANT ... ON ALL TABLES IN SCHEMA ...` plus `ALTER DEFAULT PRIVILEGES` |
+| `permission denied for sequence t_id_seq` | INSERT into serial/identity column without sequence `USAGE` | `GRANT USAGE ON ALL SEQUENCES IN SCHEMA public TO u;` |
+| `must be owner of table t` | trying to `ALTER`/`DROP` as a grantee | `ALTER TABLE t OWNER TO u;` or run DDL as the owner |
+| grants work today, fail after next migration | `ON ALL TABLES` is a snapshot; new tables not covered | `ALTER DEFAULT PRIVILEGES FOR ROLE migrator ...` |
+| default privileges "ignored" | rule set by a different role than the one creating objects | re-run with `FOR ROLE creating_role` |
+| `ERROR: role "u" cannot be dropped because some objects depend on it` | role owns objects or holds grants | `REASSIGN OWNED BY u TO other; DROP OWNED BY u; DROP ROLE u;` |
+
+Two more things that look like permission bugs but are not: `pg_hba.conf` rejections (`no pg_hba.conf entry for host ...`) happen before any `GRANT` is consulted, and row-level security policies can return zero rows to a user who has full `SELECT` privilege.
+
+## Summary and key takeaways
+
+- `GRANT ALL PRIVILEGES ON DATABASE` in Postgres grants only `CONNECT`, `CREATE` (schemas) and `TEMP`. It never grants table access.
+- Real access requires three layers: database `CONNECT`, schema `USAGE` (plus `CREATE` for DDL), and object privileges on tables, sequences and functions.
+- `GRANT ... ON ALL TABLES IN SCHEMA` covers only existing objects; pair it with `ALTER DEFAULT PRIVILEGES`, run as (or `FOR ROLE`) the role that creates the objects.
+- PostgreSQL 15+ revoked `CREATE` on `public` from `PUBLIC`; grant it explicitly to non-owner roles.
+- Prefer ownership for the migration role and explicit grants for the application role; avoid superuser for applications.
+- Verify with `\dp`, `\ddp`, `has_table_privilege()` and `information_schema.role_table_grants`.
+
+## FAQ
+
+### Why do I still get "permission denied for table" after GRANT ALL PRIVILEGES ON DATABASE?
+
+Because the database-level grant does not include table privileges. Grant `USAGE` on the schema and then `GRANT ALL PRIVILEGES ON ALL TABLES IN SCHEMA schema_name TO user;` (and the same for sequences). Add `ALTER DEFAULT PRIVILEGES` so tables created later are covered too.
+
+### How do I grant all privileges on all tables to a user in PostgreSQL, including future tables?
+
+Run `GRANT ALL ON ALL TABLES IN SCHEMA public TO u;` for existing tables, then `ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON TABLES TO u;` executed as the role that will create the future tables (or with `FOR ROLE that_role`). Repeat for sequences and functions.
+
+### Should I make the application user the database owner instead of granting privileges?
+
+If that user also runs your migrations and creates every table, making it the owner is the simplest option and avoids default-privilege surprises. If the application only reads and writes data, keep it as a grantee with just `SELECT/INSERT/UPDATE/DELETE` and let a separate owner role handle DDL; that limits the damage from a compromised application credential.

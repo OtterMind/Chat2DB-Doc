@@ -1,0 +1,282 @@
+---
+title: "Keyset Pagination in Postgres vs OFFSET: A Guide"
+description: "Keyset pagination vs offset pagination in PostgreSQL: why deep OFFSET pages get slow, the seek method with row-value comparison, indexes, and cursors."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: August 22, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# Keyset Pagination in Postgres vs OFFSET: A Guide
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="August 22, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+Keyset pagination (also called the "seek method", and often what people mean by "cursor pagination" in REST and GraphQL APIs) is the standard answer to a very common PostgreSQL problem: `LIMIT 20 OFFSET 500000` is fast on page 1 and painfully slow on page 25,000. This guide compares keyset pagination vs offset pagination in Postgres with runnable SQL, shows the `EXPLAIN ANALYZE` shape of both, and covers the details that bite in production: the composite index, tiebreakers, paging backwards, encoding cursors, `NULL` sort keys, filters, and total counts.
+
+## Setup: a table you can run this against
+
+Everything below works on PostgreSQL 14 through 17. Create a table with two million rows and a deliberately low-resolution timestamp so that ties on `created_at` actually happen.
+
+```sql
+CREATE TABLE events (
+  id          bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  account_id  int         NOT NULL,
+  created_at  timestamptz NOT NULL,
+  payload     text
+);
+
+INSERT INTO events (account_id, created_at, payload)
+SELECT (random() * 100)::int,
+       date_trunc('second', now() - random() * interval '365 days'),
+       md5(g::text)
+FROM generate_series(1, 2000000) AS g;
+
+CREATE INDEX events_created_id_idx ON events (created_at DESC, id DESC);
+
+ANALYZE events;
+```
+
+The index matches the sort order we will page by: newest first, with `id` as a unique tiebreaker. Keep that shape in mind; most keyset pagination problems come from an index that does not match the `ORDER BY`.
+
+## Why OFFSET pagination degrades
+
+The classic page query looks like this:
+
+```sql
+SELECT id, created_at, payload
+FROM events
+ORDER BY created_at DESC, id DESC
+LIMIT 20 OFFSET 500000;   -- "page 25,001"
+```
+
+Run it with `EXPLAIN (ANALYZE, BUFFERS)` (for example in Chat2DB, a free AI-powered SQL client; download at https://chat2db.ai/download or use the web version at https://app.chat2db.ai) and the plan has this shape:
+
+```text
+Limit  (actual time=... rows=20 loops=1)
+  Buffers: shared hit=...
+  ->  Index Scan using events_created_id_idx on events
+        (actual time=... rows=500020 loops=1)
+```
+
+Look at `rows=500020` on the inner node. Postgres walked the index in order, fetched 500,020 rows (visiting the heap for each one to check visibility and read `payload`), and then the `Limit` node threw away the first 500,000. There is no shortcut: a B-tree cannot jump to "the 500,001st entry" without counting its way there. Cost grows linearly with the offset, so page n costs O(n), and a user (or a crawler) paging to the end of a large table forces a near-full scan on every click.
+
+The second problem is correctness, not speed. OFFSET is positional. If a new row is inserted at the top between two requests, every row shifts down by one and the next page repeats the last row of the previous page; if a row is deleted, one row is silently skipped. For feeds, exports, and "sync everything since X" endpoints, that instability is a bug, not a nuisance.
+
+## Keyset pagination: the seek method
+
+Keyset pagination replaces "skip N rows" with "start after the last row I saw". The client remembers the sort key of the last row on the current page, and the next query seeks directly to that position in the index:
+
+```sql
+-- First page
+SELECT id, created_at, payload
+FROM events
+ORDER BY created_at DESC, id DESC
+LIMIT 20;
+
+-- Next page: last row seen had created_at = '2026-03-14 08:00:00+00', id = 1234567
+SELECT id, created_at, payload
+FROM events
+WHERE (created_at, id) < ('2026-03-14 08:00:00+00'::timestamptz, 1234567)
+ORDER BY created_at DESC, id DESC
+LIMIT 20;
+```
+
+The plan now looks like this, no matter how deep you are:
+
+```text
+Limit  (actual time=... rows=20 loops=1)
+  ->  Index Scan using events_created_id_idx on events
+        (actual time=... rows=20 loops=1)
+        Index Cond: (ROW(created_at, id) < ROW('2026-03-14 08:00:00+00'::timestamptz, '1234567'::bigint))
+```
+
+`rows=20` on the index scan: Postgres descended the B-tree to the exact position, read 20 entries, and stopped. Every page costs the same as page 1.
+
+### Row-value comparison and why it matters
+
+`(created_at, id) < (x, y)` is a row-value (row constructor) comparison. It is lexicographic, exactly like comparing tuples in most programming languages: true if `created_at < x`, or if `created_at = x` and `id < y`. That is precisely "everything after this row in `ORDER BY created_at DESC, id DESC`".
+
+You could write the same predicate by hand:
+
+```sql
+WHERE created_at < $1
+   OR (created_at = $1 AND id < $2)
+```
+
+Logically identical, but not the same to the planner. Postgres can use a row-value comparison directly as a single index range condition on a B-tree whose leading columns match the tuple, in the same order and direction. The expanded `OR` form is harder for the planner: it often ends up as a `BitmapOr` of two scans or an index scan with a `Filter`, reading more entries than necessary. Prefer the row-value form whenever all sort columns run in the same direction.
+
+The same-direction requirement is the one real limitation. `ORDER BY created_at DESC, id ASC` cannot be expressed as one row comparison, because row comparison applies a single operator to every column. For mixed directions you need either the expanded `OR` predicate with an index declared `(created_at DESC, id ASC)`, or, more simply, pick a tiebreaker that runs in the same direction as the main key. Since `id` is only there to break ties, its direction is arbitrary; make it match.
+
+### The composite index
+
+The index must cover the sort columns in order, and the `ORDER BY` must match the index so Postgres can read rows already sorted and stop after `LIMIT`. `(created_at DESC, id DESC)` is ideal here. An index declared `(created_at, id)` (both ascending) also works for the descending query, because Postgres can scan a B-tree backwards; what does not work is an index on `created_at` alone (ties are unresolved) or an index with the columns in the other order.
+
+If you only ever select the key columns, add the remaining columns with `INCLUDE (...)` and you get an index-only scan as a bonus, provided the visibility map is reasonably fresh.
+
+### Handling ties with a unique tiebreaker
+
+Never page on a non-unique key alone. In our table many rows share the same `created_at` second. With `WHERE created_at < $1` you would skip every other row in the same second as the last one you saw; with `<=` you would repeat them. Appending a unique column, here the primary key, to both the `ORDER BY` and the comparison tuple makes every row's position well-defined and the pagination deterministic. Any unique, non-null, stable column works; the primary key is almost always the right choice.
+
+## Going backwards: the previous page
+
+A cursor describes a position, so "previous page" is just a seek in the other direction: flip the comparison operator and the sort order, fetch n rows, then reverse them in the application so they display in the normal order.
+
+```sql
+-- Previous page, relative to the FIRST row currently shown
+SELECT id, created_at, payload
+FROM events
+WHERE (created_at, id) > ('2026-03-14 08:00:00+00'::timestamptz, 1234567)
+ORDER BY created_at ASC, id ASC
+LIMIT 20;
+-- then reverse the 20 rows client-side
+```
+
+The same index serves both directions. A common trick for "is there a next page?" is to request `LIMIT n + 1`; if you get n + 1 rows, drop the extra one and expose a next cursor.
+
+## Encoding the cursor for APIs
+
+Clients should not have to know your sort columns. Serialize the tuple, base64url-encode it, and hand it out as an opaque `next_cursor` string. Minimal Node example with `pg`:
+
+```js
+const encode = (row) =>
+  Buffer.from(JSON.stringify([row.created_at, String(row.id)])).toString("base64url");
+const decode = (c) => JSON.parse(Buffer.from(c, "base64url").toString());
+
+async function page(client, cursor, n = 20) {
+  const sql = cursor
+    ? `SELECT id, created_at::text AS created_at, payload FROM events
+       WHERE (created_at, id) < ($1::timestamptz, $2::bigint)
+       ORDER BY created_at DESC, id DESC LIMIT $3`
+    : `SELECT id, created_at::text AS created_at, payload FROM events
+       ORDER BY created_at DESC, id DESC LIMIT $3`;
+  const params = cursor ? [...decode(cursor), n + 1] : [n + 1];
+  const { rows } = await client.query(sql, params);
+  const hasMore = rows.length > n;
+  const items = hasMore ? rows.slice(0, n) : rows;
+  return { items, nextCursor: hasMore ? encode(items[items.length - 1]) : null };
+}
+```
+
+Two practical notes. First, `created_at::text` is deliberate: a JavaScript `Date` only has millisecond precision, while `timestamptz` has microseconds. Round-tripping through `Date` would truncate the value and make the cursor land slightly before the true position, repeating rows. Keep timestamps as strings (or ISO strings with full precision) inside the cursor. Second, treat incoming cursors as untrusted input: validate the shape and types after decoding, and always bind them as parameters, never interpolate them into SQL.
+
+## Gotcha: nullable sort columns
+
+Row-value comparison follows SQL three-valued logic. If `created_at` is `NULL`, `(created_at, id) < (x, y)` evaluates to `NULL`, the row is dropped from every page, and, worse, the default sort puts `NULL` first in a `DESC` order, so those rows would have sat at the very top. Our table avoids this with `NOT NULL`, which is the best fix. When you cannot add the constraint, sort and compare on a non-null expression and index that expression:
+
+```sql
+CREATE INDEX events_created_nn_idx
+  ON events (COALESCE(created_at, '-infinity'::timestamptz) DESC, id DESC);
+
+SELECT id, created_at, payload
+FROM events
+WHERE (COALESCE(created_at, '-infinity'::timestamptz), id) < ($1::timestamptz, $2::bigint)
+ORDER BY COALESCE(created_at, '-infinity'::timestamptz) DESC, id DESC
+LIMIT 20;
+```
+
+`NULLS LAST` on its own changes where the nulls appear, but it does not make the comparison true for them; you would still need a separate query for the null block. The `COALESCE` approach keeps everything in one contiguous index range.
+
+## Filtering and pagination together
+
+Real endpoints filter. The rule is simple: equality filters go first in the index, then the sort columns.
+
+```sql
+CREATE INDEX events_account_created_id_idx
+  ON events (account_id, created_at DESC, id DESC);
+
+SELECT id, created_at, payload
+FROM events
+WHERE account_id = 42
+  AND (created_at, id) < ($1::timestamptz, $2::bigint)
+ORDER BY created_at DESC, id DESC
+LIMIT 20;
+```
+
+Postgres seeks to `account_id = 42` and then to the cursor position within that account's slice, so each page is still one short index range. Filters that cannot be indexed (a `payload ILIKE '%x%'`, say) still work correctly with keyset pagination, because the cursor is defined by the sort key and not by a row position; they just make Postgres scan further between matches. Range filters on a column other than the sort key are the awkward case: Postgres can use only one range per index scan, so expect a filter step on the second condition.
+
+## Total counts and "page X of Y"
+
+Keyset pagination gives you "next" and "previous", not "page 37 of 2,412". An exact `count(*)` on a large table is a full scan of the table or an index, which defeats the purpose. Options, in order of cheapness:
+
+```sql
+-- Table-wide estimate maintained by VACUUM/ANALYZE (-1 on PG14+ if never vacuumed/analyzed)
+SELECT reltuples::bigint AS estimate
+FROM pg_class WHERE oid = 'events'::regclass;
+
+-- Estimate for an arbitrary WHERE clause via the planner
+CREATE OR REPLACE FUNCTION estimate_rows(q text) RETURNS bigint
+LANGUAGE plpgsql AS $$
+DECLARE plan json;
+BEGIN
+  EXECUTE 'EXPLAIN (FORMAT JSON) ' || q INTO plan;
+  RETURN (plan->0->'Plan'->>'Plan Rows')::bigint;
+END $$;
+
+SELECT estimate_rows('SELECT 1 FROM events WHERE account_id = 42');
+
+-- Exact but capped: "1,000+" style
+SELECT count(*) FROM (SELECT 1 FROM events WHERE account_id = 42 LIMIT 1001) s;
+```
+
+The `estimate_rows` function executes whatever text you pass it, so call it only with query text you built yourself, never with user input. Planner estimates are accurate to within a factor of a few for simple predicates after `ANALYZE`, which is usually good enough for a UI hint.
+
+## Keyset vs cursor (DECLARE CURSOR) vs offset
+
+"Cursor pagination" in API design almost always means keyset pagination with an opaque token. PostgreSQL also has real server-side cursors, which are a different tool:
+
+```sql
+BEGIN;
+DECLARE c CURSOR FOR
+  SELECT id, created_at FROM events ORDER BY created_at DESC, id DESC;
+FETCH 20 FROM c;
+FETCH 20 FROM c;   -- next 20, from where the server left off
+COMMIT;            -- cursor disappears (unless declared WITH HOLD)
+```
+
+| | OFFSET/LIMIT | Keyset (seek) | DECLARE CURSOR |
+|---|---|---|---|
+| Cost of page n | O(n) | O(log N) per page | Incremental |
+| Stable under inserts/deletes | No | Yes | Yes (snapshot) |
+| Jump to arbitrary page | Yes | No | No |
+| Server state | None | None | Open transaction or WITH HOLD |
+| Fits stateless HTTP | Yes | Yes | No |
+| Needs matching index | Helpful | Required | Helpful |
+
+A server-side cursor is excellent for a batch job or a report that streams millions of rows inside one session, because it keeps one consistent snapshot and never re-plans. It is the wrong tool for web APIs: it pins a transaction (or materializes the whole result for `WITH HOLD`), it is bound to one connection, and it does not survive a load balancer.
+
+## When OFFSET is still fine
+
+Keyset pagination is not a universal replacement. OFFSET remains the pragmatic choice when:
+
+- The table is small (thousands of rows) and every page is cheap anyway.
+- It is an internal admin UI where "go to page 37" matters more than latency on page 37.
+- The sort order is something you cannot index and seek on, such as a full-text relevance score, and you cap depth (many search products simply refuse pages beyond a limit).
+- You need numbered pages for SEO or accessibility and the dataset is bounded.
+
+A reasonable hybrid is OFFSET for the first few hundred rows and keyset cursors for "load more" beyond that, or simply capping the maximum offset.
+
+## Summary
+
+- `OFFSET n` makes Postgres read and discard n rows, so deep pages cost O(n) and shift under concurrent writes.
+- Keyset pagination seeks with `WHERE (created_at, id) < ($1, $2) ORDER BY created_at DESC, id DESC LIMIT n`, making every page an O(log N) index range.
+- Use a row-value comparison, a composite index matching the `ORDER BY` in column order and direction, and a unique tiebreaker.
+- Page backwards by flipping the operator and order, then reversing in the app; encode the tuple as an opaque base64url cursor and keep full timestamp precision.
+- Make sort columns `NOT NULL` or `COALESCE` them in both index and query; put equality filters first in the index.
+- Replace exact counts with planner estimates or capped counts; reserve `DECLARE CURSOR` for single-session batch work.
+
+## FAQ
+
+### Is cursor pagination the same as keyset pagination?
+
+In API terminology, yes: "cursor pagination" usually means keyset pagination where the sort-key tuple is encoded into an opaque token. It is unrelated to PostgreSQL's `DECLARE CURSOR`, which is a server-side, transaction-bound object better suited to batch processing than to stateless HTTP requests.
+
+### Can I use keyset pagination with a sort column that is not unique?
+
+Yes, but only if you append a unique tiebreaker such as the primary key to both the `ORDER BY` and the comparison tuple, and include it in the index. Without it, rows that share the same sort value will be skipped or repeated across page boundaries.
+
+### Does keyset pagination work with multiple sort directions, like date DESC and name ASC?
+
+A single row-value comparison requires all columns to run in the same direction. For mixed directions, either make the tiebreaker match the main key's direction (it is arbitrary anyway), or use the expanded `col1 < $1 OR (col1 = $1 AND col2 > $2)` form with an index declared with matching `DESC`/`ASC` per column, and verify the plan with `EXPLAIN ANALYZE`.

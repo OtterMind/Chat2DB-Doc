@@ -1,0 +1,300 @@
+---
+title: "How to List Users and Roles in PostgreSQL"
+description: "Postgres list users guide: psql \\du, \\dg and \\drg, SELECT from pg_roles vs pg_user vs pg_authid, role attributes, memberships, grants and active sessions."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: August 22, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# How to List Users and Roles in PostgreSQL
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="August 22, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+If you come from MySQL you probably reach for `SHOW USERS` and get a syntax error. There is no "postgres show users" command. To list users in Postgres you either use the psql meta-command `\du`, or you query the system catalogs `pg_roles`, `pg_user`, `pg_authid` and `pg_shadow`. This guide covers every practical way to do a PostgreSQL list users query, explains what each column means, shows how to list roles, role attributes, memberships, connected sessions and table privileges, and points out the cloud-provider quirks (RDS, Supabase) that trip people up. Everything below is tested against PostgreSQL 14 through 17 unless noted.
+
+## Users vs roles in Postgres: everything is a role
+
+Since PostgreSQL 8.1 there is a single concept: the **role**. A "user" is simply a role that has the `LOGIN` attribute, and a "group" is a role that other roles are members of. `CREATE USER alice` is literally shorthand for `CREATE ROLE alice LOGIN`. Roles are cluster-wide objects stored in the shared catalog `pg_authid`, which means the same role exists in every database of the server; only privileges on objects are per database.
+
+That has one consequence for listing: any "list users" query is really a "list roles, optionally filtered on `rolcanlogin`" query.
+
+```sql
+-- these two statements create identical objects
+CREATE USER alice PASSWORD 'secret';
+CREATE ROLE  bob LOGIN PASSWORD 'secret';
+
+-- this one is a group-style role: no login
+CREATE ROLE readonly NOLOGIN;
+GRANT readonly TO alice;
+```
+
+## Postgres list users with psql: \du, \du+ and \dg
+
+Inside `psql`, `\du` (describe users) lists all roles. `\dg` (describe groups) is an exact alias. Add `+` for the role description set with `COMMENT ON ROLE`.
+
+```text
+postgres=# \du
+                                    List of roles
+ Role name |                         Attributes                         | Member of
+-----------+------------------------------------------------------------+------------
+ alice     |                                                            | {readonly}
+ bob       |                                                            | {}
+ postgres  | Superuser, Create role, Create DB, Replication, Bypass RLS | {}
+ readonly  | Cannot login                                               | {}
+```
+
+What the columns mean:
+
+- **Role name** – the `rolname` in `pg_roles`.
+- **Attributes** – a rendered summary of the boolean flags: `Superuser`, `Create role`, `Create DB`, `Replication`, `Bypass RLS`, `Cannot login`, `No inheritance`, plus `Password valid until ...` and `N connections` when a connection limit is set.
+- **Member of** – the roles this role has been granted. This column exists in psql 15 and earlier. **psql 16 removed it** from `\du` and `\dg`; membership details moved to the new `\drg` command, which also shows the per-grant `ADMIN`, `INHERIT` and `SET` options introduced in PostgreSQL 16.
+
+You can filter with a pattern, exactly like `\dt`:
+
+```text
+postgres=# \du al*
+postgres=# \du+ readonly
+                      List of roles
+ Role name |  Attributes  | Member of |      Description
+-----------+--------------+-----------+------------------------
+ readonly  | Cannot login | {}        | Read-only reporting group
+```
+
+If you want to see what `\du` actually runs, start psql with `psql -E` (or `\set ECHO_HIDDEN on`) and it prints the underlying `SELECT ... FROM pg_catalog.pg_roles` statement. That query is a good template for the SQL versions below.
+
+## Postgres list roles with SQL: pg_roles vs pg_user vs pg_authid vs pg_shadow
+
+When you are not in psql (an application, a GUI, a monitoring job) you need plain SQL. There are four relations and the difference is only about *which rows* and *who may read them*:
+
+| Relation     | Type    | Rows              | Password column     | Readable by    |
+|--------------|---------|-------------------|---------------------|----------------|
+| `pg_authid`  | catalog | all roles         | real hash (SCRAM)   | superusers     |
+| `pg_roles`   | view    | all roles         | `********`          | everyone       |
+| `pg_shadow`  | view    | login roles only  | real hash           | superusers     |
+| `pg_user`    | view    | login roles only  | `********`          | everyone       |
+
+`pg_roles` is the one you want 95% of the time. `pg_user` is a legacy compatibility view with old column names (`usename`, `usesysid`); it is fine for a quick "who can log in" list but it hides non-login roles and the newer attributes.
+
+### List all users (login roles)
+
+```sql
+SELECT rolname, rolsuper, rolcreatedb, rolcreaterole, rolconnlimit, rolvaliduntil
+FROM   pg_roles
+WHERE  rolcanlogin
+ORDER  BY rolname;
+```
+
+```text
+ rolname  | rolsuper | rolcreatedb | rolcreaterole | rolconnlimit | rolvaliduntil
+----------+----------+-------------+---------------+--------------+---------------
+ alice    | f        | f           | f             |           -1 |
+ bob      | f        | f           | f             |           -1 |
+ postgres | t        | t           | t             |           -1 |
+```
+
+The equivalent with the legacy view:
+
+```sql
+SELECT usename, usesuper, usecreatedb, valuntil FROM pg_user ORDER BY usename;
+```
+
+### List all roles, including groups
+
+```sql
+SELECT rolname,
+       rolcanlogin    AS can_login,
+       rolsuper       AS superuser,
+       rolinherit     AS inherits,
+       rolcreaterole  AS create_role,
+       rolcreatedb    AS create_db,
+       rolreplication AS replication,
+       rolbypassrls   AS bypass_rls,
+       rolconnlimit   AS conn_limit,
+       rolvaliduntil  AS valid_until
+FROM   pg_roles
+ORDER  BY rolname;
+```
+
+A `rolconnlimit` of `-1` means unlimited; `rolvaliduntil` is `NULL` when the password never expires. `rolconfig` (not shown) holds per-role `ALTER ROLE ... SET` settings such as `search_path` or `statement_timeout`, which is worth including when you are auditing.
+
+### Filtering out system roles (pg_%)
+
+Modern versions ship a growing list of predefined roles: `pg_monitor`, `pg_read_all_data`, `pg_write_all_data`, `pg_signal_backend`, `pg_database_owner`, `pg_checkpoint` (15), `pg_use_reserved_connections` and `pg_create_subscription` (16), `pg_maintain` (17), and more. They all start with `pg_`, which is reserved, so exclude them with a regex or an escaped `LIKE` (underscore is a wildcard in `LIKE`, so it must be escaped):
+
+```sql
+SELECT rolname, rolcanlogin
+FROM   pg_roles
+WHERE  rolname !~ '^pg_'          -- or: rolname NOT LIKE 'pg\_%'
+ORDER  BY rolname;
+```
+
+Built-in roles also have `oid` below 16384, so `WHERE oid >= 16384` is another reliable filter for "roles a human created".
+
+### Seeing password hashes (superuser only)
+
+```sql
+SELECT rolname, rolpassword FROM pg_authid WHERE rolcanlogin;
+```
+
+On a non-superuser connection this raises `ERROR: permission denied for table pg_authid`. The hash looks like `SCRAM-SHA-256$4096:...` on PG 14+ defaults (`md5...` on older setups). You almost never need this; if you are checking *whether* a role has a password rather than *what* it is, `pg_roles.rolpassword IS NOT NULL` does not work (it is always `********`), so use `pg_authid` or `pg_shadow` and check `IS NOT NULL`.
+
+## Listing role memberships
+
+Membership lives in `pg_auth_members`. Joining it twice to `pg_roles` gives a readable picture:
+
+```sql
+SELECT r.rolname   AS role,
+       m.rolname   AS member,
+       g.rolname   AS granted_by,
+       am.admin_option
+FROM   pg_auth_members am
+JOIN   pg_roles r ON r.oid = am.roleid
+JOIN   pg_roles m ON m.oid = am.member
+JOIN   pg_roles g ON g.oid = am.grantor
+ORDER  BY 1, 2;
+```
+
+```text
+   role   | member | granted_by | admin_option
+----------+--------+------------+--------------
+ readonly | alice  | postgres   | f
+```
+
+`admin_option = t` means the member may grant that role to others. PostgreSQL 16 added two more columns, `inherit_option` and `set_option`, which control whether the member automatically inherits the role's privileges and whether it may `SET ROLE` to it; include them if you are on 16+.
+
+For the reverse question — "which roles is alice in, directly or indirectly?" — use the `pg_has_role()` function, which follows the membership graph for you:
+
+```sql
+SELECT rolname
+FROM   pg_roles
+WHERE  pg_has_role('alice', oid, 'member')
+AND    rolname <> 'alice';
+```
+
+In psql 16+, `\drg` prints the same information, and `\drg alice` narrows it to one role.
+
+## Listing users per database and who has CONNECT
+
+Roles are global, so there is no "users of database X" table. The closest meaningful question is "which roles are allowed to connect to database X", answered with `has_database_privilege()`:
+
+```sql
+SELECT r.rolname,
+       has_database_privilege(r.rolname, 'appdb', 'CONNECT') AS can_connect
+FROM   pg_roles r
+WHERE  r.rolcanlogin
+AND    r.rolname !~ '^pg_'
+ORDER  BY 1;
+```
+
+Keep in mind that by default `PUBLIC` has `CONNECT` on every new database, so this returns `t` for everybody until you `REVOKE CONNECT ON DATABASE appdb FROM PUBLIC`. To see the raw ACL instead:
+
+```sql
+SELECT datname, datacl FROM pg_database WHERE datname = 'appdb';
+-- or in psql: \l appdb
+```
+
+A `datacl` of `NULL` means the built-in default (owner has all, PUBLIC has CONNECT and TEMP).
+
+## Listing currently connected users
+
+Who is logged in *right now* comes from `pg_stat_activity`:
+
+```sql
+SELECT usename, datname, client_addr, application_name, state,
+       count(*) AS sessions
+FROM   pg_stat_activity
+WHERE  backend_type = 'client backend'
+GROUP  BY 1, 2, 3, 4, 5
+ORDER  BY sessions DESC;
+```
+
+```text
+ usename | datname |  client_addr  | application_name | state  | sessions
+---------+---------+---------------+------------------+--------+----------
+ app     | appdb   | 10.0.1.14     | api              | idle   |       12
+ alice   | appdb   | 10.0.3.7      | psql             | active |        1
+```
+
+Non-superusers see only their own sessions in full; other rows have `query` and `client_addr` nulled out unless the role is a member of `pg_read_all_stats` (or `pg_monitor`). Filtering on `backend_type = 'client backend'` drops autovacuum workers, WAL senders and the checkpointer, which have `usename` set to NULL or to the bootstrap superuser.
+
+## Listing privileges a user has on tables
+
+For object-level grants, the simplest psql route is `\dp` (alias `\z`), which prints the `Access privileges` column per table:
+
+```text
+appdb=# \dp public.orders
+                              Access privileges
+ Schema |  Name  | Type  |   Access privileges    | Column privileges | Policies
+--------+--------+-------+------------------------+-------------------+----------
+ public | orders | table | app=arwdDxt/app       +|                   |
+        |        |       | readonly=r/app         |                   |
+```
+
+`readonly=r/app` reads as: role `readonly` has `r` (SELECT), granted by `app`. The letters are `a` INSERT, `r` SELECT, `w` UPDATE, `d` DELETE, `D` TRUNCATE, `x` REFERENCES, `t` TRIGGER, and `m` MAINTAIN on 17.
+
+In SQL, `information_schema.role_table_grants` lists grants where the current user is the grantor, the grantee, or a member of the grantee role, which makes it ideal for "what can *I* (or my roles) do":
+
+```sql
+SELECT grantee, table_schema, table_name, privilege_type
+FROM   information_schema.role_table_grants
+WHERE  grantee = 'readonly'
+ORDER  BY 2, 3, 4;
+```
+
+To audit a role you are *not* a member of, run the query as a superuser, or use `information_schema.table_privileges`, or test explicitly with `has_table_privilege('alice', 'public.orders', 'SELECT')`. For a full dump of every grantee on every table in a schema, explode the ACL array directly:
+
+```sql
+SELECT c.relname, a.grantee::regrole AS grantee, a.privilege_type
+FROM   pg_class c
+JOIN   pg_namespace n ON n.oid = c.relnamespace
+CROSS  JOIN LATERAL aclexplode(c.relacl) a
+WHERE  n.nspname = 'public' AND c.relkind IN ('r', 'p', 'v', 'm')
+ORDER  BY 1, 2, 3;
+```
+
+## Listing the current user
+
+```sql
+SELECT current_user, session_user;
+```
+
+`session_user` is the role you authenticated as; `current_user` is the role whose privileges are in effect, which changes after `SET ROLE` or inside a `SECURITY DEFINER` function. In psql, `\conninfo` shows the user, database, host and port of the live connection.
+
+## Cloud-managed PostgreSQL nuances
+
+Managed services do not hand out real superuser, so `\du` output looks a little different:
+
+- **Amazon RDS / Aurora**: your master user is a member of `rds_superuser`, not `rolsuper = t`. You will also see `rdsadmin` (the AWS-owned real superuser; do not touch) and sometimes `rdsrepladmin` and `rds_replication`. `pg_authid` and `pg_shadow` are not readable by the master user, so use `pg_roles`.
+- **Supabase**: the `postgres` role you log in with is *not* a superuser either; expect platform roles such as `supabase_admin`, `supabase_auth_admin`, `authenticator`, `anon`, `authenticated` and `service_role`. The last three are what PostgREST switches into per request, so "who is connected" in `pg_stat_activity` will mostly show `authenticator`.
+- **Google Cloud SQL** uses `cloudsqlsuperuser`; **Azure Flexible Server** uses `azure_pg_admin`. Filter them out of reports the same way as `pg_` roles if they are noise for you.
+
+## Doing it in a GUI
+
+If you would rather not memorise catalog columns, a SQL client can show the same data visually. In Chat2DB, a free AI-powered SQL client (download at https://chat2db.ai/download or use the web version at https://app.chat2db.ai), expand a PostgreSQL connection to browse roles and their attributes, or paste any of the queries above into the editor and export the result set as CSV for an access review. The AI assistant will also translate "show me all login roles that are not system roles and when their passwords expire" into the `pg_roles` query for you.
+
+## Summary
+
+- Postgres has no `SHOW USERS`; users are roles with `LOGIN`, so list users via `\du` or `SELECT ... FROM pg_roles WHERE rolcanlogin`.
+- `\du` and `\dg` are identical; `\du+` adds comments; psql 16+ moved the "Member of" column to `\drg`.
+- `pg_roles` is readable by everyone and masks passwords; `pg_authid`/`pg_shadow` expose hashes and are superuser-only; `pg_user` is a legacy login-only view.
+- Memberships live in `pg_auth_members` (plus `inherit_option`/`set_option` on 16+); `pg_has_role()` resolves indirect membership.
+- `pg_stat_activity` lists connected users, `has_database_privilege()` answers who can connect, and `\dp` / `aclexplode()` answer who can do what on tables.
+- Exclude predefined roles with `rolname !~ '^pg_'` and expect provider roles such as `rds_superuser` or `supabase_admin` on managed services.
+
+## FAQ
+
+### Is there a "postgres show users" command like MySQL's SHOW USERS?
+
+No. PostgreSQL has no `SHOW USERS` statement. Use `\du` in psql, or `SELECT rolname FROM pg_roles WHERE rolcanlogin;` from any client. `SHOW` in Postgres only displays configuration parameters.
+
+### What is the difference between pg_user and pg_roles?
+
+`pg_roles` lists every role (login and non-login) with all modern attributes and is the recommended source. `pg_user` is a backwards-compatibility view that shows only login roles with pre-8.1 column names such as `usename`. Both hide password hashes; the real hashes are in `pg_authid` (all roles) and `pg_shadow` (login roles), which require superuser.
+
+### Why does my `\du` output not show the "Member of" column?
+
+You are using psql 16 or newer. The column was removed from `\du`/`\dg` and replaced by the dedicated `\drg` command, which shows each membership grant together with its `ADMIN`, `INHERIT` and `SET` options. The SQL equivalent is a join on `pg_auth_members`.

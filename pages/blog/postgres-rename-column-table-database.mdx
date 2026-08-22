@@ -1,0 +1,386 @@
+---
+title: "Postgres Rename Column, Table and Database: Guide"
+description: "Postgres rename column, table and database with ALTER TABLE RENAME COLUMN and ALTER DATABASE RENAME TO: locking, dependencies and zero-downtime tips."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: August 22, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# Postgres Rename Column, Table and Database: Guide
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="August 22, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+Renaming things in PostgreSQL is deceptively simple. A Postgres rename column, rename table or rename database statement is a single line of DDL, runs in milliseconds, and is fully transactional. The hard part is everything around it: what the server updates for you, what it silently leaves broken, how `ALTER TABLE ... RENAME COLUMN` locks the table, and why `ALTER DATABASE ... RENAME TO` refuses to run while anyone is connected. This guide walks through every rename form in PostgreSQL 14 through 17 with runnable SQL, then covers dependencies, locking, case sensitivity, rollback and a zero-downtime strategy.
+
+All examples use the following schema. You can paste it into `psql` or into Chat2DB, a free AI-powered SQL client (download at https://chat2db.ai/download or use the web version at https://app.chat2db.ai).
+
+```sql
+CREATE TABLE customers (
+    id         bigserial PRIMARY KEY,
+    fullname   text NOT NULL,
+    email      text UNIQUE,
+    created    timestamptz DEFAULT now()
+);
+
+CREATE TABLE orders (
+    id          bigserial PRIMARY KEY,
+    customer_id bigint REFERENCES customers(id),
+    total       numeric(12,2) NOT NULL
+);
+
+CREATE INDEX orders_customer_id_idx ON orders (customer_id);
+
+CREATE VIEW customer_orders AS
+SELECT c.fullname, o.total
+FROM customers c JOIN orders o ON o.customer_id = c.id;
+```
+
+## Postgres rename column with ALTER TABLE RENAME COLUMN
+
+The syntax is `ALTER TABLE table_name RENAME [COLUMN] old_name TO new_name`. The `COLUMN` keyword is optional.
+
+```sql
+ALTER TABLE customers RENAME COLUMN fullname TO full_name;
+ALTER TABLE customers RENAME created TO created_at;   -- COLUMN keyword omitted
+```
+
+Check the result:
+
+```sql
+\d customers
+```
+
+```text
+                          Table "public.customers"
+   Column   |           Type           | Nullable |              Default
+------------+--------------------------+----------+---------------------------------------
+ id         | bigint                   | not null | nextval('customers_id_seq'::regclass)
+ full_name  | text                     | not null |
+ email      | text                     |          |
+ created_at | timestamp with time zone |          | now()
+```
+
+Rules worth knowing:
+
+- You must own the table (or be a member of the owning role).
+- Only one column can be renamed per statement. You cannot combine `RENAME` with other `ALTER TABLE` actions in the same statement.
+- Columns of inherited or partitioned child tables cannot be renamed directly. Rename on the parent and the change propagates to every child and partition. Trying it on a partition raises `ERROR: cannot rename inherited column "x"`.
+- The new name must not already exist in the table, and it is still subject to the 63-byte identifier limit.
+
+## Postgres rename table with RENAME TO
+
+```sql
+ALTER TABLE customers RENAME TO clients;
+```
+
+Indexes, constraints and owned sequences keep working because they reference the table by OID, but their *names* do not change. After the statement above you still have `customers_pkey`, `customers_email_key` and `customers_id_seq`. If you care about naming hygiene, rename them explicitly:
+
+```sql
+ALTER INDEX customers_pkey RENAME TO clients_pkey;
+ALTER TABLE clients RENAME CONSTRAINT customers_email_key TO clients_email_key;
+ALTER SEQUENCE customers_id_seq RENAME TO clients_id_seq;
+```
+
+Note that the default expression `nextval('customers_id_seq'::regclass)` is stored as a sequence OID, so renaming the sequence updates what `\d` displays; nothing breaks either way.
+
+`RENAME TO` cannot move a table to another schema. For that use `ALTER TABLE clients SET SCHEMA archive;`.
+
+## Postgres rename database with ALTER DATABASE RENAME TO
+
+```sql
+ALTER DATABASE shop RENAME TO shop_prod;
+```
+
+Three conditions must hold:
+
+1. You are the database owner with `CREATEDB` privilege, or a superuser.
+2. Nobody else is connected to the database.
+3. You are **not** connected to it yourself. Attempting it gives `ERROR: current database cannot be renamed`.
+
+So the workflow is: connect to a different database (`postgres` is the usual choice), kick everyone out, and rename.
+
+```bash
+psql -U postgres -d postgres
+```
+
+```sql
+-- 1. See who is connected
+SELECT pid, usename, application_name, state
+FROM pg_stat_activity
+WHERE datname = 'shop';
+
+-- 2. Block new connections (optional but recommended)
+ALTER DATABASE shop WITH ALLOW_CONNECTIONS false;
+
+-- 3. Terminate the remaining sessions, except your own
+SELECT pg_terminate_backend(pid)
+FROM pg_stat_activity
+WHERE datname = 'shop'
+  AND pid <> pg_backend_pid();
+
+-- 4. Rename
+ALTER DATABASE shop RENAME TO shop_prod;
+
+-- 5. Re-open the door
+ALTER DATABASE shop_prod WITH ALLOW_CONNECTIONS true;
+```
+
+If you skip step 3 and a session is still active you get:
+
+```text
+ERROR:  database "shop" is being accessed by other users
+DETAIL:  There is 1 other session using the database.
+```
+
+Remember that renaming the database does not update connection strings, `pgbouncer.ini`, `.pgpass` files, or the `datname` in your monitoring dashboards. Plan a short maintenance window because every client will be disconnected.
+
+## Renaming schemas, indexes, constraints, sequences and views
+
+Almost every object type supports `ALTER ... RENAME TO`:
+
+```sql
+ALTER SCHEMA public_old RENAME TO public_legacy;
+ALTER INDEX orders_customer_id_idx RENAME TO orders_customer_idx;
+ALTER TABLE orders RENAME CONSTRAINT orders_customer_id_fkey TO orders_client_fkey;
+ALTER SEQUENCE orders_id_seq RENAME TO order_id_seq;
+ALTER VIEW customer_orders RENAME TO client_orders;
+ALTER MATERIALIZED VIEW sales_mv RENAME TO sales_summary_mv;
+ALTER TYPE order_status RENAME TO order_state;
+ALTER FUNCTION calc_total(bigint) RENAME TO calculate_total;
+ALTER TRIGGER trg_audit ON orders RENAME TO orders_audit_trg;
+```
+
+Since PostgreSQL 13 you can also rename an output column of a view without recreating it:
+
+```sql
+ALTER VIEW client_orders RENAME COLUMN fullname TO full_name;
+```
+
+Renaming a schema deserves extra care: any function body or application query that fully qualifies `old_schema.table` will fail, and `search_path` settings on roles and databases (`ALTER ROLE ... SET search_path`) store the schema name as plain text.
+
+## What PostgreSQL updates automatically and what it does not
+
+This is the part that separates a clean rename from a 3 a.m. incident. Internally, PostgreSQL stores most dependencies as OIDs plus attribute numbers in `pg_depend`, `pg_attrdef`, `pg_constraint` and `pg_rewrite`. Anything stored that way follows the rename for free.
+
+**Updated automatically (referenced by OID or attribute number):**
+
+- Views and materialized view definitions. After `RENAME COLUMN fullname TO full_name`, `pg_get_viewdef('client_orders')` already shows `c.full_name`.
+- Foreign keys, primary keys, unique and check constraints.
+- Indexes, including partial index predicates and expression indexes.
+- Column defaults and generated column expressions.
+- Row-level security policies (`pg_policy` stores parsed expressions).
+- Rules, triggers' `WHEN` clauses and `UPDATE OF column` lists.
+- Sequences owned by the column (`OWNED BY`).
+- SQL-standard function bodies written with `BEGIN ATOMIC ... END` (PostgreSQL 14+), because they are parsed and stored as dependency trees.
+
+**Not updated (stored as plain text):**
+
+- Your application code, ORM models and migration files.
+- `PL/pgSQL`, `PL/Python` and any other procedural function or trigger bodies. The body in `pg_proc.prosrc` is a string; it is parsed at execution time, so a trigger that does `NEW.fullname` will fail on its next fire with `ERROR: record "new" has no field "fullname"`.
+- Classic SQL functions defined with `AS $$ ... $$` (as opposed to `BEGIN ATOMIC`). Those are also stored as text.
+- Dynamic SQL built with `EXECUTE format(...)`.
+- Saved queries, BI dashboards, cron jobs, `COPY` scripts, `pg_dump` output, and `psql` scripts.
+- `search_path` values and `ALTER ROLE ... SET` settings that mention schema names.
+- Prepared statements and cached plans in connected sessions are invalidated and re-planned; that is fine for references by OID, but any plain-text SQL in the client that names the old column will error with `column "fullname" does not exist`.
+
+To find text references inside the database, grep the catalog:
+
+```sql
+SELECT n.nspname, p.proname
+FROM pg_proc p
+JOIN pg_namespace n ON n.oid = p.pronamespace
+WHERE p.prosrc ILIKE '%fullname%'
+  AND n.nspname NOT IN ('pg_catalog', 'information_schema');
+```
+
+## Finding dependencies before you rename
+
+Before renaming a table or column, list everything that points at it. `pg_depend` is the authoritative source; `information_schema` offers friendlier views.
+
+```sql
+-- Views that reference a given table
+SELECT DISTINCT dependent_ns.nspname AS view_schema,
+       dependent_view.relname        AS view_name
+FROM pg_depend d
+JOIN pg_rewrite r            ON r.oid = d.objid
+JOIN pg_class dependent_view ON dependent_view.oid = r.ev_class
+JOIN pg_class source_table   ON source_table.oid = d.refobjid
+JOIN pg_namespace dependent_ns ON dependent_ns.oid = dependent_view.relnamespace
+WHERE source_table.relname = 'clients'
+  AND d.classid = 'pg_rewrite'::regclass
+  AND dependent_view.oid <> source_table.oid;
+```
+
+```sql
+-- Views that use a specific column
+SELECT view_schema, view_name
+FROM information_schema.view_column_usage
+WHERE table_name = 'clients' AND column_name = 'full_name';
+
+-- Foreign keys pointing at a table
+SELECT tc.constraint_name, tc.table_name AS referencing_table
+FROM information_schema.table_constraints tc
+JOIN information_schema.constraint_column_usage ccu
+  ON ccu.constraint_name = tc.constraint_name
+WHERE tc.constraint_type = 'FOREIGN KEY'
+  AND ccu.table_name = 'clients';
+
+-- Triggers on the table (their bodies need manual review)
+SELECT tgname, pg_get_triggerdef(oid)
+FROM pg_trigger
+WHERE tgrelid = 'orders'::regclass AND NOT tgisinternal;
+```
+
+## Locking behavior: ACCESS EXCLUSIVE but brief
+
+Every `ALTER TABLE ... RENAME` (column or table) takes an `ACCESS EXCLUSIVE` lock on the table. The rename itself is a catalog-only update that finishes in milliseconds, so the lock is held for a very short time. The danger is not the duration, it is the queue:
+
+1. The rename has to **wait** for any open transaction that holds a conflicting lock, even a plain `SELECT` that has not committed.
+2. While it waits, every new query on that table queues behind it.
+
+A long-running report plus a rename can therefore freeze an application. Always set a lock timeout and retry:
+
+```sql
+SET lock_timeout = '3s';
+ALTER TABLE orders RENAME COLUMN total TO total_amount;
+-- ERROR:  canceling statement due to lock timeout  -> just run it again later
+```
+
+`ALTER INDEX ... RENAME` has been lighter since PostgreSQL 12: it only needs `SHARE UPDATE EXCLUSIVE`, so it does not block reads or writes. `ALTER DATABASE ... RENAME TO` does not lock tables at all, but as shown above it requires zero other connections.
+
+## IF EXISTS and idempotent rename scripts
+
+`IF EXISTS` is available on the object, not on the column:
+
+```sql
+ALTER TABLE IF EXISTS legacy_customers RENAME TO clients;  -- NOTICE, not ERROR, if missing
+ALTER INDEX IF EXISTS old_idx RENAME TO new_idx;
+ALTER SEQUENCE IF EXISTS old_seq RENAME TO new_seq;
+ALTER VIEW IF EXISTS old_view RENAME TO new_view;
+```
+
+There is no `RENAME COLUMN IF EXISTS`. For re-runnable migrations wrap it in a `DO` block:
+
+```sql
+DO $$
+BEGIN
+    IF EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_schema = 'public'
+          AND table_name   = 'clients'
+          AND column_name  = 'fullname'
+    ) THEN
+        ALTER TABLE clients RENAME COLUMN fullname TO full_name;
+    END IF;
+END $$;
+```
+
+## Case sensitivity and quoted identifiers
+
+Unquoted identifiers are folded to lowercase; quoted ones are stored exactly as written. This is the source of most "column does not exist" surprises after a rename.
+
+```sql
+CREATE TABLE "UserProfile" ("UserName" text);
+
+ALTER TABLE UserProfile RENAME COLUMN UserName TO user_name;
+-- ERROR:  relation "userprofile" does not exist
+
+ALTER TABLE "UserProfile" RENAME COLUMN "UserName" TO user_name;  -- works
+ALTER TABLE "UserProfile" RENAME TO user_profile;                 -- normalizes the table name
+```
+
+Renaming mixed-case identifiers to snake_case is one of the most common uses of these commands, and the second statement is how you do it: quote the old name, leave the new one unquoted.
+
+## Renaming in a transaction and rolling back
+
+DDL in PostgreSQL is transactional, which makes renames safe to rehearse:
+
+```sql
+BEGIN;
+ALTER TABLE orders RENAME COLUMN total TO total_amount;
+SELECT total_amount FROM orders LIMIT 1;   -- verify
+SELECT pg_get_viewdef('client_orders');    -- check dependent view text
+ROLLBACK;                                  -- or COMMIT
+```
+
+After `ROLLBACK` the column is `total` again and no other session ever saw the change. Keep in mind that the `ACCESS EXCLUSIVE` lock is held until the transaction ends, so do not leave such a transaction open while you think.
+
+## Zero-downtime column rename strategy
+
+Because application code is not updated automatically, a direct rename on a busy table breaks every deployed instance until the new code ships. Two proven patterns avoid that.
+
+### Pattern 1: add, sync, switch, drop (expand and contract)
+
+```sql
+-- Step 1: expand
+ALTER TABLE orders ADD COLUMN total_amount numeric(12,2);
+
+-- Step 2: keep both in sync while old and new code coexist
+CREATE OR REPLACE FUNCTION orders_sync_total() RETURNS trigger AS $$
+BEGIN
+    IF NEW.total_amount IS DISTINCT FROM OLD.total_amount THEN
+        NEW.total := NEW.total_amount;
+    ELSE
+        NEW.total_amount := NEW.total;
+    END IF;
+    RETURN NEW;
+END $$ LANGUAGE plpgsql;
+
+CREATE TRIGGER orders_sync_total_trg
+BEFORE INSERT OR UPDATE ON orders
+FOR EACH ROW EXECUTE FUNCTION orders_sync_total();
+
+-- Step 3: backfill in batches to keep locks and WAL small
+UPDATE orders SET total_amount = total
+WHERE id BETWEEN 1 AND 100000 AND total_amount IS NULL;
+-- ...repeat for the next ranges
+
+-- Step 4: deploy code that reads/writes total_amount
+-- Step 5: contract
+DROP TRIGGER orders_sync_total_trg ON orders;
+DROP FUNCTION orders_sync_total();
+ALTER TABLE orders DROP COLUMN total;
+```
+
+### Pattern 2: rename, then publish a compatibility view
+
+For table renames, rename immediately and leave a view with the old name. Simple single-table views are automatically updatable, so old code can still `INSERT`, `UPDATE` and `DELETE` through it.
+
+```sql
+BEGIN;
+ALTER TABLE customers RENAME TO clients;
+CREATE VIEW customers AS SELECT * FROM clients;
+COMMIT;
+-- later, once all code uses "clients":
+DROP VIEW customers;
+```
+
+The same trick works for a column: rename it, then expose the old name as an alias in a view that old code is pointed at.
+
+## Summary and key takeaways
+
+- `ALTER TABLE t RENAME COLUMN a TO b` and `ALTER TABLE t RENAME TO u` are instant, transactional, catalog-only changes that take a brief `ACCESS EXCLUSIVE` lock. Set `lock_timeout`.
+- `ALTER DATABASE d RENAME TO e` needs zero other connections; connect elsewhere, disable connections, terminate sessions with `pg_terminate_backend`, then rename.
+- Views, constraints, indexes, defaults, policies and sequences follow the rename because they reference OIDs. Their names do not change.
+- PL/pgSQL bodies, dynamic SQL, classic `$$` SQL functions, application code and saved queries are plain text and must be updated by hand. Grep `pg_proc.prosrc`.
+- `IF EXISTS` exists for tables, indexes, sequences and views, not for columns; use a `DO` block.
+- Quoted identifiers are case-sensitive; quote the old name when renaming mixed-case columns.
+- For busy tables, use expand-and-contract or a compatibility view instead of an in-place rename.
+
+## FAQ
+
+### Does renaming a column in Postgres break views and foreign keys?
+
+No. Views, foreign keys, indexes, check constraints and defaults reference the column by table OID and attribute number, so they keep working and `pg_get_viewdef` immediately shows the new name. Only view *output* column names and index or constraint *names* stay as they were, and you can rename those separately.
+
+### Why does ALTER DATABASE RENAME fail with "current database cannot be renamed"?
+
+Because you are connected to the database you are trying to rename. Connect to another database such as `postgres`, terminate other sessions with `pg_terminate_backend(pid)` from `pg_stat_activity`, and run the rename from there. You also need to be the owner with `CREATEDB` or a superuser.
+
+### Is a Postgres rename column operation slow on large tables?
+
+No. The statement only updates `pg_attribute`; it does not touch table data, so it completes in milliseconds regardless of row count. What can be slow is waiting for the `ACCESS EXCLUSIVE` lock behind long-running transactions, which is why you should set `lock_timeout` and run it during a quiet period.

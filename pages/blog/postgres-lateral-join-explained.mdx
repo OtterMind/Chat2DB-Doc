@@ -1,0 +1,354 @@
+---
+title: "Postgres LATERAL Join: CROSS and LEFT JOIN LATERAL"
+description: "Learn the Postgres LATERAL join: CROSS JOIN LATERAL vs LEFT JOIN LATERAL, top-N per group, set-returning functions, EXPLAIN plans, and indexing tips."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: August 22, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# Postgres LATERAL Join: CROSS and LEFT JOIN LATERAL
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="August 22, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+A Postgres LATERAL join lets a subquery in the `FROM` clause reference columns from the tables listed before it. Without `LATERAL`, each item in `FROM` is evaluated independently and cannot "see" its neighbors. With `LATERAL`, PostgreSQL evaluates the subquery once per row of the preceding item, which is why people describe a lateral join as a "for each row" loop or a correlated subquery that lives in `FROM` instead of `SELECT` or `WHERE`. This guide covers `CROSS JOIN LATERAL`, `LEFT JOIN LATERAL ... ON true`, the classic top-N-per-group pattern, how LATERAL compares with window functions and `DISTINCT ON`, the implicit LATERAL rule for set-returning functions, what the execution plan looks like, and when a lateral join is the wrong tool.
+
+## Sample schema: customers and orders
+
+All examples below run on PostgreSQL 14 through 17. Create the tables first so you can follow along. You can paste this into Chat2DB, a free AI-powered SQL client (download at https://chat2db.ai/download or use the web version at https://app.chat2db.ai), or into `psql`.
+
+```sql
+CREATE TABLE customers (
+    customer_id  serial PRIMARY KEY,
+    name         text NOT NULL,
+    country      text NOT NULL
+);
+
+CREATE TABLE orders (
+    order_id     serial PRIMARY KEY,
+    customer_id  int  NOT NULL REFERENCES customers(customer_id),
+    ordered_at   timestamptz NOT NULL,
+    amount       numeric(10,2) NOT NULL,
+    items        jsonb NOT NULL DEFAULT '[]'
+);
+
+INSERT INTO customers (name, country) VALUES
+    ('Alice', 'US'),
+    ('Bruno', 'BR'),
+    ('Chen',  'CN'),
+    ('Dana',  'US');   -- Dana has no orders on purpose
+
+INSERT INTO orders (customer_id, ordered_at, amount, items) VALUES
+    (1, '2026-08-01 10:00+00',  42.00, '["pen","notebook"]'),
+    (1, '2026-08-05 09:30+00', 120.50, '["monitor"]'),
+    (1, '2026-08-10 14:15+00',  15.25, '["cable"]'),
+    (1, '2026-08-18 08:00+00',  99.99, '["keyboard","mouse"]'),
+    (2, '2026-08-03 11:00+00',  60.00, '["chair"]'),
+    (2, '2026-08-20 16:45+00',  33.10, '["lamp"]'),
+    (3, '2026-08-12 12:00+00', 250.00, '["desk"]');
+```
+
+Four customers, seven orders, and one customer (Dana) with no orders at all. That last row matters when we get to `LEFT JOIN LATERAL`.
+
+## What a Postgres LATERAL join actually does
+
+Try the correlated subquery without `LATERAL`:
+
+```sql
+SELECT c.name, o.order_id
+FROM customers c,
+     (SELECT order_id FROM orders WHERE customer_id = c.customer_id) o;
+```
+
+```text
+ERROR:  invalid reference to FROM-clause entry for table "c"
+HINT:  There is an entry for table "c", but it cannot be referenced from this part of the query.
+```
+
+The hint is precise: `c` exists, but a plain subquery in `FROM` is evaluated in isolation. Add `LATERAL` and the reference becomes legal:
+
+```sql
+SELECT c.name, o.order_id
+FROM customers c,
+     LATERAL (SELECT order_id FROM orders WHERE customer_id = c.customer_id) o;
+```
+
+Semantically, PostgreSQL now does this:
+
+1. Take the first row of `customers`.
+2. Evaluate the lateral subquery with that row's `customer_id` plugged in.
+3. Emit one output row per row the subquery returns.
+4. Move to the next customer and repeat.
+
+The subquery can reference any `FROM` item that appears *to its left*; it cannot reference items to its right. Because the subquery is a complete `SELECT`, it may contain `ORDER BY`, `LIMIT`, aggregates, `GROUP BY`, or even another join.
+
+## CROSS JOIN LATERAL vs LEFT JOIN LATERAL ON true
+
+The comma syntax above is shorthand for `CROSS JOIN LATERAL`. The two forms are identical:
+
+```sql
+SELECT c.name, o.order_id
+FROM customers c
+CROSS JOIN LATERAL (
+    SELECT order_id FROM orders WHERE customer_id = c.customer_id
+) o;
+```
+
+A cross join drops any left-hand row for which the subquery returns zero rows. Dana disappears from the result. If you need to keep every left-hand row, switch to `LEFT JOIN LATERAL`. There is a syntactic catch: `LEFT JOIN` requires an `ON` clause, and since the correlation already lives inside the subquery, you supply the trivially true condition `ON true`:
+
+```sql
+SELECT c.name, o.order_id
+FROM customers c
+LEFT JOIN LATERAL (
+    SELECT order_id FROM orders WHERE customer_id = c.customer_id
+) o ON true
+ORDER BY c.name, o.order_id;
+```
+
+```text
+ name  | order_id
+-------+----------
+ Alice |        1
+ Alice |        2
+ Alice |        3
+ Alice |        4
+ Bruno |        5
+ Bruno |        6
+ Chen  |        7
+ Dana  |   (null)
+```
+
+Rule of thumb: use `CROSS JOIN LATERAL` when "no match" should eliminate the row, and `LEFT JOIN LATERAL ... ON true` when the left side is the driving list and the subquery is optional decoration.
+
+## Top-N per group: latest 3 orders per customer
+
+This is the canonical lateral join use case and the reason most people learn it. You want the three most recent orders for every customer. Because the subquery is a full `SELECT`, you can put `ORDER BY` and `LIMIT` inside it, and they apply per customer:
+
+```sql
+SELECT c.name, recent.order_id, recent.ordered_at, recent.amount
+FROM customers c
+LEFT JOIN LATERAL (
+    SELECT o.order_id, o.ordered_at, o.amount
+    FROM   orders o
+    WHERE  o.customer_id = c.customer_id
+    ORDER  BY o.ordered_at DESC
+    LIMIT  3
+) recent ON true
+ORDER BY c.name, recent.ordered_at DESC;
+```
+
+```text
+ name  | order_id |       ordered_at       | amount
+-------+----------+------------------------+--------
+ Alice |        4 | 2026-08-18 08:00:00+00 |  99.99
+ Alice |        3 | 2026-08-10 14:15:00+00 |  15.25
+ Alice |        2 | 2026-08-05 09:30:00+00 | 120.50
+ Bruno |        6 | 2026-08-20 16:45:00+00 |  33.10
+ Bruno |        5 | 2026-08-03 11:00:00+00 |  60.00
+ Chen  |        7 | 2026-08-12 12:00:00+00 | 250.00
+ Dana  |   (null) |                 (null) | (null)
+```
+
+Alice has four orders but only three appear. Dana is retained with nulls because of `LEFT JOIN LATERAL`. Change `LIMIT 3` to `LIMIT 1` and you have "latest order per customer" in one readable query.
+
+### The same query with ROW_NUMBER()
+
+A window function solves the same problem without LATERAL:
+
+```sql
+SELECT name, order_id, ordered_at, amount
+FROM (
+    SELECT c.name, o.order_id, o.ordered_at, o.amount,
+           ROW_NUMBER() OVER (PARTITION BY o.customer_id
+                              ORDER BY o.ordered_at DESC) AS rn
+    FROM   orders o
+    JOIN   customers c USING (customer_id)
+) ranked
+WHERE rn <= 3
+ORDER BY name, ordered_at DESC;
+```
+
+Differences worth knowing:
+
+- `ROW_NUMBER()` must scan and sort *all* orders before it can discard anything. LATERAL with an index can stop after three rows per customer.
+- The window version naturally drops customers with no orders (inner join); you would need an extra outer join to keep Dana.
+- The window version is one pass over `orders`, which wins when most customers have only a handful of orders and you are returning most of the table anyway.
+
+### The same query with DISTINCT ON
+
+For `LIMIT 1` specifically, PostgreSQL's `DISTINCT ON` is the most compact option:
+
+```sql
+SELECT DISTINCT ON (o.customer_id)
+       c.name, o.order_id, o.ordered_at, o.amount
+FROM   orders o
+JOIN   customers c USING (customer_id)
+ORDER  BY o.customer_id, o.ordered_at DESC;
+```
+
+`DISTINCT ON` cannot do "top 3", and like `ROW_NUMBER()` it sorts the whole input. It is also PostgreSQL-only syntax. LATERAL is the one pattern that handles top-1, top-N, optional rows, and per-group aggregates uniformly.
+
+## LATERAL with set-returning functions
+
+A second major use case is exploding arrays, JSON, or ranges into rows, one expansion per parent row. Functions such as `unnest()`, `jsonb_array_elements()`, `jsonb_each()`, `regexp_matches()`, and `generate_series()` are set-returning functions (SRFs), and they work naturally in a lateral position:
+
+```sql
+SELECT o.order_id, item.value AS item_name
+FROM   orders o
+CROSS JOIN LATERAL jsonb_array_elements_text(o.items) AS item(value)
+WHERE  o.customer_id = 1
+ORDER  BY o.order_id;
+```
+
+```text
+ order_id | item_name
+----------+-----------
+        1 | pen
+        1 | notebook
+        2 | monitor
+        3 | cable
+        4 | keyboard
+        4 | mouse
+```
+
+### The implicit LATERAL rule for functions
+
+PostgreSQL has a convenience rule: a function call in `FROM` may reference earlier `FROM` items even without the `LATERAL` keyword. The keyword is implied. So this is valid and identical to the query above:
+
+```sql
+SELECT o.order_id, item.value
+FROM   orders o,
+       jsonb_array_elements_text(o.items) AS item(value);
+```
+
+The implicit rule applies *only* to function calls, not to parenthesized subqueries. `FROM t, (SELECT ... t.col ...)` still fails; `FROM t, some_function(t.col)` works. Many people still write `LATERAL` explicitly for functions because it signals intent to the next reader.
+
+`generate_series` is a common companion for gap filling, for example producing one row per day for each customer between their first and last order:
+
+```sql
+SELECT c.name, d.day::date
+FROM   customers c
+CROSS JOIN LATERAL (
+    SELECT min(ordered_at) AS first_at, max(ordered_at) AS last_at
+    FROM   orders WHERE customer_id = c.customer_id
+) span
+CROSS JOIN LATERAL generate_series(span.first_at, span.last_at, interval '1 day') AS d(day)
+WHERE  c.customer_id = 2;
+```
+
+Note that `span` itself is lateral (it reads `c.customer_id`), and the `generate_series` call is lateral too (it reads `span.first_at`). LATERAL items chain left to right.
+
+## Computing derived columns once and reusing them
+
+SQL does not let a `SELECT` list expression reference an alias defined in the same list. The usual workaround is to repeat the expression or wrap everything in a subquery or CTE. A `LATERAL (SELECT ...) AS calc` is a lighter alternative that keeps the calculation next to the row it belongs to:
+
+```sql
+SELECT o.order_id,
+       o.amount,
+       calc.tax,
+       calc.total,
+       calc.total * 0.1 AS loyalty_points
+FROM   orders o
+CROSS JOIN LATERAL (
+    SELECT round(o.amount * 0.0825, 2)              AS tax,
+           round(o.amount * 0.0825, 2) + o.amount   AS total
+) calc
+WHERE  o.customer_id = 1;
+```
+
+Because the subquery has no `FROM` clause and no `WHERE`, it always returns exactly one row, so it never filters or multiplies the outer rows. The planner typically inlines it (it appears as a plain expression in the plan, not a subplan), so the cost is essentially zero. You can stack several `LATERAL` blocks where each builds on the previous one, reading top to bottom like variable assignments.
+
+## EXPLAIN plan shape and indexing advice
+
+Run `EXPLAIN` on the top-3 query and you will see the characteristic structure of a Postgres lateral join: a **Nested Loop** whose inner side is re-executed for every outer row.
+
+```sql
+EXPLAIN (ANALYZE, COSTS OFF)
+SELECT c.name, recent.order_id
+FROM customers c
+LEFT JOIN LATERAL (
+    SELECT o.order_id FROM orders o
+    WHERE  o.customer_id = c.customer_id
+    ORDER  BY o.ordered_at DESC
+    LIMIT  3
+) recent ON true;
+```
+
+```text
+Nested Loop Left Join (actual rows=7 loops=1)
+  ->  Seq Scan on customers c (actual rows=4 loops=1)
+  ->  Limit (actual rows=2 loops=4)
+        ->  Sort (actual rows=2 loops=4)
+              Sort Key: o.ordered_at DESC
+              ->  Seq Scan on orders o (actual rows=2 loops=4)
+                    Filter: (customer_id = c.customer_id)
+```
+
+Look at `loops=4`: the inner plan ran once per customer. On seven rows a `Seq Scan` plus `Sort` is fine, but on millions of orders every loop would rescan and sort the whole table. The fix is a composite index on the correlated column followed by the `ORDER BY` column, in matching direction:
+
+```sql
+CREATE INDEX orders_customer_recent_idx
+    ON orders (customer_id, ordered_at DESC);
+```
+
+With that index, and enough rows for the planner to prefer it, the inner side becomes:
+
+```text
+  ->  Limit (actual rows=3 loops=1000)
+        ->  Index Scan using orders_customer_recent_idx on orders o
+              Index Cond: (customer_id = c.customer_id)
+```
+
+No sort node at all: the index already delivers rows in `ordered_at DESC` order for a given customer, and `LIMIT 3` stops after three index entries. This is the scenario where LATERAL beats every alternative. Include the `ORDER BY` column in the index; an index on `customer_id` alone still forces a sort of each customer's rows.
+
+The general indexing rule for lateral joins: whatever column the subquery's `WHERE` correlates on should be the leading column of an index, and any `ORDER BY` inside the subquery should follow it.
+
+## When LATERAL is slower than a window function
+
+A nested loop pays a per-outer-row cost. That is cheap when each inner lookup is an index probe returning a few rows, and expensive when any of these hold:
+
+- **Many outer rows, full inner scans.** Without a usable index, N outer rows mean N scans of the inner table.
+- **You need most of the inner table anyway.** If you want the top 3 orders for every customer and customers average 4 orders, LATERAL touches nearly all of `orders` through thousands of small index probes; a single sequential scan with `ROW_NUMBER()` (or a hash join) is usually faster.
+- **Running totals or rank across the whole set.** Window functions compute `SUM() OVER`, `LAG()`, `RANK()` in one pass; LATERAL would need a correlated aggregate per row, which is quadratic.
+- **Large N in LIMIT N.** The benefit of stopping early shrinks as N grows.
+
+PostgreSQL's planner will not convert a lateral subquery with `LIMIT` into a window function or vice versa, so the choice is yours. When in doubt, write both and compare `EXPLAIN (ANALYZE, BUFFERS)` on realistic data volumes. Chat2DB's visual explain view makes the Nested Loop versus WindowAgg difference easy to spot.
+
+## Portability: MySQL, SQL Server, and the standard
+
+`LATERAL` is part of the SQL standard (SQL:1999), so it is not a PostgreSQL invention, but support varies:
+
+- **PostgreSQL**: supported since 9.3 (2013); all examples here work on 14, 15, 16, and 17.
+- **MySQL**: `LATERAL` derived tables arrived in 8.0.14. Earlier versions raise a syntax error, and the `ON true` trick is written the same way.
+- **SQL Server**: no `LATERAL` keyword. `CROSS APPLY` is the equivalent of `CROSS JOIN LATERAL`, and `OUTER APPLY` is the equivalent of `LEFT JOIN LATERAL ... ON true`. The inner query is written identically; only the join keyword changes.
+- **Oracle**: supports `LATERAL` since 12c and also accepts `CROSS APPLY` / `OUTER APPLY`.
+- **SQLite and MariaDB**: no LATERAL support; use window functions or correlated subqueries in `SELECT`.
+
+If your SQL must run on several engines, window functions are the most portable top-N solution. If it only has to run on PostgreSQL, LATERAL is frequently the clearest and, with the right index, the fastest.
+
+## Summary
+
+- A Postgres LATERAL join allows a `FROM`-clause subquery to reference columns from items to its left; it runs once per outer row.
+- `CROSS JOIN LATERAL` (or a comma) drops outer rows with no inner match; `LEFT JOIN LATERAL ... ON true` keeps them with nulls.
+- Put `ORDER BY` and `LIMIT` inside the subquery for top-N per group; this is the pattern `ROW_NUMBER()` and `DISTINCT ON` cannot match for early termination.
+- Function calls in `FROM` (`unnest`, `jsonb_array_elements`, `generate_series`) are implicitly lateral; parenthesized subqueries are not.
+- Expect a Nested Loop in `EXPLAIN`; index the correlated column plus the inner `ORDER BY` column to avoid per-row sorts.
+- Prefer window functions when you are scanning most of the inner table anyway or computing running aggregates.
+- `CROSS APPLY` / `OUTER APPLY` are the SQL Server equivalents; MySQL needs 8.0.14 or later.
+
+## FAQ
+
+### Why does my LEFT JOIN LATERAL need ON true?
+
+Every `LEFT JOIN` in PostgreSQL grammatically requires an `ON` or `USING` clause. With a lateral subquery the filtering condition already lives inside the subquery (`WHERE o.customer_id = c.customer_id`), so there is nothing left to put in `ON`. `ON true` satisfies the parser and tells the planner every subquery row pairs with the current outer row. `CROSS JOIN LATERAL` and the comma form do not take an `ON` clause at all.
+
+### Can a LATERAL subquery reference a table that appears after it?
+
+No. The reference direction is strictly left to right in the `FROM` list. If you need mutual references, reorder the items or split the logic into a CTE. Also note that a lateral reference is only allowed when the combining join is `INNER` or `LEFT`; PostgreSQL rejects lateral references across a `RIGHT JOIN` or `FULL JOIN` with the error "The combining JOIN type must be INNER or LEFT for a LATERAL reference", because those join types have no well-defined outer row to iterate over.
+
+### Is a lateral join the same as a correlated subquery in the SELECT list?
+
+They are close relatives. A scalar correlated subquery in `SELECT` must return one column and at most one row per outer row. A LATERAL subquery in `FROM` can return many columns and many rows, and it can be outer-joined. If you find yourself writing three scalar subqueries in `SELECT` that all filter on the same key, replacing them with one `LEFT JOIN LATERAL` that returns three columns is usually both faster (one inner scan instead of three) and easier to read.
