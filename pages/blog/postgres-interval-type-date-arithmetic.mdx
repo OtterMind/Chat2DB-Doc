@@ -1,0 +1,295 @@
+---
+title: "Postgres INTERVAL: Date Arithmetic and DATEADD"
+description: "Postgres interval guide: literals, make_interval, adding intervals to dates as a DATEADD replacement, month-end and DST behavior, justify, EXTRACT and to_char."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: August 23, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# Postgres INTERVAL: Date Arithmetic and DATEADD
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="August 23, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+Every "add 30 days", "subtract one month" or "next billing date" in PostgreSQL goes through the `interval` type. There is no `DATEADD` function as in SQL Server and no `DATE_ADD` as in MySQL; instead you add or subtract an interval with the `+` and `-` operators, and the interval type itself carries enough structure to distinguish "1 day" from "24 hours" and "1 month" from "30 days". That structure is powerful but it has rules, and most surprising results (a billing date that drifts from the 31st to the 28th, a nightly job that runs an hour early after a DST change, a sort order that treats `1 month` and `30 days` as equal) come from not knowing them.
+
+This guide covers the Postgres interval type end to end for PostgreSQL 14 through 17: literal syntax, `make_interval`, multiplication, the DATEADD equivalent for `date`, `timestamp` and `timestamptz`, month-end and DST behavior, interval fields, internal storage, the `justify_*` functions, `EXTRACT`, `to_char`, comparison and sorting, `IntervalStyle`, `generate_series`, how to store durations, and what all of this means for indexes.
+
+## Sample data
+
+Paste this into Chat2DB (a free AI-powered SQL client, at https://app.chat2db.ai or downloadable from https://chat2db.ai/download) or psql. The examples assume `SET timezone = 'UTC';` except where noted.
+
+```sql
+CREATE TABLE subscriptions (
+    id          serial PRIMARY KEY,
+    plan        text NOT NULL,
+    started_at  timestamptz NOT NULL,
+    period      interval NOT NULL,
+    trial       interval DEFAULT interval '14 days'
+);
+
+INSERT INTO subscriptions (plan, started_at, period)
+SELECT CASE WHEN g % 2 = 0 THEN 'monthly' ELSE 'annual' END,
+       timestamptz '2024-01-31 10:00:00+00' + (g * interval '1 day'),
+       CASE WHEN g % 2 = 0 THEN interval '1 month' ELSE interval '1 year' END
+FROM generate_series(0, 5) AS g;
+```
+
+## Interval literals
+
+An interval literal is the keyword `interval` followed by a quoted string. PostgreSQL accepts three notations:
+
+```sql
+SELECT interval '1 day';                         -- 1 day
+SELECT interval '2 hours 30 minutes';            -- 02:30:00
+SELECT interval '1 year 2 months 3 days 4 hours'; -- 1 year 2 mons 3 days 04:00:00
+SELECT interval '90 minutes';                    -- 01:30:00
+SELECT interval '36 hours';                      -- 36:00:00  (not rolled into days)
+SELECT interval 'P1Y2M3DT4H';                    -- ISO 8601: 1 year 2 mons 3 days 04:00:00
+SELECT interval 'PT36H';                         -- 36:00:00
+SELECT interval '1-2';                           -- SQL standard year-month: 1 year 2 mons
+SELECT interval '3 04:05:06';                    -- SQL standard day-time: 3 days 04:05:06
+```
+
+Units can be abbreviated (`1d`, `2h`, `30m`, `1 mon`, `2 weeks`) and the string can be negative (`'-1 day'` or `'1 day ago'`). One trap: a bare number with no unit is seconds, so `interval '1'` is one second, while `interval '1' YEAR` (a field-qualified literal, covered below) is one year. Also note the output above: hours and minutes are always folded into a time-of-day display, but hours are never folded into days and days are never folded into months unless you ask for it.
+
+## make_interval for dynamic values
+
+When the amount comes from a column or parameter, do not build strings. Use `make_interval`, which takes named integer arguments (`years`, `months`, `weeks`, `days`, `hours`, `mins`) and a double-precision `secs`:
+
+```sql
+SELECT make_interval(days => 3, hours => 4);        -- 3 days 04:00:00
+SELECT make_interval(months => 18);                 -- 1 year 6 mons
+SELECT make_interval(secs => 90.5);                 -- 00:01:30.5
+SELECT id, started_at + make_interval(days => id * 7) FROM subscriptions;
+```
+
+The alternative is multiplying a unit interval by a number, which also accepts fractions:
+
+```sql
+SELECT interval '1 day' * 3;      -- 3 days
+SELECT interval '1 day' * 1.5;    -- 1 day 12:00:00
+SELECT interval '1 month' * 1.5;  -- 1 mon 15 days  (half a month is defined as 15 days)
+SELECT interval '1 hour' / 4;     -- 00:15:00
+```
+
+Fractional multiplication cascades downward using 30 days per month and 24 hours per day, which is why `0.5 month` becomes 15 days rather than "half of whichever month".
+
+## Adding and subtracting intervals: the DATEADD equivalent
+
+SQL Server's `DATEADD(unit, n, d)` and MySQL's `DATE_ADD(d, INTERVAL n unit)` map directly to operator arithmetic:
+
+```sql
+-- DATEADD(day, 7, started_at)
+SELECT started_at + interval '7 days' FROM subscriptions;
+
+-- DATEADD(month, -1, started_at)
+SELECT started_at - interval '1 month' FROM subscriptions;
+
+-- dynamic count: DATEADD(day, n, d)
+SELECT started_at + n * interval '1 day' FROM subscriptions, (VALUES (10)) AS v(n);
+
+-- next renewal date using the stored period
+SELECT id, plan, started_at, started_at + period AS renews_at FROM subscriptions ORDER BY id;
+```
+
+```
+ id |  plan   |       started_at       |       renews_at
+----+---------+------------------------+------------------------
+  1 | monthly | 2024-01-31 10:00:00+00 | 2024-02-29 10:00:00+00
+  2 | annual  | 2024-02-01 10:00:00+00 | 2025-02-01 10:00:00+00
+  3 | monthly | 2024-02-02 10:00:00+00 | 2024-03-02 10:00:00+00
+  4 | annual  | 2024-02-03 10:00:00+00 | 2025-02-03 10:00:00+00
+  ...
+```
+
+Row 1 already shows month-end clamping (January 31 plus one month is February 29), which is covered in detail below.
+
+If you really want the familiar spelling, a two-line wrapper is enough: `CREATE FUNCTION dateadd(unit text, n int, d timestamptz) RETURNS timestamptz LANGUAGE sql STABLE RETURN d + (n * ('1 ' || unit)::interval);`. It is rarely worth it; the operator form reads fine.
+
+The result type follows the left operand with one important exception:
+
+```sql
+SELECT date '2024-03-01' + 7;                   -- date:      2024-03-08
+SELECT date '2024-03-01' - 7;                   -- date:      2024-02-23
+SELECT date '2024-03-01' + interval '7 days';   -- timestamp: 2024-03-08 00:00:00
+SELECT timestamp '2024-03-01 08:00' + interval '90 minutes';   -- 2024-03-01 09:30:00
+SELECT timestamptz '2024-03-01 08:00+00' + interval '1 month'; -- 2024-04-01 08:00:00+00
+```
+
+`date + integer` adds days and stays a `date`. `date + interval` promotes to `timestamp` even when the interval is whole days, so cast back with `::date` if you need a date column or a date comparison.
+
+## Month-end behavior
+
+Adding months clamps to the last valid day of the target month instead of overflowing:
+
+```sql
+SELECT date '2024-01-31' + interval '1 month';   -- 2024-02-29 00:00:00
+SELECT date '2024-01-31' + interval '2 months';  -- 2024-03-31 00:00:00
+SELECT (date '2024-01-31' + interval '1 month') + interval '1 month';  -- 2024-03-29 00:00:00
+```
+
+The third line shows the consequence: month arithmetic is not associative. Once a value has been clamped to the 29th, later additions start from the 29th. For billing schedules, always compute `anchor + n * interval '1 month'` from the original anchor date rather than chaining additions, or store the desired day-of-month separately and rebuild the date with `make_date` and `LEAST(day, days_in_month)`.
+
+## Interval fields: YEAR TO MONTH, DAY TO SECOND
+
+Both literals and column types can restrict which fields an interval may hold. Fields to the right of the least significant allowed field are silently dropped; fields to the left are kept:
+
+```sql
+SELECT interval '1 year 2 months 3 days' YEAR TO MONTH;     -- 1 year 2 mons
+SELECT interval '1 day 02:03:04.567' DAY TO SECOND(1);      -- 1 day 02:03:04.6
+SELECT interval '1 day 02:03:04' HOUR TO MINUTE;            -- 1 day 02:03:00
+
+CREATE TABLE sla (name text, target interval HOUR TO MINUTE);
+INSERT INTO sla VALUES ('gold', '4 hours 30 minutes 59 seconds');
+SELECT * FROM sla;   -- gold | 04:30:00
+```
+
+The optional `(p)` after `SECOND` sets fractional-second precision from 0 to 6. In practice most schemas use plain `interval`; field restrictions are useful when you want the database to guarantee that a duration never carries months (so it is always an exact number of seconds) or never carries seconds.
+
+## Storage: months, days, microseconds, and why '1 day' is not '24 hours'
+
+An interval is stored as three separate integers: months (4 bytes), days (4 bytes) and microseconds (8 bytes), 16 bytes total. PostgreSQL never silently converts between the three because a month is not a fixed number of days and, under daylight saving time, a day is not a fixed number of hours. This is the whole reason `interval '1 day'` and `interval '24 hours'` are different values.
+
+The difference is visible only with `timestamptz` in a DST-observing zone. When the interval has a months or days component, PostgreSQL converts the timestamp to local time, adds the calendar units so the wall-clock time is preserved, and converts back. The microseconds component is added as absolute elapsed time:
+
+```sql
+SET timezone = 'America/New_York';     -- clocks jump forward on 2024-03-10 at 02:00
+SELECT timestamptz '2024-03-09 12:00' + interval '1 day';     -- 2024-03-10 12:00:00-04 (23 elapsed hours)
+SELECT timestamptz '2024-03-09 12:00' + interval '24 hours';  -- 2024-03-10 13:00:00-04 (24 elapsed hours)
+RESET timezone;
+```
+
+Use day/month intervals for "same time tomorrow" scheduling and hour/second intervals for "exactly N hours from now" expiry. PostgreSQL 16 adds `date_add(timestamptz, interval, zone)` and `date_subtract` so you can name the zone in which the calendar arithmetic happens instead of relying on the session setting.
+
+## justify_days, justify_hours and justify_interval
+
+The `justify_*` functions normalize an interval for display using the nominal ratios of 30 days per month and 24 hours per day:
+
+```sql
+SELECT justify_hours(interval '36 hours');             -- 1 day 12:00:00
+SELECT justify_days(interval '45 days');               -- 1 mon 15 days
+SELECT justify_interval(interval '1 mon -1 hour');     -- 29 days 23:00:00
+SELECT justify_interval(interval '400 days 30 hours'); -- 1 year 1 mon 11 days 06:00:00
+```
+
+`justify_interval` also fixes mixed signs, which is why `1 mon -1 hour` becomes `29 days 23:00:00`. Because these use the 30-day month, they are for presentation and rough bucketing, not for calendar-exact arithmetic; never justify an interval and then add it back to a timestamp expecting the original result.
+
+## EXTRACT from an interval
+
+`EXTRACT(field FROM interval)` returns a single stored field, not a total. Only `EPOCH` gives a total, and it uses 365.25 days per year and 30 days per month for the months component:
+
+```sql
+SELECT EXTRACT(HOUR  FROM interval '26 hours 5 minutes');   -- 26
+SELECT EXTRACT(DAY   FROM interval '26 hours 5 minutes');   -- 0
+SELECT EXTRACT(MONTH FROM interval '1 year 14 months');     -- 2   (years and months are normalized together)
+SELECT EXTRACT(YEAR  FROM interval '1 year 14 months');     -- 2
+SELECT EXTRACT(EPOCH FROM interval '1 day 2 hours');        -- 93600
+SELECT EXTRACT(EPOCH FROM interval '1 month');              -- 2592000  (30 days)
+SELECT EXTRACT(EPOCH FROM interval '1 year');               -- 31557600 (365.25 days)
+```
+
+To convert a day/time-only interval to a number, `EXTRACT(EPOCH FROM i) / 3600` (hours) or `/ 86400` (days) is exact. For intervals containing months, there is no exact number; anchor them to a real date first (`(d + i) - d`) and then extract.
+
+## Formatting with to_char
+
+`to_char(interval, format)` prints intervals with the same pattern letters as timestamps. `HH24` shows the raw hours field, so it can exceed 23:
+
+```sql
+SELECT to_char(interval '26 hours 5 minutes 9 seconds', 'HH24:MI:SS');          -- 26:05:09
+SELECT to_char(interval '3 days 4 hours', 'DD "days" HH24 "hours"');            -- 03 days 04 hours
+SELECT to_char(justify_hours(interval '26 hours 5 minutes'), 'DD"d" HH24"h" MI"m"'); -- 01d 02h 05m
+```
+
+Combine with `justify_hours` first if you want hours folded into days. For locale-friendly text, `age()`'s default output (`1 year 2 mons 3 days`) is usually more readable than hand-built formats.
+
+## Comparison and sorting
+
+Intervals compare by converting to a single microsecond count with the nominal ratios (1 month = 30 days, 1 day = 24 hours). The consequences are important:
+
+```sql
+SELECT interval '1 month' = interval '30 days';    -- true
+SELECT interval '1 day'   = interval '24 hours';   -- true
+SELECT interval '1 month' < interval '31 days';    -- true
+SELECT interval '1 year'  = interval '360 days';   -- true (12 * 30 days)
+
+SELECT period FROM subscriptions ORDER BY period;  -- 1 mon rows first, then 1 year rows
+```
+
+So `ORDER BY`, `MIN`, `MAX`, `DISTINCT` and B-tree indexes on interval columns all treat `1 month` and `30 days` as equal. If the distinction matters, compare a derived value such as `started_at + period` instead of the interval itself. Aggregates work as expected: `SUM(interval)` and `AVG(interval)` return an interval, `AVG` over `'1 day'` and `'1 hour'` is `12:30:00`.
+
+## IntervalStyle: controlling the output format
+
+The `IntervalStyle` setting changes how intervals are printed (and, for `sql_standard`, how negative fields are interpreted on input):
+
+```sql
+SET IntervalStyle = 'postgres';          -- 1 year 2 mons 3 days 04:00:00   (default)
+SET IntervalStyle = 'postgres_verbose';  -- @ 1 year 2 mons 3 days 4 hours
+SET IntervalStyle = 'sql_standard';      -- 1-2 3 4:00:00
+SET IntervalStyle = 'iso_8601';          -- P1Y2M3DT4H
+SELECT interval '1 year 2 months 3 days 4 hours';
+RESET IntervalStyle;
+```
+
+`iso_8601` is the right choice when intervals are consumed by application code, since most languages have an ISO 8601 duration parser. Set it per session or in the connection string rather than globally, so `pg_dump` output and existing tooling are unaffected.
+
+## generate_series with interval steps
+
+`generate_series(start, stop, step interval)` is the standard way to build calendars, billing schedules and reporting buckets:
+
+```sql
+SELECT g::date AS month_start
+FROM generate_series(timestamp '2024-01-01', timestamp '2024-06-01', interval '1 month') AS g;
+
+-- 15-minute slots for one day
+SELECT g FROM generate_series(timestamptz '2024-03-01 00:00+00', timestamptz '2024-03-01 23:45+00', interval '15 minutes') AS g;
+```
+
+Watch out for month-end drift: the function adds the step cumulatively, so starting at `2024-01-31` produces `2024-02-29`, `2024-03-29`, `2024-04-29` and so on. To get true month-ends, generate month starts and subtract one day, or compute `anchor + n * interval '1 month'` over an integer series. PostgreSQL 16 also accepts an optional timezone argument for the `timestamptz` form so DST-aware daily steps can be pinned to a named zone.
+
+## Storing durations: interval vs integer seconds
+
+Both work; choose based on semantics. Store an `interval` when the duration is calendar-relative ("1 month", "2 weeks") or when you want to add it back to timestamps directly. Store `integer` or `bigint` seconds (or milliseconds) when the duration is a measured elapsed time (request latency, video length, session duration): it is 4 or 8 bytes instead of 16, aggregates and percentiles are plain numeric math, there is no 30-day-month ambiguity in comparisons, and every client driver handles it without a special type. Converting is trivial either way: `make_interval(secs => seconds)` and `EXTRACT(EPOCH FROM i)`. Avoid `text` columns such as `'1h30m'`; they cannot be compared, summed or indexed meaningfully.
+
+## Indexing and performance notes
+
+Interval arithmetic is cheap; the performance issues are about where it appears in a query.
+
+```sql
+CREATE INDEX subscriptions_started_at_idx ON subscriptions (started_at);
+
+-- Sargable: the column is bare, the constant is computed once
+SELECT * FROM subscriptions WHERE started_at >= now() - interval '30 days';
+
+-- Not sargable: the column is wrapped in arithmetic
+SELECT * FROM subscriptions WHERE started_at + interval '30 days' >= now();
+
+-- Sargable with an expression index or a generated column
+ALTER TABLE subscriptions
+  ADD COLUMN renews_at timestamptz GENERATED ALWAYS AS (started_at + period) STORED;
+CREATE INDEX subscriptions_renews_at_idx ON subscriptions (renews_at);
+SELECT * FROM subscriptions WHERE renews_at BETWEEN now() AND now() + interval '7 days';
+```
+
+`now() - interval '30 days'` is evaluated once per statement because `now()` is `STABLE`, so the planner can use it as an index boundary. Keep the interval on the constant side of the comparison, not on the column side. For append-only event tables, a BRIN index on the timestamp column is a compact alternative to B-tree for range queries with interval-based bounds. One last note: because `date + interval` yields a `timestamp`, a predicate like `date_col + interval '1 day' > now()` also forces an implicit cast per row; rewrite it as `date_col > (now() - interval '1 day')::date`.
+
+## FAQ
+
+### Is there a DATEADD function in PostgreSQL?
+
+No. Use `timestamp_or_date + interval 'N unit'` or `- interval 'N unit'`. For a dynamic count use `d + n * interval '1 day'` or `d + make_interval(days => n)`. Adding an integer to a `date` adds days directly and keeps the `date` type, while adding an interval to a `date` returns a `timestamp`.
+
+### Why does '2024-01-31' + interval '1 month' give February 29?
+
+PostgreSQL clamps to the last valid day of the target month rather than rolling into March. This is also why chained month additions drift: February 29 plus one month is March 29, not March 31. Compute each occurrence from the original anchor (`anchor + n * interval '1 month'`) to avoid drift.
+
+### How do I convert an interval to a number of hours or minutes?
+
+Use `EXTRACT(EPOCH FROM i) / 3600` for hours or `/ 60` for minutes. This is exact for intervals made of days and time; for intervals containing months the epoch uses a nominal 30-day month, so add the interval to a concrete date first and subtract if you need exact results.
+
+## Conclusion
+
+The Postgres interval type replaces DATEADD with plain `+` and `-`, and its three-part storage (months, days, microseconds) is what lets it model both calendar and elapsed durations correctly. Remember the rules: `date + integer` stays a date while `date + interval` becomes a timestamp; month additions clamp to month-end and should be computed from an anchor; `'1 day'` preserves wall-clock time across DST while `'24 hours'` does not; `justify_*`, `EXTRACT` and comparisons use nominal 30-day months; and `IntervalStyle` or `to_char` control output. Put the interval on the constant side of a `WHERE` clause so indexes stay usable, and pick `interval` or integer seconds for storage based on whether the duration is calendar-relative or measured.

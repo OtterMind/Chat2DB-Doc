@@ -1,0 +1,221 @@
+---
+title: "Text vs Varchar in Postgres: Which Should You Use?"
+description: "Text vs varchar in Postgres: how text, varchar(n) and char(n) are stored, why there is no performance difference, when ALTER TABLE rewrites, CHECK constraints."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: August 23, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# Text vs Varchar in Postgres: Which Should You Use?
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="August 23, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+If you come to PostgreSQL from MySQL, SQL Server or Oracle, the first instinct when designing a table is to pick a length for every string column: `varchar(255)` for names, `varchar(50)` for codes, `char(2)` for country codes. In Postgres that instinct is mostly unnecessary. The three character types (`text`, `varchar(n)` and `char(n)`) are stored the same way on disk, use the same indexes, and, in the words of the PostgreSQL documentation itself, there is no performance difference among them. This article explains what that means in practice, where `varchar(n)` still earns its keep, how `ALTER TABLE` behaves when you change a length, and how to enforce limits without painting yourself into a corner.
+
+Everything below applies to PostgreSQL 14 through 17 unless a version is called out.
+
+## The three types and how Postgres stores them
+
+PostgreSQL offers:
+
+- `text`: variable length, no limit other than the 1 GB per-value ceiling that applies to every variable-length datum.
+- `character varying(n)` / `varchar(n)`: variable length with an upper bound of `n` characters (characters, not bytes). Without `(n)` it is the same as `text`.
+- `character(n)` / `char(n)`: fixed length, blank-padded to exactly `n` characters on storage. Plain `char` means `char(1)`.
+
+Internally, all three are "varlena" types: each value carries a small length header (1 byte for values up to 126 bytes, 4 bytes otherwise) followed by the bytes of the string. When a row gets large (roughly 2 KB), the TOAST mechanism compresses long values and, if needed, moves them out of line into a separate TOAST table. This applies identically to `text`, `varchar(n)` and `char(n)`. There is no separate "fixed-width" storage path for `char(n)`; it simply stores the padding spaces too, which makes it larger, not faster.
+
+The documentation is explicit about this (section 8.3, Character Types): "There is no performance difference among these three types, apart from increased storage space when using the blank-padded type, and a few extra CPU cycles to check the length when storing into a length-constrained column. While character(n) has performance advantages in some other database systems, there is no such advantage in PostgreSQL; in fact character(n) is usually the slowest of the three because of its additional storage costs."
+
+That is the opposite of MySQL, where `VARCHAR(n)` affects temporary-table memory allocation and index prefix limits, and of SQL Server, where `varchar(max)` is stored and indexed differently from `varchar(n)`. Those rules do not carry over.
+
+### varchar(n) is text plus a length check
+
+The practical mental model: `varchar(n)` is `text` with a built-in check that the string is at most `n` characters. Inserting something longer raises an error; a value that is too long is not silently truncated, unless the only excess characters are spaces.
+
+```sql
+CREATE TABLE demo_types (
+  id     int GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  t      text,
+  v      varchar(5),
+  c      char(5)
+);
+
+INSERT INTO demo_types (t, v, c) VALUES ('abc', 'abc', 'abc');
+INSERT INTO demo_types (t, v, c) VALUES ('abcdefgh', 'abcdef', 'abc');
+-- ERROR:  value too long for type character varying(5)
+
+INSERT INTO demo_types (t, v, c) VALUES ('abc', 'abc   ', 'abc');  -- OK: trailing spaces trimmed to fit
+```
+
+Note the counting unit: `varchar(5)` allows five characters, so in a UTF-8 database `'héllo'` fits even though it is six bytes. `octet_length()` shows bytes, `length()` shows characters.
+
+### char(n) padding pitfalls
+
+`char(n)` pads with spaces and then mostly pretends the spaces do not exist, which causes surprises:
+
+```sql
+SELECT c, length(c), octet_length(c), c = 'abc' AS eq, c LIKE 'abc' AS like_match
+FROM demo_types WHERE id = 1;
+--   c   | length | octet_length | eq | like_match
+-- abc   |      3 |            5 | t  | f
+```
+
+Equality ignores the padding, `length()` ignores it, but `octet_length()` counts it and `LIKE 'abc'` fails because pattern matching treats the trailing spaces as significant. Casting to `text` strips the padding, so `c::text || '!'` gives `abc!`, while concatenating the raw `char` value in some contexts keeps the spaces. Sorting under a non-C collation can also behave unexpectedly because trailing spaces are treated as insignificant for `char` comparisons even where the collation would not. The advice is simple: do not use `char(n)`, even for "fixed" data such as ISO country codes. Use `text` or `varchar(2)` with a `CHECK` constraint.
+
+## Changing a varchar(n) length with ALTER TABLE
+
+Schemas evolve, and the cost of a length change depends on direction.
+
+Increasing the limit, or dropping it entirely by converting to `text`, has been a catalog-only operation since PostgreSQL 9.2. The table is not rewritten, and because `text` and `varchar` sort identically, existing btree indexes are not rebuilt either. The command still needs a brief `ACCESS EXCLUSIVE` lock to update the catalog, so it waits for running queries on the table to finish, but it does not scan the data.
+
+```sql
+CREATE TABLE customers (
+  id    bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  email varchar(50) NOT NULL
+);
+INSERT INTO customers (email)
+SELECT 'user' || g || '@example.com' FROM generate_series(1, 200000) g;
+
+-- Instant (metadata only):
+ALTER TABLE customers ALTER COLUMN email TYPE varchar(100);
+ALTER TABLE customers ALTER COLUMN email TYPE text;
+```
+
+Decreasing the limit is different. Postgres must verify that every existing value fits, and it does so by rewriting the whole table (and rebuilding its indexes), holding an `ACCESS EXCLUSIVE` lock for the duration. If any row is too long, the statement fails with `value too long for type character varying(n)` after having done the work.
+
+```sql
+-- Full rewrite, and fails if any value exceeds 20 chars:
+ALTER TABLE customers ALTER COLUMN email TYPE varchar(20);
+```
+
+Converting to `char(n)` also rewrites, because the stored bytes change (padding is added). So a schema that starts with `varchar(n)` can only be cheaply relaxed, never cheaply tightened.
+
+## Enforcing limits with CHECK constraints or domains instead
+
+Because the length in `varchar(n)` is baked into the type, you cannot add it with `NOT VALID`, and shrinking it always rewrites. A `CHECK` constraint gives you the same guarantee with far better operational properties:
+
+```sql
+ALTER TABLE customers
+  ADD CONSTRAINT customers_email_len CHECK (length(email) <= 254) NOT VALID;
+
+-- Later, in a separate transaction; scans the table but only takes a
+-- SHARE UPDATE EXCLUSIVE lock, so reads and writes continue:
+ALTER TABLE customers VALIDATE CONSTRAINT customers_email_len;
+```
+
+`NOT VALID` means new and updated rows are checked immediately while existing rows are not; `VALIDATE CONSTRAINT` then confirms the backlog without blocking normal traffic. To tighten the rule later, add the new constraint `NOT VALID`, validate it, and drop the old one. No table rewrite at any step.
+
+If many tables share the same rule, a domain centralizes it:
+
+```sql
+CREATE DOMAIN email_addr AS text
+  CHECK (length(VALUE) <= 254 AND VALUE ~ '^[^@\s]+@[^@\s]+$');
+
+CREATE TABLE signups (id bigserial PRIMARY KEY, email email_addr NOT NULL);
+
+-- Rules on a domain can also be added without validation and validated later:
+ALTER DOMAIN email_addr ADD CONSTRAINT email_lower CHECK (VALUE = lower(VALUE)) NOT VALID;
+ALTER DOMAIN email_addr VALIDATE CONSTRAINT email_lower;
+```
+
+One caveat: `ALTER DOMAIN ... ADD CONSTRAINT` without `NOT VALID` scans every table that uses the domain, so use `NOT VALID` on busy systems.
+
+## Index behavior
+
+Indexes do not care which of the three types you chose. A btree on `text` and a btree on `varchar(255)` are the same size and behave the same way. Two limits matter for long strings regardless of type:
+
+- A btree index entry cannot exceed roughly one third of a page. In PostgreSQL 12 and later the error reads `index row size N exceeds btree version 4 maximum 2704 for index "..."`. Inserting a 5,000-byte description into a column with a plain btree index fails at insert time, not at index creation time, if the table was empty when the index was built.
+- Indexing very long text is usually pointless anyway, because nobody queries `WHERE description = '...'` on a 5 KB value.
+
+If you do need equality lookups on long strings, index a hash of the value or use a hash index:
+
+```sql
+CREATE TABLE documents (
+  id   bigserial PRIMARY KEY,
+  body text NOT NULL
+);
+
+-- Option 1: functional btree on md5 (query must use the same expression)
+CREATE INDEX documents_body_md5_idx ON documents (md5(body));
+SELECT id FROM documents WHERE md5(body) = md5($1) AND body = $1;
+
+-- Option 2: hash index (equality only; WAL-logged and crash-safe since PG 10)
+CREATE INDEX documents_body_hash_idx ON documents USING hash (body);
+SELECT id FROM documents WHERE body = $1;
+```
+
+For prefix searches (`LIKE 'abc%'`) in a database whose default collation is not `C`, add an opclass: `CREATE INDEX ON customers (email text_pattern_ops);` (or `varchar_pattern_ops` for `varchar` columns). Again, the type does not change the rule, only the opclass name.
+
+## What ORMs generate by default
+
+Most of the `varchar(255)` columns in the wild exist because an ORM put them there:
+
+| ORM / framework | Field | Postgres column |
+|---|---|---|
+| Django | `CharField(max_length=100)` | `varchar(100)`; `max_length` is required (optional on Postgres since Django 4.2) |
+| Django | `TextField()` | `text` |
+| Rails / ActiveRecord | `t.string :name` | `character varying` (no limit unless `limit:` given) |
+| Rails / ActiveRecord | `t.text :body` | `text` |
+| Prisma | `String` | `text` (use `@db.VarChar(n)` to constrain) |
+| Hibernate / JPA | `String` | `varchar(255)` unless `@Column(length=...)` or `@Lob`/`columnDefinition` |
+| SQLAlchemy | `String(50)` / `String()` / `Text` | `varchar(50)` / `varchar` / `text` |
+| TypeORM | `string` | `character varying` (unlimited) |
+
+None of these choices affect Postgres performance. They only affect what happens when a value is one character too long, and how painful it is to change later.
+
+## Migrating from other databases
+
+Tools such as `pgloader`, `ora2pg` and AWS SCT preserve declared lengths, so a MySQL `VARCHAR(255)` arrives as `varchar(255)` and an Oracle `VARCHAR2(4000 BYTE)` arrives as `varchar(4000)`. A few things to check after migration:
+
+- Oracle limits are often in bytes; Postgres `varchar(n)` counts characters, so the limit becomes more permissive, which is normally fine.
+- SQL Server `nvarchar(max)` and MySQL `TEXT`/`MEDIUMTEXT`/`LONGTEXT` all map to plain `text`; the Postgres type has no size tiers.
+- MySQL silently truncates or pads depending on `sql_mode`; Postgres never truncates `varchar(n)` except for trailing spaces. Application code that relied on truncation will start receiving errors.
+- `char(n)` columns used for codes are worth converting to `text` with a `CHECK`, because the `LIKE` and concatenation behavior differs from what the source system did.
+
+## Collation and comparison semantics
+
+`text` and `varchar` compare identically under whatever collation the column (or database) uses. Under the default `en_US.utf8`-style collations, sorting is linguistic; under `C` or `C.UTF-8` it is by code point, which is faster and makes `LIKE 'prefix%'` indexable without a pattern opclass. You can set a collation per column (`email text COLLATE "C"`) on any of the three types.
+
+For case-insensitive matching you have two idiomatic options. The `citext` extension provides a type that compares case-insensitively with `=` and in unique indexes (`CREATE EXTENSION citext; ALTER TABLE customers ALTER COLUMN email TYPE citext;`). Since PostgreSQL 12 you can alternatively create a nondeterministic ICU collation (`CREATE COLLATION ci (provider = icu, locale = 'und-u-ks-level2', deterministic = false)`) and apply it to a `text` column; note that `LIKE` and pattern matching on nondeterministic collations only became available in PostgreSQL 17, so `citext` remains the simpler choice if you need those.
+
+If you want to compare declarations across environments quickly, querying `information_schema.columns` (columns `data_type` and `character_maximum_length`) in a SQL client such as Chat2DB, a free AI-powered SQL client available at https://chat2db.ai/download or in the browser at https://app.chat2db.ai, shows every string column and its declared limit in one result grid.
+
+## When varchar(n) is still reasonable
+
+"Use text" is the default, not a dogma. `varchar(n)` is a fine choice when:
+
+- The length is part of a real data contract: an ISO currency code is exactly three characters, a VAT number has a maximum length, a legacy mainframe file format fixes a width.
+- You want parity with an API or another system that will reject longer values anyway; failing early at the database is better than failing late downstream.
+- The schema is generated by an ORM and the team is happier keeping the model and the column in sync.
+
+The trade-off is that tightening the limit later rewrites the table. If there is any chance the limit will shrink or change often, prefer `text` plus a `CHECK` constraint.
+
+## Decision checklist
+
+1. Does the business rule have a genuine maximum length? If not, use `text`.
+2. If yes, will the limit ever shrink or be adjusted frequently? If yes, use `text` with a `CHECK` constraint (or a domain); otherwise `varchar(n)` is fine.
+3. Never use `char(n)`, even for fixed-width codes; use `text`/`varchar(n)` with `CHECK (length(col) = n)`.
+4. Will values exceed a couple of kilobytes and still need equality lookups? Index `md5(col)` or use a hash index; do not put a plain btree on the column.
+5. Need case-insensitive semantics? Reach for `citext` or a nondeterministic collation rather than `lower()` everywhere.
+
+## FAQ
+
+### Is text slower than varchar in Postgres?
+
+No. Both are stored as the same varlena structure, TOASTed the same way and indexed the same way. The only measurable difference is that `varchar(n)` spends a few CPU cycles checking the length on insert and update. The PostgreSQL documentation states directly that there is no performance difference among `text`, `varchar(n)` and `char(n)`, apart from the extra storage that `char(n)` padding costs.
+
+### Does increasing a varchar length lock the table?
+
+It takes an `ACCESS EXCLUSIVE` lock for the catalog update, so it queues behind long-running queries and briefly blocks new ones, but since PostgreSQL 9.2 it does not rewrite the table or rebuild indexes. Decreasing the length, or converting to `char(n)`, does rewrite the whole table under that lock. Keep `lock_timeout` set when running either in production.
+
+### Should I use varchar(255) in Postgres?
+
+Only if 255 genuinely means something for your data. The number is a habit inherited from older MySQL index-prefix limits and has no significance in Postgres. If you just need "a string", use `text`; if you need a limit, pick the real one and consider enforcing it with a `CHECK` constraint so it can be changed without a rewrite.
+
+## Conclusion
+
+In PostgreSQL, `text`, `varchar(n)` and `char(n)` share the same storage engine path, the same TOAST behavior and the same indexes, so the choice is about constraints, not speed. Default to `text`; use `varchar(n)` when a maximum length is a real part of the data contract and unlikely to shrink; use `CHECK` constraints or domains when you want limits that can be tightened later with `NOT VALID` and `VALIDATE CONSTRAINT` instead of a table rewrite; and avoid `char(n)` entirely because its padding semantics cause more bugs than they prevent.

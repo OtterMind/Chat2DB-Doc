@@ -1,0 +1,277 @@
+---
+title: "Postgres DATEDIFF: Calculate Date Differences"
+description: "PostgreSQL has no DATEDIFF. Calculate date difference with date subtraction, AGE(), EXTRACT(EPOCH), DATE_PART, business days and a custom datediff() function."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: August 23, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# Postgres DATEDIFF: Calculate Date Differences
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="August 23, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+If you arrive in PostgreSQL from SQL Server or MySQL, one of the first things you type is `SELECT DATEDIFF(day, start_date, end_date)` and one of the first errors you see is `function datediff(unknown, date, date) does not exist`. PostgreSQL simply does not ship a `DATEDIFF` function. Instead it relies on operator arithmetic: subtracting two dates returns an integer number of days, subtracting two timestamps returns an `interval`, and a handful of functions (`AGE()`, `EXTRACT()`, `DATE_PART()`, `justify_interval()`) turn those results into whatever unit you need.
+
+This article covers every practical way to calculate a date difference in PostgreSQL 14 through 17: days, hours, minutes and seconds, months and years, business days, a drop-in `datediff(unit, start, end)` function that mirrors SQL Server semantics, and the two places where people get wrong answers, namely timezones with DST and non-sargable `WHERE` clauses.
+
+## Sample data
+
+Run the following in any SQL client (you can paste it into Chat2DB, a free AI-powered SQL client, at https://app.chat2db.ai or after downloading from https://chat2db.ai/download) to follow along:
+
+```sql
+CREATE TABLE orders (
+    order_id    serial PRIMARY KEY,
+    ordered_at  timestamptz NOT NULL,
+    shipped_at  timestamptz,
+    due_date    date NOT NULL
+);
+
+INSERT INTO orders (ordered_at, shipped_at, due_date)
+SELECT ts,
+       ts + (g * interval '7 hours 13 minutes'),
+       (ts + interval '10 days')::date
+FROM generate_series(1, 6) AS g,
+     LATERAL (SELECT timestamptz '2024-03-08 09:15:00+00' + (g * interval '1 day')) AS s(ts);
+
+SELECT order_id, ordered_at, shipped_at, due_date FROM orders ORDER BY order_id;
+```
+
+The session timezone matters for everything below; the examples assume `SET timezone = 'UTC';` unless stated otherwise.
+
+## date minus date returns integer days
+
+The simplest case is two `date` columns. The `-` operator returns an `integer`:
+
+```sql
+SELECT date '2024-03-20' - date '2024-03-08' AS days;   -- 12
+SELECT due_date - ordered_at::date AS days_to_due FROM orders;   -- 10 for every row
+```
+
+This is exactly what SQL Server's `DATEDIFF(day, a, b)` returns, including the sign: `b - a` is positive when `b` is later. Because the result is a plain integer, you can `SUM`, `AVG` or compare it directly without any casting.
+
+## timestamp minus timestamp returns an interval
+
+As soon as either operand is a `timestamp` or `timestamptz`, the result is an `interval`:
+
+```sql
+SELECT shipped_at - ordered_at AS lead_time FROM orders ORDER BY order_id;
+```
+
+```
+ lead_time
+-----------------
+ 07:13:00
+ 14:26:00
+ 21:39:00
+ 1 day 04:52:00
+ 1 day 12:05:00
+ 1 day 19:18:00
+```
+
+An interval is a structured value (months, days, microseconds), not a number, so you cannot average it into hours directly or compare it with `> 24`. You have to extract the unit you want, which is the job of the next sections.
+
+## AGE(): calendar-aware difference
+
+`AGE(later, earlier)` also returns an interval, but it normalizes the result into years, months and days the way a human would:
+
+```sql
+SELECT AGE(timestamp '2024-03-15', timestamp '2021-11-30');
+-- 2 years 3 mons 15 days
+
+SELECT AGE(date '2021-11-30');   -- one-argument form: difference from CURRENT_DATE
+```
+
+Compare this with the raw subtraction, which never produces months:
+
+```sql
+SELECT timestamp '2024-03-15' - timestamp '2021-11-30';
+-- 836 days
+```
+
+Use `AGE()` when you need "2 years 3 months" style output, such as a customer tenure or a person's age. Use subtraction when you need an exact number of days or seconds.
+
+## Days, hours, minutes, seconds with EXTRACT(EPOCH)
+
+The universal way to turn any interval into a number is `EXTRACT(EPOCH FROM interval)`, which returns the total number of seconds (as `numeric` in PostgreSQL 14+, `double precision` before). Divide to get the unit you want:
+
+```sql
+SELECT order_id,
+       EXTRACT(EPOCH FROM (shipped_at - ordered_at))           AS seconds,
+       EXTRACT(EPOCH FROM (shipped_at - ordered_at)) / 60      AS minutes,
+       EXTRACT(EPOCH FROM (shipped_at - ordered_at)) / 3600    AS hours,
+       EXTRACT(EPOCH FROM (shipped_at - ordered_at)) / 86400   AS days
+FROM orders
+ORDER BY order_id;
+```
+
+```
+ order_id | seconds | minutes | hours  |  days
+----------+---------+---------+--------+---------
+        1 |   25980 |     433 |  7.216 | 0.30069
+        2 |   51960 |     866 | 14.433 | 0.60138
+        3 |   77940 |    1299 | 21.650 | 0.90208
+        ...
+```
+
+Wrap in `FLOOR()`, `ROUND()` or cast to `integer` depending on whether you want truncation or rounding. This is also the correct approach for an average lead time in hours:
+
+```sql
+SELECT ROUND(AVG(EXTRACT(EPOCH FROM (shipped_at - ordered_at)) / 3600), 2) AS avg_hours
+FROM orders;
+```
+
+`EXTRACT(EPOCH FROM timestamptz)` also works on a single value, giving seconds since 1970-01-01 UTC, so `EXTRACT(EPOCH FROM b) - EXTRACT(EPOCH FROM a)` is an alternative that avoids the intermediate interval.
+
+## DATE_PART and the "field of an interval" trap
+
+`DATE_PART('field', source)` is an older alias for `EXTRACT` and returns `double precision`. It is tempting to write:
+
+```sql
+SELECT DATE_PART('day', shipped_at - ordered_at) FROM orders;   -- careful
+```
+
+This returns only the *days component* of the interval, not the total days. For order 1 (`07:13:00`) it returns 0, and for an interval of `1 mon 5 days` it returns 5, ignoring the month entirely. The same is true of `EXTRACT(DAY FROM interval)` and `EXTRACT(HOUR FROM interval)`. Only `EPOCH` gives you a total across all fields. A related pitfall: `DATE_PART('day', ts)` on a timestamp returns the day of the month, not a difference.
+
+## Difference in months and years
+
+Months and years are not fixed numbers of seconds, so `EPOCH` cannot give an exact answer. Combine `AGE()` with `EXTRACT`:
+
+```sql
+WITH d AS (SELECT AGE(date '2024-03-15', date '2021-11-30') AS a)
+SELECT EXTRACT(YEAR FROM a)                                 AS years,       -- 2
+       EXTRACT(YEAR FROM a) * 12 + EXTRACT(MONTH FROM a)    AS total_months -- 27
+FROM d;
+```
+
+`AGE()` only counts a full month once the day of month has been reached, so 2024-03-15 minus 2021-11-30 is 27 months, not 28. If you instead want SQL Server's `DATEDIFF(month, ...)`, which counts month *boundaries crossed* regardless of the day, use the year and month fields of each date:
+
+```sql
+SELECT (EXTRACT(YEAR FROM date '2024-03-15') - EXTRACT(YEAR FROM date '2021-11-30')) * 12
+     + (EXTRACT(MONTH FROM date '2024-03-15') - EXTRACT(MONTH FROM date '2021-11-30')) AS month_boundaries;  -- 28
+```
+
+Both are legitimate; pick the one whose definition matches the report you are producing.
+
+## justify_interval for readable output
+
+The raw difference between two timestamps is expressed in days and time only, which is why `836 days` appeared earlier. `justify_interval()` rolls 24-hour blocks into days and 30-day blocks into months for display:
+
+```sql
+SELECT justify_interval(timestamp '2024-03-15' - timestamp '2021-11-30');
+-- 2 years 3 mons 26 days
+```
+
+Note the result differs from `AGE()` (26 days instead of 15) because `justify_interval` assumes every month has exactly 30 days. It is a presentation helper, not a calendar calculation. `justify_hours()` and `justify_days()` do only one of the two conversions.
+
+## Business days between two dates
+
+Counting weekdays is a common DATEDIFF follow-up. `generate_series` with a `date` step plus a weekday filter is the clearest approach:
+
+```sql
+SELECT count(*) AS business_days
+FROM generate_series(date '2024-03-08', date '2024-03-20' - 1, interval '1 day') AS d
+WHERE EXTRACT(ISODOW FROM d) < 6;   -- 1 = Monday ... 7 = Sunday
+-- 8
+```
+
+The `- 1` excludes the end date (start inclusive, end exclusive), which matches how most lead-time calculations work; drop it if both ends should count. To exclude public holidays, `LEFT JOIN` a `holidays(holiday_date date)` table and add `AND h.holiday_date IS NULL`. For large tables, wrap this in a SQL function marked `IMMUTABLE` and call it per row, or precompute a calendar table with a running weekday counter and subtract two lookups, which is far cheaper than generating a series per row.
+
+## A drop-in datediff(unit, start, end) function
+
+If you are porting code, a compatibility function saves a lot of rewriting. This version mirrors SQL Server semantics: it counts *boundaries crossed*, so `datediff('year', '2023-12-31', '2024-01-01')` is 1.
+
+```sql
+CREATE OR REPLACE FUNCTION datediff(unit text, start_ts timestamptz, end_ts timestamptz)
+RETURNS bigint
+LANGUAGE sql
+IMMUTABLE
+AS $$
+  SELECT CASE lower(unit)
+    WHEN 'year'   THEN (EXTRACT(YEAR FROM end_ts) - EXTRACT(YEAR FROM start_ts))::bigint
+    WHEN 'month'  THEN ((EXTRACT(YEAR FROM end_ts) - EXTRACT(YEAR FROM start_ts)) * 12
+                      +  EXTRACT(MONTH FROM end_ts) - EXTRACT(MONTH FROM start_ts))::bigint
+    WHEN 'day'    THEN (end_ts::date - start_ts::date)::bigint
+    WHEN 'hour'   THEN (EXTRACT(EPOCH FROM date_trunc('hour', end_ts))
+                      - EXTRACT(EPOCH FROM date_trunc('hour', start_ts)))::bigint / 3600
+    WHEN 'minute' THEN (EXTRACT(EPOCH FROM date_trunc('minute', end_ts))
+                      - EXTRACT(EPOCH FROM date_trunc('minute', start_ts)))::bigint / 60
+    WHEN 'second' THEN (EXTRACT(EPOCH FROM date_trunc('second', end_ts))
+                      - EXTRACT(EPOCH FROM date_trunc('second', start_ts)))::bigint
+    ELSE NULL
+  END
+$$;
+
+SELECT datediff('day',   ordered_at, shipped_at) AS d,
+       datediff('hour',  ordered_at, shipped_at) AS h,
+       datediff('month', ordered_at, due_date)   AS m
+FROM orders ORDER BY order_id;
+```
+
+Two honest caveats. First, `EXTRACT(YEAR ...)` and `::date` on a `timestamptz` depend on the session timezone, so the function is not truly immutable unless you pin the timezone (declare it with `SET timezone = 'UTC'` on the function or pass `AT TIME ZONE 'UTC'` inside). Declare it `STABLE` if you cannot guarantee that. Second, if you prefer MySQL semantics, where `DATEDIFF(a, b)` is just `a - b` in days, you do not need a function at all: `a::date - b::date` is already identical.
+
+## Timezone and DST pitfalls
+
+`timestamptz` is stored as an instant in UTC and displayed in the session timezone. Subtracting two `timestamptz` values gives the real elapsed time, which is usually what you want for lead times, but it can surprise you around DST transitions:
+
+```sql
+SET timezone = 'America/New_York';
+SELECT timestamptz '2024-03-11 00:00' - timestamptz '2024-03-10 00:00';   -- 23:00:00
+SELECT (timestamptz '2024-03-11 00:00')::date - (timestamptz '2024-03-10 00:00')::date;  -- 1
+```
+
+Clocks sprang forward on 2024-03-10, so only 23 hours elapsed between the two midnights. `EXTRACT(EPOCH ...) / 86400` gives 0.958 days, while the `date` subtraction gives 1. Decide explicitly which you mean: elapsed physical time (subtract `timestamptz`) or calendar days (cast to `date` in a specific timezone, for example `(ordered_at AT TIME ZONE 'America/New_York')::date`). Also note that `timestamp` without time zone knows nothing about DST, so subtracting two of those always yields a nominal 24 hours per day, which is wrong if the values actually represent local wall-clock times in a DST zone.
+
+## Performance: filter by range, not by DATEDIFF
+
+The most expensive way to use a date difference is inside `WHERE`:
+
+```sql
+-- Slow: the function hides the column from the index
+SELECT * FROM orders WHERE EXTRACT(EPOCH FROM (now() - ordered_at)) / 86400 > 30;
+SELECT * FROM orders WHERE now()::date - ordered_at::date > 30;
+```
+
+Both force a sequential scan and evaluate the expression for every row. Rewrite the condition as a range on the bare column so a B-tree index on `ordered_at` can be used:
+
+```sql
+CREATE INDEX orders_ordered_at_idx ON orders (ordered_at);
+
+-- Fast: sargable
+SELECT * FROM orders WHERE ordered_at < now() - interval '30 days';
+```
+
+The same applies to `BETWEEN` windows ("orders due within 7 days") and to joins on date differences. If you truly need to filter or sort by a computed difference between two columns of the same row, such as `shipped_at - ordered_at`, you can create an expression index on that exact expression, or store a generated column: `ALTER TABLE orders ADD COLUMN lead_time interval GENERATED ALWAYS AS (shipped_at - ordered_at) STORED;` and index that. Check with `EXPLAIN (ANALYZE, BUFFERS)` that the plan switched from `Seq Scan` to `Index Scan` or `Bitmap Heap Scan`.
+
+## Quick reference
+
+| Need | Expression |
+| --- | --- |
+| Days between two dates | `end_date - start_date` (integer) |
+| Days between two timestamps | `EXTRACT(EPOCH FROM (b - a)) / 86400` or `b::date - a::date` |
+| Hours / minutes / seconds | `EXTRACT(EPOCH FROM (b - a)) / 3600`, `/ 60`, as-is |
+| Human-readable years/months/days | `AGE(b, a)` |
+| Total months | `EXTRACT(YEAR FROM AGE(b,a)) * 12 + EXTRACT(MONTH FROM AGE(b,a))` |
+| Business days | `generate_series` + `EXTRACT(ISODOW ...) < 6` |
+| SQL Server-style units | custom `datediff(unit, a, b)` function |
+
+## FAQ
+
+### Does PostgreSQL have a DATEDIFF function?
+
+No. PostgreSQL has no built-in `DATEDIFF`. Use `end - start` (integer days for `date`, an `interval` for timestamps), `AGE()` for calendar-style differences, and `EXTRACT(EPOCH FROM ...)` divided by 60, 3600 or 86400 for minutes, hours or days. You can create your own `datediff(unit, start, end)` function as shown above if you are migrating code from SQL Server or MySQL.
+
+### What is the difference between AGE() and timestamp subtraction?
+
+Subtraction returns the exact elapsed interval expressed only in days and time (for example `836 days 03:00:00`). `AGE()` returns a calendar-normalized interval with years and months (for example `2 years 3 mons 15 days`), computed the way people count birthdays. Use subtraction for precise durations and `AGE()` for human-facing tenure or age values.
+
+### How do I get the difference in days as an integer from two timestamptz columns?
+
+Either cast both to `date` and subtract (`b::date - a::date`), which counts calendar-day boundaries in the session timezone, or compute `FLOOR(EXTRACT(EPOCH FROM (b - a)) / 86400)::int`, which counts full 24-hour periods of elapsed time. They differ by one on DST transition days and whenever the times of day differ, so choose based on whether you need calendar days or elapsed days.
+
+## Conclusion
+
+PostgreSQL replaces `DATEDIFF` with a small set of composable tools: operator subtraction for days and intervals, `AGE()` for calendar differences, `EXTRACT(EPOCH FROM ...)` for numeric seconds, minutes, hours and days, and `justify_interval()` for display. Months and years need `AGE()` plus `EXTRACT`, business days need `generate_series` with an `ISODOW` filter, and a ten-line SQL function gives you familiar `datediff(unit, start, end)` semantics for ported code. Keep `timestamptz` and DST in mind when an off-by-one-hour result appears, and keep date arithmetic out of `WHERE` clauses so your indexes stay usable.

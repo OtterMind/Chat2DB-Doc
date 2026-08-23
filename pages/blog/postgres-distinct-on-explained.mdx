@@ -1,0 +1,299 @@
+---
+title: "Postgres DISTINCT ON: Get the First Row per Group"
+description: "Postgres DISTINCT ON explained: syntax, the ORDER BY rule, latest row per group, ROW_NUMBER and LATERAL alternatives, the right index, dedup with ctid."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: August 23, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# Postgres DISTINCT ON: Get the First Row per Group
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="August 23, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+"Give me the latest order for every customer" is one of the most common questions a relational database gets asked, and one of the clumsiest to write in standard SQL. PostgreSQL has a non-standard clause built for exactly this: `SELECT DISTINCT ON (...)`. It returns the first row of each group, where "first" is defined by your `ORDER BY`. This article explains how Postgres DISTINCT ON works, the one rule people trip over, how it compares with `ROW_NUMBER()`, `LATERAL` and correlated subqueries (including what `EXPLAIN` shows), which index makes it fast, how to use it for deduplicating and deleting rows, and how to rewrite it for databases that do not have it.
+
+All examples run on PostgreSQL 14 through 17.
+
+## Sample data
+
+```sql
+CREATE TABLE customers (
+  id   int PRIMARY KEY,
+  name text NOT NULL
+);
+INSERT INTO customers
+SELECT g, 'customer_' || g FROM generate_series(1, 1000) g;
+
+CREATE TABLE orders (
+  id          bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  customer_id int NOT NULL REFERENCES customers(id),
+  status      text NOT NULL,
+  amount      numeric(10,2) NOT NULL,
+  created_at  timestamptz NOT NULL
+);
+INSERT INTO orders (customer_id, status, amount, created_at)
+SELECT (random() * 999 + 1)::int,
+       (ARRAY['paid','pending','refunded'])[(random() * 2 + 1)::int],
+       round((random() * 500)::numeric, 2),
+       now() - (random() * interval '365 days')
+FROM generate_series(1, 200000);
+ANALYZE customers, orders;
+```
+
+Roughly 200 orders per customer, spread over a year.
+
+## DISTINCT vs DISTINCT ON
+
+Plain `SELECT DISTINCT` removes duplicate rows, comparing every column in the select list:
+
+```sql
+SELECT DISTINCT customer_id, status FROM orders;   -- one row per (customer_id, status) pair
+```
+
+`DISTINCT ON (expr, ...)` is different. It groups rows by the listed expressions and keeps exactly one whole row per group, regardless of what else is in the select list:
+
+```sql
+SELECT DISTINCT ON (customer_id)
+       customer_id, id AS order_id, amount, created_at
+FROM   orders
+ORDER  BY customer_id, created_at DESC;
+```
+
+Expected shape of the output:
+
+| customer_id | order_id | amount | created_at |
+|---|---|---|---|
+| 1 | 184233 | 412.10 | 2026-08-21 09:14:02+00 |
+| 2 | 199871 | 17.95 | 2026-08-22 18:40:51+00 |
+| 3 | 150042 | 233.00 | 2026-08-19 03:02:17+00 |
+
+One row per customer, and because rows are ordered by `created_at DESC` within each customer, the row kept is the most recent one. Note that `order_id` and `amount` are not aggregated; they are the real values from that single winning row. That is what makes `DISTINCT ON` so convenient compared with `GROUP BY customer_id, MAX(created_at)`, which cannot give you the other columns without a second join.
+
+## The ORDER BY rule
+
+The rule that causes most confusion: the `DISTINCT ON` expressions must be the leftmost expressions of `ORDER BY`, in the same order. Additional `ORDER BY` columns after them decide which row within each group wins. If you break the rule you get:
+
+```sql
+SELECT DISTINCT ON (customer_id) * FROM orders ORDER BY created_at DESC;
+-- ERROR:  SELECT DISTINCT ON expressions must match initial ORDER BY expressions
+-- LINE 1: SELECT DISTINCT ON (customer_id) * FROM orders ORDER BY create...
+```
+
+If you omit `ORDER BY` entirely, the query runs, but which row survives in each group is unpredictable and can change between executions or plans. Always specify the tie-breaker columns.
+
+Two consequences worth knowing:
+
+- `ORDER BY` columns do not have to appear in the select list. (That restriction applies to plain `DISTINCT`, where you get "for SELECT DISTINCT, ORDER BY expressions must appear in select list".)
+- If the final result must be ordered by something else, wrap the query in a subquery or CTE and sort outside:
+
+```sql
+SELECT *
+FROM (
+  SELECT DISTINCT ON (customer_id) customer_id, id, amount, created_at
+  FROM orders
+  ORDER BY customer_id, created_at DESC
+) latest
+ORDER BY created_at DESC
+LIMIT 20;
+```
+
+Add deterministic tie-breakers too. Two orders with identical `created_at` would otherwise be chosen arbitrarily, so `ORDER BY customer_id, created_at DESC, id DESC` is the robust form.
+
+## The same query three other ways
+
+### ROW_NUMBER() window function
+
+```sql
+SELECT customer_id, id, amount, created_at
+FROM (
+  SELECT o.*,
+         row_number() OVER (PARTITION BY customer_id ORDER BY created_at DESC, id DESC) AS rn
+  FROM orders o
+) t
+WHERE rn = 1;
+```
+
+Standard SQL, works on MySQL 8, SQL Server, Oracle and SQLite 3.25+. More verbose, but it generalizes: change `rn = 1` to `rn <= 3` for the latest three orders per customer, which `DISTINCT ON` cannot do.
+
+### LATERAL join with LIMIT 1
+
+```sql
+SELECT c.id AS customer_id, o.id, o.amount, o.created_at
+FROM customers c
+CROSS JOIN LATERAL (
+  SELECT id, amount, created_at
+  FROM orders
+  WHERE customer_id = c.id
+  ORDER BY created_at DESC, id DESC
+  LIMIT 1
+) o;
+```
+
+Drives from the `customers` table and does one indexed probe per customer. Use `LEFT JOIN LATERAL ... ON true` if customers without orders should appear with NULLs.
+
+### Correlated subquery
+
+```sql
+SELECT o.customer_id, o.id, o.amount, o.created_at
+FROM orders o
+WHERE o.id = (
+  SELECT id FROM orders i
+  WHERE i.customer_id = o.customer_id
+  ORDER BY created_at DESC, id DESC
+  LIMIT 1
+);
+```
+
+Portable and readable for one group column, but the planner evaluates the subquery per row, and it gets awkward when several columns are needed or the key is composite.
+
+### Readability and plans compared
+
+Readability: `DISTINCT ON` is the shortest and reads almost like English once you know the rule. `ROW_NUMBER()` is the standard and most flexible. `LATERAL` is the most explicit about the access path.
+
+With no secondary index, `EXPLAIN` for the `DISTINCT ON` query looks like this (costs illustrative):
+
+```text
+Unique
+  ->  Sort
+        Sort Key: customer_id, created_at DESC, id DESC
+        ->  Seq Scan on orders
+```
+
+The whole table is read, sorted, and a `Unique` node keeps the first row per `customer_id`. The `ROW_NUMBER()` version produces `Subquery Scan (Filter: rn = 1) -> WindowAgg -> Sort -> Seq Scan`, which does the same sort plus window bookkeeping, so it is usually a little slower than `DISTINCT ON` on the same input. The `LATERAL` version without an index is the worst: a sort of `orders` per customer.
+
+## The index that makes DISTINCT ON fast
+
+Give the planner an index whose order matches `ORDER BY customer_id, created_at DESC, id DESC`:
+
+```sql
+CREATE INDEX orders_customer_latest_idx ON orders (customer_id, created_at DESC, id DESC);
+```
+
+Now the plan becomes:
+
+```text
+Unique
+  ->  Index Scan using orders_customer_latest_idx on orders
+```
+
+No sort at all: the index is already in the right order, and `Unique` skips to the next `customer_id` as it reads. If the select list contains only indexed columns, you get an `Index Only Scan`. Note that the `DESC` in the index definition is not strictly required, because Postgres can scan a btree backward, but the leading column and the sort direction pattern must be consistent (all ascending or all matching the query).
+
+With the same index, the `LATERAL` version becomes `Nested Loop -> Seq Scan on customers -> Limit -> Index Scan (1 row each)`. This is where the choice starts to matter for performance:
+
+- Few groups, many rows per group (1,000 customers, 200 orders each): `DISTINCT ON` still walks the entire index (200,000 entries) and discards 199,000 of them. `LATERAL` touches about 1,000 index entries. `LATERAL` wins, often by a wide margin.
+- Many groups, few rows per group (every customer has one or two orders): `DISTINCT ON` with an ordered index scan is hard to beat, and `LATERAL` pays a nested-loop per group for little gain.
+
+Qualitatively, PostgreSQL 16 improved this picture for `DISTINCT`: the planner can now use an incremental sort when the input is sorted on a prefix of the required keys (for example an index on `customer_id` alone), sorting only within each group instead of the whole table, and it is better at exploiting presorted input in general. It still does not perform a true "skip scan" for `DISTINCT ON`, so the many-rows-per-group case remains `LATERAL` territory.
+
+If you want to see these plans side by side, paste the three variants into Chat2DB (a free AI-powered SQL client; download at https://chat2db.ai/download or use https://app.chat2db.ai) and run `EXPLAIN (ANALYZE, BUFFERS)` on each against the sample tables.
+
+## DISTINCT ON with multiple columns and expressions
+
+Any number of expressions can be listed; they form the group key, and `ORDER BY` must begin with them in the same order:
+
+```sql
+-- Latest order per customer per status
+SELECT DISTINCT ON (customer_id, status)
+       customer_id, status, id, amount, created_at
+FROM orders
+ORDER BY customer_id, status, created_at DESC, id DESC;
+
+-- Largest order per calendar day (expression as the DISTINCT ON key)
+SELECT DISTINCT ON (created_at::date)
+       created_at::date AS day, id, customer_id, amount
+FROM orders
+ORDER BY created_at::date, amount DESC, id;
+```
+
+The expression in `DISTINCT ON` and in `ORDER BY` must be the same expression; `date_trunc('day', created_at)` in one place and `created_at::date` in the other will fail the match.
+
+## NULL handling
+
+For grouping purposes, `DISTINCT ON` treats NULLs as equal (the same rule as `DISTINCT` and `GROUP BY`), so all rows with `customer_id IS NULL` form one group. Inside a group, the secondary sort decides which row wins, and NULLs sort last in ascending order and first in descending order by default. If `created_at` could be NULL and you want real timestamps to win, be explicit:
+
+```sql
+SELECT DISTINCT ON (customer_id) *
+FROM orders
+ORDER BY customer_id, created_at DESC NULLS LAST, id DESC;
+```
+
+## DISTINCT ON inside CTEs and joining back
+
+Because `DISTINCT ON` returns one complete row per group, it slots neatly into a CTE that is then joined to other tables:
+
+```sql
+WITH latest AS (
+  SELECT DISTINCT ON (customer_id) customer_id, id AS order_id, amount, created_at
+  FROM orders
+  ORDER BY customer_id, created_at DESC, id DESC
+)
+SELECT c.name, l.order_id, l.amount, l.created_at
+FROM customers c
+LEFT JOIN latest l ON l.customer_id = c.id
+ORDER BY c.name;
+```
+
+Since PostgreSQL 12, a CTE referenced once is inlined, so the planner can still push the index scan through. If you add `WHERE c.name = 'customer_42'` outside the CTE, however, the `DISTINCT ON` still computes the winner for every customer first, because the filter cannot be pushed below the `Unique` node. For single-customer lookups, filter inside the CTE or use `LATERAL`.
+
+## Deduplicating rows with DELETE and ctid
+
+`DISTINCT ON` is the cleanest way to pick which duplicate to keep, and the system column `ctid` (physical row location) lets you delete the rest even when the table has no primary key:
+
+```sql
+CREATE TABLE contacts (email text, full_name text, updated_at timestamptz);
+INSERT INTO contacts VALUES
+  ('a@example.com', 'Ann', '2026-01-01'),
+  ('a@example.com', 'Ann Lee', '2026-03-01'),
+  ('b@example.com', 'Bob', '2026-02-01');
+
+DELETE FROM contacts
+WHERE ctid NOT IN (
+  SELECT DISTINCT ON (lower(email)) ctid
+  FROM contacts
+  ORDER BY lower(email), updated_at DESC
+);
+-- DELETE 1   (the older 'Ann' row is gone)
+```
+
+Run this in a single transaction and avoid concurrent writes to the table, because `ctid` values change when rows are updated or the table is vacuumed/rewritten. The same pattern works for `UPDATE ... WHERE ctid IN (...)` when you want to flag rather than remove the losers. Afterward, add a unique index (`CREATE UNIQUE INDEX ON contacts (lower(email));`) so the duplicates cannot return.
+
+## Portability: rewriting DISTINCT ON for other databases
+
+`DISTINCT ON` exists only in PostgreSQL (and Postgres-derived systems such as Redshift, CockroachDB, and Greenplum). Elsewhere:
+
+- MySQL 8.0+, SQL Server, Oracle, SQLite, MariaDB 10.2+: use the `ROW_NUMBER() OVER (PARTITION BY ... ORDER BY ...)` form shown above.
+- SQL Server also supports `CROSS APPLY (SELECT TOP 1 ... ORDER BY ...)`, which is the direct equivalent of the `LATERAL ... LIMIT 1` form.
+- MySQL 5.7 and older (no window functions): join against an aggregate, `JOIN (SELECT customer_id, MAX(created_at) AS mx FROM orders GROUP BY customer_id) m ON m.customer_id = o.customer_id AND m.mx = o.created_at`, and accept that ties produce multiple rows unless you break them with another join or a unique timestamp.
+
+If you must support several engines from the same codebase, write the `ROW_NUMBER()` version once; on Postgres it will perform close to `DISTINCT ON` when the matching index exists.
+
+## Common errors and fixes
+
+| Error | Cause | Fix |
+|---|---|---|
+| `SELECT DISTINCT ON expressions must match initial ORDER BY expressions` | `ORDER BY` does not start with the `DISTINCT ON` columns | Put the `DISTINCT ON` columns first in `ORDER BY`; sort the final result in an outer query |
+| Results change between runs | No `ORDER BY`, or no tie-breaker | Add `ORDER BY group_col, sort_col DESC, pk DESC` |
+| `syntax error at or near "ON"` on another database | `DISTINCT ON` is Postgres-only | Rewrite with `ROW_NUMBER()` |
+| Query is slow despite an index | Index order does not match `ORDER BY`, or many rows per group | Create `(group_col, order_col DESC, pk DESC)`; consider `LATERAL` for large groups |
+
+## FAQ
+
+### What is the difference between DISTINCT and DISTINCT ON in Postgres?
+
+`DISTINCT` removes rows that are identical across all selected columns. `DISTINCT ON (cols)` keeps one entire row per distinct value of `cols`, choosing the first row according to `ORDER BY`, and the other selected columns come from that winning row rather than being compared.
+
+### Can I use DISTINCT ON with ORDER BY a different column?
+
+Not directly: `ORDER BY` must begin with the `DISTINCT ON` expressions. Put the `DISTINCT ON` query in a subquery or CTE and apply the desired `ORDER BY` (and `LIMIT`) in the outer query.
+
+### Is DISTINCT ON faster than ROW_NUMBER()?
+
+On PostgreSQL, usually slightly, because the `Unique` node is simpler than a `WindowAgg` plus a filter, and both benefit from the same `(group_col, order_col DESC)` index. For tables with many rows per group, a `LATERAL ... LIMIT 1` join driven from the parent table can beat both, because it reads one index entry per group instead of scanning the whole index.
+
+## Conclusion
+
+Postgres `DISTINCT ON` turns "first row per group" into a one-line clause: list the group columns, then `ORDER BY` those same columns followed by the tie-breakers that define "first". Back it with a composite index on `(group_col, order_col DESC, pk DESC)` and the planner delivers an ordered index scan with no sort. Use `ROW_NUMBER()` when you need portability or the top N per group, and `LATERAL ... LIMIT 1` when groups are large and you want one probe per group. For deduplication, pair `DISTINCT ON` with `ctid` to choose survivors and delete the rest, then lock the result in with a unique index.

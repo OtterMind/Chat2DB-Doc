@@ -1,0 +1,304 @@
+---
+title: "Postgres JSONPath Guide: Query JSONB with Paths"
+description: "Practical Postgres JSONPath guide: SQL/JSON path syntax, jsonb_path_query and friends, @? and @@ with GIN indexes, strict vs lax mode, and PG17 JSON_TABLE."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: August 23, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# Postgres JSONPath Guide: Query JSONB with Paths
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="August 23, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+PostgreSQL has had `jsonb` since 9.4 and the arrow operators (`->`, `->>`, `#>`) for almost as long, but those operators only get you one key or one array element at a time. PostgreSQL 12 added the SQL/JSON path language (JSONPath) and a family of `jsonb_path_*` functions that let you express "every item in every order whose price is over 10" in a single expression, filter with regular expressions, do arithmetic, pass variables, and still hit a GIN index. PostgreSQL 17 rounded it out with the standard `JSON_TABLE`, `JSON_QUERY`, `JSON_VALUE` and `JSON_EXISTS` functions. This guide walks through the path language, every function and operator, indexing with `EXPLAIN`, strict versus lax mode, and the errors people run into most often, using a small orders dataset you can paste into any client.
+
+## Sample dataset
+
+```sql
+CREATE TABLE orders (
+  id       int PRIMARY KEY,
+  customer text NOT NULL,
+  doc      jsonb NOT NULL
+);
+
+INSERT INTO orders VALUES
+(1, 'alice', '{"status":"paid","placed":"2026-08-01T10:00:00Z",
+   "items":[{"sku":"A1","name":"cable","price":4.5,"qty":3},
+            {"sku":"B7","name":"hub","price":24.99,"qty":1}],
+   "ship":{"country":"US","zip":"94105"}}'),
+(2, 'bob',   '{"status":"pending","placed":"2026-08-02T09:30:00Z",
+   "items":[{"sku":"C3","name":"monitor","price":189,"qty":1}],
+   "ship":{"country":"DE","zip":"10115"}}'),
+(3, 'carol', '{"status":"paid","placed":"2026-08-03T15:45:00Z",
+   "items":[{"sku":"A1","name":"cable","price":4.5,"qty":10},
+            {"sku":"D2","name":"stand","price":9.99,"qty":2}],
+   "ship":{"country":"US","zip":"10001"}, "coupon":"SUMMER"}');
+
+-- Bulk rows so EXPLAIN later is meaningful
+INSERT INTO orders
+SELECT g, 'user' || g,
+       jsonb_build_object(
+         'status', (ARRAY['paid','pending','cancelled'])[1 + g % 3],
+         'placed', ('2026-01-01'::timestamptz + (g || ' minutes')::interval),
+         'items',  jsonb_build_array(
+                     jsonb_build_object('sku','S' || (g % 50), 'price', (g % 300) / 10.0, 'qty', 1 + g % 4)),
+         'ship',   jsonb_build_object('country', (ARRAY['US','DE','JP'])[1 + g % 3]))
+FROM generate_series(4, 50000) AS g;
+```
+
+## The SQL/JSON path language (PostgreSQL 12+)
+
+A JSONPath expression is a string literal of type `jsonpath`. Its building blocks:
+
+| Syntax | Meaning |
+|---|---|
+| `$` | The root of the JSON value being queried |
+| `$.key` or `$."key with spaces"` | Member access |
+| `$.items[*]` | Every element of an array |
+| `$.items[0]`, `$.items[last]`, `$.items[0 to 1]` | Element by index, the last one, or a range |
+| `$.*` | Every member value of an object |
+| `$.**` | Recursive descent: the value and all of its descendants |
+| `? (condition)` | Filter; inside it `@` refers to the current item |
+| `$var` | A variable supplied through the `vars` argument |
+
+Filter conditions support `==`, `!=`, `<`, `<=`, `>`, `>=`, `&&`, `||`, `!`, `like_regex "pattern" flag "i"`, `starts with "text"`, `exists (path)`, `is unknown`, and the item methods `.type()`, `.size()`, `.double()`, `.ceiling()`, `.floor()`, `.abs()`, `.keyvalue()`, `.datetime()` and `.datetime("template")`. PostgreSQL 16 added `.bigint()`, `.boolean()`, `.date()`, `.decimal()`, `.integer()`, `.number()`, `.string()`, `.time()`, `.time_tz()`, `.timestamp()` and `.timestamp_tz()`. Arithmetic (`+ - * / %`, unary minus) works on numbers anywhere in a path.
+
+A few examples evaluated against order 1:
+
+```sql
+SELECT jsonb_path_query(doc, '$.items[*].name') FROM orders WHERE id = 1;
+-- "cable"
+-- "hub"
+
+SELECT jsonb_path_query(doc, '$.items[*] ? (@.price > 10).sku') FROM orders WHERE id = 1;
+-- "B7"
+
+SELECT jsonb_path_query(doc, '$.items[*] ? (@.name like_regex "^c" flag "i")') FROM orders WHERE id = 1;
+-- {"qty": 3, "sku": "A1", "name": "cable", "price": 4.5}
+
+SELECT jsonb_path_query(doc, '$.ship.zip ? (@ starts with "94")') FROM orders WHERE id = 1;
+-- "94105"
+
+SELECT jsonb_path_query(doc, '$.items.size()') FROM orders WHERE id = 1;
+-- 2
+
+SELECT jsonb_path_query(doc, '$.items[*] ? (@.price * @.qty > 20)') FROM orders WHERE id = 1;
+-- {"qty": 1, "sku": "B7", "name": "hub", "price": 24.99}
+
+SELECT jsonb_path_query(doc, '$.placed.datetime()') FROM orders WHERE id = 1;
+-- "2026-08-01T10:00:00+00:00"
+
+SELECT jsonb_path_query(doc, '$.** ? (@.type() == "number")') FROM orders WHERE id = 1;
+-- 4.5, 3, 24.99, 1   (one row each)
+```
+
+## The jsonb_path_* functions
+
+All of these take `(target jsonb, path jsonpath [, vars jsonb [, silent bool]])`.
+
+| Function | Returns | Use it when |
+|---|---|---|
+| `jsonb_path_exists` | boolean | You only need yes/no: "does any item cost more than 100?" |
+| `jsonb_path_match` | boolean | The path is a single predicate such as `$.status == "paid"`; returns NULL if the result is not a single boolean |
+| `jsonb_path_query` | setof jsonb | You want every matching item as separate rows |
+| `jsonb_path_query_array` | jsonb | Same, but wrapped in one JSON array |
+| `jsonb_path_query_first` | jsonb | Only the first match (or NULL) |
+
+The `_tz` variants (`jsonb_path_exists_tz`, `jsonb_path_query_tz`, and so on, PostgreSQL 13+) are identical except that `.datetime()` comparisons may use the session `TimeZone` setting to compare values with and without time zones. The plain functions are immutable and refuse such comparisons; the `_tz` versions are stable, which means they cannot be used in index expressions.
+
+Applied to the dataset:
+
+```sql
+-- Orders with any item priced above 20
+SELECT id, customer
+FROM   orders
+WHERE  jsonb_path_exists(doc, '$.items[*] ? (@.price > 20)');
+--  id | customer
+-- ----+----------
+--   1 | alice
+--   2 | bob
+--   ... plus generated rows
+
+-- Is the order paid?
+SELECT id, jsonb_path_match(doc, '$.status == "paid"') AS paid FROM orders WHERE id <= 3;
+--  1 | t
+--  2 | f
+--  3 | t
+
+-- All SKUs across the first three orders as one array per order
+SELECT id, jsonb_path_query_array(doc, '$.items[*].sku') FROM orders WHERE id <= 3;
+--  1 | ["A1", "B7"]
+--  2 | ["C3"]
+--  3 | ["A1", "D2"]
+
+-- Order total: unnest with jsonb_path_query, aggregate in SQL
+SELECT o.id,
+       sum((item->>'price')::numeric * (item->>'qty')::int) AS total
+FROM   orders o,
+       LATERAL jsonb_path_query(o.doc, '$.items[*]') AS item
+WHERE  o.id <= 3
+GROUP  BY o.id ORDER BY o.id;
+--  id |  total
+-- ----+--------
+--   1 |  38.49
+--   2 | 189
+--   3 |  64.98
+
+-- Extract a nested scalar as text
+SELECT id, jsonb_path_query_first(doc, '$.ship.country') #>> '{}' AS country
+FROM   orders WHERE id <= 3;
+```
+
+The `#>> '{}'` idiom converts a jsonb scalar to text without the surrounding quotes; in PostgreSQL 17 `JSON_VALUE(doc, '$.ship.country')` does the same thing more readably.
+
+## Variables and silent mode
+
+Never build a path by string concatenation; pass values through `vars`, which is a jsonb object whose keys become `$name` inside the path:
+
+```sql
+SELECT id
+FROM   orders
+WHERE  jsonb_path_exists(doc,
+         '$.items[*] ? (@.price > $min && @.sku == $sku)',
+         jsonb_build_object('min', 4, 'sku', 'A1'));
+--  1, 3
+```
+
+The fourth argument, `silent`, suppresses the errors that strict mode or structural problems would otherwise raise and returns an empty result instead:
+
+```sql
+SELECT jsonb_path_query('[1,2]', 'strict $.a');
+-- ERROR:  jsonpath member accessor can only be applied to an object
+SELECT jsonb_path_query('[1,2]', 'strict $.a', '{}', true);
+-- (0 rows)
+```
+
+## Strict vs lax mode
+
+Every path runs in `lax` mode unless it starts with the keyword `strict`. The differences matter more than most tutorials admit:
+
+1. **Automatic array unwrapping.** In lax mode, applying a member accessor to an array unwraps it, so `$.items.price` behaves like `$.items[*].price`. In strict mode `$.items.price` raises an error because `items` is an array, not an object.
+2. **Missing keys.** Lax mode treats a missing member as an empty result; strict mode raises "JSON object does not contain key".
+3. **Wrapping scalars for subscripts.** In lax mode `$.status[0]` returns `"paid"` because a scalar is treated as a one-element array; strict mode errors.
+4. **Filters on arrays.** Lax mode silently unwraps arrays before applying a filter, which is usually what you want; in strict mode you must write `[*]` explicitly.
+
+```sql
+SELECT jsonb_path_query(doc, 'lax $.items.price')    FROM orders WHERE id = 1;  -- 4.5, 24.99
+SELECT jsonb_path_query(doc, 'strict $.items.price') FROM orders WHERE id = 1;
+-- ERROR:  jsonpath member accessor can only be applied to an object
+SELECT jsonb_path_query(doc, 'strict $.items[*].price') FROM orders WHERE id = 1; -- 4.5, 24.99
+```
+
+Strict mode is valuable when you want malformed documents to fail loudly, and it is the only mode in which `jsonb_path_exists('[]', 'strict $[*]')` and similar edge cases behave exactly like the SQL standard. One important subtlety: an `exists`-style check written as `$.items[*] ? (@.price > 10)` in lax mode and the predicate `$.items[*].price > 10` in `jsonb_path_match` are not equivalent when some items lack `price`; the comparison yields unknown and `jsonb_path_match` returns NULL.
+
+## The @? and @@ operators and GIN indexes
+
+Two operators wrap the boolean functions so they can be indexed:
+
+- `doc @? '$.items[*] ? (@.price > 20)'` is `jsonb_path_exists` (does the path return anything?).
+- `doc @@ '$.status == "paid"'` is `jsonb_path_match` (does the predicate evaluate to true?).
+
+Both are supported by GIN indexes, and the choice of operator class matters:
+
+```sql
+-- Default opclass: supports @>, ?, ?|, ?&, @?, @@
+CREATE INDEX orders_doc_gin ON orders USING gin (doc);
+
+-- jsonb_path_ops: smaller and faster, supports only @>, @?, @@
+CREATE INDEX orders_doc_pathops ON orders USING gin (doc jsonb_path_ops);
+```
+
+`jsonb_path_ops` hashes each full key path plus value, so it is ideal for `@?` and `@@` with equality conditions and for `@>` containment. It cannot answer key-existence (`?`) queries or range filters such as `@.price > 20`; for those only the equality parts of the path are extracted and the rest is rechecked on the heap. Confirm with `EXPLAIN`:
+
+```sql
+EXPLAIN (ANALYZE, COSTS OFF)
+SELECT id FROM orders WHERE doc @? '$.items[*] ? (@.sku == "A1")';
+-- Bitmap Heap Scan on orders
+--   Recheck Cond: (doc @? '$."items"[*]?(@."sku" == "A1")'::jsonpath)
+--   ->  Bitmap Index Scan on orders_doc_pathops
+--         Index Cond: (doc @? '$."items"[*]?(@."sku" == "A1")'::jsonpath)
+
+EXPLAIN (ANALYZE, COSTS OFF)
+SELECT id FROM orders WHERE doc @@ '$.status == "paid"';
+-- Bitmap Index Scan on orders_doc_pathops
+--   Index Cond: (doc @@ '$."status" == "paid"'::jsonpath)
+```
+
+A query such as `doc @? '$.items[*] ? (@.price > 100)'` will still show an index scan, but the index can only narrow rows by the structural part (`items` array exists); the numeric comparison runs as a recheck on every candidate, so the speedup is modest. For heavy range filtering on one path, create a B-tree expression index instead, for example on `((doc->'ship'->>'country'))` or on `jsonb_path_query_first(doc, '$.placed')`.
+
+## JSONPath vs arrows and containment: when to use which
+
+| Task | Best tool |
+|---|---|
+| Get one top-level key as text | `doc->>'status'` |
+| Get a nested value by a known path | `doc #>> '{ship,country}'` or `JSON_VALUE` (PG17) |
+| "Document contains this sub-structure" (equality only) | `doc @> '{"status":"paid"}'` (indexable, fastest) |
+| Any array element satisfies a comparison, regex or arithmetic | `@?` / `jsonb_path_exists` |
+| Unnest all elements matching a condition | `jsonb_path_query` in `LATERAL` |
+| Build a relational rowset from JSON | `JSON_TABLE` (PG17) or `jsonb_to_recordset` |
+
+Containment is the cheapest indexable predicate and should be your first choice for equality checks. Reach for JSONPath when you need comparisons other than equality, wildcards, recursion, or filtering inside arrays.
+
+## PostgreSQL 17: JSON_TABLE, JSON_QUERY, JSON_VALUE, JSON_EXISTS
+
+PostgreSQL 17 implemented the SQL/JSON query functions from the standard. They take the same path language, but with SQL syntax and explicit `ON EMPTY` / `ON ERROR` clauses:
+
+```sql
+SELECT id,
+       JSON_VALUE(doc, '$.ship.country')                         AS country,
+       JSON_QUERY(doc, '$.items[*].sku' WITH WRAPPER)            AS skus,
+       JSON_EXISTS(doc, '$.coupon')                              AS has_coupon
+FROM   orders WHERE id <= 3;
+--  1 | US | ["A1", "B7"] | f
+--  2 | DE | ["C3"]       | f
+--  3 | US | ["A1", "D2"] | t
+
+SELECT o.id, t.*
+FROM   orders o,
+       JSON_TABLE(o.doc, '$.items[*]'
+         COLUMNS (sku   text    PATH '$.sku',
+                  price numeric PATH '$.price',
+                  qty   int     PATH '$.qty')) AS t
+WHERE  o.id <= 3;
+--  1 | A1 |   4.5 |  3
+--  1 | B7 | 24.99 |  1
+--  2 | C3 |   189 |  1
+--  ...
+```
+
+`JSON_VALUE` returns a scalar as text (or a typed value with `RETURNING`), `JSON_QUERY` returns jsonb, and `JSON_TABLE` replaces the `LATERAL jsonb_path_query` plus casting pattern with typed columns. On PostgreSQL 14, 15 and 16 use the `jsonb_path_*` functions shown earlier; they are fully supported on 17 as well.
+
+## Common errors and pitfalls
+
+- **String literals inside the path use double quotes.** `'$.status == "paid"'` is correct; `'$.status == ''paid'''` compares with a SQL-escaped string that is not valid JSONPath. Likewise `$."first name"` for keys with spaces or special characters.
+- **Numbers are compared as numeric, not as text.** `@.price > 10` works on JSON numbers; if prices were stored as strings (`"4.5"`), the comparison is unknown and the filter drops the row. Fix the data or use `@.price.double() > 10`, which converts a numeric string.
+- **`.double()` and friends raise errors on bad input.** `"abc".double()` is an error in both modes; pass `silent => true` or clean the data.
+- **Lax-mode unwrapping hides mistakes.** `$.items.price` works in lax mode by accident; write `$.items[*].price` so the intent is explicit and the expression still works under `strict`.
+- **`jsonb_path_match` wants exactly one boolean.** `doc @@ '$.items[*].price > 10'` returns NULL (not true) for an order with several items, because the comparison produces several booleans. Use `@?` with a filter instead.
+- **Results are jsonb, not text.** `jsonb_path_query_first(doc, '$.status') = 'paid'` fails with a type error; compare with `'"paid"'::jsonb` or extract text via `#>> '{}'`.
+- **GIN indexes do not help `jsonb_path_query` in the SELECT list.** Only `@?`, `@@` and `@>` in the `WHERE` clause are indexable; wrapping the same logic in a function call prevents index use.
+- **Version checks.** `jsonpath`, `@?`, `@@` and `jsonb_path_*` are PostgreSQL 12+; `_tz` variants are 13+; the extra conversion methods (`.bigint()`, `.date()`, `.string()`, ...) are 16+; `JSON_TABLE`, `JSON_QUERY`, `JSON_VALUE`, `JSON_EXISTS` and `JSON_SCALAR` / `JSON_SERIALIZE` are 17+.
+
+If you are exploring a JSONB-heavy schema, a client that shows jsonb results formatted and lets you run `EXPLAIN` side by side is worth having. Chat2DB, a free AI-powered SQL client (download at https://chat2db.ai/download or use the web version at https://app.chat2db.ai), renders jsonb columns as collapsible trees and can draft the JSONPath filter from a plain-language description, which you can then verify against the rules above.
+
+## FAQ
+
+### What is the difference between @? and @@ in Postgres?
+
+`@?` runs the path and returns true if it produces at least one item, so it is used with filter expressions such as `$.items[*] ? (@.price > 20)`. `@@` evaluates the path as a single predicate such as `$.status == "paid"` and returns its boolean result; if the path yields anything other than one boolean the result is NULL. Both are accelerated by GIN indexes; both are implemented by `jsonb_path_exists` and `jsonb_path_match` respectively.
+
+### Can I use JSONPath on the json type, not just jsonb?
+
+The `jsonb_path_*` functions and `@?` / `@@` accept only `jsonb`; cast `json` columns with `::jsonb`. In PostgreSQL 17, `JSON_VALUE`, `JSON_QUERY`, `JSON_EXISTS` and `JSON_TABLE` accept `jsonb` as well (a `json` value is implicitly converted). For indexing you need `jsonb` in any case.
+
+### Why does my filter return nothing even though the data is there?
+
+Usually one of three things: the value is a JSON string and you compared it with a number (or vice versa), the path is in strict mode and a key is missing on some documents, or you used SQL single quotes inside the path instead of double quotes. Run the path with `jsonb_path_query` rather than `@?` to see the intermediate items, and add `silent => true` only after you understand which error is being swallowed.
+
+## Conclusion
+
+JSONPath gives PostgreSQL a concise, standard way to search inside jsonb documents: `$` and `.key` for navigation, `[*]` and `? (...)` for filtering arrays, methods like `.double()` and `.datetime()` for type handling, and `$var` for safe parameterization. Use `jsonb_path_exists` / `@?` and `jsonb_path_match` / `@@` in `WHERE` clauses so GIN indexes (preferably `jsonb_path_ops` for equality-heavy workloads) can do their job, and use `jsonb_path_query` in a `LATERAL` join or PostgreSQL 17's `JSON_TABLE` when you need rows. Keep the strict-versus-lax rules and the string-versus-number pitfalls in mind, check plans with `EXPLAIN`, and you will rarely need to fall back on chains of arrow operators again.

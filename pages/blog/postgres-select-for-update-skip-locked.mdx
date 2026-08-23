@@ -1,0 +1,294 @@
+---
+title: "Postgres SELECT FOR UPDATE SKIP LOCKED: Job Queues"
+description: "How Postgres SELECT FOR UPDATE, NOWAIT and SKIP LOCKED work, plus a reliable job queue with the canonical dequeue statement, indexes, retries and monitoring."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: August 23, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# Postgres SELECT FOR UPDATE SKIP LOCKED: Job Queues
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="August 23, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+`SELECT ... FOR UPDATE SKIP LOCKED` is the single most useful clause for anyone who wants to use PostgreSQL as a work queue without bolting on Redis, RabbitMQ or SQS. It lets many workers pull rows from the same table concurrently, each one grabbing a different row, without blocking each other and without handing the same job to two workers. This guide explains the row-level lock modes behind it, the lock wait options (default wait, `NOWAIT`, `SKIP LOCKED`), a complete job queue schema with the canonical dequeue statement, and the indexing, vacuum, retry and monitoring details that make it hold up in production. Everything below applies to PostgreSQL 14 through 17; `SKIP LOCKED` itself has existed since 9.5.
+
+## Row-level lock modes in PostgreSQL
+
+A plain `SELECT` in PostgreSQL never blocks writers and is never blocked by them, thanks to MVCC. Adding a locking clause changes that: the returned rows are locked until the end of the transaction, and the lock mode decides which concurrent statements have to wait.
+
+| Clause | Conflicts with | Typical use |
+|---|---|---|
+| `FOR UPDATE` | `UPDATE`, `DELETE`, `SELECT FOR UPDATE`, `FOR NO KEY UPDATE`, `FOR SHARE`, `FOR KEY SHARE` | "I am going to modify or delete this row" |
+| `FOR NO KEY UPDATE` | `UPDATE`, `DELETE`, `FOR UPDATE`, `FOR NO KEY UPDATE`, `FOR SHARE` (but not `FOR KEY SHARE`) | Same as above when you will not touch key columns; does not block foreign-key checks |
+| `FOR SHARE` | `UPDATE`, `DELETE`, `FOR UPDATE`, `FOR NO KEY UPDATE` | Prevent the row from changing while you read it |
+| `FOR KEY SHARE` | `DELETE`, `FOR UPDATE`, and updates that change key columns | What foreign key checks take internally; weakest mode |
+
+Two practical notes. First, a regular `UPDATE` that does not modify any unique-key column acquires `FOR NO KEY UPDATE`, not `FOR UPDATE`; an `UPDATE` that changes a key column, or a `DELETE`, acquires `FOR UPDATE`. Second, for a job queue `FOR UPDATE` is the right choice: a worker intends to update the row and wants nobody else, not even a `FOR KEY SHARE` holder, to interfere.
+
+Row locks are held until the transaction commits or rolls back. There is no way to release a row lock early except by ending the transaction (savepoint rollback also releases locks taken inside the savepoint).
+
+## Lock wait behavior: default, NOWAIT, SKIP LOCKED
+
+Set up a small table to experiment with. Open two sessions; in Chat2DB, a free AI-powered SQL client (download at https://chat2db.ai/download or use the web version at https://app.chat2db.ai), you can simply open two console tabs against the same database.
+
+```sql
+CREATE TABLE accounts (
+  id      int PRIMARY KEY,
+  balance numeric NOT NULL
+);
+INSERT INTO accounts
+SELECT g, 100 FROM generate_series(1, 5) AS g;
+```
+
+Session A:
+
+```sql
+BEGIN;
+SELECT * FROM accounts WHERE id = 1 FOR UPDATE;
+-- leave the transaction open
+```
+
+Session B, three variants:
+
+```sql
+-- 1) default: blocks until session A commits or rolls back
+SELECT * FROM accounts WHERE id = 1 FOR UPDATE;
+
+-- 2) NOWAIT: fails immediately
+SELECT * FROM accounts WHERE id = 1 FOR UPDATE NOWAIT;
+-- ERROR:  could not obtain lock on row in relation "accounts"
+
+-- 3) SKIP LOCKED: silently leaves out locked rows
+SELECT * FROM accounts WHERE id <= 2 FOR UPDATE SKIP LOCKED;
+--  id | balance
+-- ----+---------
+--   2 |     100
+```
+
+`NOWAIT` is for "fail fast" logic. `SKIP LOCKED` (PostgreSQL 9.5 and later) is for "give me something else": it treats locked rows as if they did not exist for this statement. The documentation is explicit that this yields an inconsistent view of the data, and that is intentional; for a queue, an inconsistent view is exactly what you want, because each worker should see a different subset of available rows.
+
+A fourth option worth knowing is `lock_timeout`, which applies to every lock wait in the session:
+
+```sql
+SET lock_timeout = '2s';
+SELECT * FROM accounts WHERE id = 1 FOR UPDATE;
+-- ERROR:  canceling statement due to lock timeout
+```
+
+## Building the job queue table
+
+A minimal but production-shaped schema:
+
+```sql
+CREATE TYPE job_status AS ENUM ('pending', 'running', 'done', 'failed');
+
+CREATE TABLE jobs (
+  id          bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  queue       text        NOT NULL DEFAULT 'default',
+  payload     jsonb       NOT NULL,
+  status      job_status  NOT NULL DEFAULT 'pending',
+  attempts    int         NOT NULL DEFAULT 0,
+  max_attempts int        NOT NULL DEFAULT 5,
+  run_at      timestamptz NOT NULL DEFAULT now(),   -- earliest time to run
+  locked_at   timestamptz,
+  locked_by   text,
+  last_error  text,
+  created_at  timestamptz NOT NULL DEFAULT now()
+);
+
+-- Only index the rows a worker can actually pick up.
+CREATE INDEX jobs_pending_idx
+  ON jobs (queue, run_at, id)
+  WHERE status = 'pending';
+
+-- Seed 10,000 jobs
+INSERT INTO jobs (payload)
+SELECT jsonb_build_object('n', g) FROM generate_series(1, 10000) AS g;
+```
+
+The partial index is important. In a busy queue, the `pending` rows are a tiny fraction of the table (most rows are `done`), and the worker query should never have to scan anything else. Including `run_at` and `id` in the key gives the dequeue statement an ordered index scan that can stop as soon as it finds the first unlocked candidate.
+
+### The canonical dequeue statement
+
+```sql
+WITH next_job AS (
+  SELECT id
+  FROM   jobs
+  WHERE  status = 'pending'
+  AND    queue  = 'default'
+  AND    run_at <= now()
+  ORDER  BY run_at, id
+  LIMIT  1
+  FOR UPDATE SKIP LOCKED
+)
+UPDATE jobs j
+SET    status    = 'running',
+       attempts  = attempts + 1,
+       locked_at = now(),
+       locked_by = 'worker-' || pg_backend_pid()
+FROM   next_job
+WHERE  j.id = next_job.id
+RETURNING j.*;
+```
+
+Step by step:
+
+1. The CTE scans the partial index in `(run_at, id)` order and tries to lock the first row. If another worker already holds that row, `SKIP LOCKED` moves on to the next one. `LIMIT 1` stops after the first successful lock. (In the execution plan the `LockRows` node sits below `Limit`, so rows that are skipped because they are locked are never counted toward the limit; PostgreSQL keeps scanning until it has one lockable row.)
+2. The outer `UPDATE` marks that row as running in the same statement and the same transaction, so no other worker can see it as `pending` between the select and the update.
+3. `RETURNING j.*` hands the full row (payload included) back to the application.
+
+Run this statement from several sessions at the same time and each one receives a different job. If the table has no available jobs the statement returns zero rows, which the worker treats as "sleep and poll again".
+
+To dequeue a batch, change `LIMIT 1` to `LIMIT 10` and remove nothing else; `SKIP LOCKED` works the same way for multiple rows.
+
+### Finishing or failing a job
+
+```sql
+-- success
+UPDATE jobs SET status = 'done', locked_at = NULL, locked_by = NULL
+WHERE id = $1;
+
+-- failure with exponential backoff and a retry cap
+UPDATE jobs
+SET    status     = CASE WHEN attempts >= max_attempts THEN 'failed' ELSE 'pending' END,
+       run_at     = now() + (interval '10 seconds' * power(2, attempts)),
+       last_error = $2,
+       locked_at  = NULL,
+       locked_by  = NULL
+WHERE  id = $1;
+```
+
+Because the row flips back to `pending` with a future `run_at`, it re-enters the partial index and will be picked up again after the backoff interval.
+
+## Why SKIP LOCKED removes worker contention
+
+Without `SKIP LOCKED`, a plain `FOR UPDATE` with `ORDER BY ... LIMIT 1` makes every worker want the same oldest row. One wins, the others queue up behind its row lock, and when the winner commits they all wake up, re-check the row (it is now `running` and no longer matches), and either return nothing or, depending on how the query is written, continue to the next row. Either way throughput collapses to roughly one dequeue per commit. With `SKIP LOCKED` each worker immediately walks past rows that are locked and takes the first free one, so N workers can dequeue N jobs in parallel with no waiting.
+
+## Visibility and atomicity caveats
+
+A few rules keep the pattern correct:
+
+- **Lock, then update, in one transaction.** If you `SELECT ... FOR UPDATE SKIP LOCKED` in one transaction and `UPDATE` in another, the lock is gone at the first commit and another worker can grab the same row.
+- **Re-check the condition after waiting.** When a locking `SELECT` waits for another transaction (the default mode, without `SKIP LOCKED`), PostgreSQL re-evaluates the `WHERE` clause on the updated row version in READ COMMITTED. If the row no longer matches it is skipped. That is what makes the "row is now running" case safe, but it means a waited-for row can vanish from your result.
+- **Locks are released at commit, not when the statement ends.** Hold the transaction as briefly as possible. A common design is to dequeue in a short transaction (mark `running`, commit), do the work outside any transaction, then write the result in a second short transaction. The cost is that a crashed worker leaves a row stuck in `running`; the fix is a visibility timeout (next section).
+- **Do not hold the lock for the duration of the work** unless the work is short. Long-running transactions block autovacuum from cleaning old tuples and can keep `pg_locks` full of idle-in-transaction holders.
+- **SERIALIZABLE is not required.** The pattern is safe under READ COMMITTED because row locks, not snapshot isolation, provide the mutual exclusion. Under SERIALIZABLE, `FOR UPDATE` still works but you should be prepared for serialization failures and retry the whole transaction.
+
+### Visibility timeouts for crashed workers
+
+Because a worker that dies after committing `running` never updates the row again, schedule a sweeper:
+
+```sql
+UPDATE jobs
+SET    status = 'pending', locked_at = NULL, locked_by = NULL
+WHERE  status = 'running'
+AND    locked_at < now() - interval '10 minutes';
+```
+
+Run it from a cron job or from each worker every minute. Alternatively, keep the dequeue transaction open while the job runs; then a crash rolls the transaction back automatically and the row is instantly available again, at the price of long transactions. Pick the trade-off that suits your job durations.
+
+## Deadlock avoidance and multi-row locking
+
+Deadlocks arise when two transactions lock the same rows in different orders. With a queue this is rare because each worker locks one row, but batch dequeues (`LIMIT 10`) lock several. Always lock in a deterministic order (the `ORDER BY run_at, id` already does this) and never lock additional rows from other tables in the same transaction in a different order. If a deadlock does occur PostgreSQL detects it after `deadlock_timeout` (default 1 second) and aborts one transaction with `ERROR: deadlock detected`; the application should retry.
+
+### FOR UPDATE with joins and OF table
+
+When a locking `SELECT` joins several tables, every table in the `FROM` list is locked by default. Use `OF` to restrict locking to the rows you actually intend to change:
+
+```sql
+SELECT j.id, q.concurrency
+FROM   jobs j
+JOIN   queues q ON q.name = j.queue
+WHERE  j.status = 'pending'
+ORDER  BY j.run_at, j.id
+LIMIT  1
+FOR UPDATE OF j SKIP LOCKED;
+```
+
+Without `OF j`, the `queues` row would also be locked and every worker would serialize on it. You can also combine modes, for example `FOR UPDATE OF j FOR SHARE OF q`.
+
+## Indexes and autovacuum bloat
+
+High-churn queues are the classic way to create bloat. Every dequeue is an `UPDATE` (new tuple version), and so is every completion. The partial index helps by excluding `done` rows, but the dead tuples still have to be vacuumed. Practical settings for the `jobs` table:
+
+```sql
+ALTER TABLE jobs SET (
+  autovacuum_vacuum_scale_factor = 0.01,
+  autovacuum_vacuum_threshold    = 1000,
+  autovacuum_analyze_scale_factor = 0.02,
+  fillfactor = 70   -- leave room for HOT updates
+);
+```
+
+Setting `fillfactor` below 100 and keeping updated columns out of indexes (note that `status` and `run_at` are in the partial index, so updates to them cannot be HOT; `locked_at` and `locked_by` are not indexed) reduces index churn. Periodically archive or delete `done` rows, or partition the table by `created_at` so old partitions can simply be dropped.
+
+Check that the dequeue actually uses the index:
+
+```sql
+EXPLAIN (ANALYZE, BUFFERS)
+SELECT id FROM jobs
+WHERE status = 'pending' AND queue = 'default' AND run_at <= now()
+ORDER BY run_at, id LIMIT 1 FOR UPDATE SKIP LOCKED;
+-- Limit -> LockRows -> Index Scan using jobs_pending_idx on jobs
+```
+
+A `LockRows` node above an `Index Scan` on the partial index is what you want to see. A `Seq Scan` means the planner could not prove the partial index predicate matches, usually because the `WHERE` clause is written differently from the index predicate.
+
+## Monitoring with pg_locks and pg_stat_activity
+
+Who is holding row locks and who is waiting:
+
+```sql
+SELECT a.pid, a.state, a.wait_event_type, a.wait_event,
+       now() - a.xact_start AS xact_age,
+       left(a.query, 80) AS query
+FROM   pg_stat_activity a
+WHERE  a.datname = current_database()
+AND    a.backend_type = 'client backend'
+ORDER  BY xact_age DESC NULLS LAST;
+```
+
+Blocked sessions show `wait_event_type = 'Lock'` and `wait_event = 'transactionid'` or `'tuple'`. To find exactly who is blocking whom:
+
+```sql
+SELECT pid, pg_blocking_pids(pid) AS blocked_by, left(query, 60)
+FROM   pg_stat_activity
+WHERE  cardinality(pg_blocking_pids(pid)) > 0;
+```
+
+Note that `pg_locks` does not list individual row locks (they live in the tuple header, not shared memory); you will see `transactionid` and `tuple` lock entries for waiters instead. With `SKIP LOCKED` in the dequeue path, you should rarely see waiters at all; if you do, look for long transactions in the completion path.
+
+## Comparison with LISTEN/NOTIFY and external queues
+
+`SKIP LOCKED` solves "who gets the job"; it does not solve "when should a worker look". Polling every second is fine for most systems, and `LISTEN/NOTIFY` can be layered on top: a trigger sends `NOTIFY jobs_new` on insert, idle workers wake up and run the dequeue statement. Because notifications are not durable and can be coalesced, the dequeue must still be the source of truth. Compared with Kafka, SQS or RabbitMQ, a PostgreSQL queue gives you transactional enqueue (write the job in the same transaction as the business data, no dual-write problem), SQL observability and no extra infrastructure, at the cost of lower raw throughput and the vacuum hygiene described above. For tens to low thousands of jobs per second on decent hardware it is usually more than enough; beyond that, or for fan-out streaming, use a purpose-built system.
+
+## Pitfalls
+
+- **FOR UPDATE in a subquery or CTE applies to that subquery only.** Locks are taken on the rows the locking query returns, so `WHERE id IN (SELECT id ... FOR UPDATE SKIP LOCKED LIMIT 1)` works, but `SELECT ... FOR UPDATE` on an outer query does not push locks into an unlocked subquery.
+- **ORDER BY + LIMIT with SKIP LOCKED is not strict FIFO.** A worker may skip the oldest job because another worker holds it, so the order in which jobs start is approximate. Good enough for queues, not a replacement for a serialized sequence.
+- **SKIP LOCKED returns intentionally inconsistent results.** Never use it for reporting or for "count how many pending jobs exist"; use a plain `SELECT` for that.
+- **Locking clauses are not allowed with `DISTINCT`, `GROUP BY`, aggregates, `UNION` or window functions.** Restructure with a CTE.
+- **`FOR UPDATE` on a view or a join locks every underlying table** unless you use `OF`.
+- **Locked rows can still be read** by ordinary `SELECT`s; `FOR UPDATE` does not hide rows, it only blocks other lockers and writers.
+
+## FAQ
+
+### Does SELECT FOR UPDATE SKIP LOCKED guarantee that two workers never get the same job?
+
+Yes, provided both workers lock and update the row inside the same transaction. The row lock is exclusive, so the second worker either waits (default), fails (`NOWAIT`) or skips the row (`SKIP LOCKED`). Once the first worker commits with `status = 'running'`, the row no longer matches `status = 'pending'` and is invisible to later dequeues.
+
+### Should I use FOR UPDATE or FOR NO KEY UPDATE in a job queue?
+
+Use `FOR UPDATE`. `FOR NO KEY UPDATE` is slightly weaker and allows concurrent `FOR KEY SHARE` locks (foreign key checks from child tables). For a queue row you are about to modify, the stronger mode is the safe default and costs nothing extra.
+
+### What happens to SKIP LOCKED in PostgreSQL versions before 9.5?
+
+The syntax does not exist; you get a syntax error. In those versions people emulated it with advisory locks (`pg_try_advisory_xact_lock(id)`) in the `WHERE` clause. All supported versions today (14 through 17) have native `SKIP LOCKED`.
+
+## Conclusion
+
+`SELECT ... FOR UPDATE SKIP LOCKED` turns an ordinary PostgreSQL table into a safe, concurrent job queue. Remember the essentials: lock and update in the same transaction, keep that transaction short, back the dequeue with a partial index on pending rows, tune autovacuum for the churn, add a visibility timeout sweeper for crashed workers, and use `pg_stat_activity` with `pg_blocking_pids()` when something stalls. Try the canonical CTE-plus-UPDATE statement from two sessions in Chat2DB and watch each one receive a different job; once you have seen it work, it is hard to go back to running a separate queue service for modest workloads.

@@ -1,0 +1,307 @@
+---
+title: "Postgres Concat Strings with ||, CONCAT, CONCAT_WS"
+description: "How to concat strings in PostgreSQL: || and NULL, CONCAT vs CONCAT_WS, FORMAT, STRING_AGG, casting numbers and dates, indexes, MySQL and SQL Server differences."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: August 23, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# Postgres Concat Strings with ||, CONCAT, CONCAT_WS
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="August 23, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+PostgreSQL gives you three ways to concat strings, and they disagree about the one thing that matters most in real data: NULL. The `||` operator returns NULL as soon as any operand is NULL; `CONCAT()` silently skips NULLs; `CONCAT_WS()` skips NULLs *and* puts a separator between the rest. Pick the wrong one and you get `NULL` full names or double spaces in exported files. This article covers all three, how non-text types (numbers, dates) are cast, `COALESCE` patterns, `FORMAT()`, aggregating many rows into one string with `STRING_AGG` and `ARRAY_TO_STRING`, concatenation inside `UPDATE`, generated columns and expression indexes on concatenated values, performance notes, the string-building helpers (`LPAD`, `REPEAT`, `LEFT`, `RIGHT`, trimming) and, for people migrating, how PostgreSQL concatenation differs from MySQL `CONCAT` and SQL Server `+`.
+
+Everything here applies to PostgreSQL 14 through 17.
+
+## Sample data
+
+```sql
+CREATE TABLE customers (
+  id          bigserial PRIMARY KEY,
+  first_name  text NOT NULL,
+  middle_name text,
+  last_name   text NOT NULL,
+  city        text,
+  signup_date date NOT NULL,
+  balance     numeric(10,2) NOT NULL DEFAULT 0
+);
+
+INSERT INTO customers (first_name, middle_name, last_name, city, signup_date, balance) VALUES
+  ('Ada',   'Byron',  'Lovelace', 'London',   '2026-01-15', 120.50),
+  ('Alan',  NULL,     'Turing',   'Wilmslow', '2026-02-20', 0),
+  ('Grace', 'Murray', 'Hopper',   NULL,       '2026-03-05', 999.99);
+
+-- a larger table for the aggregation and index examples
+CREATE TABLE orders (
+  id          bigserial PRIMARY KEY,
+  customer_id bigint NOT NULL REFERENCES customers(id),
+  sku         text NOT NULL,
+  created_at  timestamptz NOT NULL
+);
+INSERT INTO orders (customer_id, sku, created_at)
+SELECT (g % 3) + 1,
+       'SKU-' || lpad((g % 7)::text, 3, '0'),
+       timestamptz '2026-01-01 00:00+00' + g * interval '3 hours'
+FROM generate_series(1, 1000) AS g;
+```
+
+## The || operator and NULL propagation
+
+`||` is the SQL-standard concatenation operator. It is left-associative and, like every other operator in SQL, it follows three-valued logic: if either side is NULL, the result is NULL.
+
+```sql
+SELECT id,
+       first_name || ' ' || middle_name || ' ' || last_name AS full_name
+FROM customers ORDER BY id;
+```
+
+| id | full_name |
+|---|---|
+| 1 | Ada Byron Lovelace |
+| 2 | *NULL* |
+| 3 | Grace Murray Hopper |
+
+Alan Turing has no middle name, so the entire expression collapses to NULL. That is correct by the standard, and it is exactly why `||` is the wrong choice when some parts are optional.
+
+## CONCAT() ignores NULLs
+
+`CONCAT(arg1, arg2, ...)` accepts any number of arguments of any type, converts each to text with its type's output function, and treats NULL as an empty string:
+
+```sql
+SELECT id, concat(first_name, ' ', middle_name, ' ', last_name) AS full_name
+FROM customers ORDER BY id;
+```
+
+| id | full_name |
+|---|---|
+| 1 | Ada Byron Lovelace |
+| 2 | Alan  Turing |
+| 3 | Grace Murray Hopper |
+
+No more NULL, but notice the *two* spaces in `Alan  Turing`: the separators you typed are ordinary arguments and are still emitted. If every argument is NULL, `CONCAT` returns an empty string, not NULL.
+
+## CONCAT_WS: concat with separator
+
+`CONCAT_WS(separator, arg1, arg2, ...)` ("with separator") joins the non-NULL arguments with the separator and never produces doubled separators:
+
+```sql
+SELECT id, concat_ws(' ', first_name, middle_name, last_name) AS full_name,
+           concat_ws(', ', last_name, city)                   AS name_city
+FROM customers ORDER BY id;
+```
+
+| id | full_name | name_city |
+|---|---|---|
+| 1 | Ada Byron Lovelace | Lovelace, London |
+| 2 | Alan Turing | Turing, Wilmslow |
+| 3 | Grace Murray Hopper | Hopper |
+
+Two rules: if the *separator* is NULL the whole result is NULL, and empty strings are *not* skipped (only NULLs are). If your data mixes `''` and NULL for "missing", normalize first with `NULLIF(middle_name, '')`.
+
+## Concatenating numbers, dates and other non-text types
+
+`CONCAT` converts everything for you. `||` is pickier because it is resolved through operator overloading: PostgreSQL defines `text || text`, `text || anynonarray` and `anynonarray || text`, so as long as *one* side is text (or an untyped string literal), the other side is converted implicitly. Two non-text operands fail:
+
+```sql
+SELECT 'Balance: ' || balance            FROM customers WHERE id = 1;  -- Balance: 120.50
+SELECT id || '-' || last_name            FROM customers WHERE id = 1;  -- 1-Lovelace
+SELECT 'Joined ' || signup_date          FROM customers WHERE id = 1;  -- Joined 2026-01-15
+SELECT id || balance                     FROM customers WHERE id = 1;
+-- ERROR:  operator does not exist: bigint || numeric
+SELECT id::text || balance::text         FROM customers WHERE id = 1;  -- 1120.50
+SELECT concat(id, balance)               FROM customers WHERE id = 1;  -- 1120.50
+```
+
+Both paths use the type's *output function*, so the text you get depends on session settings: a `date` follows `DateStyle`, a `timestamptz` is rendered in the session `timezone`, and `numeric` keeps its declared scale (`120.50`, not `120.5`). When the exact shape matters, format explicitly before concatenating:
+
+```sql
+SELECT first_name || ' joined on ' || to_char(signup_date, 'FMMonth DD, YYYY')
+       || ' with $' || to_char(balance, 'FM999,999,990.00')
+FROM customers WHERE id = 1;
+-- Ada joined on January 15, 2026 with $120.50
+```
+
+One more overload to know about: `||` is also array concatenation. `ARRAY[1,2] || 3` appends to the array rather than producing a string, which is a classic surprise when a column turns out to be `text[]`.
+
+## COALESCE patterns
+
+When you want `||` semantics but need to tolerate a NULL in the middle, wrap the optional piece *together with its separator* in `COALESCE`:
+
+```sql
+SELECT first_name
+       || COALESCE(' ' || middle_name, '')   -- ' ' || NULL is NULL, so COALESCE drops the space too
+       || ' ' || last_name AS full_name
+FROM customers ORDER BY id;
+-- Ada Byron Lovelace / Alan Turing / Grace Murray Hopper
+```
+
+This trick relies on NULL propagation: the space disappears along with the missing middle name. `CONCAT_WS` is shorter for simple cases; the `COALESCE` form wins when different parts need different separators or when you want to substitute a placeholder such as `COALESCE(city, 'unknown')`.
+
+## FORMAT() for templates and safe dynamic SQL
+
+`FORMAT(template, args...)` is `sprintf`-style and is often more readable than a chain of `||`:
+
+```sql
+SELECT format('%s %s (%s)', first_name, last_name, city) FROM customers ORDER BY id;
+-- Ada Lovelace (London) / Alan Turing (Wilmslow) / Grace Hopper ()
+```
+
+- `%s` inserts the value as text; NULL becomes an empty string (like `CONCAT`).
+- `%I` quotes the value as an SQL *identifier* (adds double quotes when needed).
+- `%L` quotes the value as an SQL *literal* (single quotes, doubles embedded quotes) and renders NULL as the unquoted keyword `NULL`.
+- `%1$s`, `%2$s` reference arguments by position so one argument can be reused.
+
+`%I` and `%L` are what make `FORMAT` the right tool for dynamic SQL in PL/pgSQL, where `||` invites injection bugs:
+
+```sql
+DO $$
+DECLARE tbl text := 'customers'; col text := 'city'; val text := 'O''Brien';
+BEGIN
+  EXECUTE format('UPDATE %I SET %I = %L WHERE id = %s', tbl, col, val, 1);
+  -- UPDATE customers SET city = 'O''Brien' WHERE id = 1
+END $$;
+```
+
+## STRING_AGG: many rows into one string
+
+When "concat" really means "combine values from several rows", use the aggregate `STRING_AGG(expression, separator)`. It skips NULLs, accepts an `ORDER BY` inside the call, and supports `DISTINCT`:
+
+```sql
+SELECT c.last_name,
+       string_agg(o.sku, ', ' ORDER BY o.sku)              AS skus_in_order,
+       string_agg(DISTINCT o.sku, ', ' ORDER BY o.sku)     AS distinct_skus,
+       count(*)                                            AS n
+FROM orders o JOIN customers c ON c.id = o.customer_id
+WHERE o.id <= 6
+GROUP BY c.last_name ORDER BY c.last_name;
+```
+
+| last_name | skus_in_order | distinct_skus | n |
+|---|---|---|---|
+| Hopper | SKU-002, SKU-005 | SKU-002, SKU-005 | 2 |
+| Lovelace | SKU-003, SKU-006 | SKU-003, SKU-006 | 2 |
+| Turing | SKU-001, SKU-004 | SKU-001, SKU-004 | 2 |
+
+Notes:
+
+- The first argument must be `text` (or `bytea`); cast numbers with `o.id::text`.
+- With `DISTINCT`, the `ORDER BY` expression must be the same as the aggregated expression.
+- `STRING_AGG` also works as a window function (`OVER (PARTITION BY ...)`) to attach the combined string to every row.
+- PostgreSQL places no fixed length cap on the result (unlike MySQL's `group_concat_max_len`), but very large groups consume memory; aggregate only what you will display.
+
+### ARRAY_TO_STRING
+
+`ARRAY_TO_STRING(array, separator [, null_replacement])` is the array-based equivalent and is the only way to render NULL elements as a placeholder:
+
+```sql
+SELECT array_to_string(array_agg(city ORDER BY id), ', ', '(no city)') FROM customers;
+-- London, Wilmslow, (no city)
+SELECT array_to_string(ARRAY['a', NULL, 'c'], '-');   -- a-c   (NULL skipped)
+```
+
+`array_agg` plus `array_to_string` is also handy when the array itself is useful downstream (for `= ANY(...)` filters, for example).
+
+## Concatenation in UPDATE
+
+Appending to an existing value is just the same expression on the right-hand side:
+
+```sql
+UPDATE customers SET last_name = last_name || ' Jr.' WHERE id = 1;
+UPDATE customers SET city = city || ' (UK)';               -- Hopper's NULL city stays NULL
+UPDATE customers SET city = concat_ws(' ', city, '(UK)');  -- Hopper's city becomes '(UK)'
+UPDATE customers SET city = COALESCE(city || ' (UK)', city); -- leave NULLs alone, tag the rest
+```
+
+Remember that PostgreSQL's MVCC writes a complete new row version on every `UPDATE`, so "append one character to a huge text column in a loop" rewrites the whole value (and its TOAST chunks) each time. Build the final string in one statement, or with `STRING_AGG` in a single `UPDATE ... FROM`, instead of appending row by row.
+
+## Generated columns and expression indexes on concatenated values
+
+A `full_name` that is always derived from other columns is a good candidate for a stored generated column (PostgreSQL 12+), which can then be indexed like any column:
+
+```sql
+ALTER TABLE customers
+  ADD COLUMN full_name text GENERATED ALWAYS AS (first_name || ' ' || last_name) STORED;
+CREATE INDEX customers_full_name_idx ON customers (full_name);
+SELECT id, full_name FROM customers WHERE full_name = 'Alan Turing';
+```
+
+If you would rather not store it, an expression index works when the query repeats the exact expression:
+
+```sql
+CREATE INDEX customers_full_name_expr_idx ON customers ((first_name || ' ' || last_name));
+CREATE INDEX customers_full_name_lower_idx ON customers (lower(first_name || ' ' || last_name) text_pattern_ops);
+
+EXPLAIN SELECT id FROM customers WHERE lower(first_name || ' ' || last_name) LIKE 'ada l%';
+-- Index Scan using customers_full_name_lower_idx ...
+```
+
+Here is the pitfall: **generated columns and index expressions must be IMMUTABLE**, and `concat`, `concat_ws` and `format` are marked `STABLE` because they call type output functions that can depend on session settings. `CREATE INDEX ON customers ((concat(first_name, ' ', last_name)))` fails with `functions in index expression must be marked IMMUTABLE`. The `||` operator between two `text` values is immutable; `text || integer` is *not* (it goes through the same output-function path), so write `id::text` explicitly (the integer-to-text cast is immutable) and avoid `date::text` (stable, because of `DateStyle`). In short: for anything indexed or generated, use `||` on text operands with explicit, immutable casts.
+
+## Performance notes
+
+- `text`, `varchar` and `varchar(n)` are stored identically; concatenation speed is the same. Avoid `char(n)`: it pads with spaces, and `'abc'::char(5) || 'x'` silently trims the padding in one context and keeps it in another.
+- Concatenation is cheap CPU work; the cost that shows up in practice is volume. Values over roughly 2 KB are compressed and stored out of line in the TOAST table, so selecting or rewriting a large concatenated `text` column touches extra pages. Keep giant generated strings out of hot tables or generate them at read time.
+- `CONCAT_WS` versus nested `COALESCE(... || ...)` makes no measurable difference; choose for readability.
+- An index on a concatenated expression only helps queries that use the *same* expression (or the generated column). A filter on `first_name` alone still needs its own index.
+- `STRING_AGG` with `ORDER BY` sorts inside each group; on large groups add an index that already delivers the rows in that order, or pre-sort in a subquery.
+
+## Building strings: LEFT, RIGHT, REPEAT, LPAD, RPAD
+
+```sql
+SELECT 'INV-' || to_char(signup_date, 'YYYY') || '-' || lpad(id::text, 5, '0') AS invoice_no,  -- INV-2026-00001
+       left(first_name, 1) || '.' || left(last_name, 1) || '.'                  AS initials,    -- A.L.
+       repeat('*', 6) || right('4111111111111111', 4)                          AS masked_card, -- ******1111
+       rpad(last_name, 12, '.') || lpad(balance::text, 8, ' ')                 AS ledger_line  -- Lovelace....  120.50
+FROM customers WHERE id = 1;
+```
+
+`LPAD`/`RPAD` also *truncate* to the given length, and `REPEAT` with a negative or zero count returns an empty string, so `repeat('*', length(x) - 4)` is safe for short inputs.
+
+## Trimming whitespace and cleaning up
+
+Source data often carries stray spaces that then end up inside your concatenated strings:
+
+```sql
+SELECT trim('  Ada  '),                      -- 'Ada'        both sides, spaces only
+       btrim('--Ada--', '-'),                -- 'Ada'        custom characters
+       ltrim('  Ada'), rtrim('Ada  '),       -- left / right only
+       trim(both ' -' from ' - Ada - '),     -- 'Ada'        SQL-standard syntax, set of chars
+       regexp_replace('Ada   Byron  Lovelace', '\s+', ' ', 'g');  -- collapse runs of whitespace
+```
+
+A robust full-name expression therefore looks like `concat_ws(' ', nullif(trim(first_name), ''), nullif(trim(middle_name), ''), nullif(trim(last_name), ''))`: trim, turn empties into NULL, let `CONCAT_WS` skip them. If you want to check these expressions interactively against your own schema, paste them into Chat2DB, a free AI-powered SQL client (download at https://chat2db.ai/download or use the web version at https://app.chat2db.ai), which shows the resulting column types alongside the values.
+
+## Differences vs MySQL CONCAT and SQL Server +
+
+| Behavior | PostgreSQL | MySQL | SQL Server |
+|---|---|---|---|
+| Operator | `\|\|` (NULL propagates) | `\|\|` is logical OR unless `PIPES_AS_CONCAT` sql_mode is on | `+` (NULL propagates unless `CONCAT_NULL_YIELDS_NULL OFF`) |
+| `CONCAT()` with a NULL argument | NULL skipped | **whole result is NULL** | NULL skipped (2012+) |
+| `CONCAT_WS()` | skips NULLs | skips NULLs | skips NULLs (2017+) |
+| Numbers with operator | need one text side or a cast | `CONCAT` converts; `+` adds | `+` does arithmetic or errors; cast first |
+| Rows to one string | `STRING_AGG(x, sep ORDER BY ...)` | `GROUP_CONCAT(x ORDER BY ... SEPARATOR ...)`, truncated at `group_concat_max_len` | `STRING_AGG(x, sep) WITHIN GROUP (ORDER BY ...)` (2017+) |
+
+The two migration traps: MySQL's `CONCAT` returns NULL when *any* argument is NULL, the opposite of PostgreSQL, so code ported from MySQL that relied on `CONCAT` to detect missing values silently changes meaning; and Oracle users should note that Oracle's `||` treats NULL as an empty string, whereas PostgreSQL's `||` returns NULL, so Oracle-style `a || b` expressions need `CONCAT_WS` or `COALESCE` in PostgreSQL.
+
+## FAQ
+
+### Why does my || concatenation return NULL in PostgreSQL?
+
+Because at least one operand is NULL and `||` follows standard three-valued logic. Use `CONCAT()` or `CONCAT_WS()` to skip NULLs, or wrap the optional part in `COALESCE`. Check for empty strings too: `''` is not NULL and will not be skipped by any of these.
+
+### Should I use CONCAT or || in PostgreSQL?
+
+Use `CONCAT_WS` or `CONCAT` in queries where parts may be missing and you want a readable result. Use `||` when NULL should propagate, when you are concatenating arrays or `bytea`, and whenever the expression must be immutable (generated columns, expression indexes), since `concat` and `concat_ws` are only `STABLE`.
+
+### How do I concatenate a number or a date with a string?
+
+With `||`, make sure one side is text (`'Total: ' || balance`) or cast explicitly (`id::text || '-' || code`); two non-text operands raise `operator does not exist`. `CONCAT` and `FORMAT` cast everything automatically. For dates and numerics, prefer `to_char()` so the output does not depend on `DateStyle` or the numeric scale.
+
+## Conclusion
+
+To concat strings in PostgreSQL: reach for `||` when all parts are guaranteed non-NULL or when you need an immutable expression for an index or generated column; reach for `CONCAT_WS` (or `CONCAT`) when parts are optional; use `FORMAT` for templates and for safe dynamic SQL with `%I`/`%L`; and use `STRING_AGG` or `ARRAY_TO_STRING` when the values live in different rows. Cast or `to_char` non-text values explicitly when the output format matters, trim and `NULLIF` dirty input before joining it, and keep an eye on the NULL semantics when moving code from MySQL, SQL Server or Oracle, because that is where every concatenation bug in a migration comes from.
