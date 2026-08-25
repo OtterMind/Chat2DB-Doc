@@ -1,0 +1,265 @@
+---
+title: "PostgreSQL UNNEST: Turn Arrays into Rows"
+description: "How to use UNNEST in PostgreSQL: expand arrays to rows, WITH ORDINALITY, multi-array unnest, joins, jsonb equivalents and performance notes."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: August 25, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# PostgreSQL UNNEST: Turn Arrays into Rows
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="August 25, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+`UNNEST` is the bridge between PostgreSQL's array types and the relational world. It takes an array and returns one row per element, which means anything you can do to a table — filter, join, aggregate, window — you can also do to the contents of an array column, a `text[]` parameter from your application, or a list you built inline. It is one of the highest-leverage functions in Postgres, and most people only ever use a third of it.
+
+## The basics
+
+```sql
+SELECT unnest(ARRAY['red', 'green', 'blue']) AS color;
+```
+
+```
+ color
+-------
+ red
+ green
+ blue
+```
+
+Applied to a column, `UNNEST` expands each row into as many rows as the array has elements:
+
+```sql
+CREATE TABLE posts (
+  id    int PRIMARY KEY,
+  title text,
+  tags  text[]
+);
+
+INSERT INTO posts VALUES
+  (1, 'Indexing basics',  ARRAY['postgres', 'index', 'performance']),
+  (2, 'JSON in Postgres', ARRAY['postgres', 'json']),
+  (3, 'Draft',            ARRAY[]::text[]),
+  (4, 'Untagged',         NULL);
+
+SELECT id, title, unnest(tags) AS tag
+FROM posts;
+```
+
+```
+ id |      title       |    tag
+----+------------------+-------------
+  1 | Indexing basics  | postgres
+  1 | Indexing basics  | index
+  1 | Indexing basics  | performance
+  2 | JSON in Postgres | postgres
+  2 | JSON in Postgres | json
+```
+
+Note what happened to rows 3 and 4: an empty array and a `NULL` array both produce **zero** rows. Calling a set-returning function in the `SELECT` list behaves like an implicit cross join, and a cross join with an empty set eliminates the row. If you need those rows back, move `UNNEST` into the `FROM` clause with a lateral left join, which is the modern and more predictable form anyway:
+
+```sql
+SELECT p.id, p.title, t.tag
+FROM posts p
+LEFT JOIN LATERAL unnest(p.tags) AS t(tag) ON true;
+```
+
+```
+ id |      title       |    tag
+----+------------------+-------------
+  1 | Indexing basics  | postgres
+  1 | Indexing basics  | index
+  1 | Indexing basics  | performance
+  2 | JSON in Postgres | postgres
+  2 | JSON in Postgres | json
+  3 | Draft            | (null)
+  4 | Untagged         | (null)
+```
+
+Since PostgreSQL 9.3, `LEFT JOIN LATERAL ... ON true` is the idiomatic way to expand an array without losing rows. Use it by default in production queries; the `SELECT`-list form is fine for quick interactive work.
+
+## Keeping the position: WITH ORDINALITY
+
+Arrays are ordered, and that order is often meaningful — a ranked list, a path, a sequence of steps. `WITH ORDINALITY` adds a 1-based index column:
+
+```sql
+SELECT p.id, t.tag, t.position
+FROM posts p
+CROSS JOIN LATERAL unnest(p.tags) WITH ORDINALITY AS t(tag, position)
+WHERE p.id = 1;
+```
+
+```
+ id |     tag     | position
+----+-------------+----------
+  1 | postgres    |        1
+  1 | index       |        2
+  1 | performance |        3
+```
+
+This is how you keep an array round-trippable: expand it, transform it, and reassemble it in the original order with `ORDER BY position` inside `array_agg`.
+
+## Multiple arrays at once
+
+In the `FROM` clause, `UNNEST` accepts several arrays and expands them side by side, padding the shorter ones with `NULL`:
+
+```sql
+SELECT *
+FROM unnest(
+       ARRAY['alice', 'bob', 'carol'],
+       ARRAY[30, 41, 25],
+       ARRAY['eng', 'sales']
+     ) AS t(name, age, team);
+```
+
+```
+ name  | age | team
+-------+-----+-------
+ alice |  30 | eng
+ bob   |  41 | sales
+ carol |  25 | (null)
+```
+
+This turns three parallel arrays — exactly what many client libraries send — into a table you can `INSERT ... SELECT` from. It is the fastest way to do a bulk insert from an application without building a giant multi-row `VALUES` list:
+
+```sql
+INSERT INTO employees (name, age, team)
+SELECT * FROM unnest($1::text[], $2::int[], $3::text[]) AS t(name, age, team);
+```
+
+One statement, three array parameters, any number of rows, and the query plan is cached because the SQL text never changes. Compare that with generating `VALUES ($1,$2,$3),($4,$5,$6),...` for every batch size and forcing a re-plan each time.
+
+The same trick powers bulk updates:
+
+```sql
+UPDATE employees e
+   SET team = u.team
+  FROM unnest($1::int[], $2::text[]) AS u(id, team)
+ WHERE e.id = u.id;
+```
+
+## Filtering, aggregating and joining
+
+Once elements are rows, everything else is ordinary SQL. Tag frequencies:
+
+```sql
+SELECT tag, count(*) AS posts
+FROM posts, unnest(tags) AS tag
+GROUP BY tag
+ORDER BY posts DESC, tag;
+```
+
+Joining array elements to a lookup table:
+
+```sql
+SELECT p.id, p.title, tg.display_name
+FROM posts p
+CROSS JOIN LATERAL unnest(p.tags) AS t(tag)
+JOIN tag_metadata tg ON tg.slug = t.tag;
+```
+
+Deduplicating and sorting an array in place:
+
+```sql
+SELECT id,
+       (SELECT array_agg(DISTINCT t ORDER BY t)
+        FROM unnest(tags) AS t) AS clean_tags
+FROM posts;
+```
+
+Finding rows whose array contains a value does **not** need `UNNEST` — and should not use it:
+
+```sql
+-- Good: uses a GIN index on tags
+SELECT * FROM posts WHERE tags @> ARRAY['postgres'];
+
+-- Bad: unnests every row before filtering
+SELECT DISTINCT p.* FROM posts p, unnest(p.tags) t WHERE t = 'postgres';
+```
+
+The containment operator `@>` can use a GIN index:
+
+```sql
+CREATE INDEX posts_tags_gin_idx ON posts USING gin (tags);
+```
+
+`UNNEST` cannot. This is the single most important performance rule about arrays in Postgres: **expand for output, not for filtering.**
+
+## UNNEST versus IN and ANY
+
+`= ANY(array)` is the array-native equivalent of `IN (list)`:
+
+```sql
+SELECT * FROM employees WHERE id = ANY($1::int[]);
+```
+
+This takes one parameter instead of N, so the same prepared statement serves any list length. `UNNEST` gives you the same result set via a join:
+
+```sql
+SELECT e.* FROM employees e JOIN unnest($1::int[]) AS u(id) ON u.id = e.id;
+```
+
+The difference matters at scale. For a handful of values, `= ANY` is fine and the planner treats it like an index lookup. For thousands of values, the join form is usually faster because the planner can choose a hash join over the unnested set instead of evaluating a large array scan per row. Benchmark both on your data — the crossover is typically somewhere in the hundreds.
+
+## Arrays of composite types and multidimensional arrays
+
+`UNNEST` on an array of composites gives you rows you can dot-access after a cast:
+
+```sql
+CREATE TYPE line_item AS (sku text, qty int);
+
+SELECT (item).sku, (item).qty
+FROM unnest(ARRAY[('A-1', 2), ('B-7', 1)]::line_item[]) AS item;
+```
+
+Multidimensional arrays are flattened completely, in row-major order — `UNNEST` does not preserve the shape:
+
+```sql
+SELECT unnest(ARRAY[[1,2],[3,4]]);  -- 1, 2, 3, 4
+```
+
+If you need per-row expansion of a 2-D array, use `generate_subscripts`:
+
+```sql
+SELECT i, arr[i][1] AS a, arr[i][2] AS b
+FROM (SELECT ARRAY[[1,2],[3,4]] AS arr) s,
+     generate_subscripts(s.arr, 1) AS i;
+```
+
+## The JSON equivalents
+
+Arrays are not the only nested structure in Postgres. For `jsonb`, the equivalents are:
+
+```sql
+-- jsonb array -> rows of jsonb
+SELECT jsonb_array_elements('[1, 2, 3]'::jsonb);
+
+-- jsonb array -> rows of text
+SELECT jsonb_array_elements_text('["a", "b"]'::jsonb);
+
+-- jsonb object -> key/value rows
+SELECT * FROM jsonb_each_text('{"a": 1, "b": 2}'::jsonb);
+
+-- jsonb array of objects -> a real table
+SELECT *
+FROM jsonb_to_recordset('[{"sku":"A-1","qty":2},{"sku":"B-7","qty":1}]'::jsonb)
+     AS x(sku text, qty int);
+```
+
+The same rules apply: use `LEFT JOIN LATERAL ... ON true` to keep rows with empty arrays, add `WITH ORDINALITY` when the order matters, and filter with the containment operator `@>` against a GIN index rather than by expanding.
+
+## Performance notes
+
+- **Expansion multiplies rows.** A million rows with ten elements each becomes ten million rows. Filter and limit *before* the `UNNEST` whenever possible — push the `WHERE` into a CTE or subquery so fewer rows reach the expansion.
+- **`unnest` in the `SELECT` list of a query with multiple set-returning functions** produced a bizarre "lockstep" result before PostgreSQL 10. Since 10 the semantics are sane (they expand in parallel, padded with `NULL`), but the `LATERAL` form makes the intent explicit and works identically on every version.
+- **Estimates are guesses.** The planner assumes about 100 rows from a set-returning function unless it knows better. If a plan goes wrong downstream, `ROWS` on a custom function or a materialised CTE can help it.
+- **`array_length` before expanding** is cheaper than expanding to count: `array_length(tags, 1)` beats `(SELECT count(*) FROM unnest(tags))`.
+
+Check the plan with `EXPLAIN (ANALYZE, BUFFERS)` and look at the `Function Scan` node's actual row count against its estimate. If you are iterating on queries like these, [Chat2DB](https://chat2db.ai/download) is a free AI-powered SQL client that keeps the plan beside the editor, and there is a browser version at [app.chat2db.ai](https://app.chat2db.ai).
+
+## Summary
+
+`UNNEST` converts arrays to rows: use `LEFT JOIN LATERAL unnest(col) ON true` so rows with empty or `NULL` arrays survive, `WITH ORDINALITY` when order matters, and the multi-array form for cheap bulk inserts and updates from application parameters. Aggregate back with `array_agg(... ORDER BY ...)`. And remember the one rule that keeps queries fast: filter arrays with `@>` and a GIN index, and save `UNNEST` for producing output.

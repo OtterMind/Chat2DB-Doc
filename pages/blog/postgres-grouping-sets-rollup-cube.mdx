@@ -1,0 +1,261 @@
+---
+title: "Postgres GROUPING SETS, ROLLUP, and CUBE"
+description: "Postgres GROUP BY GROUPING SETS, ROLLUP and CUBE explained with SQL examples for building multi-level subtotal and grand-total reports."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: August 24, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# Postgres GROUPING SETS, ROLLUP, and CUBE
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="August 24, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+Every sales dashboard eventually needs the same three numbers on one screen: the total for each city, the total for each region, and the total across everything. PostgreSQL has supported the standard SQL extensions `GROUPING SETS`, `ROLLUP`, and `CUBE` since version 9.5, and together they let a single `GROUP BY` clause produce detail rows and every level of subtotal you need in one pass. This article builds one small `sales` table, runs it through all three constructs, and shows how to tell a genuine `NULL` in your data apart from the `NULL` Postgres uses as a subtotal marker.
+
+## The problem: one query, many subtotals
+
+Before these extensions existed, the only way to get per-group subtotals alongside a grand total was to write several differently-grouped `SELECT` statements and stitch them together with `UNION ALL`. For a report broken down by region and city, that looks like this:
+
+```sql
+-- The "old way": three separate grouped queries unioned together
+SELECT region, city, SUM(amount) AS total
+FROM   sales
+GROUP  BY region, city
+
+UNION ALL
+
+SELECT region, NULL AS city, SUM(amount) AS total
+FROM   sales
+GROUP  BY region
+
+UNION ALL
+
+SELECT NULL AS region, NULL AS city, SUM(amount) AS total
+FROM   sales;
+```
+
+This works, and it is the pattern most people reach for instinctively, but it has real costs. Every branch of the `UNION ALL` reads the whole table (or index) again, so a table with three grouping levels means three scans and three aggregation passes, even though the underlying rows never change between them. The SQL is also verbose and easy to get subtly wrong: forget to cast a `NULL` consistently, drop a column from one branch, or mismatch the column order, and the query either fails to parse or silently produces the wrong shape. `GROUPING SETS`, `ROLLUP`, and `CUBE` exist to replace this whole pattern with a single `GROUP BY` clause that Postgres can plan and execute as one aggregation.
+
+## Example dataset: a small sales table
+
+The rest of this article reuses one table so you can trace every output row back to the input. It has two regions, two named cities per region, a row with no city at all (representing online orders that were never assigned to a specific storefront), and two products:
+
+```sql
+CREATE TABLE sales (
+  region  text,
+  city    text,
+  product text,
+  amount  numeric
+);
+
+INSERT INTO sales (region, city, product, amount) VALUES
+('East', 'Boston',    'Widget', 1200),
+('East', 'Boston',    'Gadget',  800),
+('East', 'New York',  'Widget', 2500),
+('East', 'New York',  'Gadget', 1300),
+('East', NULL,        'Online',  500),
+('West', 'Seattle',   'Widget',  900),
+('West', 'Seattle',   'Gadget',  600),
+('West', 'Portland',  'Widget',  700),
+('West', 'Portland',  'Gadget',  400);
+```
+
+Nine rows in total. Summing `amount` for each `(region, city)` pair gives Boston 2000, New York 3800, the online row 500, Seattle 1500, and Portland 1100. Rolling those up by region gives East 6300 and West 2600, and the grand total across all nine rows is 8900. Keep those five numbers in mind — 2000, 3800, 500, 1500, 1100 at the detail level, 6300 and 2600 per region, and 8900 overall — because every query below produces the same figures, just organized differently.
+
+That `NULL` city on the online row is deliberate. It is a real, meaningful value in the data (this order simply has no associated city), and it is going to collide visually with the `NULL` that Postgres inserts as a placeholder for subtotal rows. We will come back to that collision once `GROUPING SETS` is on the table.
+
+## GROUPING SETS: naming the exact combinations you want
+
+`GROUPING SETS` lets you list, literally, which combinations of grouping columns you want in the result, including the empty combination `()` for a grand total. Each combination in the list becomes its own set of grouped rows, computed from the same underlying data in the same query:
+
+```sql
+SELECT region, city, SUM(amount) AS total
+FROM   sales
+GROUP  BY GROUPING SETS ((region, city), (region), ())
+ORDER  BY region NULLS LAST, city NULLS LAST;
+```
+
+```
+ region |   city   | total
+--------+----------+-------
+ East   | Boston   |  2000
+ East   | New York |  3800
+ East   |          |   500   -- real row: the online orders with no city
+ East   |          |  6300   -- subtotal: all of East
+ West   | Portland |  1100
+ West   | Seattle  |  1500
+ West   |          |  2600   -- subtotal: all of West
+        |          |  8900   -- grand total
+```
+
+Eight rows come back from one scan of `sales`: five detail-level rows (one of which happens to have a genuinely `NULL` city), two region subtotals, and one grand total. Notice that the region subtotal for East (6300) sits right next to the real online-orders row (500) and both show a blank `city` column — that ambiguity is exactly the problem the `GROUPING()` function solves further down. The three grouping combinations you listed, `(region, city)`, `(region)`, and `()`, map directly onto the three `UNION ALL` branches from the previous section, but here Postgres only needs to read the table once and can share the sort or hash step across all three combinations.
+
+You are not limited to a hierarchical set of columns, either. `GROUPING SETS ((region), (product), ())` would give you a region breakdown and a product breakdown side by side in one result set, something a plain `ROLLUP` cannot express because its combinations always nest one column inside the previous one.
+
+## ROLLUP: a shorthand for hierarchical subtotals
+
+Writing out `GROUPING SETS ((region, city), (region), ())` by hand is exactly the pattern you need whenever the columns form a hierarchy — city rolls up into region, region rolls up into everything. `ROLLUP` is shorthand for precisely that pattern:
+
+```sql
+SELECT region, city, SUM(amount) AS total
+FROM   sales
+GROUP  BY ROLLUP (region, city)
+ORDER  BY region NULLS LAST, city NULLS LAST;
+```
+
+This produces the identical eight rows shown above for `GROUPING SETS ((region, city), (region), ())`, because that is literally what `ROLLUP (region, city)` expands to internally. For `n` columns, `ROLLUP` generates `n + 1` grouping sets: the full detail level, then each prefix of the column list with columns dropped from the right, ending in the empty set. `ROLLUP (a, b, c)` therefore produces `(a, b, c)`, `(a, b)`, `(a)`, and `()` — four levels from three columns, following a hierarchy where `c` rolls into `b`, `b` rolls into `a`, and `a` rolls into the grand total.
+
+### Column order matters
+
+Because `ROLLUP` peels columns off from the right, the order you list them in changes which subtotals you get. `ROLLUP (region, city)` gives you a subtotal per region (city dropped) and then a grand total. Swap the arguments and the hierarchy changes with it:
+
+```sql
+SELECT city, region, SUM(amount) AS total
+FROM   sales
+GROUP  BY ROLLUP (city, region)
+ORDER  BY city NULLS LAST, region NULLS LAST;
+```
+
+Now the intermediate subtotal is per **city** (region dropped), not per region — `ROLLUP (city, region)` expands to `(city, region)`, `(city)`, and `()`. In this particular dataset every city belongs to exactly one region, so the per-city subtotal happens to equal the matching per-`(city, region)` detail row, except for the `NULL`-city group, which sums every row where `city IS NULL` regardless of region. With a dataset where multiple regions shared a city name, the difference would be more visible: the per-city subtotal would combine amounts across regions, something `ROLLUP (region, city)` never does. If you need subtotals broken out in both directions rather than in one fixed hierarchy, `ROLLUP` is the wrong tool — that is what `CUBE` is for.
+
+## CUBE: every combination, not just the hierarchy
+
+`CUBE` generates the full power set of the listed columns: every possible combination of "included" or "not included," not just the nested prefixes that `ROLLUP` produces. `CUBE (region, city)` expands to all four combinations of two columns — `(region, city)`, `(region)`, `(city)`, and `()` — where `ROLLUP (region, city)` only produces three of those four (it skips `(city)` on its own):
+
+```sql
+SELECT region, city, SUM(amount) AS total,
+       GROUPING(region) AS g_region,
+       GROUPING(city)   AS g_city
+FROM   sales
+GROUP  BY CUBE (region, city)
+ORDER  BY g_region, region NULLS LAST, g_city, city NULLS LAST;
+```
+
+```
+ region |   city   | total | g_region | g_city
+--------+----------+-------+----------+--------
+ East   | Boston   |  2000 |    0     |   0
+ East   | New York |  3800 |    0     |   0
+ East   |          |   500 |    0     |   0     -- real row: online orders
+ West   | Portland |  1100 |    0     |   0
+ West   | Seattle  |  1500 |    0     |   0
+ East   |          |  6300 |    0     |   1     -- subtotal: all of East
+ West   |          |  2600 |    0     |   1     -- subtotal: all of West
+        | Boston   |  2000 |    1     |   0     -- subtotal: Boston, any region
+        | New York |  3800 |    1     |   0     -- subtotal: New York, any region
+        |          |   500 |    1     |   0     -- subtotal: NULL-city rows, any region
+        | Portland |  1100 |    1     |   0     -- subtotal: Portland, any region
+        | Seattle  |  1500 |    1     |   0     -- subtotal: Seattle, any region
+        |          |  8900 |    1     |   1     -- grand total
+```
+
+Thirteen rows total: five detail rows, two region-only subtotals, five city-only subtotals, and one grand total. The city-only subtotals look identical in value to their matching detail rows in this dataset because each named city only appears under one region, but the query is genuinely computing "total for this city across every region," which would differ from the detail row the moment two regions shared a city name. `CUBE` is the right choice whenever a report needs to answer "what does this look like broken down by region alone, by city alone, and both together" without deciding in advance which dimension is the "outer" one — geographic sales-by-region-and-by-channel reports, or any pivot-table-style summary, are typical uses.
+
+## Telling a subtotal NULL from a real NULL
+
+Every example so far has a blank cell that could mean two different things: either the underlying column truly holds `NULL` for that row (our online orders with no assigned city), or the column was left out of that particular grouping set and Postgres filled it with `NULL` as a placeholder. Looking only at the output, `region = 'East', city = NULL, total = 500` and `region = 'East', city = NULL, total = 6300` are visually identical in shape — you can only tell them apart because you happen to remember which amount belongs to which row. That does not scale past a handful of rows, and it breaks completely if a column can be `NULL` in the source data at all.
+
+### GROUPING() to detect subtotal rows
+
+`GROUPING(column)` solves this directly. It returns `1` if the row is a subtotal in which `column` was excluded from the grouping set (so its `NULL` is a placeholder), and `0` if the row reflects an actual value from the data — even when that actual value happens to be `NULL`, as with the online orders:
+
+```sql
+SELECT region, city, SUM(amount) AS total,
+       GROUPING(city) AS is_city_subtotal
+FROM   sales
+GROUP  BY ROLLUP (region, city)
+ORDER  BY region NULLS LAST, GROUPING(city), city NULLS LAST;
+```
+
+```
+ region |   city   | total | is_city_subtotal
+--------+----------+-------+------------------
+ East   | Boston   |  2000 |        0
+ East   | New York |  3800 |        0
+ East   |          |   500 |        0        -- real NULL city, not a subtotal
+ East   |          |  6300 |        1        -- genuine subtotal for East
+ West   | Portland |  1100 |        0
+ West   | Seattle  |  1500 |        0
+ West   |          |  2600 |        1
+        |          |  8900 |        1
+```
+
+Ordering by `GROUPING(city)` before `city` puts the real detail row ahead of the subtotal row within each region, which both makes the report readable and proves the two blank-looking rows are not the same thing.
+
+### Labeling rows with a CASE expression
+
+Combine `GROUPING()` on every rolled-up column to build a plain-language label for each row, which is usually nicer to show in a report than raw 0/1 flags:
+
+```sql
+SELECT region, city, SUM(amount) AS total,
+       CASE
+         WHEN GROUPING(region) = 1 THEN 'Grand Total'
+         WHEN GROUPING(city)   = 1 THEN 'Region Subtotal'
+         ELSE 'Detail'
+       END AS row_type
+FROM   sales
+GROUP  BY ROLLUP (region, city)
+ORDER  BY region NULLS LAST, GROUPING(city), city NULLS LAST;
+```
+
+Because `GROUPING(region)` is only `1` on the single row where region itself was dropped from the grouping set — the grand total — that condition is checked first, and `GROUPING(city) = 1` catches every region-level subtotal without also matching the grand-total row. The `ELSE` branch is every detail row, including the one with a genuinely `NULL` city, which correctly falls through to `'Detail'` rather than being mislabeled as a subtotal.
+
+## Sorting and mixing aggregate functions
+
+Two practical additions make these reports usable rather than just correct. First, `ORDER BY` needs to reference the grouping columns and, as shown above, often `GROUPING()` itself so that detail rows, subtotals, and the grand total sort in a sensible order instead of wherever the aggregation happened to place them. Second, nothing restricts you to `SUM`. Any aggregate — `COUNT`, `AVG`, `MIN`, `MAX`, or several at once — works the same way across every grouping level in a single query:
+
+```sql
+SELECT region, city,
+       COUNT(*)       AS n_orders,
+       SUM(amount)    AS total,
+       AVG(amount)    AS avg_amount
+FROM   sales
+GROUP  BY ROLLUP (region, city)
+ORDER  BY region NULLS LAST, GROUPING(city), city NULLS LAST;
+```
+
+```
+ region |   city   | n_orders | total | avg_amount
+--------+----------+----------+-------+------------
+ East   | Boston   |    2     |  2000 |   1000
+ East   | New York |    2     |  3800 |   1900
+ East   |          |    1     |   500 |    500
+ East   |          |    5     |  6300 |   1260
+ West   | Portland |    2     |  1100 |    550
+ West   | Seattle  |    2     |  1500 |    750
+ West   |          |    4     |  2600 |    650
+        |          |    9     |  8900 |  988.89
+```
+
+`COUNT(*)` at the region level correctly counts every underlying row rolled into that region (five for East, including the single online order), and `AVG` is recomputed from the raw rows at each level rather than averaged from the already-summarized subtotals, which is exactly the behavior a correct report needs.
+
+## How Postgres executes this: one pass, not many
+
+The efficiency argument from the very first section is not just theoretical. Run `EXPLAIN` against a `ROLLUP`, `CUBE`, or `GROUPING SETS` query and you will see a single `GroupAggregate` (or, for hashable inputs, `HashAggregate`) node listing multiple `Group Key` lines, one per grouping combination, feeding off one sorted or hashed pass over the input:
+
+```sql
+EXPLAIN (COSTS OFF)
+SELECT region, city, SUM(amount)
+FROM   sales
+GROUP  BY ROLLUP (region, city);
+```
+
+```
+ GroupAggregate
+   Group Key: region, city
+   Group Key: region
+   Group Key: ()
+   ->  Sort
+         Sort Key: region, city
+         ->  Seq Scan on sales
+```
+
+Compare that to the `EXPLAIN` output for the equivalent `UNION ALL` version from the first section, which shows three independent `Seq Scan` (or `Index Scan`) nodes, one under each `Append` branch, each followed by its own aggregation step. On a small nine-row table the difference is invisible; on a table with millions of rows and several grouping levels, cutting three or four full scans down to one is often the entire point of reaching for `ROLLUP` or `GROUPING SETS` in the first place. If you want to see this plan shape for yourself alongside the result rows, a client like Chat2DB (download at https://chat2db.ai/download or use the browser version at https://app.chat2db.ai) will run the query, format the subtotal rows, and show the `EXPLAIN` plan side by side, which makes it easy to confirm you are getting one aggregation pass rather than several.
+
+## Conclusion
+
+`GROUPING SETS`, `ROLLUP`, and `CUBE` all describe the same idea — compute several levels of subtotal in one `GROUP BY` — at three levels of shorthand. Reach for `GROUPING SETS` when you need to name an arbitrary, possibly non-hierarchical, list of combinations; use `ROLLUP` when your columns form a natural drill-down hierarchy and you want the standard nested subtotals with minimal typing; and use `CUBE` when you want every combination of a small number of columns, hierarchy or not. Whichever one you pick, remember that the `NULL` values Postgres inserts for excluded columns look identical to real `NULL`s in your data until you check `GROUPING(column)`, and that the whole point of these constructs is a single aggregation pass rather than a stack of unioned queries. Paste the `sales` table from this article into Chat2DB or your own Postgres instance and try swapping the columns inside `ROLLUP` or adding a third column to `CUBE` — the row counts grow quickly, but the underlying rules stay exactly as described here.

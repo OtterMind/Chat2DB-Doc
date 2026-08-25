@@ -1,0 +1,282 @@
+---
+title: "How to Change a Column Type in PostgreSQL"
+description: "Change a PostgreSQL column type safely: ALTER COLUMN TYPE with USING casts, which conversions rewrite the table, locking, and a zero-downtime migration."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: August 25, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# How to Change a Column Type in PostgreSQL
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="August 25, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+Changing a column type in PostgreSQL is a one-line statement that behaves in two completely different ways. On a small table it is instant and boring. On a 200 GB table in production it takes an `ACCESS EXCLUSIVE` lock, rewrites every row, rebuilds every index, and blocks all reads and writes until it finishes. Knowing which case you are in — before you press enter — is the whole skill.
+
+## The basic statement
+
+```sql
+ALTER TABLE orders
+  ALTER COLUMN status TYPE varchar(32);
+```
+
+Several columns can be changed in one statement, which means one table scan instead of several:
+
+```sql
+ALTER TABLE orders
+  ALTER COLUMN status TYPE varchar(32),
+  ALTER COLUMN total  TYPE numeric(14,2),
+  ALTER COLUMN notes  TYPE text;
+```
+
+If PostgreSQL knows an assignment cast between the old and new type, it applies it automatically. If it does not, you get:
+
+```
+ERROR:  column "total" cannot be cast automatically to type numeric
+HINT:  You might need to specify "USING total::numeric".
+```
+
+## The USING clause
+
+`USING` is an arbitrary expression evaluated per row, producing the new value:
+
+```sql
+ALTER TABLE orders
+  ALTER COLUMN total TYPE numeric(12,2)
+  USING total::numeric(12,2);
+```
+
+Real data is rarely that clean. Text columns that should have been numeric usually contain empty strings, and `''::numeric` raises `invalid input syntax for type numeric`. Convert blanks to `NULL` first:
+
+```sql
+ALTER TABLE orders
+  ALTER COLUMN total TYPE numeric(12,2)
+  USING NULLIF(btrim(total), '')::numeric(12,2);
+```
+
+Other conversions worth keeping in a snippet file:
+
+```sql
+-- text -> boolean, mapping the usual spellings
+ALTER TABLE users ALTER COLUMN active TYPE boolean
+  USING CASE lower(btrim(active))
+          WHEN 'true'  THEN true  WHEN 't' THEN true
+          WHEN 'yes'   THEN true  WHEN '1' THEN true
+          WHEN 'false' THEN false WHEN 'f' THEN false
+          WHEN 'no'    THEN false WHEN '0' THEN false
+          ELSE NULL
+        END;
+
+-- naive timestamp -> timestamptz, stating the timezone the values were in
+ALTER TABLE events ALTER COLUMN occurred_at TYPE timestamptz
+  USING occurred_at AT TIME ZONE 'UTC';
+
+-- json -> jsonb (binary storage, indexable, deduplicated keys)
+ALTER TABLE payloads ALTER COLUMN body TYPE jsonb USING body::jsonb;
+
+-- comma-separated text -> array
+ALTER TABLE posts ALTER COLUMN tags TYPE text[] USING string_to_array(tags, ',');
+
+-- float -> integer, deciding the rounding explicitly
+ALTER TABLE metrics ALTER COLUMN score TYPE integer USING round(score)::integer;
+```
+
+The `AT TIME ZONE` case deserves emphasis. Without `USING`, Postgres interprets naive timestamps in the session timezone, so the same migration run from a laptop in Berlin and from a server in UTC produces different data. Always be explicit.
+
+### Dry-run the conversion first
+
+A single unconvertible row aborts the migration after all the rewriting work is done. Count the failures before you start:
+
+```sql
+SELECT count(*)
+FROM orders
+WHERE total IS NOT NULL
+  AND NULLIF(btrim(total), '')::numeric IS NULL;
+```
+
+Better still, list the offending values so you can fix them:
+
+```sql
+SELECT id, total
+FROM orders
+WHERE total IS NOT NULL
+  AND total !~ '^\s*-?\d+(\.\d+)?\s*$'
+LIMIT 50;
+```
+
+## Which conversions rewrite the table?
+
+PostgreSQL skips the rewrite when the new type is *binary coercible* from the old one and no `USING` expression changes the values. In that case only the catalog is updated and the statement completes in milliseconds regardless of table size.
+
+**No rewrite:**
+
+- `varchar(n)` → `text`
+- `varchar(50)` → `varchar(200)` or `varchar` (widening only)
+- `numeric(10,2)` → `numeric(14,2)` (more precision, same scale)
+- `timestamp` → `timestamptz` **when the session timezone is UTC** (PostgreSQL 12+)
+- Adding or removing a domain over the same base type
+
+**Full rewrite:**
+
+- `integer` → `bigint` (the classic 32-bit ID exhaustion migration)
+- `text` → anything numeric, boolean, uuid, date or json
+- `varchar(200)` → `varchar(50)` (shrinking re-checks every value)
+- `numeric(12,2)` → `numeric(12,4)` (scale change re-rounds every value)
+- Anything with a `USING` clause that transforms the data
+
+Check your assumption before running the statement:
+
+```sql
+SELECT pg_size_pretty(pg_total_relation_size('orders')) AS size;
+```
+
+Anything above a few gigabytes on a busy table means the direct `ALTER` is not an option during business hours. If you would rather not memorise the coercibility rules, the free [Postgres ALTER COLUMN TYPE Generator](https://chat2db.ai/tools/postgres-alter-column-type-generator) reports whether a given type pair rewrites the table and writes both the direct statement and a batched migration.
+
+## Locking, and how not to take the site down
+
+`ALTER TABLE ... ALTER COLUMN TYPE` always takes an `ACCESS EXCLUSIVE` lock, even when there is no rewrite. That lock conflicts with everything, including plain `SELECT`s. Two consequences follow.
+
+First, the statement has to *acquire* the lock, and it queues behind any open transaction touching the table — including a session that ran a `SELECT` twenty minutes ago and never committed. While it waits, every new query queues behind *it*. A trivial catalog-only change can therefore freeze a table for the duration of someone's forgotten transaction. Always fail fast instead:
+
+```sql
+SET lock_timeout = '3s';
+ALTER TABLE orders ALTER COLUMN status TYPE varchar(32);
+```
+
+If the lock is not available within three seconds the statement aborts, nothing has piled up behind it, and you retry in a moment. Every migration tool should set this.
+
+Second, while the rewrite runs the lock is held for its full duration. Watch what is blocked:
+
+```sql
+SELECT pid, wait_event_type, state, left(query, 80) AS query
+FROM pg_stat_activity
+WHERE wait_event_type = 'Lock';
+```
+
+And find the long-running transactions that would block you *before* you start:
+
+```sql
+SELECT pid, state, now() - xact_start AS xact_age, left(query, 60)
+FROM pg_stat_activity
+WHERE xact_start IS NOT NULL
+ORDER BY xact_start
+LIMIT 10;
+```
+
+## Dependencies that block the change
+
+Postgres refuses to change a column type when a view depends on it:
+
+```
+ERROR:  cannot alter type of a column used by a view or rule
+DETAIL:  rule _RETURN on view active_orders depends on column "status"
+```
+
+There is no `CASCADE` for this — you must drop the dependent views, run the `ALTER`, and recreate them in the same transaction. Find them first:
+
+```sql
+SELECT DISTINCT dependent.relname AS view_name, dependent.relkind
+FROM pg_depend d
+JOIN pg_rewrite r      ON r.oid = d.objid
+JOIN pg_class dependent ON dependent.oid = r.ev_class
+JOIN pg_class source    ON source.oid = d.refobjid
+JOIN pg_attribute a     ON a.attrelid = source.oid AND a.attnum = d.refobjsubid
+WHERE source.oid = 'public.orders'::regclass
+  AND a.attname = 'status';
+```
+
+Save the definitions with `pg_get_viewdef('active_orders'::regclass, true)` before dropping them. Generated columns, indexes on expressions over the column, and foreign keys pointing at it are rebuilt automatically, but they are part of why the rewrite is slow.
+
+## The zero-downtime pattern
+
+When the table is large and the rewrite unacceptable, do the work incrementally: add a new column, keep it in sync, backfill in batches, then swap names in a short transaction.
+
+**Step 1 — add the column.** A nullable column without a default is a catalog-only change:
+
+```sql
+ALTER TABLE orders ADD COLUMN total_new numeric(12,2);
+```
+
+**Step 2 — keep new writes in sync.**
+
+```sql
+CREATE OR REPLACE FUNCTION orders_sync_total() RETURNS trigger AS $$
+BEGIN
+  NEW.total_new := NULLIF(btrim(NEW.total), '')::numeric(12,2);
+  RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER orders_sync_total_trg
+  BEFORE INSERT OR UPDATE OF total ON orders
+  FOR EACH ROW EXECUTE FUNCTION orders_sync_total();
+```
+
+**Step 3 — backfill in batches.** One `UPDATE` over 200 million rows creates 200 million dead tuples in a single transaction, bloats the table and blocks vacuum. Batch it:
+
+```sql
+DO $$
+DECLARE
+  updated bigint;
+BEGIN
+  LOOP
+    WITH batch AS (
+      SELECT ctid FROM orders
+      WHERE total_new IS NULL AND total IS NOT NULL
+      LIMIT 10000
+    )
+    UPDATE orders t
+       SET total_new = NULLIF(btrim(t.total), '')::numeric(12,2)
+      FROM batch
+     WHERE t.ctid = batch.ctid;
+    GET DIAGNOSTICS updated = ROW_COUNT;
+    EXIT WHEN updated = 0;
+    COMMIT;  -- procedural COMMIT works in DO blocks on PG 11+
+  END LOOP;
+END $$;
+```
+
+Watch autovacuum while this runs; on a busy table it is worth lowering `autovacuum_vacuum_scale_factor` for the duration so dead tuples are reclaimed as you go.
+
+**Step 4 — build the indexes on the new column** with `CREATE INDEX CONCURRENTLY`, so the swap does not have to.
+
+**Step 5 — swap.** A rename is a catalog operation, so the exclusive lock is held for milliseconds:
+
+```sql
+SET lock_timeout = '3s';
+BEGIN;
+ALTER TABLE orders RENAME COLUMN total     TO total_old;
+ALTER TABLE orders RENAME COLUMN total_new TO total;
+ALTER TABLE orders ALTER COLUMN total SET NOT NULL;  -- if applicable
+DROP TRIGGER orders_sync_total_trg ON orders;
+COMMIT;
+```
+
+**Step 6 — clean up** once the application has been verified on the new column:
+
+```sql
+ALTER TABLE orders DROP COLUMN total_old;
+DROP FUNCTION orders_sync_total();
+```
+
+Note that `SET NOT NULL` scans the table to verify. On PostgreSQL 12+ you can avoid that scan by first adding a `NOT VALID` check constraint, validating it concurrently, then setting `NOT NULL` — the planner recognises the proven constraint and skips the scan.
+
+## The special case: integer to bigint
+
+Running out of 32-bit IDs is the most common reason to change a type, and it has an extra wrinkle: the primary key is referenced by foreign keys in other tables, and each of those columns needs the same treatment. Change the referencing columns first, then the referenced one, and remember that the sequence behind the column also needs `ALTER SEQUENCE orders_id_seq AS bigint;`. Because every foreign key has to be revalidated, plan this as a multi-step migration with `NOT VALID` constraints and later validation rather than one long statement.
+
+## Checklist
+
+1. Measure the table: `pg_total_relation_size`.
+2. Decide whether the conversion is binary coercible or a rewrite.
+3. Find dependent views and save their definitions.
+4. Dry-run the `USING` expression and count the rows that would fail.
+5. Always `SET lock_timeout` before the `ALTER`.
+6. Small table or no rewrite → run it directly, ideally inside a transaction with the view recreation.
+7. Large busy table → new column, trigger, batched backfill, concurrent indexes, rename swap.
+8. Verify afterwards with `information_schema.columns` and re-run `ANALYZE` so the planner has fresh statistics.
+
+Type migrations are where a fast feedback loop pays off. [Chat2DB](https://chat2db.ai/download) is a free AI-powered SQL client that runs the dry-run counts, keeps the dependency queries next to the migration script, and shows the resulting structure without a separate `\d` round trip — there is also a browser version at [app.chat2db.ai](https://app.chat2db.ai).

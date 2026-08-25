@@ -1,0 +1,246 @@
+---
+title: "Postgres Transaction Isolation Levels Explained"
+description: "Postgres isolation levels explained: Read Committed, Repeatable Read, Serializable, with SQL demos of dirty reads, phantom reads and serialization failures."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: August 24, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# Postgres Transaction Isolation Levels Explained
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="August 24, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+PostgreSQL runs every statement inside a transaction, and every transaction runs at an isolation level that decides how much of the rest of the database's concurrent activity it is allowed to see. The SQL standard defines four levels — Read Uncommitted, Read Committed, Repeatable Read and Serializable — but Postgres implements them on top of Multiversion Concurrency Control (MVCC), which changes what each level actually means in practice. This article works through the three distinct behaviors Postgres offers, with runnable two-session examples for each, and ends with the exact error you get when Serializable rejects a transaction and how to set the level in the first place.
+
+## MVCC and the anomalies isolation levels guard against
+
+Under MVCC, a row is never updated in place; an `UPDATE` writes a new row version and leaves the old one for transactions that still need to see it. This is what lets readers avoid blocking on writers. What differs between isolation levels is which row versions a given query is allowed to read, and that in turn determines which of four classic anomalies can occur:
+
+- **Dirty read** — reading a row that another transaction has written but not yet committed.
+- **Non-repeatable read** — re-reading the same row twice in one transaction and getting different data because another transaction committed a change in between.
+- **Phantom read** — re-running the same filtered query twice in one transaction and getting a different set of rows because another transaction inserted or deleted matching rows in between.
+- **Serialization anomaly** — the result of committing a set of concurrent transactions is not equivalent to any possible serial (one-at-a-time) execution of those same transactions, even if no individual anomaly above occurred.
+
+The SQL standard specifies which of these each level must prevent:
+
+| Isolation Level | Dirty Read | Non-repeatable Read | Phantom Read | Serialization Anomaly |
+|---|---|---|---|---|
+| Read Uncommitted | Possible | Possible | Possible | Possible |
+| Read Committed | Not possible | Possible | Possible | Possible |
+| Repeatable Read | Not possible | Not possible | Possible | Possible |
+| Serializable | Not possible | Not possible | Not possible | Not possible |
+
+A level is free to prevent more than the standard requires, and that is exactly what Postgres does.
+
+## How Postgres maps onto the standard
+
+Postgres accepts all four level names but only implements three distinct behaviors:
+
+- **Read Uncommitted** is accepted syntactically and then silently treated as **Read Committed**. Because MVCC never exposes uncommitted row versions to other transactions, dirty reads are structurally impossible in Postgres regardless of which level you ask for.
+- **Read Committed** is the default for every new connection unless you change it. Each individual *statement* sees a fresh snapshot of the committed data.
+- **Repeatable Read** gives each *transaction* a single snapshot, taken at the first query, and every statement in that transaction reads through it. Because the snapshot never moves, Postgres's Repeatable Read also blocks phantom reads — stricter than the standard requires, since it is really full Snapshot Isolation rather than a naive row-locking implementation.
+- **Serializable** is built on top of Repeatable Read's snapshot mechanism plus Serializable Snapshot Isolation (SSI), added in PostgreSQL 9.1, which watches for the read/write dependency patterns that can produce a serialization anomaly and aborts one of the offending transactions before it can commit.
+
+You can see which level a session is actually using at any time with `SHOW transaction_isolation;`.
+
+## Read Committed: a fresh snapshot for every statement
+
+Because each statement in a Read Committed transaction gets its own snapshot, a `SELECT` always sees the latest committed data at the moment it starts — it can never see another transaction's uncommitted writes, but it can see different data from one statement to the next if something else commits in between. `UPDATE`, `DELETE` and `SELECT ... FOR UPDATE` add a wrinkle: if such a statement finds a row that a concurrent, still-open transaction has already modified, it blocks until that transaction ends. If the blocking transaction commits, Postgres re-checks the statement's `WHERE` clause against the newly committed row version (a mechanism called EvalPlanQual) and, if it still matches, applies the change on top of that newer version rather than the one originally read.
+
+### Watching Read Committed handle a concurrent update
+
+Set up a small table and open two `psql` sessions (or two tabs in a client like Chat2DB, which makes it easy to keep two connections open side by side while you flip between them):
+
+```sql
+CREATE TABLE accounts (
+  id      int PRIMARY KEY,
+  name    text NOT NULL,
+  balance numeric NOT NULL
+);
+
+INSERT INTO accounts (id, name, balance) VALUES
+  (1, 'alice', 100),
+  (2, 'bob', 50);
+```
+
+```sql
+-- Session A
+BEGIN;
+UPDATE accounts SET balance = balance - 20 WHERE id = 1;
+-- balance is 80 inside this transaction, but nothing is committed yet
+```
+
+```sql
+-- Session B, while Session A is still open
+SELECT balance FROM accounts WHERE id = 1;
+-- returns 100 -- Session B's snapshot only sees committed data, so no dirty read
+
+UPDATE accounts SET balance = balance + 10 WHERE id = 1;
+-- this blocks: Session A holds a row lock on id = 1 from its own uncommitted UPDATE
+```
+
+Session B's `UPDATE` now waits. Switch back to Session A and finish its transaction:
+
+```sql
+-- Session A
+COMMIT;
+```
+
+The moment Session A commits, Session B's blocked `UPDATE` wakes up, re-evaluates its `WHERE id = 1` against the row Session A just committed (balance 80), and applies `+ 10` to that value rather than to the 100 it originally would have used. Session B then needs its own `COMMIT` to persist the result:
+
+```sql
+-- Session B
+COMMIT;
+
+SELECT balance FROM accounts WHERE id = 1;
+-- 90
+```
+
+Read Committed is forgiving in exactly this way: two statements never see impossible data, but a multi-statement transaction can still act on a mix of snapshots, so it is not safe to assume that a value read early in a transaction is still accurate by the time you write based on it.
+
+## Repeatable Read: one snapshot for the whole transaction
+
+Starting a transaction with `BEGIN ISOLATION LEVEL REPEATABLE READ` fixes the snapshot at the first query and holds it for every subsequent statement, so re-running the same `SELECT` later in the same transaction returns exactly the same rows, with no new inserts, updates or deletes from other transactions visible — no non-repeatable reads and no phantoms. Postgres additionally enforces a first-committer-wins rule: if two Repeatable Read transactions try to modify the *same* row concurrently, whichever one commits second gets a `could not serialize access due to concurrent update` error and must retry. What this rule does **not** catch is a pair of transactions that read overlapping data but each writes a *different* row — a pattern known as write skew.
+
+### Write skew: two doctors, one on-call rule
+
+Suppose a hospital's rule is that at least one doctor must always be on call:
+
+```sql
+CREATE TABLE doctors (
+  id      int PRIMARY KEY,
+  name    text NOT NULL,
+  on_call boolean NOT NULL
+);
+
+INSERT INTO doctors (id, name, on_call) VALUES
+  (1, 'Grant', true),
+  (2, 'Ho', true);
+```
+
+Both doctors decide, at almost the same time, that they can safely go off call because a colleague is still covering:
+
+```sql
+-- Session A
+BEGIN ISOLATION LEVEL REPEATABLE READ;
+SELECT count(*) FROM doctors WHERE on_call;
+-- 2 -- looks safe to go off call
+UPDATE doctors SET on_call = false WHERE name = 'Grant';
+```
+
+```sql
+-- Session B, started before Session A commits
+BEGIN ISOLATION LEVEL REPEATABLE READ;
+SELECT count(*) FROM doctors WHERE on_call;
+-- 2 -- Session B's snapshot was taken before Grant's update, so it also looks safe
+UPDATE doctors SET on_call = false WHERE name = 'Ho';
+```
+
+```sql
+-- Session A
+COMMIT;
+
+-- Session B
+COMMIT;
+```
+
+Both commits succeed. Neither transaction touched the row the other one wrote, so the first-committer-wins check has nothing to complain about, yet the two commits together leave both doctors off call — the invariant "at least one doctor on call" is violated even though every individual statement behaved correctly. This is write skew: each transaction's decision was correct given what it read, but the combination of two decisions based on the same stale snapshot produces a result no serial execution of these two transactions could ever produce.
+
+## Serializable: catching write skew with SSI
+
+Serializable transactions use the same MVCC snapshots as Repeatable Read, but SSI additionally tracks read/write dependencies between concurrent transactions and looks for the specific cycle of dependencies that indicates a serialization anomaly is about to happen. When it finds one, it aborts one of the transactions rather than let both commit.
+
+### The same write skew under SERIALIZABLE
+
+Reset `on_call` to `true` for both doctors, then repeat the scenario at the stricter level:
+
+```sql
+-- Session A
+BEGIN ISOLATION LEVEL SERIALIZABLE;
+SELECT count(*) FROM doctors WHERE on_call;
+-- 2
+UPDATE doctors SET on_call = false WHERE name = 'Grant';
+COMMIT;
+```
+
+```sql
+-- Session B, started before Session A commits
+BEGIN ISOLATION LEVEL SERIALIZABLE;
+SELECT count(*) FROM doctors WHERE on_call;
+-- 2
+UPDATE doctors SET on_call = false WHERE name = 'Ho';
+COMMIT;
+```
+
+Session A's `COMMIT` succeeds. Session B's `COMMIT` fails with:
+
+```
+ERROR:  could not serialize access due to read/write dependencies among transactions
+```
+
+The SQLSTATE for this error is `40001` (`serialization_failure`), the same code used for the Repeatable Read same-row conflict, and it is meant to be caught by application code, not shown to a user. Any application that uses `SERIALIZABLE` must be written to catch `40001`, roll back, and re-run the *entire* transaction from the beginning — Postgres guarantees that the set of committed transactions is equivalent to some serial order, but it does not guarantee that any particular transaction will get to commit on its first try. Without retry logic, a serializable application simply drops work on the floor whenever contention occurs.
+
+## Setting the isolation level
+
+You can set the level for a single transaction, either before it starts or as its first statement:
+
+```sql
+BEGIN ISOLATION LEVEL REPEATABLE READ;
+-- ... statements ...
+COMMIT;
+```
+
+```sql
+BEGIN;
+SET TRANSACTION ISOLATION LEVEL SERIALIZABLE;
+-- ... statements ...
+COMMIT;
+```
+
+`SET TRANSACTION ISOLATION LEVEL` must be the first statement executed after `BEGIN`; running it after any other query in the transaction raises an error, because the snapshot may already have been taken. To change the default for every new transaction in the current session, use `SET default_transaction_isolation`, or set it permanently for a role or database:
+
+```sql
+SET default_transaction_isolation = 'repeatable read';
+
+ALTER ROLE reporting_user SET default_transaction_isolation = 'repeatable read';
+
+SHOW default_transaction_isolation;
+```
+
+For read-only Serializable workloads, adding `READ ONLY DEFERRABLE` lets a transaction wait briefly for a safe snapshot instead of ever being aborted, which is useful for long-running reports that do not need to run immediately:
+
+```sql
+BEGIN ISOLATION LEVEL SERIALIZABLE READ ONLY DEFERRABLE;
+```
+
+## Practical guidance
+
+- **Read Committed** is the right default for most OLTP applications: it never blocks readers against readers, it never dirty-reads, and its per-statement snapshot matches how most CRUD code already assumes the database behaves. Just be aware that a single transaction can act on more than one point-in-time view of the data.
+- **Repeatable Read** is worth reaching for when a transaction runs several queries that must agree with each other — a report that sums several tables, or an export that must reflect one consistent instant. It costs nothing extra for pure reads and only starts producing serialization errors when a write actually conflicts.
+- **Serializable** is for the smaller set of cases where a business invariant spans multiple rows and simple row-level locking can't express it, such as the on-call rule above, inventory checks, or double-booking prevention. Use it deliberately, keep transactions short, and always implement retry-on-`40001`, since occasional aborts are an expected and correct part of how SSI enforces correctness rather than a bug to work around.
+
+## Running these demos yourself
+
+All of the examples above need two open connections running statements in a specific order, which is awkward in a single terminal but easy in a client that lets you keep multiple SQL consoles side by side. Chat2DB (download at https://chat2db.ai/download or try the web version at https://app.chat2db.ai) lets you open two tabs against the same Postgres database, step through Session A and Session B in the order shown here, and inspect the current isolation level or lock state between steps without losing either session.
+
+## FAQ
+
+### Does Postgres ever perform a dirty read?
+
+No. MVCC guarantees that a transaction only ever sees row versions committed before its snapshot was taken (or its own uncommitted changes), so `READ UNCOMMITTED` behaves identically to `READ COMMITTED` and dirty reads cannot occur at any isolation level in Postgres.
+
+### Is Postgres's Repeatable Read the same as Repeatable Read in other databases?
+
+Not necessarily. Some databases implement Repeatable Read with row-level locking that still permits phantom reads. Postgres implements it as full Snapshot Isolation, which also blocks phantoms, but it can still permit write skew, which is a serialization anomaly the SQL standard's Repeatable Read level is not required to prevent either.
+
+### What should my application do when it gets SQLSTATE 40001?
+
+Roll back the transaction and retry it from the start, typically with a short backoff and a retry limit. This applies to both the Repeatable Read same-row conflict and the Serializable dependency-cycle failure; both share the `serialization_failure` SQLSTATE precisely so that generic retry logic can handle either one.
+
+## Conclusion
+
+Postgres turns the SQL standard's four isolation levels into three real behaviors: Read Committed gives each statement its own fresh snapshot and is the sensible default; Repeatable Read gives a whole transaction one fixed snapshot and upgrades naturally to full Snapshot Isolation, closing off phantom reads but not write skew; Serializable adds SSI on top to detect the read/write dependency cycles that cause write skew and forces one side to retry with a `40001` error. Pick the level based on what your transaction actually needs to be true when it commits, not out of habit — most code belongs on Read Committed, consistency-sensitive reports belong on Repeatable Read, and invariant-critical writes belong on Serializable with retry logic built in from day one.

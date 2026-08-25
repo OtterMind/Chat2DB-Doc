@@ -1,0 +1,150 @@
+---
+title: "Fixing Postgres Table Bloat with REINDEX"
+description: "Detect and fix PostgreSQL table and index bloat using pgstattuple, VACUUM FULL, REINDEX CONCURRENTLY and pg_repack, with SQL examples."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: August 24, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# Fixing Postgres Table Bloat with REINDEX
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="August 24, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+A table that used to fit in a few hundred megabytes and now takes gigabytes, with the same row count, is the classic symptom of bloat. Queries that once hit a warm cache start reading cold pages, index scans get slower, and `VACUUM` runs longer every time. This guide is about the part that comes after you already know about routine vacuuming: how to measure exactly how much space is wasted, and which of the three practical tools — `VACUUM FULL`, `REINDEX CONCURRENTLY`, or `pg_repack` — fits the situation you are actually in, plus how to stop the bloat from coming back.
+
+## Why bloat happens
+
+PostgreSQL's MVCC model never updates a row in place. An `UPDATE` writes a brand-new row version and marks the old one as no longer visible to new transactions; a `DELETE` just marks the row dead. Autovacuum comes along afterward and frees that dead space for reuse by future inserts and updates on the same table, but it does not shrink the file on disk — the freed space stays allocated to the table, ready to be reused. Bloat is what you get when dead space accumulates faster than it is reused, or when autovacuum falls behind: a table file that is much larger than the live data it holds. For how routine (auto)vacuum works day to day, see our guide to VACUUM and autovacuum tuning; this article is about measuring the leftover bloat precisely and reclaiming it.
+
+## Measuring table bloat precisely with pgstattuple
+
+Estimating bloat from catalog statistics is fast but approximate. When you need an exact number — before deciding whether an outage-causing rewrite is worth it — use the `pgstattuple` extension, which physically scans the relation:
+
+```sql
+CREATE EXTENSION IF NOT EXISTS pgstattuple;
+
+SELECT * FROM pgstattuple('public.orders');
+```
+
+A typical result on a bloated table looks like this (illustrative example, not a benchmark):
+
+```
+ table_len | tuple_count | tuple_len | tuple_percent | dead_tuple_count | dead_tuple_len | dead_tuple_percent | free_space | free_percent
+-----------+-------------+-----------+---------------+-------------------+----------------+---------------------+------------+---------------
+ 734003200 |     1200000 | 410000000 |         55.86 |            180000 |       61000000 |                8.31 |   95000000 |         12.94
+```
+
+The columns that matter:
+
+- `table_len` — the total size of the table on disk in bytes, including all the slack you are trying to account for.
+- `dead_tuple_percent` — the share of the table taken up by dead row versions that autovacuum has not yet reclaimed (or that a long-running transaction is preventing it from reclaiming).
+- `free_percent` — space that has already been reclaimed by vacuum and is free for reuse, but is not returned to the operating system. A high `free_percent` with low `dead_tuple_percent` means vacuum is doing its job but the table simply has more allocated space than it needs right now.
+
+`pgstattuple` does a full sequential scan of the relation, so it is exact but can be slow and I/O-heavy on a large table; run it during a quiet period, and prefer it for occasional deep checks rather than routine monitoring. For day-to-day monitoring, the cheap and approximate number is `n_dead_tup` in `pg_stat_user_tables`, which is the same estimate autovacuum itself relies on to decide when to run:
+
+```sql
+SELECT relname, n_live_tup, n_dead_tup, last_autovacuum
+FROM   pg_stat_user_tables
+WHERE  relname = 'orders';
+```
+
+## Measuring index bloat with pgstatindex
+
+Indexes bloat independently of their table, especially B-trees on columns that are updated frequently, because page splits and deleted entries leave partially empty pages behind. `pgstatindex()`, also part of `pgstattuple`, reports on a single index:
+
+```sql
+SELECT * FROM pgstatindex('orders_pkey');
+```
+
+Example output:
+
+```
+ version | tree_level | index_size | root_block_no | internal_pages | leaf_pages | empty_pages | deleted_pages | avg_leaf_density | leaf_fragmentation
+---------+------------+------------+----------------+-----------------+------------+-------------+----------------+-------------------+---------------------
+       4 |          2 |  104857600 |              3 |              45 |      12000 |           0 |            120 |             62.30 |               18.40
+```
+
+`avg_leaf_density` is the useful number here: it is the percentage of each leaf page that actually holds live data. A freshly built B-tree sits around 90%; a value in the 50–65% range, like the example above, means roughly a third to a half of every leaf page is wasted space, and the index is a good candidate for a rebuild.
+
+## Fix #1: VACUUM FULL
+
+`VACUUM FULL` rewrites the entire table into a brand-new file with no dead tuples and no leftover free space, then swaps it in and drops the old file. The result is as compact as a freshly loaded table:
+
+```sql
+VACUUM FULL orders;
+```
+
+The catch is the lock. `VACUUM FULL` takes an `ACCESS EXCLUSIVE` lock on the table for the entire duration of the rewrite, which blocks every other query against it — reads and writes alike — until it finishes. On a small lookup table this is a non-issue; on a busy multi-gigabyte table serving live traffic, it means an outage for as long as the rewrite takes. Reserve `VACUUM FULL` for maintenance windows, tables that can tolerate being briefly unavailable, or tables you know are small.
+
+## Fix #2: REINDEX CONCURRENTLY
+
+When the bloat is concentrated in an index rather than the table's heap, `REINDEX CONCURRENTLY` (available since PostgreSQL 12) rebuilds it without taking the exclusive lock that a plain `REINDEX` requires:
+
+```sql
+REINDEX INDEX CONCURRENTLY orders_pkey;
+```
+
+It builds a new index alongside the old one while normal reads and writes continue against the table, then swaps the new index in and drops the old one. The tradeoffs: it temporarily needs roughly double the disk space for that index (both copies exist at once while the rebuild is in progress), it takes noticeably longer than a regular `REINDEX` because it has to coordinate with concurrent transactions, and it cannot run inside an explicit transaction block — issue it as a standalone statement, not wrapped in `BEGIN ... COMMIT`. `REINDEX TABLE CONCURRENTLY orders` rebuilds every index on the table the same way, one at a time.
+
+## Fix #3: pg_repack
+
+`VACUUM FULL` fixes table bloat but locks everything; `REINDEX CONCURRENTLY` avoids locking but only handles indexes. When the table's heap itself is bloated and you cannot afford a maintenance window, `pg_repack` fills the gap. It is a widely used extension plus command-line tool that builds a new copy of the table (and its indexes) in the background while the original stays fully readable and writable, then takes a brief exclusive lock only at the very end to swap the copies:
+
+```bash
+pg_repack -d mydb -t public.orders
+```
+
+This requires the `pg_repack` extension to be installed in the database (`CREATE EXTENSION pg_repack;`) and the matching client binary on the machine you run it from. It needs enough free disk space to hold a second copy of the table plus its indexes during the rebuild, similar in spirit to `REINDEX CONCURRENTLY`'s extra-space requirement, but for the whole table rather than one index. For a bloated table on a system that cannot tolerate an outage, `pg_repack` is usually the right tool; save `VACUUM FULL` for cases where a short lock is acceptable and you would rather not install an extra extension.
+
+## Preventing bloat: tuning autovacuum per table
+
+The best fix for bloat is not letting it accumulate in the first place. The default autovacuum thresholds are tuned for an average table; a high-churn table — one with thousands of updates or deletes per minute — needs autovacuum to run more aggressively than the defaults allow. Set per-table storage parameters instead of touching the global configuration:
+
+```sql
+ALTER TABLE orders SET (
+  autovacuum_vacuum_scale_factor = 0.05,
+  autovacuum_vacuum_cost_limit = 2000
+);
+```
+
+Lowering `autovacuum_vacuum_scale_factor` from the default of 0.2 to something like 0.05 makes autovacuum trigger after only 5% of the table's rows have changed instead of 20%, so dead tuples get reclaimed sooner and in smaller batches. Raising `autovacuum_vacuum_cost_limit` lets each autovacuum run do more I/O per second before throttling itself, so it finishes faster on a large, busy table.
+
+### Watch for long-running transactions
+
+No amount of autovacuum tuning helps if something is holding back the vacuum horizon. A transaction that has been open for hours prevents vacuum from removing any row version that transaction could still see, even rows that every other session considers long dead. Check for these before assuming autovacuum is misconfigured:
+
+```sql
+SELECT pid, usename, state, xact_start, now() - xact_start AS duration, query
+FROM   pg_stat_activity
+WHERE  xact_start IS NOT NULL
+ORDER  BY xact_start
+LIMIT  10;
+```
+
+A row with `duration` measured in hours and an `idle in transaction` state is a strong candidate for the cause of a bloat problem that tuning alone will not fix — the application holding that connection open needs to commit or roll back.
+
+## A monitoring checklist
+
+A quick query across all tables catches bloat problems before they need `VACUUM FULL` or `pg_repack`:
+
+```sql
+SELECT relname,
+       n_live_tup,
+       n_dead_tup,
+       round(100.0 * n_dead_tup / GREATEST(n_live_tup, 1), 2) AS dead_pct,
+       last_vacuum,
+       last_autovacuum
+FROM   pg_stat_user_tables
+ORDER  BY n_dead_tup DESC
+LIMIT  20;
+```
+
+Tables with a high `dead_pct` and an old or null `last_autovacuum` are falling behind; that is the moment to tune their storage parameters, check `pg_stat_activity` for a stuck transaction, and — if the bloat has already built up — run `pgstattuple` to size the problem before picking a fix. If you would rather browse table and index sizes visually than write a query for it every time, Chat2DB (download at https://chat2db.ai/download, or use the web version at https://app.chat2db.ai) shows table and index size alongside row counts in its schema browser, which makes it easy to spot the table that has quietly outgrown its data.
+
+## Conclusion
+
+Bloat is the gap between how big a table's file is and how much live data it actually holds, created by MVCC's dead row versions and closed only partially by routine vacuum. Measure it exactly with `pgstattuple` and `pgstatindex` rather than guessing, then match the fix to the constraint you're under: `VACUUM FULL` when a maintenance-window lock is acceptable, `REINDEX CONCURRENTLY` for a bloated index that must stay online, and `pg_repack` when the table itself needs rewriting without downtime. None of it replaces prevention — tune `autovacuum_vacuum_scale_factor` down on high-churn tables, keep transactions short, and check `pg_stat_user_tables` regularly so bloat gets caught while a plain `VACUUM` would still fix it.

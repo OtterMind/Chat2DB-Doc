@@ -1,0 +1,139 @@
+---
+title: "Reading Postgres EXPLAIN ANALYZE BUFFERS"
+description: "Read PostgreSQL EXPLAIN (ANALYZE, BUFFERS) output: costs, actual rows, buffer hits and the signs of a slow query plan."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: August 24, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# Reading Postgres EXPLAIN ANALYZE BUFFERS
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="August 24, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+Most people learn `EXPLAIN` by pasting a query, staring at a tree of scan and join nodes, and squinting at the `cost=` numbers until something looks "big." That gets you halfway. The other half — the part that actually tells you why a query is slow — lives in the `ANALYZE` and `BUFFERS` output: real timings, real row counts, and real page I/O against the buffer pool. This article is about reading those numbers specifically, not about what `EXPLAIN` is in general or how to format the raw plan text; the focus here is on what the numbers inside a plan actually mean and how to use them to diagnose a slow query.
+
+## EXPLAIN vs EXPLAIN ANALYZE vs BUFFERS
+
+Plain `EXPLAIN` never runs your query. It asks the planner to pick a plan and print its cost estimates, based entirely on table statistics — row counts, distinct value estimates, histograms — collected the last time `ANALYZE` (or autovacuum's analyze) ran. That makes it safe to run against anything, including a slow `DELETE`, but it also means the numbers are a prediction, not a measurement.
+
+`EXPLAIN ANALYZE` actually executes the query and instruments every node with a timer and a row counter. This is far more informative, but it comes with a real caveat: because the statement runs for real, an `EXPLAIN ANALYZE` on an `INSERT`, `UPDATE`, or `DELETE` genuinely writes those changes. If you want to analyze the plan for a write without keeping its effects, wrap it in a transaction and roll back:
+
+```sql
+BEGIN;
+EXPLAIN (ANALYZE, BUFFERS)
+UPDATE orders SET status = 'archived' WHERE placed_at < now() - interval '1 year';
+ROLLBACK;
+```
+
+Adding `BUFFERS` to `EXPLAIN (ANALYZE, ...)` reports how many 8&nbsp;KB pages each node touched in `shared_buffers`, split into hits, reads, and (for write-adjacent nodes) dirtied and written pages. Timing numbers are useful, but they are also noisy — CPU scheduling, other backends, and OS caching effects can shift wall-clock time by double digits of percent from run to run. Buffer counts are far more stable: the same query against the same data will touch essentially the same number of pages every time, which makes `BUFFERS` the more trustworthy signal when you're comparing "did this optimization actually help."
+
+## Turning on I/O timing
+
+The buffer line always shows hit and read counts, because counting pages costs nothing extra. Whether it also shows *how long* those reads took depends on a separate setting:
+
+```sql
+SET track_io_timing = on;
+```
+
+With `track_io_timing` on, `BUFFERS` output can include `read=` and `write=` timing figures alongside the page counts on platforms where a cheap high-resolution timer is available. Without it, you only get counts — still useful, since a `read=` count that dwarfs `hit=` already tells you the query is doing real I/O, but you lose the ability to say how many milliseconds that I/O actually cost. The setting has a small but nonzero overhead per read/write call, since it requires an extra clock read, so it's common to leave it off in normal production traffic and turn it on only for the session or transaction you're diagnosing.
+
+## Reading a plan bottom-up
+
+`EXPLAIN` prints a tree, indented so that child nodes sit below and to the right of their parents, but execution happens the other way around: the innermost, most-indented nodes run first and feed rows upward to the nodes that depend on them. A `Hash Join` doesn't start joining until its `Hash` child has built a hash table from its own child's output; a `Sort` can't emit a single row until it has pulled every row from beneath it.
+
+This matters most inside a `Nested Loop`. The first child under a nested loop is the outer side, evaluated once. The second child is the inner side, and it is re-evaluated once per row produced by the outer side. `EXPLAIN ANALYZE` reports this directly with `loops=N`: the `actual time=` and `rows=` values shown on that inner node are the *average per execution*, not the total, so to get the real cost contributed by that node you mentally multiply time-per-loop by the loop count. A node reporting `actual time=0.050..0.062 rows=1 loops=40000` looks cheap in isolation but has actually run 40,000 times and accounted for roughly 2.4 seconds of the query.
+
+## The cost= numbers: planner currency, not milliseconds
+
+Every node's cost is printed as `cost=startup..total`, for example:
+
+```
+Seq Scan on orders  (cost=0.00..1834.00 rows=100000 width=97)
+```
+
+The startup cost is how much work the planner estimates happens before the node can produce its first row; the total cost is the estimate for producing all of them. These numbers are in arbitrary planner cost units, calibrated loosely against `seq_page_cost`, `random_page_cost`, and `cpu_tuple_cost`, not seconds or page counts. They exist so the planner can compare alternative plans for the *same* query and pick the cheaper one; comparing the cost of one query against the cost of an unrelated query, or treating cost as a time prediction, is a common mistake. A plan with `cost=0.00..50000.00` is not "50000 milliseconds" — it might run in 8 ms or 8 seconds depending on how well the estimates match reality, which is exactly what the `actual` numbers tell you.
+
+## actual time=, rows=, loops=: what really happened
+
+Once you add `ANALYZE`, every node also prints:
+
+```
+Seq Scan on orders  (cost=0.00..1834.00 rows=100000 width=97) (actual time=0.010..12.345 rows=100000 loops=1)
+```
+
+`actual time=start..end` is real wall-clock milliseconds: when the node produced its first row, and when it finished producing all of them, measured from the start of that node's own execution (not from the start of the whole query). `rows=` here is the real number of rows the node returned, and `loops=` is how many times the node executed, as described above.
+
+The single most useful diagnostic in the entire plan is comparing the planner's `rows=` estimate in the `cost=` section against the `rows=` in the `actual` section, on the same node. If the planner guessed `rows=10` and the node actually returned `rows=100000`, the planner's model of your data is badly wrong, and every join or sort strategy chosen above that node was chosen using a bad estimate. The two usual causes are: statistics that are stale or missing (fixed by running `ANALYZE` on the table, or checking that autovacuum is keeping up), or a predicate too complex for the planner's estimation logic to model accurately (correlated columns, expressions, or `OR` chains across columns commonly confuse it, and sometimes an extended statistics object or a rewritten predicate is the real fix).
+
+## Buffers: shared hit / read / dirtied / written
+
+With `BUFFERS` enabled, each node also prints something like:
+
+```
+Buffers: shared hit=812 read=203
+```
+
+- `hit=` — the page was already sitting in `shared_buffers`, so this was a memory read. Cheap.
+- `read=` — the page was not in `shared_buffers` and had to be fetched from the OS page cache or, worse, from disk. This is the number that tells you about real I/O pressure, and it's the one to watch when a query that "used to be fast" starts slowing down.
+- `dirtied=` — pages the query itself modified in memory (for example, setting hint bits during a first read, or an actual data change), which now need to be written back eventually.
+- `written=` — pages the backend had to flush out itself, typically because it needed a buffer slot and the least-recently-used page happened to be dirty.
+
+If you run the same query twice and the second run still shows a large `read=` relative to `hit=`, that's a signal the working set for this query doesn't fit comfortably in `shared_buffers` (or the OS page cache), so pages are being evicted between runs. On a query that should be "warm" — one your application runs constantly — a persistently high `read=` count relative to `hit=` is worth taking seriously even if the timing looks acceptable on a quiet benchmark machine, because it usually gets worse under concurrent load.
+
+## A worked example: sequential scan to index scan
+
+The following is a constructed, illustrative example — not a benchmark from a specific machine — meant to show the pattern you'd look for. Suppose `orders` has a few million rows and no index on `customer_id`:
+
+```sql
+EXPLAIN (ANALYZE, BUFFERS)
+SELECT * FROM orders WHERE customer_id = 48213;
+```
+
+Before adding an index, stale statistics and a full scan might look like this:
+
+```
+Seq Scan on orders  (cost=0.00..92850.00 rows=12 width=97) (actual time=0.045..410.221 rows=1834 loops=1)
+  Filter: (customer_id = 48213)
+  Rows Removed by Filter: 4998166
+  Buffers: shared hit=1042 read=41108
+Planning Time: 0.112 ms
+Execution Time: 410.980 ms
+```
+
+Two problems jump out. First, the planner estimated `rows=12` but the query actually returned `rows=1834` — a roughly 150x underestimate, which points at stale statistics on `customer_id`. Second, `Buffers: shared read=41108` against `hit=1042` shows this scan pulled the vast majority of the table's pages from outside the buffer pool, which is the dominant cost behind the 410 ms execution time.
+
+After running `ANALYZE orders` to refresh statistics and adding a targeted index:
+
+```sql
+ANALYZE orders;
+CREATE INDEX orders_customer_id_idx ON orders (customer_id);
+```
+
+the same query, in this illustrative scenario, produces a very different plan:
+
+```
+Index Scan using orders_customer_id_idx on orders  (cost=0.42..612.30 rows=1801 width=97) (actual time=0.028..1.104 rows=1834 loops=1)
+  Index Cond: (customer_id = 48213)
+  Buffers: shared hit=6 read=2
+Planning Time: 0.098 ms
+Execution Time: 1.198 ms
+```
+
+The estimate (`rows=1801`) is now close to the actual (`rows=1834`), and total buffer touches dropped from over 42,000 pages to 8. That combination — accurate estimates plus a small, mostly-`hit` buffer count — is what a healthy plan looks like, and it's a far more convincing signal than the timing improvement alone, since timing can vary between runs while the drop in buffer touches is a direct, repeatable measure of how much less work Postgres did.
+
+## Common red flags checklist
+
+When you're triaging a plan, these are the patterns worth searching for first:
+
+- **Large estimated-vs-actual row mismatches** on any node, especially ones feeding a join — they cascade into bad join and scan choices above them.
+- **`Buffers: shared read=` dominating `hit=`** on a query that runs frequently and should be warm in cache; it points at cache pressure or a working set larger than `shared_buffers`.
+- **Nested loops with a high `loops=` count** wrapped around an inner node that itself does a sequential scan or a costly filter — the per-loop cost looks small until you multiply by the loop count.
+- **Sort or hash nodes that spill to disk**, shown as `Sort Method: external merge  Disk: 24576kB` instead of `Sort Method: quicksort  Memory: 1024kB`. A disk-based sort means the node needed more space than `work_mem` allowed and had to write intermediate runs to temporary files, which shows up as extra I/O and extra time that a larger `work_mem` (or a smaller intermediate row set) can often eliminate.
+
+## Wrapping up
+
+`EXPLAIN` estimates, `EXPLAIN ANALYZE` measures, and `BUFFERS` tells you where the time actually went in terms of page I/O rather than just wall-clock noise. Read plans bottom-up, treat `cost=` as a relative planner metric rather than a time prediction, watch for gaps between estimated and actual row counts, and pay attention to `read=` buffers on queries that should be cache-warm. If you'd rather not parse the indented text by eye, paste the same `EXPLAIN (ANALYZE, BUFFERS)` output into the free [PostgreSQL EXPLAIN Plan Visualizer](https://chat2db.ai/tools/explain-plan-visualizer) to get it rendered as a navigable tree with the cost, timing, and buffer figures broken out per node. And if you're running these queries from a SQL client day to day, Chat2DB can execute the `EXPLAIN` for you and keep the plan next to the query editor so you don't have to switch windows to read it.

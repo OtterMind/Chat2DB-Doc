@@ -1,0 +1,224 @@
+---
+title: "Postgres SYSDATE Equivalent: NOW vs CURRENT_DATE"
+description: "PostgreSQL has no SYSDATE. Learn the equivalents — now(), CURRENT_DATE, clock_timestamp(), statement_timestamp() — and which one to use where."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: August 25, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# Postgres SYSDATE Equivalent: NOW vs CURRENT_DATE
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="August 25, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+Migrating from Oracle, the first thing that breaks is usually `SYSDATE`:
+
+```
+ERROR:  column "sysdate" does not exist
+LINE 1: SELECT SYSDATE;
+```
+
+PostgreSQL has no `SYSDATE`. It has something more precise — half a dozen functions that each answer a slightly different question about "now" — and picking the right one matters more than the migration guides suggest, because two of them are transaction-stable and one is not.
+
+## The complete list
+
+```sql
+SELECT now()                        AS now,
+       CURRENT_TIMESTAMP            AS current_timestamp,
+       transaction_timestamp()      AS transaction_timestamp,
+       statement_timestamp()        AS statement_timestamp,
+       clock_timestamp()            AS clock_timestamp,
+       CURRENT_DATE                 AS current_date,
+       CURRENT_TIME                 AS current_time,
+       LOCALTIMESTAMP               AS localtimestamp,
+       timeofday()                  AS timeofday;
+```
+
+| Function | Returns | Changes during a transaction? |
+| --- | --- | --- |
+| `now()` | `timestamptz` | No — fixed at transaction start |
+| `CURRENT_TIMESTAMP` | `timestamptz` | No — identical to `now()` |
+| `transaction_timestamp()` | `timestamptz` | No — identical to `now()` |
+| `statement_timestamp()` | `timestamptz` | Per statement |
+| `clock_timestamp()` | `timestamptz` | Yes — reads the OS clock every call |
+| `CURRENT_DATE` | `date` | No |
+| `CURRENT_TIME` | `timetz` | No |
+| `LOCALTIMESTAMP` | `timestamp` (no zone) | No |
+| `timeofday()` | `text` | Yes — legacy, avoid |
+
+The closest match for Oracle's `SYSDATE` depends on what your code relied on. Oracle's `SYSDATE` returns the *database server's* date and time, with no timezone, and it advances during a transaction. If you need the same value everywhere in a statement — which is what most application code actually wants — `now()` is the right substitute. If you specifically need a wall-clock reading that advances, use `clock_timestamp()`.
+
+## Transaction stability is the whole point
+
+This is the behaviour that surprises people, and it is deliberate:
+
+```sql
+BEGIN;
+SELECT now(), clock_timestamp();
+SELECT pg_sleep(2);
+SELECT now(), clock_timestamp();
+COMMIT;
+```
+
+```
+             now              |        clock_timestamp
+------------------------------+------------------------------
+ 2026-08-25 09:14:02.11374+00 | 2026-08-25 09:14:02.11374+00
+ 2026-08-25 09:14:02.11374+00 | 2026-08-25 09:14:04.12801+00
+```
+
+`now()` returned the identical value both times. That is what makes it useful: every row inserted by a multi-statement transaction gets the same `created_at`, so "everything written by this transaction" is a single, exact timestamp value rather than a range you have to guess at. It also means a batch job that runs for an hour records the time it *started*, not a smear of times across the hour.
+
+Use `clock_timestamp()` when you are measuring elapsed time inside a function or benchmarking a loop:
+
+```sql
+DO $$
+DECLARE t0 timestamptz := clock_timestamp();
+BEGIN
+  PERFORM count(*) FROM large_table;
+  RAISE NOTICE 'took %', clock_timestamp() - t0;
+END $$;
+```
+
+Using `now()` there would report zero, every time.
+
+`statement_timestamp()` sits between the two: constant within a statement, updated for the next one. It is what you want for per-statement audit logging inside a long transaction.
+
+## timestamptz versus timestamp
+
+`now()` returns `timestamptz` — "timestamp with time zone." The name is misleading: Postgres does **not** store a timezone. It stores a UTC instant and converts it to the session's `TimeZone` on output. `timestamp` (without time zone) stores the literal wall-clock digits with no instant attached, so the same value means different moments in different places.
+
+```sql
+SET TIME ZONE 'UTC';
+SELECT now();                    -- 2026-08-25 09:14:02.113+00
+
+SET TIME ZONE 'Asia/Shanghai';
+SELECT now();                    -- 2026-08-25 17:14:02.113+08
+```
+
+Same instant, two renderings. Store events as `timestamptz` unless you have a specific reason not to — "the meeting is at 09:00 local time in whatever city, whenever that turns out to be" is the rare case that genuinely needs `timestamp` plus a separate timezone column.
+
+`LOCALTIMESTAMP` returns `timestamp` — the current time rendered in the session timezone and then stripped of its offset. It is the closest literal analogue to Oracle's `SYSDATE`, and precisely for that reason it is usually the wrong choice in new code: you have thrown away the information needed to interpret it.
+
+## Getting just the date
+
+```sql
+SELECT CURRENT_DATE;              -- 2026-08-25
+SELECT now()::date;               -- 2026-08-25 (same, via cast)
+SELECT date_trunc('day', now());  -- 2026-08-25 00:00:00+00 (still timestamptz)
+```
+
+All three respect the session timezone, which is exactly the trap in a global application: at 23:30 UTC, `CURRENT_DATE` is already tomorrow for a session set to `Asia/Tokyo`. If a report must be computed in a specific zone, say so explicitly:
+
+```sql
+SELECT (now() AT TIME ZONE 'America/New_York')::date AS business_date;
+```
+
+To bucket `timestamptz` data by local day, truncate in the target zone and convert back:
+
+```sql
+SELECT date_trunc('day', created_at AT TIME ZONE 'America/New_York') AS local_day,
+       count(*)
+FROM orders
+GROUP BY 1
+ORDER BY 1;
+```
+
+`AT TIME ZONE` is a two-way operator that is easy to misread: applied to a `timestamptz` it produces a `timestamp` in that zone; applied to a naive `timestamp` it interprets the value as being in that zone and produces a `timestamptz`.
+
+## Date arithmetic without SYSDATE
+
+Oracle code adds numbers to dates: `SYSDATE + 7`. PostgreSQL uses interval arithmetic, which is more explicit and handles months and DST correctly:
+
+```sql
+SELECT now() + interval '7 days'          AS next_week,
+       now() - interval '1 month'         AS last_month,
+       CURRENT_DATE + 30                  AS thirty_days_out,  -- date + int works
+       CURRENT_DATE - interval '1 day'    AS yesterday,
+       date_trunc('month', now())         AS month_start,
+       date_trunc('month', now()) + interval '1 month - 1 day' AS month_end;
+```
+
+Note the asymmetry: `date + integer` is allowed and means days, but `timestamptz + integer` is not — you must use an interval. This is the most common porting error after `SYSDATE` itself.
+
+Filtering "the last 30 days" should always be written as a range against the raw column, never by wrapping the column in a function:
+
+```sql
+-- Good: sargable, uses an index on created_at
+SELECT * FROM orders WHERE created_at >= now() - interval '30 days';
+
+-- Bad: computes a value per row, no index usage
+SELECT * FROM orders WHERE now() - created_at <= interval '30 days';
+SELECT * FROM orders WHERE date_trunc('day', created_at) >= CURRENT_DATE - 30;
+```
+
+The first form lets Postgres evaluate the right-hand side once and use a B-tree index on `created_at`. The others force a sequential scan. If you genuinely need a function on the column, index the expression instead:
+
+```sql
+CREATE INDEX orders_created_day_idx ON orders (date_trunc('day', created_at));
+```
+
+## Defaults, and why `now()` is safe there
+
+A column default is evaluated per inserted row, at insert time:
+
+```sql
+CREATE TABLE orders (
+  id         bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  updated_at timestamptz NOT NULL DEFAULT now()
+);
+```
+
+There is no risk of the default being frozen at table-creation time — `now()` is stored as an expression, not a value. (`CURRENT_TIMESTAMP` is identical here; use whichever reads better to your team.)
+
+For `updated_at`, a default is not enough because it only applies on insert. Postgres has no `ON UPDATE CURRENT_TIMESTAMP` like MySQL, so use a trigger:
+
+```sql
+CREATE OR REPLACE FUNCTION set_updated_at() RETURNS trigger AS $$
+BEGIN
+  NEW.updated_at := now();
+  RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER orders_set_updated_at
+  BEFORE UPDATE ON orders
+  FOR EACH ROW EXECUTE FUNCTION set_updated_at();
+```
+
+## Testing code that depends on "now"
+
+Because `now()` is transaction-stable, you can freeze it in tests by overriding the search path with a stub function — but the cleaner approach is to pass the reference time in as a parameter and default it to `now()`:
+
+```sql
+CREATE FUNCTION expiring_soon(as_of timestamptz DEFAULT now())
+RETURNS TABLE (id bigint, expires_at timestamptz) AS $$
+  SELECT id, expires_at FROM subscriptions
+  WHERE expires_at BETWEEN as_of AND as_of + interval '7 days';
+$$ LANGUAGE sql STABLE;
+```
+
+Production calls it with no argument; tests pass a fixed timestamp. This is far more maintainable than mocking the clock.
+
+## Quick porting reference
+
+| Oracle | PostgreSQL |
+| --- | --- |
+| `SYSDATE` | `now()` (or `LOCALTIMESTAMP` for a naive value) |
+| `SYSTIMESTAMP` | `clock_timestamp()` |
+| `TRUNC(SYSDATE)` | `CURRENT_DATE` |
+| `SYSDATE + 7` | `now() + interval '7 days'` |
+| `ADD_MONTHS(SYSDATE, 3)` | `now() + interval '3 months'` |
+| `MONTHS_BETWEEN(a, b)` | `extract(year from age(a, b)) * 12 + extract(month from age(a, b))` |
+| `TO_CHAR(SYSDATE, 'YYYY-MM-DD')` | `to_char(now(), 'YYYY-MM-DD')` |
+| `LAST_DAY(SYSDATE)` | `(date_trunc('month', now()) + interval '1 month - 1 day')::date` |
+
+`to_char` survives the migration unchanged, which is a small mercy — and if you need to build a format pattern, the free [Postgres TO_CHAR Date Format Builder](https://chat2db.ai/tools/postgres-to-char-format-builder) previews the output as you assemble it.
+
+## Summary
+
+There is no `SYSDATE` in PostgreSQL because one function cannot answer three different questions. Use `now()` (or `CURRENT_TIMESTAMP`) for the transaction's timestamp — stable, `timestamptz`, correct for `created_at` defaults and business logic. Use `clock_timestamp()` when you need real elapsed time inside a transaction. Use `CURRENT_DATE`, remembering that it depends on the session timezone, and use `AT TIME ZONE` to pin reports to a specific business zone. Do date arithmetic with intervals, and keep filters sargable by comparing the raw column against a computed constant rather than wrapping the column in a function. If you are working through an Oracle-to-Postgres port, [Chat2DB](https://chat2db.ai/download) is a free AI-powered SQL client that connects to both, which makes comparing results between the two databases a lot less tedious — the browser version is at [app.chat2db.ai](https://app.chat2db.ai).

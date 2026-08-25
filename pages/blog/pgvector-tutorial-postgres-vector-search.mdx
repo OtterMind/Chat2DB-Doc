@@ -1,0 +1,292 @@
+---
+title: "pgvector Tutorial: Vector Search in Postgres"
+description: "A hands-on pgvector tutorial: install the extension, store embeddings, build HNSW indexes, filter by metadata and tune recall for vector search in PostgreSQL."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: August 25, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# pgvector Tutorial: Vector Search in Postgres
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="August 25, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+If your application already runs on PostgreSQL, you probably do not need a separate vector database to add semantic search or retrieval-augmented generation. The `pgvector` extension adds vector column types, distance operators and approximate nearest-neighbour indexes directly to Postgres, so embeddings live in the same transaction, the same backup and the same permissions model as the rest of your data. This tutorial walks through a working setup end to end: installing the extension, designing the table, inserting embeddings, querying nearest neighbours, indexing them and tuning recall.
+
+## Installing the extension
+
+`pgvector` ships as a standard extension. On a self-managed server you install the OS package (`postgresql-17-pgvector` on Debian/Ubuntu, or `make && make install` from source), then enable it per database:
+
+```sql
+CREATE EXTENSION IF NOT EXISTS vector;
+
+SELECT extname, extversion FROM pg_extension WHERE extname = 'vector';
+```
+
+On managed platforms it is already compiled and only needs enabling — RDS and Aurora PostgreSQL, Cloud SQL, Azure Database for PostgreSQL, Supabase and Neon all ship it. The version matters more than people expect:
+
+- **0.5.0** introduced HNSW indexes.
+- **0.6.0** made HNSW builds dramatically faster and parallel.
+- **0.7.0** added `halfvec`, `sparsevec`, binary quantization and L1 distance.
+- **0.8.0** improved the planner's costing for filtered queries.
+
+Check `extversion` before you copy an index definition from a blog post; half the "syntax error at or near halfvec" reports are simply an older build.
+
+## Designing the table
+
+A vector column has a fixed dimension, declared at creation time and enforced on insert:
+
+```sql
+CREATE TABLE documents (
+  id         bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  tenant_id  text        NOT NULL,
+  source_url text,
+  content    text        NOT NULL,
+  metadata   jsonb       NOT NULL DEFAULT '{}'::jsonb,
+  embedding  vector(1536),
+  created_at timestamptz NOT NULL DEFAULT now()
+);
+```
+
+The dimension must match your embedding model exactly: 1536 for OpenAI `text-embedding-3-small`, 3072 for `text-embedding-3-large`, 768 for many open-source sentence-transformer models. Insert a vector of the wrong length and Postgres rejects it with `expected 1536 dimensions, not 768` — which is a feature, not a nuisance, because it catches the classic bug of mixing embeddings from two different models in one column.
+
+Keep the original text in the same row. Retrieval systems almost always need the chunk back, and a join to fetch it defeats the point of having everything in one database.
+
+### Storage sizes
+
+A `vector(1536)` is 4 bytes per dimension plus 8 bytes of header — about 6 KB per row. A million rows is roughly 6 GB before indexes, which is enough to matter. Two options reduce it:
+
+```sql
+-- Half precision: 2 bytes per dimension, ~3 KB per row
+ALTER TABLE documents ALTER COLUMN embedding TYPE halfvec(1536);
+
+-- Binary quantization, for a coarse first pass
+CREATE INDEX ON documents USING hnsw ((binary_quantize(embedding)::bit(1536)) bit_hamming_ops);
+```
+
+`halfvec` loses very little recall for most models and halves both storage and index size. It is the default choice above a few million rows.
+
+## Inserting embeddings
+
+Vectors are written as a bracketed literal. From SQL directly:
+
+```sql
+INSERT INTO documents (tenant_id, content, embedding)
+VALUES ('acme', 'Refund policy: returns accepted within 30 days.',
+        '[0.0123, -0.0456, 0.0789 /* ... 1536 values ... */]');
+```
+
+In practice you generate embeddings in the application and bind them as parameters. With `psycopg` and the `pgvector` Python helper:
+
+```python
+from pgvector.psycopg import register_vector
+import psycopg
+
+conn = psycopg.connect("postgresql://app@db.internal/rag")
+register_vector(conn)
+
+rows = [(tenant, chunk, embed(chunk)) for chunk in chunks]
+with conn.cursor() as cur:
+    cur.executemany(
+        "INSERT INTO documents (tenant_id, content, embedding) VALUES (%s, %s, %s)",
+        rows,
+    )
+conn.commit()
+```
+
+Batch the inserts. A `COPY` or a multi-row `INSERT` of a few hundred rows per statement is one to two orders of magnitude faster than a round trip per chunk, and embedding pipelines are usually the ingest bottleneck already.
+
+## Querying nearest neighbours
+
+`pgvector` provides one operator per distance metric:
+
+| Operator | Meaning | Use with |
+| --- | --- | --- |
+| `<->` | Euclidean (L2) distance | Raw, unnormalised embeddings |
+| `<=>` | Cosine distance | Normalised embeddings (most text models) |
+| `<#>` | Negative inner product | Dot-product-trained models |
+| `<+>` | L1 / taxicab distance | Sparse or count-like features |
+
+A top-10 search looks like this:
+
+```sql
+SELECT id,
+       content,
+       embedding <=> $1 AS distance,
+       1 - (embedding <=> $1) AS cosine_similarity
+FROM documents
+ORDER BY embedding <=> $1
+LIMIT 10;
+```
+
+Two details trip people up. First, `<#>` returns the *negative* inner product, because Postgres index scans always sort ascending — multiply by `-1` to get the familiar score. Second, cosine *distance* is `1 - similarity`, so smaller is better; if your application expects a similarity in `[0, 1]`, convert it in the `SELECT` list as shown above.
+
+To drop weak matches, filter on the distance rather than trying to pick a fixed `LIMIT`:
+
+```sql
+SELECT id, content
+FROM documents
+WHERE embedding <=> $1 < 0.35
+ORDER BY embedding <=> $1
+LIMIT 10;
+```
+
+The right threshold is model-specific. Measure it on a sample of known-good and known-bad pairs instead of copying a number from a tutorial.
+
+## Adding an index
+
+Without an index every query scans the whole table and computes distance for each row. That is exact and perfectly fine below roughly ten thousand rows. Beyond that you want an approximate index.
+
+### HNSW
+
+```sql
+SET maintenance_work_mem = '2GB';
+SET max_parallel_maintenance_workers = 4;
+
+CREATE INDEX documents_embedding_hnsw_idx
+  ON documents USING hnsw (embedding vector_cosine_ops)
+  WITH (m = 16, ef_construction = 64);
+```
+
+`m` is the number of links each node keeps (higher = better recall, larger index); `ef_construction` is how many candidates are examined while building (higher = better graph, slower build). The defaults of 16 and 64 are a sensible starting point for almost everything.
+
+At query time, recall is controlled per session:
+
+```sql
+SET hnsw.ef_search = 100;  -- default 40; raise for better recall
+```
+
+### IVFFlat
+
+```sql
+-- Only after the data is loaded!
+CREATE INDEX documents_embedding_ivfflat_idx
+  ON documents USING ivfflat (embedding vector_cosine_ops)
+  WITH (lists = 1000);
+
+SET ivfflat.probes = 32;
+```
+
+IVFFlat clusters vectors into `lists` buckets and searches `probes` of them. Build it on an empty table and every centroid is garbage, so recall collapses — this is the single most common pgvector mistake. A good starting point is `lists = rows / 1000` up to a million rows, then `sqrt(rows)` beyond, with `probes ≈ sqrt(lists)`.
+
+HNSW is the better default: higher recall at the same latency, works on an empty table, no rebuild when the data distribution shifts. IVFFlat wins when build time or index size dominates. If you would rather not memorise the operator-class names and parameter combinations, the free [pgvector Index & Schema Generator](https://chat2db.ai/tools/pgvector-index-generator) writes the whole script — table, index and matching query — from your dimensions and metric.
+
+## Verifying that the index is used
+
+An approximate index only serves the exact operator it was built for. Check with `EXPLAIN`:
+
+```sql
+EXPLAIN (ANALYZE, BUFFERS)
+SELECT id FROM documents ORDER BY embedding <=> $1 LIMIT 10;
+```
+
+```
+Limit  (cost=... rows=10)
+  ->  Index Scan using documents_embedding_hnsw_idx on documents
+        Order By: (embedding <=> '[...]'::vector)
+```
+
+If you see `Seq Scan` followed by `Sort`, one of these is true:
+
+- The query uses a different operator than the index's operator class (`<->` against a `vector_cosine_ops` index).
+- There is no `LIMIT`, so the planner sees no benefit in an ordered scan.
+- The column was cast or wrapped in a function, so the index expression no longer matches.
+- The table is small enough that a scan genuinely is cheaper.
+
+## Combining vector search with filters
+
+Real applications rarely search the whole corpus. They search one tenant, one language, one date range. Postgres can combine a `WHERE` clause with an ANN index, but the index returns a bounded candidate set first, so a highly selective filter can leave you with fewer rows than your `LIMIT`. Three patterns work:
+
+**Over-fetch and filter.** Ask for more candidates than you need and let the filter cut them down:
+
+```sql
+SELECT id, content
+FROM documents
+WHERE tenant_id = $2
+ORDER BY embedding <=> $1
+LIMIT 10;
+```
+
+with `SET hnsw.ef_search = 200;` so the graph traversal keeps enough candidates alive.
+
+**Partial indexes.** When you have a handful of large partitions — a few big tenants, a few languages — build one index each:
+
+```sql
+CREATE INDEX documents_acme_hnsw_idx
+  ON documents USING hnsw (embedding vector_cosine_ops)
+  WHERE tenant_id = 'acme';
+```
+
+The planner picks the partial index automatically when the `WHERE` clause matches, and each search stays inside the right subset.
+
+**Pre-filter into a CTE.** If the filtered subset is small, exact search over it beats approximate search over everything:
+
+```sql
+WITH candidates AS (
+  SELECT id, content, embedding
+  FROM documents
+  WHERE tenant_id = $2 AND created_at > now() - interval '90 days'
+)
+SELECT id, content, embedding <=> $1 AS distance
+FROM candidates
+ORDER BY distance
+LIMIT 10;
+```
+
+## Hybrid search: vectors plus full-text
+
+Semantic search misses exact identifiers — order numbers, error codes, product SKUs. Postgres already has full-text search, so combine the two with reciprocal rank fusion:
+
+```sql
+WITH semantic AS (
+  SELECT id, row_number() OVER (ORDER BY embedding <=> $1) AS rank
+  FROM documents ORDER BY embedding <=> $1 LIMIT 50
+),
+keyword AS (
+  SELECT id, row_number() OVER (
+           ORDER BY ts_rank_cd(to_tsvector('english', content),
+                               plainto_tsquery('english', $2)) DESC) AS rank
+  FROM documents
+  WHERE to_tsvector('english', content) @@ plainto_tsquery('english', $2)
+  LIMIT 50
+)
+SELECT COALESCE(s.id, k.id) AS id,
+       COALESCE(1.0 / (60 + s.rank), 0) + COALESCE(1.0 / (60 + k.rank), 0) AS score
+FROM semantic s
+FULL OUTER JOIN keyword k USING (id)
+ORDER BY score DESC
+LIMIT 10;
+```
+
+This is the same fusion technique dedicated vector databases use, expressed in twenty lines of SQL — and it stays consistent with your transactional data.
+
+## Measuring recall
+
+Approximate means approximate. Measure how much you are giving up before you ship:
+
+```sql
+-- Ground truth: force an exact scan
+SET LOCAL enable_indexscan = off;
+SELECT id FROM documents ORDER BY embedding <=> $1 LIMIT 10;
+
+-- Approximate result
+RESET enable_indexscan;
+SET hnsw.ef_search = 40;
+SELECT id FROM documents ORDER BY embedding <=> $1 LIMIT 10;
+```
+
+Run both over a few hundred sample queries and count how many of the exact top-10 appear in the approximate top-10. That fraction is your recall. Raise `hnsw.ef_search` (or `ivfflat.probes`) until it clears your target, then check the latency cost. Tuning without this measurement is guesswork.
+
+## Operational notes
+
+- **Vacuum matters.** HNSW indexes grow with deletes; `VACUUM` reclaims the space but the graph is not rebuilt, so heavily churned tables benefit from a periodic `REINDEX CONCURRENTLY`.
+- **Builds are memory-hungry.** If `maintenance_work_mem` is too small the build spills to disk and takes many times longer. Give it as much as you can spare for the duration.
+- **Backfills should be batched.** Adding an embedding column to an existing table and updating every row in one transaction bloats the table badly. Update in batches of a few thousand with commits between them.
+- **Watch the null case.** Rows with `embedding IS NULL` are never returned by an ordered scan, which silently hides content that has not been embedded yet. Track `count(*) FILTER (WHERE embedding IS NULL)` as a pipeline health metric.
+
+## Wrapping up
+
+`pgvector` turns PostgreSQL into a perfectly serviceable vector store: fixed-dimension columns, four distance operators, HNSW and IVFFlat indexes, and full participation in transactions, backups and row-level security. Start without an index while your corpus is small, move to HNSW with `m = 16, ef_construction = 64`, tune `hnsw.ef_search` against a measured recall target, and reach for `halfvec` when storage becomes the constraint. If you are iterating on schemas and query plans while you tune, Chat2DB is a free AI-powered SQL client that runs these queries and shows the explain plan next to the editor — [download it](https://chat2db.ai/download) or use the browser version at [app.chat2db.ai](https://app.chat2db.ai).

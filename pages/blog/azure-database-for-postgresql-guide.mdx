@@ -1,0 +1,220 @@
+---
+title: "Azure Database for PostgreSQL: A Practical Guide"
+description: "Get started with Azure Database for PostgreSQL Flexible Server: provisioning, networking, high availability, extensions, connection pooling and cost control."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: August 25, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# Azure Database for PostgreSQL: A Practical Guide
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="August 25, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+Azure Database for PostgreSQL is Microsoft's managed Postgres service. The current deployment option is **Flexible Server**, which replaced the older Single Server model and gives you far more control: choice of availability zone, a maintenance window you pick, stop/start for non-production, and direct access to most server parameters. This guide covers what you actually need to decide when you provision one, and the operational details that are easy to get wrong.
+
+## Provisioning
+
+The CLI is the shortest path to a reproducible setup:
+
+```bash
+az postgres flexible-server create \
+  --resource-group rg-analytics \
+  --name pg-analytics-prod \
+  --location westeurope \
+  --tier GeneralPurpose \
+  --sku-name Standard_D4ds_v5 \
+  --storage-size 256 \
+  --version 17 \
+  --admin-user pgadmin \
+  --admin-password "$PGADMIN_PASSWORD" \
+  --high-availability ZoneRedundant \
+  --zone 1 \
+  --standby-zone 2 \
+  --public-access None \
+  --vnet vnet-core --subnet snet-postgres
+```
+
+Four decisions in that command deserve thought.
+
+**Compute tier.** `Burstable` (B-series) accumulates CPU credits and is genuinely fine for dev, test and low-traffic internal tools — but a burstable instance that exhausts its credits gets throttled hard, and it looks exactly like a database problem when it happens. Never put a latency-sensitive production workload on it. `GeneralPurpose` is the default for most applications; `MemoryOptimized` is for large working sets where the goal is keeping indexes in `shared_buffers`.
+
+**Storage size determines IOPS.** On Flexible Server, provisioned IOPS scale with the disk size on the standard storage type. A 32 GB volume gets a small IOPS allocation regardless of how fast your compute is, so a database that fits in 32 GB but does heavy random I/O should still be provisioned larger — or moved to a premium SSD v2 disk where IOPS and throughput are configured independently of capacity. Storage can be grown online but **not shrunk**, so size deliberately.
+
+**Version.** Pick the newest major version the service supports that your extensions and ORM tolerate. In-place major version upgrades are available but require downtime, so the version you choose at creation tends to be the version you run for a long time.
+
+**Networking.** More on this below — it is the choice you cannot change later without recreating the server.
+
+## Networking: private access versus public access
+
+Flexible Server offers two mutually exclusive models, chosen at creation time and **immutable afterwards**:
+
+**Private access (VNet integration)** injects the server into a delegated subnet. It has no public endpoint at all; only resources that can route to that VNet can reach it. This is the right choice for production. The subnet must be delegated to `Microsoft.DBforPostgreSQL/flexibleServers` and cannot host anything else, and DNS resolution requires a private DNS zone (`privatelink.postgres.database.azure.com`) linked to every VNet that needs to resolve the name — including the hub VNet if you use hub-and-spoke, and your VPN or ExpressRoute clients.
+
+**Public access** gives the server a public FQDN protected by a firewall rule list:
+
+```bash
+az postgres flexible-server firewall-rule create \
+  --resource-group rg-analytics --name pg-analytics-prod \
+  --rule-name office --start-ip-address 203.0.113.10 --end-ip-address 203.0.113.10
+```
+
+The convenience option "Allow public access from any Azure service within Azure to this server" opens the database to *every* Azure tenant, not just yours. Leave it off.
+
+Because the model cannot be changed after creation, the first question to answer is where your application runs. If it is in Azure, use private access. If you genuinely need to connect from arbitrary networks, use public access with a tight firewall list, `sslmode=verify-full`, and Entra ID authentication rather than a shared password.
+
+## Connecting
+
+```bash
+psql "host=pg-analytics-prod.postgres.database.azure.com \
+      port=5432 dbname=analytics user=pgadmin \
+      sslmode=verify-full sslrootcert=/etc/ssl/certs/DigiCertGlobalRootCA.crt.pem"
+```
+
+Three things differ from a self-hosted server:
+
+- **TLS is mandatory.** `sslmode=require` is the minimum; use `verify-full` with Azure's published root certificate so you are verifying the server, not just encrypting.
+- **The admin user is not a superuser.** You get `azure_pg_admin`, which can create roles, databases and extensions from the allow-list, but cannot `ALTER SYSTEM`, install arbitrary C extensions, or read the raw data directory. Anything that assumes superuser — some migration tools, `pg_repack` in certain modes — needs checking.
+- **Flexible Server no longer requires the `user@server` login format** that Single Server did. If you are migrating old connection strings, drop the `@servername` suffix.
+
+Entra ID (formerly Azure AD) authentication replaces passwords with tokens:
+
+```bash
+az postgres flexible-server ad-admin create \
+  --resource-group rg-analytics --server-name pg-analytics-prod \
+  --display-name "DBA Group" --object-id "$GROUP_OBJECT_ID" --type Group
+
+# The token is the password
+export PGPASSWORD=$(az account get-access-token \
+  --resource https://ossrdbms-aad.database.windows.net --query accessToken -o tsv)
+psql "host=... user=dba@contoso.com dbname=analytics sslmode=verify-full"
+```
+
+Tokens are short-lived, so applications must refresh them — most Azure SDKs handle this through `DefaultAzureCredential`. Combined with managed identities, this removes database passwords from your configuration entirely, which is the single biggest security win available on the platform.
+
+## High availability and backups
+
+Zone-redundant HA provisions a standby in a different availability zone and replicates synchronously; same-zone HA keeps the standby in the same zone, which reduces latency but survives fewer failure modes. Failover promotes the standby and repoints the DNS name, so applications reconnect rather than reconfigure. Check the current SLA figures in Azure's documentation before you commit, since they differ per configuration and change over time.
+
+Two things HA does **not** give you:
+
+- **A read replica.** The HA standby is not readable. If you need read scale-out, create explicit read replicas — asynchronous, promotable, billed as separate servers.
+- **Protection from your own mistakes.** A `DELETE` without a `WHERE` replicates to the standby instantly. That is what backups are for.
+
+Backups are automatic, with a configurable retention window and point-in-time restore. Restore creates a **new server** — it never overwrites the original — so plan for the DNS name to change and for the restore to take time proportional to the database size. Test this. A backup policy that has never been restored is a hypothesis, not a plan.
+
+For cross-region protection, enable geo-redundant backup at creation time (it cannot be turned on later) or configure a cross-region read replica.
+
+## Extensions
+
+Extensions must be allow-listed at the server level before they can be created:
+
+```bash
+az postgres flexible-server parameter set \
+  --resource-group rg-analytics --server-name pg-analytics-prod \
+  --name azure.extensions --value "pg_stat_statements,pgcrypto,uuid-ossp,vector,postgis"
+```
+
+Then, in the database:
+
+```sql
+CREATE EXTENSION IF NOT EXISTS pg_stat_statements;
+CREATE EXTENSION IF NOT EXISTS vector;
+```
+
+Some extensions — `pg_stat_statements`, `pg_cron`, `pg_prewarm` — also need to be in `shared_preload_libraries`, which requires a server restart:
+
+```bash
+az postgres flexible-server parameter set \
+  --resource-group rg-analytics --server-name pg-analytics-prod \
+  --name shared_preload_libraries --value "pg_stat_statements,pg_cron"
+az postgres flexible-server restart \
+  --resource-group rg-analytics --name pg-analytics-prod
+```
+
+`pg_stat_statements` should be on from day one on every server. Without it you are debugging performance blind.
+
+Check what is actually available on your server:
+
+```sql
+SELECT name, default_version, installed_version, comment
+FROM pg_available_extensions
+ORDER BY name;
+```
+
+## Connection pooling
+
+Postgres allocates a process per connection, and managed instances cap `max_connections` by SKU size — a small server may allow only a few hundred. Serverless applications and container platforms that scale horizontally exhaust that quickly.
+
+Flexible Server includes **built-in PgBouncer**, enabled with a parameter and reached on port 6432:
+
+```bash
+az postgres flexible-server parameter set \
+  --resource-group rg-analytics --server-name pg-analytics-prod \
+  --name pgbouncer.enabled --value true
+```
+
+```
+host=pg-analytics-prod.postgres.database.azure.com port=6432 ...
+```
+
+The default pool mode is transaction pooling, which is what makes the multiplexing effective — and which breaks session-scoped features: `SET` outside a transaction, session advisory locks, `LISTEN`/`NOTIFY`, and server-side prepared statements in older client libraries. Most ORMs have a flag for this (`prepareThreshold=0` for JDBC, `prepare_threshold=None` for psycopg, `statement_cache_size=0` for asyncpg). Test your stack against port 6432 before assuming it works.
+
+## Monitoring
+
+The metrics worth alerting on:
+
+- **CPU percent** — sustained above ~80% means either a query problem or an undersized SKU.
+- **Memory percent** — Postgres will not use swap gracefully.
+- **Storage percent** — a full disk makes the server read-only and is a genuine outage.
+- **IOPS consumed percent** — the most commonly missed one; storage throttling looks like slow queries.
+- **Active connections** versus `max_connections`.
+- **Replica lag**, if you run read replicas.
+
+Inside the database, the standard tooling works:
+
+```sql
+-- Slowest statements by total time
+SELECT calls, round(total_exec_time::numeric, 1) AS total_ms,
+       round(mean_exec_time::numeric, 2) AS mean_ms, left(query, 90) AS query
+FROM pg_stat_statements
+ORDER BY total_exec_time DESC
+LIMIT 20;
+
+-- Cache hit ratio: below ~0.99 on an OLTP workload suggests more memory is needed
+SELECT sum(blks_hit)::numeric / NULLIF(sum(blks_hit) + sum(blks_read), 0) AS cache_hit_ratio
+FROM pg_stat_database;
+
+-- Bloat and vacuum health
+SELECT relname, n_live_tup, n_dead_tup, last_autovacuum
+FROM pg_stat_user_tables
+ORDER BY n_dead_tup DESC
+LIMIT 10;
+```
+
+Enable Query Store (`pg_qs.query_capture_mode`) if you want Azure's own historical query analysis alongside `pg_stat_statements`. To run these diagnostics from your desktop against a private-access server, connect through a jump host or VPN with any Postgres client — [Chat2DB](https://chat2db.ai/download) is a free AI-powered option that keeps several environments side by side, which is handy when comparing a production server with its restored copy; there is also a browser version at [app.chat2db.ai](https://app.chat2db.ai).
+
+## Controlling cost
+
+- **Stop non-production servers.** `az postgres flexible-server stop` halts compute billing; storage keeps accruing. Servers auto-restart after seven days, so pair it with a scheduled job.
+- **Reserved capacity** for steady production workloads is a substantial discount over pay-as-you-go for a one- or three-year commitment.
+- **Right-size on evidence.** Look at CPU, memory and IOPS metrics over a full business cycle before scaling up. Scaling compute is an online operation with a short restart, so it is reversible.
+- **Watch storage growth.** It only goes up, and it sets your IOPS floor. Table bloat and unused indexes are the usual culprits — `pg_stat_user_indexes` with `idx_scan = 0` finds indexes nobody uses.
+
+## Migrating in
+
+For a one-off move with acceptable downtime, `pg_dump`/`pg_restore` in directory format with parallel jobs is simple and reliable:
+
+```bash
+pg_dump -Fd -j 4 -f dump/ "host=old-server dbname=analytics user=app"
+pg_restore -j 4 -d "host=pg-analytics-prod.postgres.database.azure.com dbname=analytics user=pgadmin sslmode=require" dump/
+```
+
+For minimal downtime, use logical replication (the Azure Database Migration Service wraps this) — the target subscribes to the source, catches up, and you cut over when lag reaches zero. The usual caveats apply: logical replication does not copy sequences' current values or DDL, so bump sequences and recreate indexes on the target as part of the cutover checklist.
+
+## Summary
+
+Choose Flexible Server, decide the networking model *first* because it is permanent, and prefer private access with Entra ID authentication. Size storage for IOPS rather than capacity alone, allow-list your extensions and turn on `pg_stat_statements` immediately, use zone-redundant HA for availability but do not mistake it for a backup or a read replica, and enable the built-in PgBouncer if your application scales horizontally — after verifying your driver tolerates transaction pooling. Test a restore before you need one.

@@ -1,0 +1,261 @@
+---
+title: "Postgres LAG and LEAD: Compare Rows in SQL"
+description: "Use LAG and LEAD in PostgreSQL to compare a row with the previous or next one: deltas, gap detection, sessionization, defaults, frames and index tips."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: August 25, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# Postgres LAG and LEAD: Compare Rows in SQL
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="August 25, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+Relational algebra has no notion of "the previous row" — but almost every analytical question does. What changed since the last reading? How long between two events? Which value differs from the one before it? `LAG` and `LEAD` are the window functions that answer these, and once they are in your toolbox a whole class of self-joins and application-side loops disappears.
+
+## The mental model
+
+`LAG(expr, offset, default)` returns `expr` from the row `offset` positions *before* the current one within the window partition. `LEAD` does the same going forward. Both default to `offset = 1` and `default = NULL`.
+
+```sql
+CREATE TABLE readings (
+  device_id  int,
+  taken_at   timestamptz,
+  celsius    numeric(5,2)
+);
+
+SELECT device_id,
+       taken_at,
+       celsius,
+       lag(celsius)  OVER w AS previous_celsius,
+       lead(celsius) OVER w AS next_celsius
+FROM readings
+WINDOW w AS (PARTITION BY device_id ORDER BY taken_at)
+ORDER BY device_id, taken_at;
+```
+
+```
+ device_id |        taken_at        | celsius | previous_celsius | next_celsius
+-----------+------------------------+---------+------------------+--------------
+         1 | 2026-08-25 09:00:00+00 |   21.40 |           (null) |        21.80
+         1 | 2026-08-25 09:05:00+00 |   21.80 |            21.40 |        24.90
+         1 | 2026-08-25 09:10:00+00 |   24.90 |            21.80 |       (null)
+         2 | 2026-08-25 09:00:00+00 |   18.00 |           (null) |        18.10
+```
+
+Three things to internalise:
+
+1. **`ORDER BY` inside `OVER` defines "previous."** Without it the order is undefined and the result is meaningless. The window's `ORDER BY` is independent of the query's final `ORDER BY`.
+2. **`PARTITION BY` resets the sequence.** Device 2's first row does not see device 1's last row.
+3. **The `WINDOW` clause** lets you name a window once and reuse it — worth using as soon as you have more than one window function.
+
+## Deltas: the most common use
+
+Turning a running total into a per-period change is the canonical example:
+
+```sql
+SELECT taken_at::date            AS day,
+       celsius,
+       celsius - lag(celsius) OVER (ORDER BY taken_at) AS delta,
+       round(
+         100.0 * (celsius - lag(celsius) OVER (ORDER BY taken_at))
+         / NULLIF(lag(celsius) OVER (ORDER BY taken_at), 0), 2
+       )                          AS pct_change
+FROM readings
+WHERE device_id = 1
+ORDER BY taken_at;
+```
+
+`NULLIF(..., 0)` guards against division by zero — a percentage change from zero is undefined, and returning `NULL` is better than an error mid-report.
+
+The third argument of `LAG` supplies a default for the first row of each partition, which is often cleaner than filtering `NULL`s out afterwards:
+
+```sql
+-- Treat the first reading as a change from zero
+SELECT taken_at, celsius - lag(celsius, 1, 0::numeric) OVER (ORDER BY taken_at) AS delta
+FROM readings WHERE device_id = 1;
+```
+
+Note the explicit cast: the default's type must match the expression's type, and `0` is `integer` while `celsius` is `numeric`.
+
+## Time between events
+
+`LAG` over a timestamp column gives you gaps directly:
+
+```sql
+SELECT user_id,
+       occurred_at,
+       occurred_at - lag(occurred_at) OVER (PARTITION BY user_id ORDER BY occurred_at)
+         AS since_previous
+FROM events
+ORDER BY user_id, occurred_at;
+```
+
+Turn that into an average time between purchases per customer:
+
+```sql
+WITH gaps AS (
+  SELECT customer_id,
+         created_at - lag(created_at) OVER (PARTITION BY customer_id ORDER BY created_at) AS gap
+  FROM orders
+)
+SELECT customer_id,
+       count(*) FILTER (WHERE gap IS NOT NULL) AS repeat_orders,
+       avg(gap)                                AS avg_between_orders
+FROM gaps
+GROUP BY customer_id
+HAVING count(*) FILTER (WHERE gap IS NOT NULL) > 0
+ORDER BY avg_between_orders;
+```
+
+## Detecting gaps and islands
+
+The "gaps and islands" problem — grouping consecutive events that belong together — is `LAG` plus a cumulative sum. Sessionizing page views with a 30-minute inactivity timeout:
+
+```sql
+WITH marked AS (
+  SELECT user_id,
+         viewed_at,
+         CASE
+           WHEN viewed_at - lag(viewed_at) OVER (PARTITION BY user_id ORDER BY viewed_at)
+                > interval '30 minutes'
+             OR lag(viewed_at) OVER (PARTITION BY user_id ORDER BY viewed_at) IS NULL
+           THEN 1 ELSE 0
+         END AS is_new_session
+  FROM page_views
+),
+sessions AS (
+  SELECT user_id,
+         viewed_at,
+         sum(is_new_session) OVER (PARTITION BY user_id ORDER BY viewed_at) AS session_no
+  FROM marked
+)
+SELECT user_id,
+       session_no,
+       min(viewed_at)                  AS started_at,
+       max(viewed_at)                  AS ended_at,
+       max(viewed_at) - min(viewed_at) AS duration,
+       count(*)                        AS page_views
+FROM sessions
+GROUP BY user_id, session_no
+ORDER BY user_id, session_no;
+```
+
+The pattern is worth memorising: mark the boundary with `LAG`, then `sum() OVER (ORDER BY ...)` turns the boundary flags into a group number. It works for finding runs of consecutive days, streaks, contiguous ID ranges and state changes.
+
+## Finding state changes
+
+Only interested in rows where a value actually changed?
+
+```sql
+SELECT *
+FROM (
+  SELECT order_id,
+         status,
+         changed_at,
+         lag(status) OVER (PARTITION BY order_id ORDER BY changed_at) AS previous_status
+  FROM order_status_history
+) s
+WHERE previous_status IS DISTINCT FROM status
+ORDER BY order_id, changed_at;
+```
+
+Use `IS DISTINCT FROM` rather than `<>`: it treats `NULL` as a comparable value, so the first row of each partition (where `previous_status` is `NULL`) is correctly reported as a change instead of being filtered out by three-valued logic.
+
+Window functions cannot appear in `WHERE` — they are evaluated after it — which is why the subquery is necessary. A CTE works equally well and usually reads better.
+
+## LEAD for validity intervals
+
+`LEAD` shines when you need to know when a row stops being current:
+
+```sql
+SELECT product_id,
+       price,
+       valid_from,
+       lead(valid_from, 1, 'infinity'::timestamptz)
+         OVER (PARTITION BY product_id ORDER BY valid_from) AS valid_to
+FROM price_history
+ORDER BY product_id, valid_from;
+```
+
+The `'infinity'` default closes the last interval cleanly, so downstream range queries do not need a special case for the current price. Feed the result into a `tstzrange` and you have a proper temporal table:
+
+```sql
+SELECT product_id,
+       tstzrange(valid_from,
+                 lead(valid_from, 1, 'infinity'::timestamptz)
+                   OVER (PARTITION BY product_id ORDER BY valid_from)) AS validity,
+       price
+FROM price_history;
+```
+
+## Offsets greater than one
+
+Both functions take an arbitrary offset — useful for comparing against the same weekday last week, or the same month last year, when the data is regularly spaced:
+
+```sql
+SELECT day,
+       revenue,
+       lag(revenue, 7) OVER (ORDER BY day) AS same_day_last_week,
+       revenue - lag(revenue, 7) OVER (ORDER BY day) AS wow_change
+FROM daily_revenue
+ORDER BY day;
+```
+
+The important caveat: `LAG(x, 7)` means "seven rows back," not "seven days back." If any day is missing from the table the comparison silently shifts. When gaps are possible, generate a dense series first and left join onto it:
+
+```sql
+WITH days AS (
+  SELECT generate_series(date '2026-01-01', date '2026-08-25', interval '1 day')::date AS day
+)
+SELECT d.day,
+       COALESCE(r.revenue, 0) AS revenue,
+       lag(COALESCE(r.revenue, 0), 7) OVER (ORDER BY d.day) AS same_day_last_week
+FROM days d
+LEFT JOIN daily_revenue r ON r.day = d.day
+ORDER BY d.day;
+```
+
+## LAG/LEAD and window frames
+
+A frequent source of confusion: `LAG` and `LEAD` ignore the window frame entirely. Writing `ROWS BETWEEN 3 PRECEDING AND CURRENT ROW` changes what `sum()` or `avg()` sees, but `LAG(x, 5)` still reaches five rows back regardless. Frames apply to aggregate window functions and to `first_value`/`last_value`/`nth_value` — not to the offset functions.
+
+That distinction explains the classic `last_value` surprise:
+
+```sql
+-- Returns the current row, not the partition's last row!
+SELECT last_value(celsius) OVER (PARTITION BY device_id ORDER BY taken_at) FROM readings;
+
+-- Correct: widen the frame
+SELECT last_value(celsius) OVER (
+         PARTITION BY device_id ORDER BY taken_at
+         ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING
+       ) FROM readings;
+```
+
+The default frame is `RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW`, so "last value so far" is the current row. `LAG`/`LEAD` are immune to this because they do not consult the frame.
+
+## Performance
+
+A window function needs its input sorted by `PARTITION BY`, then `ORDER BY`. If a matching index exists, PostgreSQL reads it in order and skips the sort:
+
+```sql
+CREATE INDEX readings_device_taken_idx ON readings (device_id, taken_at);
+```
+
+Check with `EXPLAIN (ANALYZE, BUFFERS)`: an `Index Scan` feeding a `WindowAgg` is good; a `Sort` node with a large `Sort Method: external merge  Disk: ...` line means the sort spilled and either the index is missing or `work_mem` is too small.
+
+Other tips that matter on large tables:
+
+- Filter *before* the window: window functions run after `WHERE`, so restricting rows early reduces the sort input. Move the filter into a CTE or subquery if you need to filter on the window result itself.
+- Reuse one named `WINDOW` clause instead of repeating the same `OVER (...)`; the planner computes it once either way, but the query becomes far more readable and less error-prone.
+- Multiple *different* windows mean multiple sorts. Ordering them so that compatible windows are adjacent lets Postgres reuse a sort.
+
+If you are exploring plans while tuning these queries, [Chat2DB](https://chat2db.ai/download) is a free AI-powered SQL client that shows the explain plan next to the editor; the web version lives at [app.chat2db.ai](https://app.chat2db.ai).
+
+## Summary
+
+`LAG` and `LEAD` give SQL a memory. Use `PARTITION BY` to reset per entity, always specify `ORDER BY` inside `OVER`, and reach for the third argument when a sensible default beats a `NULL`. Combine `LAG` with a cumulative `sum()` for gaps-and-islands problems like sessionization and streaks, use `LEAD` with an `'infinity'` default to close validity intervals, filter changes with `IS DISTINCT FROM`, and remember that these two functions ignore window frames — that is a feature, and it is why they are so predictable.

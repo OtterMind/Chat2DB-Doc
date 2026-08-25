@@ -1,0 +1,253 @@
+---
+title: "Postgres SERIAL vs IDENTITY Columns Compared"
+description: "Compare Postgres SERIAL and IDENTITY columns: syntax, sequence ownership, migration steps and why IDENTITY is the modern default."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: August 24, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# Postgres SERIAL vs IDENTITY Columns Compared
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="August 24, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+Almost every PostgreSQL tutorial starts a table definition with `id SERIAL PRIMARY KEY`, and for a long time that was the right advice. But `SERIAL` was never a real column type — it is a piece of syntactic sugar that Postgres quietly expands into several separate objects at `CREATE TABLE` time, and that expansion has consequences for permissions, dumps, and data integrity that catch people off guard. Since PostgreSQL 10, the SQL standard's `GENERATED ... AS IDENTITY` syntax has been available as a cleaner replacement, and it has become the recommended default for new tables. This article walks through what `SERIAL` actually does under the hood, the problems that causes, how `IDENTITY` columns work instead, and the exact steps to migrate an existing table from one to the other.
+
+## What SERIAL Actually Is
+
+When you write `id SERIAL PRIMARY KEY`, Postgres does not create a column of type `serial`. There is no such storage type. Instead, at parse time, the following happens automatically:
+
+1. A column is created with type `integer` (or `bigint` for `BIGSERIAL`, `smallint` for `SMALLSERIAL`).
+2. A sequence object is created, named by convention `<table>_<column>_seq`.
+3. The column gets a `DEFAULT nextval('<table>_<column>_seq')`.
+4. The sequence is marked as owned by the column with `ALTER SEQUENCE ... OWNED BY table.column`, so dropping the column or the table also drops the sequence.
+
+Here is the expansion in practice:
+
+```sql
+CREATE TABLE customers (
+  id   SERIAL PRIMARY KEY,
+  name text NOT NULL
+);
+```
+
+Running `\d customers` in psql shows exactly what was created, and the default value is the giveaway:
+
+```
+                                     Table "public.customers"
+ Column |  Type   | Collation | Nullable |                Default
+--------+---------+-----------+----------+----------------------------------------
+ id     | integer |           | not null | nextval('customers_id_seq'::regclass)
+ name   | text    |           | not null |
+Indexes:
+    "customers_pkey" PRIMARY KEY, btree (id)
+```
+
+Notice that the `Type` column just says `integer` — there is no trace of `SERIAL` left anywhere in the catalog once the table exists. The only evidence that this is a "serial" column is the `nextval()` default and, if you go looking, the ownership link between the sequence and the column. You can confirm the sequence and its ownership directly:
+
+```sql
+SELECT
+  s.relname  AS sequence_name,
+  d.refobjid::regclass AS owning_table,
+  a.attname  AS owning_column
+FROM pg_class s
+JOIN pg_depend d ON d.objid = s.oid AND d.deptype = 'a'
+JOIN pg_attribute a ON a.attrelid = d.refobjid AND a.attnum = d.refobjsubid
+WHERE s.relkind = 'S' AND s.relname = 'customers_id_seq';
+```
+
+This is a genuinely convenient shorthand — one line of DDL instead of four separate statements — but because it produces several independent catalog objects rather than one property on the column, it opens the door to a handful of surprises.
+
+## Problems with SERIAL
+
+### Permissions Live on a Separate Object
+
+The sequence created by `SERIAL` is its own object with its own privilege set, entirely separate from the table's privileges. Granting `INSERT` on the table does not implicitly grant the ability to call `nextval()` on the sequence:
+
+```sql
+GRANT INSERT ON customers TO app_user;
+
+-- app_user tries to insert without specifying id:
+-- INSERT INTO customers (name) VALUES ('New Row');
+-- ERROR:  permission denied for sequence customers_id_seq
+```
+
+The fix is an extra, easy-to-forget grant:
+
+```sql
+GRANT USAGE, SELECT ON SEQUENCE customers_id_seq TO app_user;
+```
+
+Every role that needs to insert rows into a `SERIAL` table needs this second grant, and it is trivial to miss when writing migration scripts or onboarding a new service account, because the error message mentions the sequence, not the table, which is rarely where people look first.
+
+### Nothing Stops the Sequence From Drifting
+
+The sequence tracks "the next value to hand out," but Postgres has no way to know when you bypass it. If application code, a data import, or a manual fix inserts an explicit id, the sequence's internal counter does not move:
+
+```sql
+INSERT INTO customers (id, name) VALUES (5, 'Manually Inserted');
+
+-- The sequence still believes the next value is 1, 2, 3...
+INSERT INTO customers (name) VALUES ('Normal Insert');
+-- Eventually, once the sequence counter reaches 5:
+-- ERROR:  duplicate key value violates unique constraint "customers_pkey"
+-- DETAIL:  Key (id)=(5) already exists.
+```
+
+This kind of drift is extremely common after restoring a dump, running a bulk import with explicit ids, or copying rows between environments, and the resulting duplicate-key error can show up long after the actual cause, which makes it confusing to debug.
+
+### Dump and Restore Has More Moving Parts
+
+Because a `SERIAL` column is really three things (a plain column, a sequence, and a default expression) plus an ownership link, `pg_dump` has to emit all of them separately: `CREATE SEQUENCE`, `ALTER SEQUENCE ... OWNED BY`, the `ALTER TABLE ... ALTER COLUMN ... SET DEFAULT`, and the sequence's current value via `setval()`. Tools that only understand "columns and their types" — custom migration scripts, some ORMs, ad hoc `CREATE TABLE AS` copies — often reproduce the column but forget one of the other three pieces, which is exactly how sequence drift and permission gaps get introduced in the first place.
+
+## GENERATED ... AS IDENTITY
+
+PostgreSQL 10 introduced the SQL-standard `GENERATED ... AS IDENTITY` syntax specifically to address these issues by making auto-increment behavior a real, first-class property of the column rather than a bundle of separate objects glued together by convention. There are two variants.
+
+### GENERATED ALWAYS AS IDENTITY
+
+`GENERATED ALWAYS AS IDENTITY` tells Postgres that this column's value should always come from the underlying sequence, and it rejects explicit values in a plain `INSERT`:
+
+```sql
+CREATE TABLE customers_identity (
+  id   INT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  name text NOT NULL
+);
+
+INSERT INTO customers_identity (name) VALUES ('Auto Insert');
+-- Works fine, id is assigned automatically.
+
+INSERT INTO customers_identity (id, name) VALUES (100, 'Manual Insert');
+-- ERROR:  cannot insert a non-DEFAULT value into column "id"
+-- DETAIL:  Column "id" is an identity column defined as GENERATED ALWAYS.
+-- HINT:  Use OVERRIDING SYSTEM VALUE to override.
+```
+
+If you genuinely need to insert an explicit value — restoring a backup, migrating rows from another system, fixing a specific row — the standard escape hatch is `OVERRIDING SYSTEM VALUE`:
+
+```sql
+INSERT INTO customers_identity (id, name)
+OVERRIDING SYSTEM VALUE
+VALUES (100, 'Manual Insert');
+```
+
+This is the strictest option: it makes accidental explicit inserts fail loudly at the exact moment they happen, rather than silently succeeding and causing a duplicate-key error somewhere down the line.
+
+### GENERATED BY DEFAULT AS IDENTITY
+
+`GENERATED BY DEFAULT AS IDENTITY` is the closest drop-in replacement for `SERIAL`. It behaves the same way in everyday use — the sequence supplies a value if you omit the column — but an explicit value in the `INSERT` is accepted without any special syntax:
+
+```sql
+CREATE TABLE customers_default_identity (
+  id   INT GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
+  name text NOT NULL
+);
+
+INSERT INTO customers_default_identity (name) VALUES ('Auto Insert');
+-- id is assigned from the identity sequence.
+
+INSERT INTO customers_default_identity (id, name) VALUES (100, 'Manual Insert');
+-- Allowed, exactly like SERIAL — but note the sequence's counter is not
+-- advanced by this insert, so the same drift risk as SERIAL still applies here.
+```
+
+That last caveat matters: `GENERATED BY DEFAULT` fixes the permissions and catalog-visibility problems of `SERIAL`, but it does not by itself prevent sequence drift, because it still allows values to bypass the sequence. If you want Postgres to actively guard against that class of bug, `GENERATED ALWAYS` is the stronger choice; use `GENERATED BY DEFAULT` mainly when you need a smooth, low-friction replacement for existing `SERIAL` usage.
+
+## Why IDENTITY Is the Modern Default
+
+Three concrete advantages explain why `GENERATED ... AS IDENTITY` is now the recommended choice for new tables:
+
+- **It is a real, visible column property.** Where `SERIAL` leaves only a `nextval()` default as a hint, `\d` on an identity column shows the property directly: `Identity generation: BY DEFAULT` or `Identity generation: ALWAYS`. There is no ambiguity about whether a column is auto-generated.
+- **No separate sequence grant is required for normal use.** A role with `INSERT` privilege on the table can insert rows and receive generated identity values without a matching `GRANT USAGE ON SEQUENCE`. The identity sequence is treated as an internal implementation detail of the column rather than an independently privileged object, which removes an entire category of "it works for me but not for the app role" bugs.
+- **It follows the SQL standard.** `GENERATED ... AS IDENTITY` is the same syntax used by Oracle, SQL Server, DB2, and other databases that implement the standard, which makes cross-database tooling, ORMs, and migrations more predictable than a Postgres-specific `SERIAL` shorthand.
+
+If you are designing a schema by hand and want to see these properties laid out visually rather than by memorizing `\d` output, a table designer like the one in [Chat2DB](https://chat2db.ai/download) can help — it displays a column's identity generation mode and its owning sequence alongside the rest of the column metadata, which is a useful sanity check while you are getting used to the difference from `SERIAL`.
+
+## Migrating an Existing SERIAL Column to IDENTITY
+
+If you decide a `SERIAL` column should become an `IDENTITY` column — usually because of the permission model, or because tooling expects standard identity metadata — Postgres supports the conversion with `ALTER TABLE`, but it takes a few careful steps rather than one command. There is no single statement that flips an existing `SERIAL` column in place, and the old sequence is not automatically reused as the new identity sequence, so you should not invent syntax like attaching an arbitrary existing sequence directly as an identity sequence — instead, follow the documented path below.
+
+First, drop the existing default that calls `nextval()` on the old sequence:
+
+```sql
+ALTER TABLE customers ALTER COLUMN id DROP DEFAULT;
+```
+
+Next, add the identity property. Because a sequence named `customers_id_seq` still exists (it is now orphaned, but not yet dropped), Postgres will create a new sequence with a disambiguated name such as `customers_id_seq1` to back the identity column:
+
+```sql
+ALTER TABLE customers ALTER COLUMN id ADD GENERATED BY DEFAULT AS IDENTITY;
+```
+
+At this point the column is a proper identity column, but the new sequence starts counting from 1, which would collide with any existing rows. Set it to continue after the current maximum id using `pg_get_serial_sequence()`, which correctly resolves to a column's associated sequence for both `SERIAL` and `IDENTITY` columns:
+
+```sql
+SELECT setval(
+  pg_get_serial_sequence('customers', 'id'),
+  (SELECT COALESCE(MAX(id), 1) FROM customers)
+);
+```
+
+Finally, clean up the old, now-unused sequence so it does not linger in the catalog:
+
+```sql
+DROP SEQUENCE customers_id_seq;
+```
+
+If any external tooling or scripts depended on the sequence being named `customers_id_seq`, you can rename the new one to match after the old one is gone, using `ALTER SEQUENCE customers_id_seq1 RENAME TO customers_id_seq`. Otherwise, leaving Postgres's auto-generated name in place is perfectly fine.
+
+### Confirming the Migration With \d
+
+Before the migration, `\d customers` shows a plain default expression:
+
+```
+ id     | integer |           | not null | nextval('customers_id_seq'::regclass)
+```
+
+After the migration, the same command shows the column as a true identity column, with no separate `Default` entry and an explicit identity line instead:
+
+```
+                                     Table "public.customers"
+ Column |  Type   | Collation | Nullable |               Default
+--------+---------+-----------+----------+--------------------------------------
+ id     | integer |           | not null | generated by default as identity
+ name   | text    |           | not null |
+Indexes:
+    "customers_pkey" PRIMARY KEY, btree (id)
+```
+
+That "generated by default as identity" line is the confirmation you are looking for — it means the property now lives on the column definition itself rather than being inferred from a default expression pointing at a sequence.
+
+## Sequence Maintenance Applies to Both
+
+Whether a table uses `SERIAL` or `IDENTITY`, the underlying mechanism is still a sequence, and sequences can still fall out of sync with the data. The most common trigger is restoring a dump or bulk-loading rows that carry explicit primary key values — `pg_restore` correctly restores the sequence's stored value as part of a full dump, but a manual `COPY` or `INSERT` of rows with explicit ids into an already-existing table will not touch the sequence at all. The first ordinary insert afterward can then fail:
+
+```sql
+-- After loading historical rows with explicit ids via COPY:
+INSERT INTO customers (name) VALUES ('Next Customer');
+-- ERROR:  duplicate key value violates unique constraint "customers_pkey"
+```
+
+The fix is the same `setval()` and `pg_get_serial_sequence()` pattern shown in the migration section, run any time you suspect the counter is behind the data:
+
+```sql
+SELECT setval(
+  pg_get_serial_sequence('customers', 'id'),
+  (SELECT MAX(id) FROM customers)
+);
+```
+
+`pg_get_serial_sequence(table, column)` is worth remembering on its own: it looks up the sequence associated with a column regardless of whether that column is `SERIAL` or `IDENTITY`, so scripts that need to be generic across both styles can rely on it instead of hardcoding a sequence name that might differ from table to table.
+
+## Recommendation
+
+For new tables, use `GENERATED BY DEFAULT AS IDENTITY` as the default choice — it keeps the familiar behavior of accepting explicit ids when needed, while fixing the permission and catalog-visibility issues that come with `SERIAL`. Reach for `GENERATED ALWAYS AS IDENTITY` when you specifically want Postgres to reject manual inserts unless the caller opts in with `OVERRIDING SYSTEM VALUE`, which is a reasonable default for tables where ids should genuinely never be set by hand, such as internal audit or event tables.
+
+For existing tables that already use `SERIAL`, there is rarely a need to rush a migration. The column keeps working exactly as it always has, and a conversion is only worth the operational effort when you have hit a concrete problem — typically a permissions headache with sequence grants, or tooling that specifically inspects identity metadata and does not recognize `SERIAL`'s implicit default pattern. Migrating purely for style, on a large or heavily used table, adds risk without a corresponding benefit.
+
+## Wrapping Up
+
+`SERIAL` and `IDENTITY` both end up calling the same kind of sequence object under the covers, but the difference in how that sequence is exposed — as a separately privileged object versus a property of the column — is exactly what causes the permission errors, drift bugs, and dump complications that `SERIAL` is known for. If you are inspecting an unfamiliar schema and want to quickly see which columns are `SERIAL`, which are `IDENTITY`, and how their sequences are owned without running `\d` on every table by hand, the schema browser in [Chat2DB](https://app.chat2db.ai) surfaces that information directly in its table view, which can save time when auditing a database before deciding whether a migration is worth doing at all.

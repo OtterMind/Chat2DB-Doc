@@ -1,0 +1,184 @@
+---
+title: "Postgres Partial vs Covering Indexes Explained"
+description: "Postgres partial and covering (INCLUDE) indexes explained with EXPLAIN examples, sizing comparisons and when each beats a plain B-tree."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: August 24, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# Postgres Partial vs Covering Indexes Explained
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="August 24, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+A plain B-tree index in PostgreSQL makes two commitments: it indexes every row in the table, and it stores every column you list as a search key, in the order you list them. Both commitments cost something. Indexing every row means the index grows with the table even if only a sliver of rows ever get queried through it. Storing columns as search keys means those columns participate in ordering, uniqueness and page splits, whether or not you ever need them for anything beyond "fetch it while I'm here." Partial indexes and covering indexes each relax one of those commitments. A partial index keeps the column list but drops most of the rows. A covering index keeps every row but demotes some columns to passengers that ride along without acting as search keys. Understanding the difference — and how they combine — lets you build indexes that match the actual query pattern instead of a generic "index everything" default.
+
+## Partial indexes: fewer rows, same columns
+
+A partial index is created with a `WHERE` clause on the `CREATE INDEX` statement itself, not to be confused with the `WHERE` clause of the query that will use it:
+
+```sql
+CREATE TABLE orders (
+  id          bigint PRIMARY KEY,
+  customer_id bigint NOT NULL,
+  status      text NOT NULL,
+  total       numeric NOT NULL,
+  currency    text NOT NULL,
+  deleted_at  timestamptz
+);
+```
+
+The classic soft-delete pattern indexes only the live rows:
+
+```sql
+CREATE INDEX orders_active_idx ON orders (customer_id) WHERE deleted_at IS NULL;
+```
+
+If a table accumulates deleted rows over the years but almost every query filters `WHERE deleted_at IS NULL`, an index covering only the live rows is much smaller than one covering the whole history, and it stays smaller as the deleted rows pile up. The same idea applies to a status column that is almost always in one terminal state. If 98% of orders end up `fulfilled` and the operational queries only ever care about the other 2%, indexing every row wastes space on rows the application never looks up by status:
+
+```sql
+CREATE INDEX orders_pending_idx ON orders (status) WHERE status = 'pending';
+```
+
+Partial indexes are also how you express a uniqueness rule that should only apply to a subset of rows — for example, an email must be unique among active users, but a deactivated account is allowed to share an email with a new signup:
+
+```sql
+CREATE TABLE users (
+  id         bigint PRIMARY KEY,
+  email      text NOT NULL,
+  is_active  boolean NOT NULL DEFAULT true
+);
+
+CREATE UNIQUE INDEX users_active_email_idx ON users (email) WHERE is_active;
+```
+
+A plain `UNIQUE` constraint on `email` cannot express "unique only while active"; a partial unique index can, because uniqueness is only enforced among the rows the index actually contains.
+
+### The predicate-implication rule
+
+The planner will only use a partial index for a query if it can prove, from the query's own `WHERE` clause, that every row the query could return already satisfies the index's predicate. This is a syntactic and semantic check, not a runtime one — Postgres does not scan rows to see if they happen to match; it reasons about the conditions themselves.
+
+A query whose predicate matches the index's predicate can use it:
+
+```sql
+EXPLAIN (COSTS OFF)
+SELECT customer_id FROM orders WHERE status = 'pending';
+--                        QUERY PLAN
+-- ---------------------------------------------------------
+--  Index Only Scan using orders_pending_idx on orders
+--    Index Cond: (status = 'pending'::text)
+```
+
+But a broader query that also wants other statuses cannot, because the planner cannot prove that rows with `status = 'processing'` are in the index — they aren't:
+
+```sql
+EXPLAIN (COSTS OFF)
+SELECT customer_id FROM orders WHERE status IN ('pending', 'processing');
+--                     QUERY PLAN
+-- --------------------------------------------
+--  Seq Scan on orders
+--    Filter: (status = ANY ('{pending,processing}'::text[]))
+```
+
+Likewise, `WHERE status = 'pending' AND customer_id = 42` can use `orders_pending_idx`, because `status = 'pending'` implies the predicate exactly, but a query with no reference to `status` at all cannot, because nothing in it implies the predicate one way or the other. This is the main mental model to keep: a partial index is only a candidate when the query's conditions are provably at least as restrictive as the index's `WHERE` clause. If your application sometimes runs the narrow query and sometimes a broader one, you likely need the partial index for the narrow, frequent case and a full index (or none) for the rest.
+
+## Covering indexes with INCLUDE
+
+PostgreSQL 11 added the `INCLUDE` clause, which lets you attach extra columns to an index without making them part of the search key:
+
+```sql
+CREATE INDEX orders_customer_covering_idx
+  ON orders (customer_id)
+  INCLUDE (total, currency);
+```
+
+Here `customer_id` is the only key column: it determines the sort order of the index, it is what an equality or range condition matches against, and it is what a unique index would enforce uniqueness on. `total` and `currency` are stored in the index's leaf pages purely as extra payload — Postgres does not sort by them, does not use them to narrow a search, and does not include them in any uniqueness check. Their only job is to let certain queries be answered without a trip back to the table.
+
+This is different from just adding those columns to the key list:
+
+```sql
+-- Not the same thing: total and currency are now part of the sort key
+CREATE INDEX orders_customer_wide_idx ON orders (customer_id, total, currency);
+```
+
+With the wide, non-INCLUDE version, the index is physically sorted by `customer_id, total, currency` together, which is only useful if your queries actually filter or order by `total` and `currency` after `customer_id`. It also changes what a `UNIQUE` index would mean: `UNIQUE (customer_id, total, currency)` allows the same customer to appear many times as long as some combination of `total` or `currency` differs, whereas `UNIQUE (customer_id) INCLUDE (total, currency)` enforces uniqueness on `customer_id` alone and simply carries `total` and `currency` along as non-key payload. Use `INCLUDE` when you only need those columns for output, not for searching or ordering — it keeps the B-tree's internal (non-leaf) pages narrower, because internal pages store only key columns, while `INCLUDE` columns exist solely in the leaf pages next to the heap pointer.
+
+## Index-Only Scans and the visibility map
+
+The payoff for covering a query's columns is the Index-Only Scan: Postgres answers the query straight from the index without touching the table's heap pages at all. Two conditions have to hold:
+
+1. Every column the query needs — in the `SELECT` list and in any `WHERE` condition — must be present in the index, either as a key column or as an `INCLUDE` column.
+2. The pages containing the relevant rows must be marked all-visible in the visibility map, meaning no transaction currently running could still see an older version of those rows. If a page is not all-visible, Postgres must still visit the heap for rows on that page to check visibility, even though it already has the column values from the index.
+
+Compare the plan before and after adding the covering index. Without `INCLUDE`, a query that also wants `total` has to fetch it from the heap:
+
+```sql
+EXPLAIN (ANALYZE, BUFFERS)
+SELECT total FROM orders WHERE customer_id = 42;
+--                                       QUERY PLAN
+-- --------------------------------------------------------------------------------
+--  Index Scan using orders_active_idx on orders (actual time=0.02..0.03 rows=1 loops=1)
+--    Index Cond: (customer_id = 42)
+--    Buffers: shared hit=3
+```
+
+An `Index Scan` locates the matching entries in the index, then fetches the actual row from the heap for every match to read `total` (and to recheck visibility). After creating `orders_customer_covering_idx` and running `VACUUM` so the visibility map is up to date, the same style of query — now restricted to the covered columns — can skip the heap entirely:
+
+```sql
+VACUUM orders;
+
+EXPLAIN (ANALYZE, BUFFERS)
+SELECT total, currency FROM orders WHERE customer_id = 42;
+--                                        QUERY PLAN
+-- ---------------------------------------------------------------------------------
+--  Index Only Scan using orders_customer_covering_idx on orders (actual time=0.01..0.02 rows=1 loops=1)
+--    Index Cond: (customer_id = 42)
+--    Heap Fetches: 0
+--    Buffers: shared hit=2
+```
+
+`Index Only Scan` plus `Heap Fetches: 0` is the signal that Postgres answered the query purely from the index. If instead you see `Heap Fetches: 1200` on a scan that returned 1200 rows, the index-only optimization is being defeated in practice — the planner chose the plan expecting it to pay off, but every row still required a heap visit. That almost always means the table has a lot of recently modified pages that `autovacuum` has not caught up with yet; running `VACUUM` (or waiting for autovacuum, or tuning it to run more often on that table) refreshes the visibility map and lets subsequent scans actually skip the heap.
+
+## Combining partial and covering indexes
+
+The two techniques are independent and stack cleanly. A narrow, high-frequency query pattern — "give me the pending orders for this customer, with enough detail to render a summary row" — is a good candidate for both a `WHERE` predicate and `INCLUDE` columns on the same index:
+
+```sql
+CREATE INDEX orders_pending_by_customer_idx
+  ON orders (customer_id)
+  INCLUDE (total, currency)
+  WHERE status = 'pending';
+```
+
+This index only contains pending rows, keeping it small relative to the full table, and each entry it does contain carries `total` and `currency` so that a query like the following can be answered as an Index Only Scan once the visibility map is current:
+
+```sql
+EXPLAIN (ANALYZE, BUFFERS)
+SELECT total, currency
+FROM   orders
+WHERE  customer_id = 42 AND status = 'pending';
+--                                          QUERY PLAN
+-- ------------------------------------------------------------------------------------
+--  Index Only Scan using orders_pending_by_customer_idx on orders
+--    Index Cond: (customer_id = 42)
+--    Heap Fetches: 0
+```
+
+Note that `status = 'pending'` does not need to appear in the index's key columns for the planner to use this index — it only needs to be provable from the query, and it is, because the query's condition is identical to the index's predicate.
+
+## When neither technique is worth it
+
+Partial indexes are not free to have around. Every additional index the planner considers adds to planning time, and a partial index whose predicate matches most of the table gives you almost none of the size benefit while still costing maintenance overhead on every insert and update that touches a matching row. If `status = 'pending'` actually covers 80% of a table, a partial index on it barely differs from a full index — you are better off with a plain index, or reconsidering whether that query needs an index at all.
+
+`INCLUDE` columns have a more subtle cost: they still occupy space in every leaf entry of the index, even though they never act as search keys. Adding a handful of small columns is usually a fine trade for the queries they save from a heap fetch, but including a wide `text` or `jsonb` column "just in case" bloats the entire index, slows down every insert and update on the underlying table (because now that payload has to be written into the index too, not just the row), and only pays off if a meaningful share of queries actually benefit from the resulting index-only scan. Before adding a column to `INCLUDE`, check that queries actually select or filter on it and that the win is Index Only Scans, not something a regular index already provides.
+
+## Building these with a tool instead of by hand
+
+Getting the syntax order right — key columns before `INCLUDE`, `INCLUDE` before `WHERE` — is easy to fumble under pressure, and it is easy to forget that a predicate has to be provably implied by your real queries or the index will just sit unused. Chat2DB's [Postgres CREATE INDEX Generator](https://chat2db.ai/tools/postgres-create-index-generator) handles both cases: it builds the statement from a form that supports both the partial `WHERE` clause and the covering `INCLUDE` column list, so you can compose the same `orders (customer_id) INCLUDE (total, currency) WHERE status = 'pending'` pattern shown above without hand-assembling clause order from memory, then paste the result straight into a migration.
+
+## Conclusion
+
+A B-tree indexes every row and every listed column by default; partial and covering indexes each relax one side of that default. Reach for a partial index — `CREATE INDEX ... WHERE predicate` — when a query pattern only ever touches a well-defined slice of the table, and remember the planner will only use it when the query's own conditions imply the predicate. Reach for `INCLUDE` when a query needs a few extra columns purely for output and you want an Index Only Scan without dragging those columns into the sort key or a uniqueness check. Verify both with `EXPLAIN (ANALYZE, BUFFERS)`: look for `Index Scan` versus `Index Only Scan`, and watch `Heap Fetches` — zero means the index-only path is actually paying off, while a high count usually just means the table needs a `VACUUM`. Used together, on the right query pattern, partial and covering indexes turn a general-purpose B-tree into something purpose-built, without needing a materialized view or a separate summary table.

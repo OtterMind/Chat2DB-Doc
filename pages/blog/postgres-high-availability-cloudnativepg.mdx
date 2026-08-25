@@ -1,0 +1,172 @@
+---
+title: "Postgres High Availability with CloudNativePG"
+description: "Run highly available PostgreSQL on Kubernetes with CloudNativePG: architecture, failover, backups and a step-by-step cluster setup."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: August 24, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# Postgres High Availability with CloudNativePG
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="August 24, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+Running a single PostgreSQL pod on Kubernetes is easy. Running PostgreSQL so that it survives a node failure, a pod eviction, or a routine upgrade without an application outage is a different problem entirely, and it is one that plain Kubernetes primitives do not solve for you. This article looks at why that gap exists, what CloudNativePG (CNPG) does to close it, and how to install the operator, stand up a three-instance cluster, watch a failover happen, and back the cluster up.
+
+## Why plain StatefulSets are not enough
+
+A `StatefulSet` gives PostgreSQL two things it needs: stable network identities and stable, per-pod persistent volumes that survive a pod restart. That solves durability for a single instance, but it does not solve availability. A `StatefulSet` has no idea that pod 0 is supposed to be a primary and pods 1 and 2 are supposed to be streaming replicas. It does not start replication, it does not know how to tell a replica to catch up, and when the primary pod dies it will happily reschedule a fresh, empty pod in its place rather than promoting an existing replica that already has the data.
+
+Everything that makes a Postgres cluster "highly available" — replica provisioning, continuous streaming replication, leader election, automatic failover, and safely updating the primary last during a rolling upgrade — has to be built on top of the `StatefulSet`, not inside it. For years the standard way to do that was to run Patroni or Stolon alongside Postgres: a separate agent process, a distributed consensus store such as etcd or Kubernetes' own API server, and a pile of extra YAML to wire it all together. That works, but it means operating two systems (Postgres and the HA agent) instead of one, and getting the Kubernetes-specific plumbing — Services, readiness probes, PodDisruptionBudgets — right on your own.
+
+CloudNativePG takes a different approach: instead of bolting an external HA tool onto Kubernetes, it is written as a Kubernetes operator from the ground up, so the reconciliation loop that manages Postgres replication is the same reconciliation loop that manages the Kubernetes objects around it.
+
+## What CloudNativePG actually is
+
+CloudNativePG is an open-source Kubernetes operator, developed under the `cloudnative-pg/cloudnative-pg` project and hosted as a CNCF Sandbox project, that manages the entire lifecycle of a PostgreSQL cluster through a single custom resource: `Cluster`. You describe the desired state — how many instances, how much storage, which Postgres version, which parameters — and the operator's controller continuously reconciles the actual state of the pods, volumes, and Services to match it.
+
+Concretely, the operator is responsible for:
+
+- Bootstrapping a new cluster with `initdb`, from an existing backup, or by pointing at another Postgres instance to replicate from.
+- Setting up native Postgres streaming replication between the primary and every replica, with no third-party consensus store required — the operator itself acts as the control plane.
+- Detecting a failed primary and promoting the most up-to-date replica automatically.
+- Performing rolling updates (Postgres minor versions, operator-managed configuration changes) instance by instance, always updating the primary last.
+- Taking base backups and archiving WAL files to object storage for point-in-time recovery.
+- Exposing Prometheus-compatible metrics for every instance.
+
+Because all of this lives in one controller talking directly to the Kubernetes API, there is no Patroni, no etcd cluster, and no separate DCS (distributed configuration store) to run and monitor. The `Cluster` object status field itself becomes the single source of truth for "who is the primary right now."
+
+## Architecture: one primary, native streaming replicas, three Services
+
+A CNPG `Cluster` with `spec.instances: 3` produces one primary and two physical streaming replicas, all using PostgreSQL's built-in streaming replication protocol — there is no logical replication or trigger-based replication involved by default. Each instance runs in its own pod with its own `PersistentVolumeClaim`, and the operator continuously monitors replication lag and WAL positions across all of them.
+
+To make this usable from application code, the operator creates three Kubernetes Services per cluster, named after the cluster:
+
+- `<cluster-name>-rw` — always points at the current primary. Every write goes here, and applications should use this Service by default since it also accepts reads.
+- `<cluster-name>-ro` — points only at the replicas, for read-only, load-balanced traffic that should not touch the primary.
+- `<cluster-name>-r` — points at any instance, primary or replica, useful for tooling that just needs a connection to the cluster regardless of role.
+
+Because `-rw` always follows the primary, applications never need to know which pod is currently elected; they just point at the Service name and the operator keeps the endpoint list correct as roles change.
+
+## Installing the operator
+
+The operator itself is installed once per Kubernetes cluster, via a single manifest published on each CloudNativePG release. Rather than hardcoding a version number that will go stale, check the [releases page](https://github.com/cloudnative-pg/cloudnative-pg/releases) for the current stable tag and apply it:
+
+```bash
+# Replace <version> with the current release tag, e.g. 1.24.0
+kubectl apply -f https://raw.githubusercontent.com/cloudnative-pg/cloudnative-pg/main/releases/cnpg-<version>.yaml
+
+# Confirm the operator deployment is up
+kubectl get deployment -n cnpg-system cnpg-controller-manager
+```
+
+It's also worth installing the `cnpg` `kubectl` plugin, which is used throughout this article to inspect cluster status:
+
+```bash
+kubectl krew install cnpg
+# or download the binary directly from the cloudnative-pg/cloudnative-pg releases page
+```
+
+### A minimal three-instance cluster
+
+Once the operator is running, a highly available cluster is just a `Cluster` custom resource:
+
+```yaml
+apiVersion: postgresql.cnpg.io/v1
+kind: Cluster
+metadata:
+  name: orders-db
+spec:
+  instances: 3
+
+  postgresql:
+    parameters:
+      max_connections: "200"
+      shared_buffers: "256MB"
+
+  bootstrap:
+    initdb:
+      database: orders
+      owner: orders_app
+
+  storage:
+    size: 20Gi
+    storageClass: standard
+```
+
+Apply it and watch the pods come up:
+
+```bash
+kubectl apply -f orders-db-cluster.yaml
+kubectl get pods -l cnpg.io/cluster=orders-db
+kubectl get clusters.postgresql.cnpg.io
+```
+
+Within a couple of minutes you should see one pod flagged as the primary and two as replicas, plus the three Services (`orders-db-rw`, `orders-db-ro`, `orders-db-r`) created automatically. Application deployments should be configured with a connection string pointing at `orders-db-rw.<namespace>.svc` for read-write traffic.
+
+## Watching a failover happen
+
+The value of all this becomes obvious the moment the primary disappears. If you delete the primary pod directly, or the node it is running on fails, the operator's controller notices within its next reconciliation cycle that the pod carrying the primary role is gone. It compares the WAL position of the remaining replicas, picks the one that is most caught up, and promotes it to primary. The `-rw` Service's endpoint is updated to point at the newly promoted pod, so any client that reconnects (rather than holding a stale TCP connection open) is transparently routed to the new primary.
+
+You can simulate this yourself and observe it with the `cnpg` plugin:
+
+```bash
+# Check current status: who is primary, replication lag, sync state
+kubectl cnpg status orders-db
+
+# Force a failover by deleting the primary pod
+kubectl delete pod orders-db-1
+
+# Watch the promotion happen
+kubectl cnpg status orders-db
+```
+
+`kubectl cnpg status` prints the current primary, each replica's replication lag, and whether replication is synchronous or asynchronous, which is the fastest way to confirm a failover completed cleanly rather than digging through pod logs. The old primary's pod, once Kubernetes reschedules it, is rejoined to the cluster as a replica rather than fighting for the primary role again — the operator handles that resynchronization automatically using `pg_rewind` when possible.
+
+## Backups and point-in-time recovery
+
+Streaming replication protects you against a single instance failing; it does nothing for the case where someone runs a bad `DELETE` without a `WHERE` clause, or where you need to restore last Tuesday's data. For that, CNPG integrates with continuous WAL archiving and base backups to S3-compatible object storage through Barman Cloud, configured under `spec.backup.barmanObjectStore` on the `Cluster` resource. The general shape looks like this:
+
+```yaml
+spec:
+  backup:
+    barmanObjectStore:
+      destinationPath: "s3://my-backups/orders-db"
+      s3Credentials:
+        accessKeyId:
+          name: backup-creds
+          key: ACCESS_KEY_ID
+        secretAccessKey:
+          name: backup-creds
+          key: ACCESS_SECRET_KEY
+      wal:
+        compression: gzip
+    retentionPolicy: "30d"
+```
+
+The exact set of nested fields under `barmanObjectStore` (endpoint overrides, compression algorithms, additional cloud-provider-specific credential fields, and whether backups are configured as a plugin versus a built-in integration) has evolved across CNPG releases, so treat the block above as illustrative of the pattern rather than a copy-paste guarantee — check the CloudNativePG documentation for the field names that match the operator version you actually installed. Once configured, continuous WAL archiving combined with periodic base backups gives you point-in-time recovery: you can bootstrap a brand-new `Cluster` from the object store and specify a target timestamp, and the operator will replay WAL up to that point rather than only being able to restore to the moment of the last full backup.
+
+## Monitoring
+
+Every CNPG instance runs with a metrics exporter built into the operator's sidecar-free architecture, exposing a Prometheus-compatible endpoint on each pod. If you already run the Prometheus Operator, CNPG ships `PodMonitor` support so that metrics collection is wired up declaratively alongside the `Cluster` resource rather than through manual scrape-config edits. That gets you visibility into connection counts, replication lag, checkpoint activity, and WAL generation rate per instance, which is the same data `kubectl cnpg status` shows you interactively, just available for dashboards and alerting.
+
+## CloudNativePG vs. managed Postgres vs. self-managed Patroni
+
+None of these options is universally correct, and the right choice depends mostly on how much Kubernetes and Postgres expertise your team already has in-house.
+
+A managed service like Amazon RDS, Aurora, or Cloud SQL removes almost all operational burden: backups, patching, failover, and storage scaling are handled by the provider, at the cost of less control over configuration, extensions, and where your data physically lives, plus ongoing usage-based cost that can be higher than self-hosting at scale.
+
+Self-managing Postgres with Patroni gives you the most flexibility and is a mature, widely deployed pattern, but it means running and understanding a second distributed system (typically etcd or Consul) purely for leader election, on top of Postgres itself.
+
+CloudNativePG sits between the two: if your workloads are already on Kubernetes, it gives you HA, backups, and rolling updates as native Kubernetes objects, with one operator to reason about instead of two systems, but you are still responsible for the underlying cluster's node health, storage class performance, and networking — none of which a managed service asks you to think about.
+
+## Connecting to the cluster
+
+Once the `Cluster` is up and the `-rw` and `-ro` Services exist, day-to-day work is just connecting to Postgres like any other instance. If you're exposing the cluster outside of Kubernetes for development or ad-hoc querying — via a `LoadBalancer` Service, a port-forward, or an ingress — [Chat2DB](https://chat2db.ai/download) (or the web version at [app.chat2db.ai](https://app.chat2db.ai)) is a convenient way to point at the `-rw` endpoint for writes and the `-ro` endpoint for read-only reporting queries, browse the schema, and run SQL without needing a separate desktop client per environment.
+
+## Conclusion
+
+Kubernetes gives Postgres durable storage and stable identity through `StatefulSets`, but availability — replication, failover, and safe rolling updates — is a layer that has to be built on top, and CloudNativePG builds it as a native operator instead of bolting on an external tool like Patroni. A `Cluster` resource with a handful of fields gets you a primary, N replicas, and three Services that abstract away which pod currently holds which role; `kubectl cnpg status` and a deleted pod are enough to see failover happen end to end; and `barmanObjectStore` configuration adds continuous backup and point-in-time recovery on top. Whether that combination beats a managed database or a hand-rolled Patroni setup for your team depends on how much of that Kubernetes-native model you actually want to own.

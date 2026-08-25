@@ -1,0 +1,237 @@
+---
+title: "PL/pgSQL Exception Handling and RAISE Guide"
+description: "PL/pgSQL exception handling guide: BEGIN/EXCEPTION blocks, RAISE, SQLSTATE codes, custom errors and rollback behavior with examples."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: August 24, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# PL/pgSQL Exception Handling and RAISE Guide
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="August 24, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+Every PostgreSQL error you have ever seen in `psql` — a unique key violation, a division by zero, a missing table — has a name and a five-character SQLSTATE code behind it. PL/pgSQL lets you intercept those errors instead of letting them abort the whole transaction, using a `BEGIN ... EXCEPTION ... END` block inside a function, procedure, or `DO` statement. Handled well, this turns a hard failure into a controlled retry, a friendlier application error, or a log entry. Handled carelessly, it either swallows real bugs or adds subtransaction overhead to code paths that never needed it. This guide covers where exception blocks are scoped, how named conditions map to SQLSTATE codes, the full `RAISE` syntax, a worked funds-transfer example, `GET STACKED DIAGNOSTICS`, the performance trade-off of wrapping too much code in exception handlers, and how the same rules apply inside triggers.
+
+## Where exception handling lives
+
+An exception handler in PL/pgSQL is attached to a specific `BEGIN` block:
+
+```sql
+DO $$
+BEGIN
+  -- statements that might fail
+  INSERT INTO accounts (account_id, balance) VALUES (1, 1000);
+EXCEPTION
+  WHEN unique_violation THEN
+    RAISE NOTICE 'account 1 already exists';
+END;
+$$;
+```
+
+The important detail most people miss is that the `EXCEPTION` clause only catches errors raised by statements textually inside that same `BEGIN ... END` block. If you call a function and it raises an error, the error propagates out of that function to whichever block wraps the call — not to some handler defined deep inside the callee unless the callee's own code catches it first. A handler at the top of a large function does not "see" every statement equally; it sees whatever runs inside its own block, including nested blocks that do not have their own `EXCEPTION` clause.
+
+The second detail, which explains a lot of confusing behavior, is that PostgreSQL implicitly opens a subtransaction — functionally equivalent to a `SAVEPOINT` — the moment execution enters a block that has an `EXCEPTION` clause. If an error occurs inside that block, PostgreSQL rolls back to that savepoint, undoing only the changes made since the block started, and then runs the matching `WHEN` branch. Everything that happened before the block began, in the same outer transaction, is untouched and stays pending until you `COMMIT` (or the caller decides otherwise). This is why you can catch a duplicate-key error on one `INSERT`, log it, and keep going with the other statements in the same transaction — the failed `INSERT`'s effects are gone, but nothing else is. A plain `BEGIN ... END` block with no `EXCEPTION` clause does not create a subtransaction at all, so it has essentially no overhead.
+
+## Named conditions vs SQLSTATE codes
+
+Every PostgreSQL error carries a five-character SQLSTATE code, and PL/pgSQL defines human-readable condition names as aliases for the codes you would otherwise have to memorize. `WHEN unique_violation THEN` and `WHEN SQLSTATE '23505' THEN` are exactly interchangeable — the parser resolves the name to the code before matching:
+
+```sql
+BEGIN
+  INSERT INTO accounts (account_id, balance) VALUES (1, 1000);
+EXCEPTION
+  WHEN unique_violation THEN
+    RAISE NOTICE 'account already exists, skipping insert';
+END;
+```
+
+```sql
+BEGIN
+  INSERT INTO accounts (account_id, balance) VALUES (1, 1000);
+EXCEPTION
+  WHEN SQLSTATE '23505' THEN
+    RAISE NOTICE 'account already exists, skipping insert';
+END;
+```
+
+Both blocks behave identically at runtime; the named form is just easier to read and less error-prone to type than a bare code. A handful of conditions come up constantly in application code:
+
+### Frequently used conditions
+
+- `unique_violation` — SQLSTATE `23505`, a unique or primary key constraint was violated.
+- `foreign_key_violation` — SQLSTATE `23503`, a referenced row is missing or a referencing row still exists.
+- `no_data_found` — raised when a `SELECT ... INTO` (or similar construct) matches zero rows in a context that expects one.
+- `too_many_rows` — raised when a `SELECT ... INTO` matches more than one row where exactly one was expected.
+- `division_by_zero` — SQLSTATE `22012`, self-explanatory arithmetic error.
+
+This is a starting point, not an exhaustive list — PostgreSQL defines dozens of condition names covering everything from `check_violation` and `not_null_violation` to `deadlock_detected` and `insufficient_privilege`. You can always fall back to the raw SQLSTATE if a condition you need does not have a friendly name yet, and `WHEN OTHERS THEN` catches anything not matched by an earlier branch in the same block.
+
+## Raising errors with RAISE
+
+`RAISE` both reports messages and, at the right severity, raises an actual error that unwinds the current block. The general form is:
+
+```sql
+RAISE [ level ] 'format-string' [, expression [, ...]]
+  [ USING option = expression [, ...] ];
+```
+
+The severity levels, from quietest to loudest, are `DEBUG`, `LOG`, `NOTICE`, `WARNING`, and `EXCEPTION`. Only `EXCEPTION` actually aborts the current block and triggers subtransaction rollback; the others just emit a message according to your `client_min_messages` / `log_min_messages` settings and execution continues normally:
+
+```sql
+RAISE DEBUG 'checking balance for account %', p_account_id;
+RAISE LOG 'transfer_funds called with amount %', p_amount;
+RAISE NOTICE 'processing % rows', v_row_count;
+RAISE WARNING 'balance % is unusually low', v_balance;
+RAISE EXCEPTION 'balance % cannot be negative', v_balance;
+```
+
+The `%` placeholders are substituted positionally by the expressions that follow the format string, in order — there is no need to cast them to text first, and a literal `%` in the message is written as `%%`. For application-level errors you want calling code to detect reliably, attach structured fields with `USING`:
+
+```sql
+RAISE EXCEPTION 'insufficient funds: balance % is less than %', v_balance, p_amount
+  USING ERRCODE = 'P0001',
+        DETAIL  = 'Requested withdrawal exceeds available balance',
+        HINT    = 'Choose a smaller amount or top up the source account';
+```
+
+`ERRCODE` sets the SQLSTATE the error carries, so calling code (or an outer `EXCEPTION` block) can match on it with `WHEN SQLSTATE '...' THEN` regardless of the exact wording of the message. `MESSAGE`, `DETAIL`, and `HINT` correspond to the fields `psql` prints as the primary error, the `DETAIL:` line, and the `HINT:` line respectively, and are exactly what a client surfaces to a user or logs for debugging. PostgreSQL reserves the `P0001`–`P0004` range (`plpgsql_error`, `raise_exception`, `no_data_found`, `too_many_rows`, `assert_failure`) loosely for user code, and `P0001` in particular is the default code `RAISE EXCEPTION` uses when you do not specify `ERRCODE` yourself, so picking your own distinct codes for different error categories makes them easier to distinguish later.
+
+## A worked example: transferring funds safely
+
+Put the pieces together in a function that checks a balance before moving money, and raises a specific, catchable error when the check fails:
+
+```sql
+CREATE OR REPLACE FUNCTION transfer_funds(
+  p_from_account int,
+  p_to_account   int,
+  p_amount       numeric
+) RETURNS void AS $$
+DECLARE
+  v_balance numeric;
+BEGIN
+  SELECT balance INTO v_balance
+  FROM   accounts
+  WHERE  account_id = p_from_account
+  FOR UPDATE;
+
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'account % does not exist', p_from_account
+      USING ERRCODE = 'P0002';
+  END IF;
+
+  IF v_balance < p_amount THEN
+    RAISE EXCEPTION 'insufficient funds: balance % is less than %', v_balance, p_amount
+      USING ERRCODE = 'P0001',
+            HINT    = 'Choose a smaller amount or top up the source account';
+  END IF;
+
+  UPDATE accounts SET balance = balance - p_amount WHERE account_id = p_from_account;
+  UPDATE accounts SET balance = balance + p_amount WHERE account_id = p_to_account;
+END;
+$$ LANGUAGE plpgsql;
+```
+
+Note that `transfer_funds` itself has no `EXCEPTION` clause — if the balance check fails, the error simply propagates out of the function, and none of its `UPDATE` statements (which have not run yet in this ordering) or the earlier `SELECT ... FOR UPDATE` lock need to be individually unwound; PostgreSQL's normal statement-level and transaction-level rollback handles that. The catching happens where the caller decides how to react:
+
+```sql
+DO $$
+BEGIN
+  BEGIN
+    PERFORM transfer_funds(1, 2, 500);
+  EXCEPTION
+    WHEN SQLSTATE 'P0001' THEN
+      RAISE NOTICE 'transfer rejected: %', SQLERRM;
+  END;
+END;
+$$;
+```
+
+Wrapping the call in its own `BEGIN ... EXCEPTION ... END` block means the failed `transfer_funds` call rolls back to the subtransaction savepoint created at the start of that inner block, the `DO` block itself keeps running, and `SQLERRM` gives you the exact message text of the error that was just caught. If you tried to catch `SQLSTATE 'P0001'` here without matching it against the code the function actually raised, PostgreSQL would instead fall through to `WHEN OTHERS` (if present) or propagate the error further out — so keeping application error codes intentional and documented matters as much as the message text itself.
+
+## GET STACKED DIAGNOSTICS for structured logging
+
+Inside an exception handler, `GET STACKED DIAGNOSTICS` retrieves detailed information about the error that was just caught, which is far more useful for logging than reconstructing it from `SQLERRM` alone:
+
+```sql
+CREATE OR REPLACE FUNCTION safe_insert_account(p_id int, p_balance numeric)
+RETURNS boolean AS $$
+DECLARE
+  v_message  text;
+  v_sqlstate text;
+  v_detail   text;
+BEGIN
+  INSERT INTO accounts (account_id, balance) VALUES (p_id, p_balance);
+  RETURN true;
+EXCEPTION
+  WHEN unique_violation THEN
+    GET STACKED DIAGNOSTICS
+      v_message  = MESSAGE_TEXT,
+      v_sqlstate = RETURNED_SQLSTATE,
+      v_detail   = PG_EXCEPTION_DETAIL;
+
+    INSERT INTO error_log (occurred_at, sqlstate, message, detail)
+      VALUES (clock_timestamp(), v_sqlstate, v_message, v_detail);
+
+    RETURN false;
+END;
+$$ LANGUAGE plpgsql;
+```
+
+`MESSAGE_TEXT` and `RETURNED_SQLSTATE` are the two you will reach for most often, but `PG_EXCEPTION_DETAIL`, `PG_EXCEPTION_HINT`, `PG_EXCEPTION_CONTEXT`, and — for constraint violations specifically — `COLUMN_NAME`, `CONSTRAINT_NAME`, `TABLE_NAME`, and `SCHEMA_NAME` are all available. This is the cleanest way to turn a caught exception into a structured audit-log row without parsing the message text yourself, and it works the same way regardless of whether the error came from your own `RAISE EXCEPTION` or from PostgreSQL's constraint machinery.
+
+## The cost of exception blocks: scope them narrowly
+
+Because every `BEGIN` block with an `EXCEPTION` clause opens a subtransaction, wrapping an entire large function — or worse, every single statement in it — in its own handler adds real overhead: each subtransaction has bookkeeping cost, and heavy use inside a loop that runs thousands of times is a well-known way to slow a function down noticeably. It also tends to hide bugs, because a broad `WHEN OTHERS THEN` around fifty lines of code will just as happily catch a typo in a column name as it catches the one constraint violation you actually expected.
+
+The better pattern is to scope the exception block tightly around the one operation you know can fail, and let everything else propagate normally:
+
+```sql
+CREATE OR REPLACE FUNCTION upsert_sku(p_sku text, p_price numeric)
+RETURNS void AS $$
+BEGIN
+  BEGIN
+    INSERT INTO sku_catalog (sku, price) VALUES (p_sku, p_price);
+  EXCEPTION
+    WHEN unique_violation THEN
+      UPDATE sku_catalog SET price = p_price WHERE sku = p_sku;
+  END;
+END;
+$$ LANGUAGE plpgsql;
+```
+
+Only the `INSERT` is inside the subtransaction; the rest of the function, and any statements a caller adds around this call, are unaffected. This also keeps the failure surface small: if `unique_violation` is the only error you are prepared to recover from, only that condition should be listed, so anything else — a disk-full error, a permissions problem — still aborts the transaction the way you would want it to.
+
+## Exception handling in triggers
+
+Trigger functions are ordinary PL/pgSQL functions and follow exactly the same `BEGIN ... EXCEPTION ... END` rules, which makes them a good place to translate a low-level constraint violation into a domain-specific error before it ever reaches the application:
+
+```sql
+CREATE OR REPLACE FUNCTION validate_account_insert() RETURNS trigger AS $$
+BEGIN
+  BEGIN
+    INSERT INTO account_audit (account_id, balance, logged_at)
+    VALUES (NEW.account_id, NEW.balance, clock_timestamp());
+  EXCEPTION
+    WHEN unique_violation THEN
+      RAISE EXCEPTION 'account % already has an audit entry for this change', NEW.account_id
+        USING ERRCODE = 'P0001',
+              HINT    = 'Check for a duplicate trigger invocation or a retried update';
+  END;
+  RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER trg_account_audit
+  AFTER INSERT OR UPDATE ON accounts
+  FOR EACH ROW EXECUTE FUNCTION validate_account_insert();
+```
+
+The subtransaction here rolls back only the failed audit insert, not the row change on `accounts` that fired the trigger in the first place (that undo happens through the normal statement/transaction rollback if the re-raised exception is not caught further out). Keeping the handler scoped to the single `INSERT` — rather than wrapping the whole trigger body — means an unrelated bug elsewhere in the function still surfaces as its own distinct error instead of being mislabeled as a duplicate-audit-entry problem.
+
+## Wrapping up
+
+`BEGIN ... EXCEPTION ... END` gives PL/pgSQL a precise, subtransaction-scoped way to recover from specific, expected errors — named conditions and SQLSTATE codes are two spellings of the same thing, `RAISE` lets you both log at low severities and abort with a custom `ERRCODE`, and `GET STACKED DIAGNOSTICS` turns a caught error into structured data worth logging. The recurring theme is scope: catch only the condition you understand, around only the statement that can produce it, and let everything else propagate. If you want a console to iterate on functions like these — running them, inspecting the exact error and SQLSTATE that came back, and tweaking the `EXCEPTION` branches until they match — Chat2DB is a free option, available as a desktop download at https://chat2db.ai/download or directly in the browser at https://app.chat2db.ai.

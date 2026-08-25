@@ -1,0 +1,230 @@
+---
+title: "Postgres BIGINT vs INT: Which to Use"
+description: "PostgreSQL BIGINT vs INT vs SMALLINT: ranges, storage, alignment padding, index size, and how to migrate a primary key to bigint without downtime."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: August 25, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# Postgres BIGINT vs INT: Which to Use
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="August 25, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+Choosing between `int` and `bigint` looks like a micro-optimisation until the day a production `INSERT` fails with `integer out of range` and the table is 400 GB. This article covers what the integer types actually cost, when the extra four bytes are free, and how to migrate a primary key from `int` to `bigint` without taking the application down.
+
+## The three integer types
+
+| Type | Aliases | Size | Range |
+| --- | --- | --- | --- |
+| `smallint` | `int2` | 2 bytes | −32,768 … 32,767 |
+| `integer` | `int`, `int4` | 4 bytes | −2,147,483,648 … 2,147,483,647 |
+| `bigint` | `int8` | 8 bytes | −9,223,372,036,854,775,808 … 9,223,372,036,854,775,807 |
+
+The practical figures: `integer` runs out at about **2.1 billion**, `bigint` at about **9.2 quintillion**. If a table inserts a thousand rows a second, `integer` IDs last around 68 days when negative values are unused — and identity/serial sequences start at 1, so you only get the positive half.
+
+There is no unsigned integer in PostgreSQL. A column that should never be negative gets a check constraint instead:
+
+```sql
+ALTER TABLE orders ADD CONSTRAINT orders_qty_positive CHECK (qty > 0);
+```
+
+## Storage: when the extra bytes are free
+
+The naive analysis says `bigint` costs four extra bytes per row — 4 MB per million rows, which is nothing. The real analysis has to account for **alignment padding**, and that is where the surprises are.
+
+PostgreSQL aligns each column to its type's boundary: 8-byte types (`bigint`, `timestamptz`, `float8`) start at an 8-byte boundary, 4-byte types at a 4-byte boundary. Padding bytes are inserted to make that work, and they are pure waste. Consider:
+
+```sql
+CREATE TABLE a (id bigint, flag boolean, ts timestamptz);  -- 8 + 1 + (7 pad) + 8 = 24
+CREATE TABLE b (id bigint, ts timestamptz, flag boolean);  -- 8 + 8 + 1 + (7 pad) = 24
+CREATE TABLE c (id int,    flag boolean, ts timestamptz);  -- 4 + 1 + (3 pad) + 8 = 16
+```
+
+Table `c` saves eight bytes per row, not four, because switching to `int` also lets the boolean fit in the padding that already existed. Conversely, adding a single `bigint` to a table whose columns currently pack neatly can cost more than eight bytes once padding is recomputed.
+
+You can measure the real width instead of guessing:
+
+```sql
+SELECT a.attname,
+       format_type(a.atttypid, a.atttypmod) AS type,
+       t.typalign,
+       t.typlen
+FROM pg_attribute a
+JOIN pg_type t ON t.oid = a.atttypid
+WHERE a.attrelid = 'public.orders'::regclass AND a.attnum > 0
+ORDER BY a.attnum;
+
+SELECT pg_column_size(row(1::bigint, true, now())) AS bigint_row,
+       pg_column_size(row(1::int,    true, now())) AS int_row;
+```
+
+The practical rule for wide tables: declare columns **largest fixed-width type first**, then smaller ones, then the variable-length ones (`text`, `jsonb`, arrays) at the end. On a table with a dozen columns this routinely saves 5–10% of heap size for free.
+
+## Index size
+
+Every B-tree entry stores the key plus a 6-byte tuple pointer and a 2-byte header. An `int` key gives 4 + 8 = 12 bytes, rounded up to 16 by alignment; a `bigint` key gives 8 + 8 = 16 bytes. In practice a `bigint` primary key index is roughly the same size or up to ~15% larger than the `int` equivalent, and the difference compounds across every foreign key index that references it.
+
+The knock-on effect matters more than the disk: a larger index means fewer entries per 8 KB page, which means more pages to keep in `shared_buffers`, which means a lower cache hit ratio on the hot path. On a table with a billion rows and six indexes, that is a real cost. On a table with a million rows, it is noise.
+
+## So which should you use?
+
+**Use `bigint` for surrogate primary keys, always.** The rationale is asymmetric risk. If you are wrong about `int` being enough, the fix is a multi-day migration on your largest table under lock. If you are wrong about `bigint` being necessary, you wasted a few gigabytes. Frameworks agree: Rails switched to `bigint` primary keys in 5.1, Django's `BigAutoField` became the default in 3.2, and every modern schema generator does the same.
+
+**Use `integer` for genuinely bounded values.** Row counts, quantities, scores, ages, day counts, port numbers — anything with a natural ceiling far below two billion. There is no reason to store a percentage in eight bytes.
+
+**Use `smallint` sparingly.** It saves two bytes that alignment usually eats anyway. It is worth it in wide fact tables with many small numeric columns declared together, where the packing works out, and not worth the thought anywhere else.
+
+**Match foreign keys to their referenced column exactly.** An `int` foreign key pointing at a `bigint` primary key still works — Postgres compares across integer types without a problem — but it caps the child table at 2.1 billion referencing values and creates a landmine for later. Keep the types identical.
+
+## Sequences, identity and the hidden 32-bit limit
+
+A `serial` column is `integer` plus a sequence; `bigserial` is `bigint` plus a sequence. Both are legacy syntax — the SQL-standard form is preferred:
+
+```sql
+CREATE TABLE orders (
+  id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  ...
+);
+```
+
+The subtlety: the *sequence* has its own type, independent of the column. Changing a column from `int` to `bigint` does not automatically widen the sequence that feeds it, and a sequence created as `AS integer` stops at 2,147,483,647 with:
+
+```
+ERROR:  nextval: reached maximum value of sequence "orders_id_seq" (2147483647)
+```
+
+Widen it explicitly:
+
+```sql
+ALTER SEQUENCE orders_id_seq AS bigint MAXVALUE 9223372036854775807;
+```
+
+Monitor how close you are before it becomes an incident:
+
+```sql
+SELECT c.relname                                   AS table_name,
+       a.attname                                   AS column_name,
+       format_type(a.atttypid, a.atttypmod)        AS column_type,
+       pg_sequence_last_value(s.seqrelid::regclass) AS last_value,
+       CASE format_type(a.atttypid, a.atttypmod)
+         WHEN 'integer' THEN 2147483647
+         WHEN 'smallint' THEN 32767
+         ELSE 9223372036854775807
+       END                                          AS max_value,
+       round(100.0 * pg_sequence_last_value(s.seqrelid::regclass) /
+             CASE format_type(a.atttypid, a.atttypmod)
+               WHEN 'integer' THEN 2147483647
+               WHEN 'smallint' THEN 32767
+               ELSE 9223372036854775807
+             END, 2)                                AS pct_used
+FROM pg_sequence s
+JOIN pg_depend d  ON d.objid = s.seqrelid AND d.deptype = 'a'
+JOIN pg_class c   ON c.oid = d.refobjid
+JOIN pg_attribute a ON a.attrelid = c.oid AND a.attnum = d.refobjsubid
+ORDER BY pct_used DESC NULLS LAST;
+```
+
+Alert at 70%. Migrating at 70% is a planned project; migrating at 99% is an outage.
+
+Remember that sequence values are consumed by rolled-back transactions too — sequences are non-transactional by design, so a job that inserts and rolls back burns IDs permanently. Tables with heavy upsert traffic (`INSERT ... ON CONFLICT DO NOTHING` still calls `nextval`) can exhaust an `int` sequence with far fewer than two billion actual rows.
+
+## Migrating int to bigint without downtime
+
+The naive approach rewrites the table:
+
+```sql
+ALTER TABLE orders ALTER COLUMN id TYPE bigint;  -- ACCESS EXCLUSIVE, full rewrite
+```
+
+On a large table this locks out reads and writes for as long as the rewrite takes — hours, potentially. The safe pattern is the same add-column/backfill/swap dance used for any type change, with two extra wrinkles: the sequence and the foreign keys.
+
+**1. Widen the referencing columns first.** Every child table's foreign key column must become `bigint` too, or the new range is unusable. Do them one at a time, smallest first.
+
+**2. Add the new column.**
+
+```sql
+ALTER TABLE orders ADD COLUMN id_new bigint;
+```
+
+**3. Keep it in sync.**
+
+```sql
+CREATE OR REPLACE FUNCTION orders_sync_id() RETURNS trigger AS $$
+BEGIN
+  NEW.id_new := NEW.id;
+  RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER orders_sync_id_trg
+  BEFORE INSERT OR UPDATE OF id ON orders
+  FOR EACH ROW EXECUTE FUNCTION orders_sync_id();
+```
+
+**4. Backfill in batches** so each transaction stays short:
+
+```sql
+DO $$
+DECLARE updated bigint;
+BEGIN
+  LOOP
+    WITH batch AS (
+      SELECT ctid FROM orders WHERE id_new IS NULL LIMIT 10000
+    )
+    UPDATE orders t SET id_new = t.id FROM batch WHERE t.ctid = batch.ctid;
+    GET DIAGNOSTICS updated = ROW_COUNT;
+    EXIT WHEN updated = 0;
+    COMMIT;
+  END LOOP;
+END $$;
+```
+
+**5. Build the replacement unique index concurrently:**
+
+```sql
+CREATE UNIQUE INDEX CONCURRENTLY orders_pkey_new ON orders (id_new);
+```
+
+**6. Swap in one short transaction,** guarded by `lock_timeout` so it fails fast rather than queueing:
+
+```sql
+SET lock_timeout = '3s';
+BEGIN;
+ALTER TABLE orders DROP CONSTRAINT orders_pkey;
+ALTER TABLE orders RENAME COLUMN id     TO id_old;
+ALTER TABLE orders RENAME COLUMN id_new TO id;
+ALTER TABLE orders ALTER COLUMN id SET NOT NULL;
+ALTER TABLE orders ADD CONSTRAINT orders_pkey PRIMARY KEY USING INDEX orders_pkey_new;
+ALTER SEQUENCE orders_id_seq AS bigint OWNED BY orders.id;
+ALTER TABLE orders ALTER COLUMN id SET DEFAULT nextval('orders_id_seq');
+DROP TRIGGER orders_sync_id_trg ON orders;
+COMMIT;
+```
+
+**7. Re-add foreign keys as `NOT VALID`,** then validate them without an exclusive lock:
+
+```sql
+ALTER TABLE order_items
+  ADD CONSTRAINT order_items_order_id_fkey
+  FOREIGN KEY (order_id) REFERENCES orders(id) NOT VALID;
+
+ALTER TABLE order_items VALIDATE CONSTRAINT order_items_order_id_fkey;
+```
+
+`VALIDATE CONSTRAINT` takes only a `SHARE UPDATE EXCLUSIVE` lock, so normal traffic continues.
+
+**8. Drop the old column** after the application has been verified.
+
+The [Postgres ALTER COLUMN TYPE Generator](https://chat2db.ai/tools/postgres-alter-column-type-generator) writes this whole sequence — direct statement, rewrite verdict and batched migration — from the type pair, which saves transcribing it by hand.
+
+## What about UUIDs?
+
+The third option for primary keys is `uuid` (16 bytes). It buys client-side generation and non-guessable IDs, at the cost of double the storage of `bigint` and, for random v4 values, poor index locality: inserts scatter across the whole B-tree instead of appending to the right-hand edge, causing more page splits and more WAL. UUID v7, which encodes a timestamp prefix, restores the locality and is the better choice when you need UUIDs. If you do not need them, `bigint` identity remains the cheapest and fastest surrogate key.
+
+## Summary
+
+Default to `bigint` for surrogate keys — the asymmetry of the failure modes makes it the only rational choice. Use `integer` for bounded quantities and `smallint` only where the packing genuinely works out. Keep foreign key types identical to what they reference, order columns from widest to narrowest to avoid alignment padding, and put a monitoring query on sequence consumption so a 32-bit ceiling is a scheduled migration rather than a 2 a.m. page. If you are inspecting types and index sizes across environments while planning that migration, [Chat2DB](https://chat2db.ai/download) shows column types, index definitions and table sizes in one panel — the web version is at [app.chat2db.ai](https://app.chat2db.ai).
