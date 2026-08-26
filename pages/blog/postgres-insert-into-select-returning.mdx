@@ -1,0 +1,233 @@
+---
+title: "INSERT INTO in PostgreSQL: SELECT, Bulk, RETURNING"
+description: "How to use INSERT INTO in PostgreSQL: multi-row VALUES, INSERT INTO SELECT, ON CONFLICT upserts, RETURNING, DEFAULT values and fast bulk loading with COPY."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: August 26, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# INSERT INTO in PostgreSQL: SELECT, Bulk, RETURNING
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="August 26, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+Every PostgreSQL tutorial shows you `INSERT INTO t VALUES (...)` in the first five minutes and then moves on. But the difference between an insert that loads a million rows in twelve seconds and one that takes forty minutes is entirely in the details of this statement. Here is the full picture: column lists, multi-row values, `INSERT INTO SELECT`, `RETURNING`, conflict handling, and when to abandon `INSERT` for `COPY`.
+
+## Always name your columns
+
+```sql
+-- Fragile: breaks silently when someone adds a column
+INSERT INTO products VALUES (1, 'Keyboard', 49.99, 'peripherals');
+
+-- Correct
+INSERT INTO products (id, name, price, category)
+VALUES (1, 'Keyboard', 49.99, 'peripherals');
+```
+
+Without a column list, PostgreSQL matches values to columns by physical position. Add a column to the table, or reorder one during a migration, and every positional insert in your codebase starts writing values into the wrong columns — or fails with a type error if you are lucky. Name the columns. It is two seconds of typing that removes an entire class of production incident.
+
+Columns you omit get their `DEFAULT`, or `NULL` if there is no default. You can be explicit about that:
+
+```sql
+CREATE TABLE products (
+  id         bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  sku        text NOT NULL UNIQUE,
+  name       text NOT NULL,
+  price      numeric(10,2) NOT NULL DEFAULT 0,
+  created_at timestamptz NOT NULL DEFAULT now()
+);
+
+INSERT INTO products (sku, name, price)
+VALUES ('KB-01', 'Keyboard', DEFAULT);      -- price becomes 0
+
+INSERT INTO products (sku, name) VALUES ('MS-01', 'Mouse');   -- same thing
+
+INSERT INTO products DEFAULT VALUES;         -- fails here: sku is NOT NULL with no default
+```
+
+With `GENERATED ALWAYS AS IDENTITY`, you cannot supply `id` yourself at all — an attempt raises `cannot insert a non-DEFAULT value into column "id"`. That is the point: it prevents the classic bug where an application inserts explicit IDs, the sequence falls behind, and later inserts collide. If you genuinely need to override it (during a data migration, say), use `OVERRIDING SYSTEM VALUE`:
+
+```sql
+INSERT INTO products (id, sku, name)
+OVERRIDING SYSTEM VALUE
+VALUES (500, 'LEGACY-1', 'Imported item');
+
+-- Then fix the sequence, or the next insert collides
+SELECT setval(pg_get_serial_sequence('products', 'id'),
+              (SELECT max(id) FROM products));
+```
+
+## Multi-row VALUES
+
+One statement, many rows. This is dramatically faster than one statement per row because you pay the parse, plan and network round trip once:
+
+```sql
+INSERT INTO products (sku, name, price) VALUES
+  ('KB-01', 'Keyboard',  49.99),
+  ('MS-01', 'Mouse',     24.50),
+  ('MN-01', 'Monitor',  219.00),
+  ('HS-01', 'Headset',   79.90);
+```
+
+The difference is not marginal. Inserting 10,000 rows one statement at a time over a network typically takes tens of seconds; batched 1,000 rows per statement it takes well under a second. The whole `INSERT` is one transaction, so if any row violates a constraint, none of them are inserted.
+
+There is a practical ceiling: the protocol allows at most 65,535 bind parameters per statement, so with 8 columns you can send about 8,000 rows per parameterised statement. Batches of 500–2,000 rows are a good default — beyond that the gains flatten and memory use climbs.
+
+## INSERT INTO ... SELECT
+
+To copy data between tables, skip the round trip to your application entirely:
+
+```sql
+INSERT INTO orders_archive (id, customer_id, total_cents, created_at)
+SELECT id, customer_id, total_cents, created_at
+FROM   orders
+WHERE  created_at < now() - interval '2 years';
+```
+
+The `SELECT` can be arbitrarily complex — joins, aggregates, window functions, CTEs. This is how you build a summary table:
+
+```sql
+INSERT INTO daily_revenue (day, country, orders, revenue_cents)
+SELECT date_trunc('day', o.created_at)::date,
+       c.country,
+       count(*),
+       sum(o.total_cents)
+FROM   orders o
+JOIN   customers c ON c.id = o.customer_id
+WHERE  o.created_at >= DATE '2026-08-01'
+  AND  o.status = 'completed'
+GROUP  BY 1, 2;
+```
+
+Two rules: the `SELECT` list must line up with the column list by **position and type**, and column *names* in the `SELECT` are irrelevant. `SELECT country, day` into `(day, country)` will not warn you — it will either fail on a type mismatch or, if both are text, silently store the wrong data.
+
+Archive-then-delete is a natural pairing, and a CTE makes it atomic:
+
+```sql
+WITH moved AS (
+  DELETE FROM orders
+  WHERE  created_at < now() - interval '2 years'
+  RETURNING *
+)
+INSERT INTO orders_archive
+SELECT * FROM moved;
+```
+
+Both statements see the same snapshot, so nothing is lost or duplicated even if new rows arrive mid-flight.
+
+## RETURNING
+
+`RETURNING` gives you back the rows the database actually wrote, including generated IDs and defaults, without a follow-up `SELECT`:
+
+```sql
+INSERT INTO products (sku, name, price)
+VALUES ('SP-01', 'Speaker', 59.00)
+RETURNING id, created_at;
+```
+
+It works with multi-row inserts too, returning one row per inserted row in insertion order. That makes inserting a parent and its children a two-statement operation:
+
+```sql
+WITH new_order AS (
+  INSERT INTO orders (customer_id, status)
+  VALUES ($1, 'pending')
+  RETURNING id
+)
+INSERT INTO order_lines (order_id, sku, quantity, price)
+SELECT new_order.id, v.sku, v.quantity, v.price
+FROM   new_order,
+       (VALUES ('KB-01', 1, 49.99::numeric),
+               ('MS-01', 2, 24.50)) AS v(sku, quantity, price);
+```
+
+No round trip in between, no risk of an orphaned order if the second statement fails.
+
+## Handling duplicates: ON CONFLICT
+
+A plain `INSERT` that hits a unique constraint raises `duplicate key value violates unique constraint` and aborts the transaction. `ON CONFLICT` lets you decide what should happen instead.
+
+Skip duplicates:
+
+```sql
+INSERT INTO products (sku, name, price)
+VALUES ('KB-01', 'Keyboard', 49.99)
+ON CONFLICT (sku) DO NOTHING;
+```
+
+Update the existing row (an upsert):
+
+```sql
+INSERT INTO products (sku, name, price, updated_at)
+VALUES ('KB-01', 'Keyboard Pro', 59.99, now())
+ON CONFLICT (sku) DO UPDATE
+SET name = EXCLUDED.name,
+    price = EXCLUDED.price,
+    updated_at = EXCLUDED.updated_at;
+```
+
+`EXCLUDED` is the pseudo-table holding the row you tried to insert; the bare table name refers to the row already stored. That distinction lets you write accumulate-style updates:
+
+```sql
+INSERT INTO page_views (path, day, views)
+VALUES ('/pricing', CURRENT_DATE, 1)
+ON CONFLICT (path, day) DO UPDATE
+SET views = page_views.views + EXCLUDED.views;
+```
+
+The conflict target must be backed by a unique index or constraint on exactly those columns, otherwise you get `there is no unique or exclusion constraint matching the ON CONFLICT specification`. Add a `WHERE` clause to the `DO UPDATE` when you only want to overwrite under certain conditions — for example, never letting a stale message overwrite a newer one:
+
+```sql
+ON CONFLICT (sku) DO UPDATE
+SET price = EXCLUDED.price, updated_at = EXCLUDED.updated_at
+WHERE products.updated_at < EXCLUDED.updated_at;
+```
+
+If you would rather not hand-write these, our [Postgres UPSERT generator](https://chat2db.ai/tools/postgres-upsert-generator) builds the statement, the bulk form and the required unique constraint from a column list.
+
+One gotcha with `INSERT ... SELECT ... ON CONFLICT DO UPDATE`: if the source contains two rows with the same key, you get `ON CONFLICT DO UPDATE command cannot affect row a second time`. De-duplicate first:
+
+```sql
+INSERT INTO products (sku, name, price)
+SELECT DISTINCT ON (sku) sku, name, price
+FROM   staging.products_import
+ORDER  BY sku, imported_at DESC
+ON CONFLICT (sku) DO UPDATE SET name = EXCLUDED.name, price = EXCLUDED.price;
+```
+
+## When INSERT is the wrong tool
+
+For bulk loading — tens of thousands of rows or more from a file — `COPY` is several times faster than even batched `INSERT`, because it skips per-row statement overhead entirely:
+
+```sql
+\copy products (sku, name, price) FROM 'products.csv' WITH (FORMAT csv, HEADER true)
+```
+
+Use `\copy` (the psql meta-command) rather than server-side `COPY` unless you have superuser access and the file is on the database server.
+
+For a very large initial load, the standard recipe is: create the table without indexes, `COPY` the data in, then build the indexes and add the foreign keys. Building an index once over a full table is far cheaper than maintaining it across a million individual inserts. If the table was created or truncated in the same transaction, adding `FREEZE` avoids a later rewrite:
+
+```sql
+BEGIN;
+TRUNCATE products;
+\copy products FROM 'products.csv' WITH (FORMAT csv, HEADER true, FREEZE)
+COMMIT;
+```
+
+Other tuning knobs for a one-off load: raise `maintenance_work_mem` before creating indexes, drop non-essential triggers with `ALTER TABLE ... DISABLE TRIGGER USER`, and if you can tolerate losing the data on a crash, `SET synchronous_commit = off` for the session.
+
+## A quick reference
+
+| Goal | Statement |
+| --- | --- |
+| One row, get the ID | `INSERT ... VALUES (...) RETURNING id` |
+| Many rows at once | `INSERT ... VALUES (...), (...), (...)` |
+| Copy from another table | `INSERT ... SELECT ... FROM ...` |
+| Ignore duplicates | `... ON CONFLICT (key) DO NOTHING` |
+| Insert or update | `... ON CONFLICT (key) DO UPDATE SET c = EXCLUDED.c` |
+| Move rows atomically | `WITH d AS (DELETE ... RETURNING *) INSERT ... SELECT * FROM d` |
+| Load a CSV file | `\copy t (cols) FROM 'f.csv' WITH (FORMAT csv, HEADER true)` |
+
+Get the column list, the batching and the conflict handling right and `INSERT` stops being the slow part of your pipeline. If you want to run these interactively with schema autocompletion and AI help writing the `SELECT` half, [Chat2DB](https://chat2db.ai/download) is a free SQL client that works with PostgreSQL and 20+ other databases, with a browser version at [app.chat2db.ai](https://app.chat2db.ai).

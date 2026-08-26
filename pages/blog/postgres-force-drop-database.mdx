@@ -1,0 +1,250 @@
+---
+title: "Force Drop a Database in PostgreSQL (In Use Fix)"
+description: "Fix \"database is being accessed by other users\" in PostgreSQL: DROP DATABASE WITH FORCE, terminating connections, blocking reconnects and dropping templates."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: August 26, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# Force Drop a Database in PostgreSQL (In Use Fix)
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="August 26, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+You try to drop a database and get this:
+
+```
+ERROR:  database "staging" is being accessed by other users
+DETAIL:  There are 3 other sessions using the database.
+```
+
+PostgreSQL will not drop a database while anything is connected to it. This article covers the modern one-liner, the manual method for older versions, how to stop clients reconnecting faster than you can kill them, and the two other errors that look similar but need different fixes.
+
+## The short answer: WITH (FORCE)
+
+PostgreSQL 13 and later accept a `FORCE` option that terminates existing connections for you:
+
+```sql
+DROP DATABASE staging WITH (FORCE);
+```
+
+From the shell, `dropdb` has a matching flag:
+
+```bash
+dropdb --force staging
+dropdb --force --if-exists staging   # no error if it does not exist
+```
+
+That is the whole answer for most people. `WITH (FORCE)` sends the equivalent of `pg_terminate_backend` to every session on the target database, waits briefly for them to go away, and then drops it. If a session refuses to die within about five seconds, the command still fails — which in practice means a backend stuck in an uninterruptible operation, and you fall back to the manual method below.
+
+Two things `FORCE` does not do: it does not help if the *current* session is connected to the database you are dropping, and it does not stop a connection pool from immediately reconnecting.
+
+## Connect somewhere else first
+
+You cannot drop the database you are connected to:
+
+```sql
+DROP DATABASE staging;
+-- ERROR:  cannot drop the currently open database
+```
+
+Switch to another database — `postgres` exists on virtually every cluster for exactly this purpose:
+
+```bash
+psql -d postgres -c "DROP DATABASE staging WITH (FORCE);"
+```
+
+In an interactive psql session, `\c postgres` first.
+
+## The manual method (PostgreSQL 12 and older)
+
+Without `FORCE`, you terminate the sessions yourself:
+
+```sql
+SELECT pg_terminate_backend(pid)
+FROM   pg_stat_activity
+WHERE  datname = 'staging'
+  AND  pid <> pg_backend_pid();
+
+DROP DATABASE staging;
+```
+
+`pg_terminate_backend` sends `SIGTERM` to the backend process; the session's current transaction is rolled back and the connection closes. `pid <> pg_backend_pid()` excludes your own session, which matters if you happen to be connected to the same database (you should not be, but the guard is free).
+
+Before terminating, it is worth looking at what you are about to kill:
+
+```sql
+SELECT pid, usename, application_name, client_addr, state,
+       now() - state_change AS idle_for,
+       left(query, 60) AS last_query
+FROM   pg_stat_activity
+WHERE  datname = 'staging'
+ORDER  BY state_change;
+```
+
+An `idle in transaction` session from an application that crashed hours ago is safe to kill. An `active` session running a migration is not.
+
+## The reconnect race
+
+The genuinely annoying case: you terminate every connection, and by the time `DROP DATABASE` runs, the application's connection pool has already opened three new ones. You kill them again. It reconnects again. This loop can go on indefinitely.
+
+The fix is to revoke the right to connect before killing anything:
+
+```sql
+-- 1. Stop new connections at the door
+REVOKE CONNECT ON DATABASE staging FROM PUBLIC;
+
+-- 2. Kill what is already there
+SELECT pg_terminate_backend(pid)
+FROM   pg_stat_activity
+WHERE  datname = 'staging' AND pid <> pg_backend_pid();
+
+-- 3. Now nothing can get back in
+DROP DATABASE staging;
+```
+
+Note that `REVOKE CONNECT ... FROM PUBLIC` does not stop superusers or roles with an explicit `CONNECT` grant. The heavier hammer sets the connection limit to zero, which applies to everyone except superusers:
+
+```sql
+ALTER DATABASE staging WITH ALLOW_CONNECTIONS false;   -- PG 9.5+
+```
+
+Or, on older versions, by updating the catalog directly:
+
+```sql
+UPDATE pg_database SET datallowconn = false WHERE datname = 'staging';
+```
+
+If you end up not dropping the database after all, remember to reverse it:
+
+```sql
+ALTER DATABASE staging WITH ALLOW_CONNECTIONS true;
+GRANT CONNECT ON DATABASE staging TO PUBLIC;
+```
+
+Put together, the bulletproof sequence is:
+
+```bash
+psql -d postgres <<'SQL'
+ALTER DATABASE staging WITH ALLOW_CONNECTIONS false;
+SELECT pg_terminate_backend(pid)
+FROM   pg_stat_activity
+WHERE  datname = 'staging' AND pid <> pg_backend_pid();
+DROP DATABASE staging;
+SQL
+```
+
+Even so: if the database is served through PgBouncer or a similar pooler, the pooler holds server-side connections independently of your application. Pause or reconfigure the pooler as well, or its connections will reappear the moment you kill them.
+
+## Other errors that look like this one
+
+### "database is used by an active logical replication slot"
+
+```
+ERROR:  database "staging" is used by an active logical replication slot
+DETAIL:  There is 1 active slot.
+```
+
+`FORCE` does not clear replication slots. Drop the slot yourself:
+
+```sql
+SELECT slot_name, active, active_pid, database
+FROM   pg_replication_slots
+WHERE  database = 'staging';
+
+-- If active, terminate the walsender first
+SELECT pg_terminate_backend(active_pid)
+FROM   pg_replication_slots
+WHERE  slot_name = 'staging_slot' AND active;
+
+SELECT pg_drop_replication_slot('staging_slot');
+```
+
+Leaving an unused slot behind is worse than the error: an inactive slot pins WAL forever and will eventually fill your disk. This error is doing you a favour.
+
+### "cannot drop a template database"
+
+```
+ERROR:  cannot drop a template database
+```
+
+A database marked as a template cannot be dropped. Clear the flag first:
+
+```sql
+UPDATE pg_database SET datistemplate = false WHERE datname = 'my_template';
+DROP DATABASE my_template;
+```
+
+This is one of the very few cases where updating a system catalog by hand is the documented approach. Do not do it to `template0` or `template1` — `template0` is the pristine source `CREATE DATABASE` copies from, and losing it means you cannot create databases with a different encoding.
+
+### "must be owner of database"
+
+```
+ERROR:  must be owner of database staging
+```
+
+Only the database owner or a superuser can drop it. Check and, if you are a superuser, take ownership:
+
+```sql
+SELECT datname, pg_get_userbyid(datdba) AS owner FROM pg_database;
+ALTER DATABASE staging OWNER TO postgres;
+```
+
+### It hangs instead of erroring
+
+If `DROP DATABASE` sits there doing nothing, something holds a lock on the database object. Look for it:
+
+```sql
+SELECT a.pid, a.usename, a.state, a.wait_event_type, a.wait_event, left(a.query, 60)
+FROM   pg_locks l
+JOIN   pg_stat_activity a ON a.pid = l.pid
+WHERE  l.database = (SELECT oid FROM pg_database WHERE datname = 'staging');
+```
+
+A prepared (two-phase) transaction is a classic culprit, and it does not appear in `pg_stat_activity` at all because it has no backend:
+
+```sql
+SELECT gid, prepared, owner, database FROM pg_prepared_xacts WHERE database = 'staging';
+ROLLBACK PREPARED 'the_gid_from_above';
+```
+
+## Before you drop: take a backup
+
+`DROP DATABASE` is immediate and irreversible. The files are unlinked; there is no recycle bin, and no transaction to roll back — you cannot even run it inside a `BEGIN` block. A dump takes seconds on a small database and costs nothing:
+
+```bash
+pg_dump -Fc -d staging -f staging_$(date +%Y%m%d).dump
+```
+
+To restore later:
+
+```bash
+createdb staging
+pg_restore -d staging staging_20260826.dump
+```
+
+If you only want to reset a database's contents rather than remove it, dropping and recreating the schema is usually the better move and avoids all of the above:
+
+```sql
+DROP SCHEMA public CASCADE;
+CREATE SCHEMA public;
+GRANT ALL ON SCHEMA public TO postgres;
+GRANT ALL ON SCHEMA public TO PUBLIC;   -- restore the default grants
+```
+
+## Quick reference
+
+| Situation | Command |
+| --- | --- |
+| PG 13+, connections present | `DROP DATABASE db WITH (FORCE);` |
+| Shell equivalent | `dropdb --force --if-exists db` |
+| PG 12 and older | terminate via `pg_stat_activity`, then `DROP DATABASE` |
+| Clients keep reconnecting | `ALTER DATABASE db WITH ALLOW_CONNECTIONS false;` first |
+| Active replication slot | `pg_drop_replication_slot('slot')` first |
+| Template database | `UPDATE pg_database SET datistemplate = false ...` |
+| Prepared transaction blocking | `ROLLBACK PREPARED 'gid'` |
+
+For day-to-day work — inspecting who is connected, what they are running, and terminating a stuck session without hand-writing catalog queries — a client with a session monitor saves time. [Chat2DB](https://chat2db.ai/download) is a free AI-powered SQL client that shows active sessions, locks and databases in one view, and it runs in the browser at [app.chat2db.ai](https://app.chat2db.ai).

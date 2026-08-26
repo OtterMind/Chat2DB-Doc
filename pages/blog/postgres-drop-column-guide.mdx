@@ -1,0 +1,230 @@
+---
+title: "How to Remove a Column in PostgreSQL Safely"
+description: "Drop a column in PostgreSQL without breaking things: ALTER TABLE DROP COLUMN, CASCADE vs RESTRICT, dependent views, disk space, and a zero-downtime rollout."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: August 26, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# How to Remove a Column in PostgreSQL Safely
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="August 26, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+Removing a column in PostgreSQL is one line of SQL. Removing it *without* taking down an application, orphaning a view, or discovering you needed the data after all takes a bit more thought. Here is the full statement, what it does to your table on disk, and the rollout order that makes it safe on a live system.
+
+## The statement
+
+```sql
+ALTER TABLE products DROP COLUMN legacy_code;
+```
+
+Add `IF EXISTS` to make the migration idempotent — useful when the same script may run twice:
+
+```sql
+ALTER TABLE products DROP COLUMN IF EXISTS legacy_code;
+```
+
+Drop several columns in one statement. This is not just tidier; it takes the table lock once instead of three times:
+
+```sql
+ALTER TABLE products
+  DROP COLUMN IF EXISTS legacy_code,
+  DROP COLUMN IF EXISTS old_price,
+  DROP COLUMN IF EXISTS import_batch;
+```
+
+## What actually happens on disk
+
+`DROP COLUMN` does **not** rewrite the table and does **not** free any space. PostgreSQL marks the column as dropped in the system catalog (`pg_attribute.attisdropped = true`) and renames it to something like `........pg.dropped.7........`. The data stays in every existing row, invisible and unreachable.
+
+This is good news operationally: dropping a column from a 500 GB table is instant, no matter how large the table is. It is bad news if you dropped the column to reclaim disk space, because you did not reclaim any.
+
+Two consequences follow.
+
+**The space comes back only when rows are rewritten.** Any `UPDATE` to a row rewrites it without the dropped column. To reclaim everything at once you need a full rewrite:
+
+```sql
+-- Rewrites the table, reclaims the space, takes an ACCESS EXCLUSIVE lock
+VACUUM FULL products;
+```
+
+`VACUUM FULL` blocks all reads and writes for the duration and needs free disk space equal to the table size. On a production table, `pg_repack` does the same job online. Plain `VACUUM` does not help here — it reclaims dead tuples, not dropped-column bytes in live ones.
+
+**The 1,600-column limit counts dropped columns.** Postgres allows at most 1,600 columns per table, and dropped ones still occupy a slot until the table is rewritten. A table that has columns added and dropped repeatedly (some migration tooling does this) can eventually fail with `tables can have at most 1600 columns` even though `\d` shows forty. `VACUUM FULL` or a `pg_repack` clears the slots.
+
+You can see the hidden columns yourself:
+
+```sql
+SELECT attnum, attname, attisdropped
+FROM   pg_attribute
+WHERE  attrelid = 'products'::regclass
+  AND  attnum > 0
+ORDER  BY attnum;
+```
+
+## Dependencies: RESTRICT vs CASCADE
+
+By default `DROP COLUMN` is `RESTRICT`: if anything depends on the column, the statement fails.
+
+```sql
+ALTER TABLE products DROP COLUMN category;
+-- ERROR:  cannot drop column category of table products because other objects depend on it
+-- DETAIL:  view product_summary depends on column category of table products
+-- HINT:  Use DROP ... CASCADE to drop the dependent objects too.
+```
+
+`CASCADE` drops the dependents along with it:
+
+```sql
+ALTER TABLE products DROP COLUMN category CASCADE;
+-- NOTICE:  drop cascades to view product_summary
+```
+
+Read that `NOTICE` before you trust it. `CASCADE` will happily drop a view, a materialized view, or a foreign key constraint that some other part of your system relies on, and it does so silently apart from that one notice line. On production, find the dependents first and handle them deliberately.
+
+### Find what depends on a column
+
+```sql
+SELECT DISTINCT
+       dependent.relname AS dependent_object,
+       dependent.relkind AS kind   -- v = view, m = matview, r = table, i = index
+FROM   pg_depend d
+JOIN   pg_rewrite r        ON r.oid = d.objid
+JOIN   pg_class dependent  ON dependent.oid = r.ev_class
+JOIN   pg_class source     ON source.oid = d.refobjid
+JOIN   pg_attribute a      ON a.attrelid = d.refobjid AND a.attnum = d.refobjsubid
+WHERE  source.relname = 'products'
+  AND  a.attname = 'category'
+  AND  dependent.relname <> 'products';
+```
+
+Indexes and constraints are easier to spot:
+
+```sql
+-- Indexes that include the column
+SELECT indexname, indexdef
+FROM   pg_indexes
+WHERE  tablename = 'products' AND indexdef LIKE '%category%';
+
+-- Constraints referencing it
+SELECT conname, pg_get_constraintdef(oid)
+FROM   pg_constraint
+WHERE  conrelid = 'products'::regclass
+  AND  pg_get_constraintdef(oid) LIKE '%category%';
+```
+
+Indexes and constraints on the dropped column are removed automatically, no `CASCADE` needed. A multi-column index that includes the dropped column is dropped **entirely** — `(category, created_at)` disappears, not just the `category` part. If queries relied on the `created_at` prefix, rebuild it first:
+
+```sql
+CREATE INDEX CONCURRENTLY idx_products_created_at ON products (created_at);
+-- then drop the column, which removes the old composite index
+```
+
+### Generated columns and functions
+
+A generated column referencing the target blocks the drop and is not always obvious:
+
+```sql
+ALTER TABLE products DROP COLUMN price;
+-- ERROR: cannot drop column price of table products because other objects depend on it
+-- DETAIL: column price_with_tax of table products depends on column price
+```
+
+Functions are the opposite problem: PL/pgSQL bodies are **not** dependency-tracked. A function that does `SELECT category FROM products` will drop fine and then fail at runtime with `column "category" does not exist`. Grep your function bodies before you drop:
+
+```sql
+SELECT n.nspname, p.proname
+FROM   pg_proc p
+JOIN   pg_namespace n ON n.oid = p.pronamespace
+WHERE  n.nspname NOT IN ('pg_catalog', 'information_schema')
+  AND  p.prosrc ILIKE '%category%';
+```
+
+## The locking problem
+
+`ALTER TABLE ... DROP COLUMN` takes an `ACCESS EXCLUSIVE` lock. The catalog update itself is instantaneous, so this is usually fine — but the lock has to be *acquired*, and that is where migrations stall.
+
+If a long-running query is reading the table, your `ALTER TABLE` waits. Worse, it queues *ahead* of every subsequent query, so a 30-second analytics query plus a one-millisecond `ALTER TABLE` equals 30 seconds of your application blocking on a table it normally reads in microseconds.
+
+Always bound the wait:
+
+```sql
+SET lock_timeout = '3s';
+ALTER TABLE products DROP COLUMN legacy_code;
+```
+
+If the lock cannot be acquired in three seconds the statement fails with `canceling statement due to lock timeout` and you retry later, instead of taking the site down. Wrap it in a retry loop in your migration tool.
+
+Check what is holding the lock:
+
+```sql
+SELECT pid, state, wait_event_type, now() - query_start AS duration, left(query, 80)
+FROM   pg_stat_activity
+WHERE  pid IN (SELECT pid FROM pg_locks WHERE relation = 'products'::regclass)
+ORDER  BY duration DESC;
+```
+
+## The zero-downtime rollout
+
+The dangerous window is not the `ALTER TABLE` — it is the gap where the column is gone but your application still selects it. `SELECT *` in an ORM, a cached prepared statement, or a stale pod all produce `column products.legacy_code does not exist` and 500s.
+
+Deploy in this order:
+
+1. **Stop reading it.** Ship an application version that never references the column — no `SELECT *` on that table, no ORM field mapping to it. Verify with logs or `pg_stat_statements`:
+
+   ```sql
+   SELECT calls, left(query, 120)
+   FROM   pg_stat_statements
+   WHERE  query ILIKE '%legacy_code%'
+   ORDER  BY calls DESC;
+   ```
+
+   Reset the stats, wait a full business cycle (including nightly batch jobs), and check again. Zero calls is your green light.
+
+2. **Stop writing it.** If the column is `NOT NULL`, drop that constraint first so that older instances still writing rows do not fail: `ALTER TABLE products ALTER COLUMN legacy_code DROP NOT NULL;`
+
+3. **Back up the data, if there is any doubt.** Dropping the column is not reversible without a restore. A cheap insurance policy:
+
+   ```sql
+   CREATE TABLE products_legacy_code_backup AS
+   SELECT id, legacy_code FROM products WHERE legacy_code IS NOT NULL;
+   ```
+
+   Keep it for a release cycle, then drop it.
+
+4. **Rename first, drop later.** The safest intermediate step is to rename rather than drop — it is equally instant, but trivially reversible:
+
+   ```sql
+   ALTER TABLE products RENAME COLUMN legacy_code TO legacy_code_deprecated_20260826;
+   ```
+
+   Anything still referencing the old name fails loudly and immediately, in a way you can undo with a second `RENAME`. Wait a week; if nothing broke, drop it for real.
+
+5. **Drop it**, with a `lock_timeout`, during a low-traffic window.
+
+6. **Reclaim space** with `pg_repack` if the column held a lot of data and the table is large.
+
+## Rolling back
+
+There is no `UNDROP COLUMN`. Adding a column with the same name gives you an empty column, not your data:
+
+```sql
+ALTER TABLE products ADD COLUMN legacy_code text;   -- all NULLs
+```
+
+Recovery means restoring from a backup or point-in-time recovery to just before the migration, then copying the column across. That is why steps 3 and 4 above exist: the backup table and the rename window cost almost nothing and are the difference between a five-minute fix and a restore.
+
+## Summary
+
+- `ALTER TABLE t DROP COLUMN c` is instant and does not reclaim disk space; only a rewrite (`VACUUM FULL` or `pg_repack`) does.
+- Dropped columns still consume one of the 1,600 column slots until the table is rewritten.
+- Check dependents before using `CASCADE`; views and matviews are tracked, function bodies are not.
+- A composite index containing the column is dropped entirely — rebuild what you still need first.
+- Always set `lock_timeout` so a blocked `ALTER TABLE` cannot pile up behind a long query.
+- Rename before you drop. It buys you a free, instantly reversible test.
+
+For exploring dependencies visually before a migration — which views, indexes and constraints touch a column — a GUI client helps: [Chat2DB](https://chat2db.ai/download) shows table structure, indexes and dependent objects side by side and can generate the migration SQL for you, with a browser version at [app.chat2db.ai](https://app.chat2db.ai).

@@ -1,0 +1,203 @@
+---
+title: "PostgreSQL 13 End of Life: What to Do Now"
+description: "PostgreSQL 13 reached end of life in November 2025. What EOL means, the risks of staying, and how to upgrade with pg_upgrade or logical replication."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: August 26, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# PostgreSQL 13 End of Life: What to Do Now
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="August 26, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+PostgreSQL 13 received its final minor release in November 2025 and is now out of support. If you are still running it — and plenty of teams are, because it works fine and nothing is on fire — this article explains exactly what you lose, how much time you have before the next deadline, and the two practical upgrade paths.
+
+## What "end of life" actually means
+
+The PostgreSQL Global Development Group supports each major version for **five years** from its initial release. During that window, the community ships a minor release roughly every quarter containing bug fixes and security patches. After the final minor release, that branch is closed: no more fixes, including for security vulnerabilities.
+
+| Major version | Released | Final minor release |
+| --- | --- | --- |
+| 12 | October 2019 | November 2024 |
+| 13 | September 2020 | November 2025 |
+| 14 | September 2021 | November 2026 |
+| 15 | October 2022 | November 2027 |
+| 16 | September 2023 | November 2028 |
+| 17 | September 2024 | November 2029 |
+
+Two things follow from the table. First, PostgreSQL 13 has been unsupported since late 2025 — any CVE disclosed since then has no upstream fix for your version. Second, and more usefully: **PostgreSQL 14 goes end of life in November 2026**. If you are planning a 13 → 14 upgrade to minimise the version jump, you will be doing this again within months. Go to 16 or 17 instead.
+
+## The risks of staying
+
+**Unpatched security vulnerabilities.** This is the headline risk and the one your auditors will care about. Postgres has a good security record, but "good" is not "none" — server-side vulnerabilities allowing privilege escalation or crashes are disclosed most years. On 13 you get no fix, and your only mitigations are network-level.
+
+**Unpatched data-corruption bugs.** Less discussed and arguably more dangerous. Minor releases regularly fix bugs in areas like index handling, `VACUUM` and replication that can corrupt data under specific conditions. Those fixes stop arriving.
+
+**Compliance failures.** SOC 2, PCI-DSS and ISO 27001 audits all include controls about running supported software with a patching process. An EOL database is a straightforward finding.
+
+**Ecosystem drift.** Client libraries, ORMs, extensions and managed-service tooling drop support for old server versions on their own schedules. Extensions are the sharp edge: a new release of PostGIS, TimescaleDB or pgvector may simply not build against 13, so you get stuck on old extension versions too.
+
+**Cloud provider forced upgrades.** AWS RDS, Azure Database for PostgreSQL and Google Cloud SQL all eventually auto-upgrade EOL versions, usually with limited notice and during a maintenance window you did not choose. Upgrading on your own schedule is strictly better than having it done to you at 2am.
+
+## What you gain by moving
+
+The 13 → 17 jump is four years of work. The highlights that most workloads notice:
+
+- **PG 14**: much reduced bloat from frequently-updated tables, faster nested-loop joins with parallel queries, `date_bin()`, JSON subscripting (`col['key']`).
+- **PG 15**: `MERGE`, `SELECT DISTINCT` parallelism, faster sorting (measurably so — sorts on large result sets improved substantially), compression options for WAL.
+- **PG 16**: logical replication from a standby, parallel `FULL` and `RIGHT` hash joins, `pg_stat_io` for real I/O visibility, big improvements to `COPY` throughput.
+- **PG 17**: a rewritten `VACUUM` memory structure that cuts vacuum time and memory use dramatically on large tables, incremental backup via `pg_basebackup`, `MERGE ... RETURNING`, better `IN (...)` handling with B-tree indexes.
+
+The `VACUUM` improvements in 17 alone are often worth the upgrade for anyone with tables above a few hundred million rows.
+
+## Path 1: pg_upgrade (fast, brief downtime)
+
+`pg_upgrade` rewrites the system catalogs in place rather than dumping and reloading data. With `--link` it takes minutes regardless of database size, because user data files are hard-linked rather than copied.
+
+```bash
+# 1. Install the new version alongside the old one (Debian/Ubuntu example)
+sudo apt install postgresql-17
+
+# 2. Stop both clusters
+sudo systemctl stop postgresql@13-main postgresql@17-main
+
+# 3. Dry run — checks for incompatibilities, changes nothing
+sudo -u postgres /usr/lib/postgresql/17/bin/pg_upgrade \
+  --old-datadir=/var/lib/postgresql/13/main \
+  --new-datadir=/var/lib/postgresql/17/main \
+  --old-bindir=/usr/lib/postgresql/13/bin \
+  --new-bindir=/usr/lib/postgresql/17/bin \
+  --old-options="-c config_file=/etc/postgresql/13/main/postgresql.conf" \
+  --new-options="-c config_file=/etc/postgresql/17/main/postgresql.conf" \
+  --check
+
+# 4. The real thing, with --link for speed
+sudo -u postgres /usr/lib/postgresql/17/bin/pg_upgrade \
+  ... same arguments ... --link
+
+# 5. Start the new cluster and rebuild statistics
+sudo systemctl start postgresql@17-main
+sudo -u postgres /usr/lib/postgresql/17/bin/vacuumdb --all --analyze-in-stages
+```
+
+Three points that catch people out:
+
+**`--check` first, always.** It reports extensions missing from the new cluster, unsupported data types, and privilege problems, in a few seconds and with zero risk. Fix everything it lists before proceeding.
+
+**`--link` makes rollback impossible.** Hard-linked files are shared between clusters; once the new server starts and writes, the old data directory is no longer usable. Take a full backup first, and verify you can restore it. If you need a rollback path, use `--clone` (on filesystems that support reflinks) or the default copy mode.
+
+**Statistics are not carried over.** `pg_upgrade` does not migrate the planner statistics, so immediately after the upgrade every query plans against empty stats and your database appears catastrophically slow. `vacuumdb --analyze-in-stages` fixes this progressively — run it *before* letting traffic back in, not after the first complaint.
+
+Also check extension versions after the upgrade:
+
+```sql
+SELECT name, default_version, installed_version
+FROM   pg_available_extensions
+WHERE  installed_version IS NOT NULL
+  AND  installed_version <> default_version;
+
+ALTER EXTENSION pg_stat_statements UPDATE;
+```
+
+## Path 2: logical replication (near-zero downtime)
+
+For a database where minutes of downtime are unacceptable, replicate 13 into a fresh 17 cluster and cut over when it has caught up. PostgreSQL 13 supports logical replication as a publisher, so this works.
+
+On the old (13) server:
+
+```sql
+-- postgresql.conf: wal_level = logical, then restart
+ALTER SYSTEM SET wal_level = 'logical';
+-- restart required
+
+CREATE PUBLICATION upgrade_pub FOR ALL TABLES;
+```
+
+On the new (17) server, load the schema first — logical replication copies data, not DDL:
+
+```bash
+pg_dump -d mydb --schema-only -h old-server | psql -d mydb -h new-server
+```
+
+Then subscribe:
+
+```sql
+CREATE SUBSCRIPTION upgrade_sub
+  CONNECTION 'host=old-server dbname=mydb user=repl password=...'
+  PUBLICATION upgrade_pub;
+```
+
+Watch it catch up:
+
+```sql
+-- on the new server
+SELECT subname, received_lsn, latest_end_lsn, last_msg_receipt_time
+FROM   pg_stat_subscription;
+
+-- on the old server
+SELECT slot_name, active,
+       pg_size_pretty(pg_wal_lsn_diff(pg_current_wal_lsn(), confirmed_flush_lsn)) AS lag
+FROM   pg_replication_slots;
+```
+
+The cutover: stop writes to the old server, wait for lag to hit zero, advance the sequences (logical replication does **not** replicate sequence values — this is the single most common way this migration goes wrong), repoint the application, then drop the subscription.
+
+```sql
+-- On the new server, after the final sync. Run for every sequence:
+SELECT setval('orders_id_seq', (SELECT max(id) FROM orders));
+```
+
+Generate all of them at once with `\gexec`:
+
+```sql
+SELECT format('SELECT setval(%L, (SELECT coalesce(max(%I),1) FROM %I.%I));',
+              pg_get_serial_sequence(format('%I.%I', table_schema, table_name), column_name),
+              column_name, table_schema, table_name)
+FROM   information_schema.columns
+WHERE  column_default LIKE 'nextval%'
+  AND  table_schema NOT IN ('pg_catalog', 'information_schema')
+\gexec
+```
+
+Also note that logical replication does not copy tables without a primary key or replica identity, does not replicate DDL, and does not replicate large objects. Check for tables without a replica identity before you start:
+
+```sql
+SELECT c.relname
+FROM   pg_class c
+JOIN   pg_namespace n ON n.oid = c.relnamespace
+WHERE  c.relkind = 'r'
+  AND  n.nspname NOT IN ('pg_catalog', 'information_schema')
+  AND  c.relreplident = 'd'
+  AND  NOT EXISTS (SELECT 1 FROM pg_index i WHERE i.indrelid = c.oid AND i.indisprimary);
+```
+
+## Managed services
+
+On a managed platform, the provider does the mechanics; your job is to test the application against the new version first.
+
+- **AWS RDS / Aurora**: `ModifyDBInstance` with the new engine version, or a blue/green deployment for a short cutover. Run `ANALYZE` afterwards — RDS does not do it for you.
+- **Azure Database for PostgreSQL Flexible Server**: in-place major version upgrade from the portal or CLI.
+- **Google Cloud SQL**: in-place upgrade, or a database migration service job for lower downtime.
+
+In every case, restore a snapshot to a scratch instance, upgrade *that*, and run your test suite against it before touching production.
+
+## The pre-upgrade checklist
+
+Regardless of path:
+
+1. **Read the release notes for each major version between 13 and your target**, specifically the "Migration to Version X" section. That is where incompatible changes are listed.
+2. **Check for removed features.** The big one in this range: `pg_stat_statements` column renames, changes to `SECURITY DEFINER` search path handling, and the removal of `postmaster -o` style options. Also verify any use of `standard_conforming_strings`-dependent escaping.
+3. **Inventory your extensions** and confirm each has a build for the target version.
+4. **Test with the new libpq.** Client driver behaviour around SSL and SCRAM changed across these versions.
+5. **Take a verified backup** — `pg_dump` plus a base backup, and actually restore one somewhere to prove it works.
+6. **Plan the rollback**, and know how long it takes before you need it.
+
+## Do not stop at 14
+
+The single most common mistake with an EOL upgrade is minimising the jump. Going 13 → 14 in late 2026 buys you weeks of support, not years, and you pay the full testing cost either way. The testing effort scales with your application's surface area, not with the number of versions skipped, and `pg_upgrade` handles a 13 → 17 jump in exactly one step. Pick 16 for maximum ecosystem maturity or 17 for the vacuum and backup improvements, and give yourself three or four years before the next one.
+
+While you are testing, a client that connects to both the old and new server side by side makes comparing schemas and query results much easier — [Chat2DB](https://chat2db.ai/download) is a free AI-powered SQL client that handles multiple PostgreSQL connections at once and can explain plan differences between versions. It also runs in the browser at [app.chat2db.ai](https://app.chat2db.ai).

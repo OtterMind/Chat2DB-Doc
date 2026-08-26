@@ -1,0 +1,243 @@
+---
+title: "pg_hba.conf Explained: PostgreSQL Authentication"
+description: "Understand pg_hba.conf: connection types, address matching, scram-sha-256 vs md5 vs peer vs trust, rule ordering, reloading and a secure baseline."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: August 26, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# pg_hba.conf Explained: PostgreSQL Authentication
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="August 26, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+`pg_hba.conf` is the file that decides who is allowed to connect to your PostgreSQL server, from where, to which database, and how they must prove who they are. HBA stands for **host-based authentication**. Almost every "I can't connect to Postgres" problem traces back to this file, and almost every insecure Postgres deployment does too. Here is how it actually works.
+
+## Where the file lives
+
+```sql
+SHOW hba_file;
+--  /etc/postgresql/16/main/pg_hba.conf
+```
+
+On Debian and Ubuntu it is under `/etc/postgresql/<version>/<cluster>/`. On RHEL-family systems and most source builds it sits inside the data directory, typically `/var/lib/pgsql/16/data/`. Docker images put it in `/var/lib/postgresql/data/`. Always ask the server rather than guessing — a machine with two installed versions has two files, and editing the wrong one is a genuinely common waste of an afternoon.
+
+## The format
+
+Each non-comment line is one rule with five (or four) whitespace-separated fields:
+
+```
+# TYPE  DATABASE        USER            ADDRESS                 METHOD  [OPTIONS]
+local   all             postgres                                peer
+host    all             all             127.0.0.1/32            scram-sha-256
+hostssl myapp           app_user        10.0.1.0/24             scram-sha-256
+host    replication     replicator      10.0.2.15/32            scram-sha-256
+host    all             all             0.0.0.0/0               reject
+```
+
+`local` lines have no ADDRESS field — they apply to Unix domain socket connections, which have no network address.
+
+### TYPE
+
+| Value | Applies to |
+| --- | --- |
+| `local` | Unix domain socket connections |
+| `host` | TCP connections, with or without SSL |
+| `hostssl` | TCP connections that use SSL only |
+| `hostnossl` | TCP connections that do **not** use SSL |
+| `hostgssenc` | TCP connections with GSSAPI encryption |
+
+`hostssl` is how you *require* encryption. A `host` rule accepts both encrypted and plaintext connections, so if you want to guarantee TLS you must use `hostssl` and make sure no broader `host` rule matches first. `hostssl` requires `ssl = on` in `postgresql.conf` and a configured certificate.
+
+### DATABASE
+
+A database name, a comma-separated list, `all`, `sameuser` (the database whose name matches the role), `samerole`, or `replication`.
+
+**`replication` is not covered by `all`.** This surprises everyone the first time. Replication connections are a special connection type, and a `host all all ...` rule does not match them — a standby will fail with a `no pg_hba.conf entry` error until you add an explicit `replication` line.
+
+You can also prefix a filename with `@` to read the list from another file: `@/etc/postgresql/analytics_dbs.conf`.
+
+### USER
+
+A role name, a comma-separated list, or `all`. A name prefixed with `+` matches any member of that group role, directly or indirectly:
+
+```
+host    myapp    +app_readers    10.0.0.0/8    scram-sha-256
+```
+
+That single line covers everyone in the `app_readers` group without listing them, which is the right way to manage a team.
+
+### ADDRESS
+
+CIDR notation, a bare IP with a mask on the following field, a hostname, or one of the keywords:
+
+```
+host  all  all  10.0.1.0/24        scram-sha-256   # a subnet
+host  all  all  10.0.2.15/32       scram-sha-256   # a single host
+host  all  all  ::1/128            scram-sha-256   # IPv6 loopback
+host  all  all  samenet            scram-sha-256   # any subnet the server is directly on
+host  all  all  .example.com       scram-sha-256   # any host in the domain (needs reverse DNS)
+host  all  all  all                scram-sha-256   # any address, v4 or v6
+```
+
+The IPv6 point deserves emphasis: on a modern Linux system, `psql -h localhost` frequently resolves to `::1`, not `127.0.0.1`. A rule for `127.0.0.1/32` alone will produce a mystifying `no pg_hba.conf entry for host "::1"`. Always add both loopback lines.
+
+Hostname matching requires a reverse DNS lookup on every connection attempt, which is slow and fails open in confusing ways. Prefer CIDR.
+
+### METHOD
+
+| Method | Use it for |
+| --- | --- |
+| `scram-sha-256` | Everything with a password. The modern default. |
+| `md5` | Legacy clients only. Weaker. |
+| `peer` | `local` lines: matches the OS user name to the role name. |
+| `ident` | TCP equivalent of `peer`, via an ident server. Rarely appropriate. |
+| `cert` | Client TLS certificates. Implies SSL. |
+| `trust` | No authentication at all. |
+| `reject` | Explicitly deny. |
+| `gss`, `sspi`, `ldap`, `radius`, `pam`, `bsd` | External auth systems. |
+
+`trust` means anyone who can open a TCP connection to the port can log in as any role, including superusers, with no password. It belongs on a Unix socket during initial setup and nowhere else. The default Docker Postgres image ships with `trust` for host connections, which is fine for a throwaway container and catastrophic if that container ever gets a public port.
+
+## Rule ordering is the whole game
+
+PostgreSQL reads `pg_hba.conf` from top to bottom and uses the **first line whose TYPE, DATABASE, USER and ADDRESS all match** the incoming connection. It then applies that line's method — and if authentication fails, the connection is rejected. It does not fall through to try later matching lines.
+
+That means a broad rule at the top shadows everything below it:
+
+```
+# WRONG: nobody ever reaches the second line
+host  all    all       0.0.0.0/0     reject
+host  myapp  app_user  10.0.1.0/24   scram-sha-256
+```
+
+Specific rules go first, general rules last:
+
+```
+# RIGHT
+hostssl myapp  app_user  10.0.1.0/24   scram-sha-256
+host    all    all       0.0.0.0/0     reject
+```
+
+The same applies to a `trust` line left over from setup. If `host all all 127.0.0.1/32 trust` sits above your real rules, every local connection bypasses passwords entirely, regardless of what comes after.
+
+## Applying and verifying changes
+
+**You do not need to restart.** A reload is enough, and it does not disturb existing connections:
+
+```sql
+SELECT pg_reload_conf();
+```
+
+```bash
+sudo systemctl reload postgresql
+# or
+sudo -u postgres pg_ctl reload -D /var/lib/pgsql/16/data
+```
+
+Then — and this is the step that saves you — check that the server actually parsed what you wrote:
+
+```sql
+SELECT line_number, type, database, user_name, address, auth_method, error
+FROM   pg_hba_file_rules
+ORDER  BY line_number;
+```
+
+If a line has a syntax error, the `error` column tells you what is wrong and PostgreSQL **keeps the previous rules in effect**. Without checking this view, you can edit the file, reload, and spend twenty minutes wondering why nothing changed.
+
+`pg_hba_file_rules` is available from PostgreSQL 10 onwards. On PG 16+, `pg_stat_activity` also exposes the matched rule for each session, which is superb for debugging:
+
+```sql
+SELECT pid, usename, client_addr, auth_method
+FROM   pg_stat_activity WHERE pid <> pg_backend_pid();
+```
+
+## Debugging "no pg_hba.conf entry for host"
+
+The full error looks like this:
+
+```
+FATAL:  no pg_hba.conf entry for host "203.0.113.42", user "app_user",
+        database "myapp", no encryption
+```
+
+Everything you need is in that message. Read it as four facts and check each against your rules:
+
+1. **The address** — `203.0.113.42`. Is this what you expected? Behind a NAT gateway, a load balancer, or Docker, the address the server sees is not the address of the machine you are sitting at. This is the number-one cause.
+2. **The user** — `app_user`. Does a rule cover this role, either by name, via `all`, or via a `+group`?
+3. **The database** — `myapp`. Remember that `replication` connections need their own line.
+4. **The encryption state** — `no encryption` here. If your only rule is `hostssl`, an unencrypted client will not match it. Conversely, `SSL encryption` in the message means a `hostnossl` rule will not match.
+
+The error is raised *before* the password is checked, so a correct password will never fix it. Similarly, `password authentication failed for user` means a rule *did* match — the problem is the password or the role, not this file.
+
+## A production baseline
+
+```
+# TYPE      DATABASE        USER            ADDRESS                 METHOD
+
+# Local administration via the Unix socket, no password needed
+local       all             postgres                                peer
+
+# Local application users on the socket
+local       all             all                                     scram-sha-256
+
+# Loopback, both address families
+host        all             all             127.0.0.1/32            scram-sha-256
+host        all             all             ::1/128                 scram-sha-256
+
+# Application servers — TLS required
+hostssl     myapp           +app_users      10.0.1.0/24             scram-sha-256
+
+# Read-only analytics access to one database only
+hostssl     analytics       +analysts       10.0.3.0/24             scram-sha-256
+
+# Standby servers
+hostssl     replication     replicator      10.0.2.0/24             scram-sha-256
+
+# Deny everything else, explicitly
+host        all             all             all                     reject
+```
+
+Four properties make this a good baseline: nothing uses `trust`; every network rule is `hostssl`; access is granted per-database to groups rather than to `all`/`all`; and the final `reject` makes the default deny explicit rather than implicit.
+
+If you need to generate a specific rule and are unsure of the field order or the CIDR syntax, our [pg_hba.conf generator](https://chat2db.ai/tools/pg-hba-conf-generator) builds the line, flags the combinations that silently do not work, and gives you the reload and verification SQL.
+
+## Moving from md5 to scram-sha-256
+
+`md5` is still widely deployed and worth migrating away from. The switch is not just an edit to this file — existing password hashes are stored in the old format and must be regenerated:
+
+```sql
+-- 1. Change the default for new passwords
+ALTER SYSTEM SET password_encryption = 'scram-sha-256';
+SELECT pg_reload_conf();
+
+-- 2. Every user must set their password again (even to the same value)
+ALTER USER app_user PASSWORD 'their-existing-password';
+
+-- 3. Check who has migrated
+SELECT rolname,
+       CASE WHEN rolpassword LIKE 'SCRAM-SHA-256$%' THEN 'scram'
+            WHEN rolpassword LIKE 'md5%'            THEN 'md5'
+            ELSE 'none' END AS hash_type
+FROM   pg_authid WHERE rolcanlogin;
+
+-- 4. Only when everyone shows 'scram', change the method in pg_hba.conf
+```
+
+Do step 4 last. If you switch the method before the hashes are regenerated, those users cannot log in at all — the server has no SCRAM verifier to check against.
+
+Also confirm your client libraries support SCRAM: libpq 10+, JDBC 42.2+, psycopg2 2.8+, and Npgsql 4+ all do, but very old drivers do not.
+
+## Related files
+
+`pg_hba.conf` decides *whether you may connect*. Two neighbours handle the rest:
+
+- **`postgresql.conf`** decides *where the server listens*. `listen_addresses = 'localhost'` (the default on many packages) means no amount of `pg_hba.conf` editing will let a remote client in. Set it to a specific interface or `'*'`, and restart — this setting is not reloadable.
+- **`pg_ident.conf`** maps operating-system user names to PostgreSQL role names, used with the `peer`, `ident`, `gss` and `cert` methods via a `map=` option.
+
+Once connected, what a role may *do* is governed by `GRANT`, `REVOKE` and row-level security — not by this file. Authentication and authorisation are separate layers, and it is worth keeping that distinction clear when you are debugging.
+
+For inspecting roles, grants and active sessions without writing catalog queries by hand, a GUI client helps: [Chat2DB](https://chat2db.ai/download) is a free AI-powered SQL client that shows PostgreSQL roles, privileges and connections in one place, with a browser version at [app.chat2db.ai](https://app.chat2db.ai).

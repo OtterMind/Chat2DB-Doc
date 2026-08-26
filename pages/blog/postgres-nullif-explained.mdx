@@ -1,0 +1,242 @@
+---
+title: "PostgreSQL NULLIF: Divide-by-Zero and Empty Strings"
+description: "How NULLIF works in PostgreSQL: prevent division by zero, turn empty strings into NULL, combine it with COALESCE, and how it differs from CASE."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: August 26, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# PostgreSQL NULLIF: Divide-by-Zero and Empty Strings
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="August 26, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+`NULLIF` is the smallest useful function in PostgreSQL and one of the most under-used. It does exactly one thing — return `NULL` when two values are equal — and that one thing solves two problems that show up in nearly every real schema: division by zero, and the empty string that should have been `NULL`.
+
+## The definition
+
+```sql
+NULLIF(value1, value2)
+```
+
+Returns `NULL` if `value1 = value2`, otherwise returns `value1`. That is the entire function.
+
+```sql
+SELECT NULLIF(5, 5);        -- NULL
+SELECT NULLIF(5, 0);        -- 5
+SELECT NULLIF('', '');      -- NULL
+SELECT NULLIF('abc', '');   -- 'abc'
+SELECT NULLIF(NULL, 1);     -- NULL
+```
+
+It is shorthand for a `CASE` expression:
+
+```sql
+CASE WHEN value1 = value2 THEN NULL ELSE value1 END
+```
+
+Note that it never returns `value2`. `value2` is only ever a comparison target — a common misreading is to expect `NULLIF(a, b)` to return `b` in some branch. It does not.
+
+The comparison uses the normal `=` operator, so it follows normal type resolution rules. If the two arguments are not implicitly comparable you get an error rather than a silent `false`:
+
+```sql
+SELECT NULLIF(1, 'x');
+-- ERROR:  invalid input syntax for type integer: "x"
+```
+
+Cast explicitly when mixing types:
+
+```sql
+SELECT NULLIF(status::text, '');
+```
+
+## Use case 1: division by zero
+
+This is the reason most people find `NULLIF`. In PostgreSQL, dividing by zero is an error, not a `NULL` or an infinity:
+
+```sql
+SELECT conversions / visits AS rate FROM daily_stats;
+-- ERROR:  division by zero
+```
+
+One row with `visits = 0` kills the whole query. Wrap the divisor:
+
+```sql
+SELECT conversions / NULLIF(visits, 0) AS rate FROM daily_stats;
+```
+
+Now zero divisors become `NULL`, and `x / NULL` is `NULL` — a missing rate rather than an aborted query, which is almost always the semantically correct answer. You cannot compute a conversion rate for a day with no visits.
+
+If you would rather display `0` than `NULL`, wrap the whole thing in `COALESCE`. This `COALESCE(..., NULLIF(...))` sandwich is the idiom worth memorising:
+
+```sql
+SELECT day,
+       coalesce(conversions::numeric / NULLIF(visits, 0), 0) AS rate
+FROM   daily_stats;
+```
+
+Note the `::numeric` cast. Two integers divide as integers in PostgreSQL, so `3 / 4` is `0`, not `0.75`. Cast the numerator (or the divisor) to `numeric` before dividing, or your carefully guarded rate will be zero for every row under 100%:
+
+```sql
+SELECT 3 / 4;                    -- 0        integer division
+SELECT 3::numeric / 4;           -- 0.75
+SELECT round(100.0 * conversions / NULLIF(visits, 0), 2) AS pct
+FROM   daily_stats;              -- 100.0 is numeric, so the whole expression is numeric
+```
+
+A full percentage-of-total calculation with a window function:
+
+```sql
+SELECT category,
+       sum(revenue)                                   AS revenue,
+       round(100.0 * sum(revenue)
+             / NULLIF(sum(sum(revenue)) OVER (), 0), 2) AS pct_of_total
+FROM   sales
+GROUP  BY category
+ORDER  BY revenue DESC;
+```
+
+Without the `NULLIF`, a filtered result set with no revenue at all makes the whole query fail instead of returning an empty or zero-valued report.
+
+The same guard applies to `%` (modulo), which also raises `division by zero`, and to `avg` over an empty set — though `avg` already returns `NULL` rather than erroring, so it needs no help.
+
+## Use case 2: empty strings that should be NULL
+
+Data imported from CSV files, HTML forms, or a MySQL database routinely uses `''` where `NULL` belongs. PostgreSQL treats those as completely different values, so `COALESCE` alone does not save you:
+
+```sql
+SELECT coalesce(middle_name, 'N/A') FROM people;
+-- Returns '' for rows where middle_name is the empty string, not 'N/A'
+```
+
+`NULLIF` normalises first:
+
+```sql
+SELECT coalesce(NULLIF(middle_name, ''), 'N/A') FROM people;
+```
+
+Read it inside out: turn `''` into `NULL`, then replace any `NULL` with `'N/A'`. This handles both representations of "missing" in one expression.
+
+The same pattern cleans up an import:
+
+```sql
+UPDATE people
+SET    middle_name = NULLIF(middle_name, ''),
+       phone       = NULLIF(trim(phone), ''),
+       notes       = NULLIF(trim(notes), '')
+WHERE  middle_name = '' OR trim(phone) = '' OR trim(notes) = '';
+```
+
+Wrapping in `trim` first catches the whitespace-only variants — `' '` is not `''`, and is just as meaningless.
+
+You can push this into the load itself so the bad data never lands:
+
+```sql
+INSERT INTO people (id, name, middle_name, phone)
+SELECT id,
+       name,
+       NULLIF(trim(middle_name), ''),
+       NULLIF(trim(phone), '')
+FROM   staging.people_import;
+```
+
+And enforce it going forward with a check constraint, so the problem cannot come back:
+
+```sql
+ALTER TABLE people
+  ADD CONSTRAINT people_middle_name_not_empty
+  CHECK (middle_name <> '');   -- NULL passes; '' does not
+```
+
+That constraint is worth understanding: a `CHECK` passes when the expression is `true` **or** `NULL`. `NULL <> ''` evaluates to `NULL`, so `NULL` is allowed while `''` is rejected. Exactly the semantics you want.
+
+Casting an empty string to a non-text type is another place `NULLIF` earns its keep:
+
+```sql
+SELECT ''::integer;                 -- ERROR: invalid input syntax for type integer: ""
+SELECT NULLIF('', '')::integer;     -- NULL
+
+-- Loading numbers from a text staging column
+UPDATE staging.orders
+SET    total_cents = NULLIF(trim(total_raw), '')::integer;
+```
+
+## Use case 3: sentinel values
+
+Legacy systems love magic values: `-1` for unknown, `9999-12-31` for "no end date", `'UNKNOWN'` for a missing country. `NULLIF` converts them to real `NULL`s at query time so aggregates behave:
+
+```sql
+SELECT avg(NULLIF(age, -1))              AS avg_age,
+       max(NULLIF(end_date, '9999-12-31'::date)) AS last_real_end_date,
+       count(NULLIF(country, 'UNKNOWN')) AS rows_with_known_country
+FROM   legacy_records;
+```
+
+This matters because aggregates ignore `NULL` but happily average in a `-1`. Without the `NULLIF`, `avg(age)` over a table where a third of rows are `-1` is meaningless.
+
+For more than one sentinel, chain or use `CASE`:
+
+```sql
+-- Two sentinels
+SELECT NULLIF(NULLIF(country, 'UNKNOWN'), 'N/A') FROM legacy_records;
+
+-- Many sentinels — CASE is clearer
+SELECT CASE WHEN country IN ('UNKNOWN', 'N/A', '-', '') THEN NULL ELSE country END
+FROM   legacy_records;
+```
+
+## NULLIF and the NULL argument
+
+If `value1` is `NULL`, the result is `NULL` regardless of `value2` — because `NULL = anything` is `NULL`, not `true`, so the `CASE` falls through to `ELSE value1`, which is `NULL`. Convenient, but it means `NULLIF` cannot be used to *detect* `NULL`:
+
+```sql
+SELECT NULLIF(NULL, NULL);   -- NULL, not an error
+SELECT NULLIF(col, NULL) FROM t;   -- always returns col, useless
+```
+
+For NULL-aware comparison you want `IS DISTINCT FROM`:
+
+```sql
+SELECT * FROM t WHERE a IS DISTINCT FROM b;   -- treats NULL as a comparable value
+```
+
+## Performance and indexes
+
+`NULLIF` is a cheap, immutable expression — the planner treats it as such and it adds no measurable cost. But wrapping an *indexed* column in it makes an index unusable:
+
+```sql
+-- Cannot use an index on email
+SELECT * FROM users WHERE NULLIF(email, '') = 'a@example.com';
+
+-- Can
+SELECT * FROM users WHERE email = 'a@example.com';
+```
+
+Keep `NULLIF` in the `SELECT` list and in `UPDATE ... SET`, not in `WHERE` clauses on indexed columns. If you genuinely need it in a predicate, build a matching expression index:
+
+```sql
+CREATE INDEX idx_users_email_nullif ON users (NULLIF(email, ''));
+```
+
+## Differences from other databases
+
+- **MySQL**: `NULLIF` exists and behaves identically. But MySQL's default (non-strict) mode returns `NULL` for `x / 0` instead of erroring, so ported queries often lack the guard — add it when migrating to PostgreSQL, or the query will start failing on data it used to tolerate.
+- **SQL Server**: identical semantics; `NULLIF(x, 0)` is the same standard idiom for division.
+- **Oracle**: `NULLIF` exists, and Oracle additionally treats `''` as `NULL` natively, so the empty-string use case does not arise — which is exactly why Oracle-to-Postgres migrations produce so many empty strings that should be `NULL`.
+
+## Summary
+
+Two idioms cover ninety percent of real usage:
+
+```sql
+-- Never divide by zero again
+numerator::numeric / NULLIF(denominator, 0)
+
+-- Treat '' and NULL as the same kind of missing
+coalesce(NULLIF(trim(col), ''), 'fallback')
+```
+
+Both are short, standard SQL, and both replace a `CASE` expression that would be three times longer. If you are writing analytics queries with a lot of ratios, adding `NULLIF` around every divisor is a habit that pays for itself the first time a report does not crash at 3am. A client with AI-assisted SQL like [Chat2DB](https://chat2db.ai/download) will suggest these guards as you write — it works with PostgreSQL and 20+ other databases, and runs in the browser at [app.chat2db.ai](https://app.chat2db.ai).

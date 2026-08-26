@@ -1,0 +1,276 @@
+---
+title: "PostgreSQL UPDATE: FROM, Joins, and RETURNING"
+description: "A practical guide to UPDATE in PostgreSQL: update from another table, update with join, subqueries, RETURNING, batching large updates and avoiding locks."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: August 26, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# PostgreSQL UPDATE: FROM, Joins, and RETURNING
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="August 26, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+`UPDATE` looks like the simplest statement in SQL until you need to pull values from another table, update ten million rows without locking out your application, or find out which rows actually changed. PostgreSQL's `UPDATE` has a `FROM` clause, a `RETURNING` clause, and a copy-on-write storage model that all change how you should write it. This guide walks through the forms you actually need.
+
+## The basic form
+
+```sql
+UPDATE products
+SET    price = 19.99,
+       updated_at = now()
+WHERE  sku = 'ABC-123';
+```
+
+Two things to internalise immediately:
+
+**`UPDATE` without a `WHERE` clause updates every row.** There is no confirmation prompt. In an interactive session, get in the habit of writing the `WHERE` clause first, running it as a `SELECT`, and only then changing `SELECT *` to `UPDATE ... SET`.
+
+**Every column you do not mention keeps its value.** You never need to list unchanged columns, and you should not — listing them makes the statement longer and risks writing a stale value you read earlier.
+
+You can set several columns from a row constructor, which is handy when the values come from a subquery:
+
+```sql
+UPDATE products
+SET    (price, currency) = (SELECT price, currency FROM price_list WHERE sku = products.sku)
+WHERE  sku IN ('ABC-123', 'DEF-456');
+```
+
+## UPDATE ... FROM: the join form
+
+PostgreSQL does not support `UPDATE ... JOIN` the way MySQL does. The equivalent is `UPDATE ... FROM`, and it reads almost the same:
+
+```sql
+UPDATE orders o
+SET    customer_country = c.country,
+       customer_tier    = c.tier
+FROM   customers c
+WHERE  o.customer_id = c.id
+  AND  o.customer_country IS NULL;
+```
+
+The `FROM` clause lists the *other* tables. The join condition goes in `WHERE`. The target table (`orders`) must **not** be repeated in `FROM` — if you write `FROM orders o2, customers c` you get a self-join and almost certainly the wrong answer.
+
+You can join more than one table, and you can use explicit join syntax inside `FROM`:
+
+```sql
+UPDATE order_lines ol
+SET    tax_rate = tr.rate
+FROM   orders o
+JOIN   customers c ON c.id = o.customer_id
+JOIN   tax_rates  tr ON tr.country = c.country
+WHERE  ol.order_id = o.id
+  AND  ol.tax_rate IS DISTINCT FROM tr.rate;
+```
+
+That last condition is worth copying into your habits. `IS DISTINCT FROM` is a NULL-safe `<>`: it treats `NULL` and a value as different, and `NULL` and `NULL` as the same. Adding it means rows whose value is already correct are not rewritten at all — which matters because of how Postgres stores updates.
+
+### The one-row-per-target rule
+
+If the `FROM` clause matches a target row more than once, PostgreSQL picks **one** of the matching source rows arbitrarily and applies it. It does not error, and it does not apply both. This is the single most common silent bug in `UPDATE ... FROM`.
+
+```sql
+-- customers has two rows with the same email → which one wins? Undefined.
+UPDATE orders o
+SET    customer_id = c.id
+FROM   customers c
+WHERE  o.customer_email = c.email;
+```
+
+De-duplicate the source explicitly so the result is deterministic:
+
+```sql
+UPDATE orders o
+SET    customer_id = c.id
+FROM   (
+         SELECT DISTINCT ON (email) email, id
+         FROM   customers
+         ORDER  BY email, created_at DESC   -- newest customer wins
+       ) c
+WHERE  o.customer_email = c.email;
+```
+
+## Correlated subqueries
+
+When you only set one column and the source is small, a correlated subquery is often clearer than `FROM`:
+
+```sql
+UPDATE products p
+SET    stock = (
+         SELECT coalesce(sum(quantity), 0)
+         FROM   inventory i
+         WHERE  i.sku = p.sku
+       );
+```
+
+Note the difference in behaviour: with `FROM`, target rows with no matching source row are **not** updated. With a correlated subquery, they *are* updated — to `NULL`, unless you wrap it in `coalesce` as above. That asymmetry catches people out constantly. If you want subquery semantics but only for matching rows, add an `EXISTS` guard:
+
+```sql
+UPDATE products p
+SET    stock = (SELECT sum(quantity) FROM inventory i WHERE i.sku = p.sku)
+WHERE  EXISTS (SELECT 1 FROM inventory i WHERE i.sku = p.sku);
+```
+
+## RETURNING: get the result in one round trip
+
+`RETURNING` turns `UPDATE` into a statement that produces rows. You can return the new values, computed expressions, or columns from the joined tables:
+
+```sql
+UPDATE orders
+SET    status = 'shipped',
+       shipped_at = now()
+WHERE  status = 'ready'
+  AND  warehouse_id = 7
+RETURNING id, customer_id, shipped_at;
+```
+
+This is how you implement a queue claim without a second `SELECT`:
+
+```sql
+UPDATE jobs
+SET    status = 'running',
+       started_at = now(),
+       worker_id = $1
+WHERE  id = (
+         SELECT id FROM jobs
+         WHERE  status = 'pending'
+         ORDER  BY priority DESC, created_at
+         FOR UPDATE SKIP LOCKED
+         LIMIT  1
+       )
+RETURNING id, payload;
+```
+
+`FOR UPDATE SKIP LOCKED` lets many workers claim different jobs concurrently instead of queueing behind one row lock. If the query returns no rows, the queue is empty.
+
+`RETURNING` can also show you *both* the old and new value by joining the pre-image in through `FROM`:
+
+```sql
+WITH before AS (
+  SELECT id, price FROM products WHERE category = 'books'
+)
+UPDATE products p
+SET    price = p.price * 1.05
+FROM   before b
+WHERE  p.id = b.id
+RETURNING p.id, b.price AS old_price, p.price AS new_price;
+```
+
+## Updating from a list of values
+
+To apply different values to different rows in one statement, join against a `VALUES` list:
+
+```sql
+UPDATE products p
+SET    price = v.price,
+       updated_at = now()
+FROM  (VALUES
+         ('ABC-123', 19.99::numeric),
+         ('DEF-456', 24.50),
+         ('GHI-789', 8.25)
+      ) AS v(sku, price)
+WHERE p.sku = v.sku;
+```
+
+Cast the first row's values explicitly — otherwise Postgres infers `text` or `unknown` for the whole column and you get `operator does not exist: numeric = text`.
+
+The `CASE` alternative works but scans the whole table and gets unreadable past a handful of rows:
+
+```sql
+UPDATE products
+SET price = CASE sku
+              WHEN 'ABC-123' THEN 19.99
+              WHEN 'DEF-456' THEN 24.50
+            END
+WHERE sku IN ('ABC-123', 'DEF-456');   -- the WHERE is mandatory, or everything else becomes NULL
+```
+
+## Why big updates hurt, and how to batch them
+
+PostgreSQL never modifies a row in place. An `UPDATE` writes a **new version** of the row and marks the old one dead; `VACUUM` reclaims it later. That has three consequences for a ten-million-row update:
+
+1. The table roughly doubles in size on disk until autovacuum catches up.
+2. Every index on the table is updated too, unless the update qualifies for a HOT (heap-only tuple) optimisation — which requires that no indexed column changed *and* that the page has free space.
+3. It runs in one transaction, holding a `ROW EXCLUSIVE` lock and generating a huge amount of WAL. Replicas lag; a rollback throws away hours of work.
+
+Batching fixes all three. Loop over the primary key in chunks, committing each one:
+
+```sql
+-- Run repeatedly until it reports 0 rows
+WITH batch AS (
+  SELECT id
+  FROM   events
+  WHERE  processed_at IS NULL
+  ORDER  BY id
+  LIMIT  10000
+  FOR UPDATE SKIP LOCKED
+)
+UPDATE events e
+SET    processed_at = now()
+FROM   batch b
+WHERE  e.id = b.id;
+```
+
+Driven from a shell loop with a short pause between batches, autovacuum keeps up and replication lag stays flat:
+
+```bash
+while true; do
+  n=$(psql -qtAX -d mydb -f batch.sql -c "SELECT 1")
+  rows=$(psql -qtAX -d mydb -c "SELECT count(*) FROM events WHERE processed_at IS NULL")
+  echo "remaining: $rows"
+  [ "$rows" -eq 0 ] && break
+  sleep 0.5
+done
+```
+
+For a column that is being set on *every* row, adding a new column and backfilling is often cheaper than updating in place — and on PostgreSQL 11+ adding a column with a non-volatile default is instant because the default is stored in the catalog rather than written to every row.
+
+## Locks and concurrency
+
+An `UPDATE` takes a `FOR UPDATE`-style lock on each row it touches, and holds it until the transaction commits. Two transactions updating the same rows in different orders deadlock:
+
+```sql
+-- session A                          -- session B
+BEGIN;                                BEGIN;
+UPDATE accounts SET .. WHERE id = 1;  UPDATE accounts SET .. WHERE id = 2;
+UPDATE accounts SET .. WHERE id = 2;  UPDATE accounts SET .. WHERE id = 1;
+-- ERROR: deadlock detected
+```
+
+The fix is not a retry loop (though you want one anyway) — it is to always touch rows in a consistent order, e.g. `ORDER BY id` in the subquery that selects what to update.
+
+Also keep transactions short. A transaction that updates a row and then makes an HTTP call holds that row lock for the duration of the network round trip. Do the I/O first, then open the transaction.
+
+## Checking your work
+
+Before running an `UPDATE` you cannot undo, three habits pay for themselves:
+
+```sql
+-- 1. Count what you are about to change
+SELECT count(*) FROM orders o JOIN customers c ON c.id = o.customer_id
+WHERE o.customer_country IS NULL;
+
+-- 2. Check the plan for an accidental sequential scan or nested-loop blowup
+EXPLAIN UPDATE orders o SET customer_country = c.country
+FROM customers c WHERE o.customer_id = c.id;
+
+-- 3. Run it in a transaction you can roll back
+BEGIN;
+UPDATE ...;   -- check the reported row count
+ROLLBACK;     -- or COMMIT when it matches expectations
+```
+
+That third one is the single best habit in this article. `UPDATE 4213` when you expected `UPDATE 12` tells you the join condition is wrong, and `ROLLBACK` costs nothing.
+
+If you would rather not do this from a terminal, a GUI client makes the pattern easier to follow: [Chat2DB](https://chat2db.ai/download) is a free AI-powered SQL client that previews the affected rows, explains the plan in plain language, and keeps the transaction open until you decide. It also runs in the browser at [app.chat2db.ai](https://app.chat2db.ai).
+
+## Summary
+
+- Use `UPDATE ... FROM` instead of `UPDATE ... JOIN`; the target table goes only after `UPDATE`, never in `FROM`.
+- De-duplicate the source, because a multi-match silently picks one row.
+- Add `WHERE col IS DISTINCT FROM new_value` to skip no-op writes and avoid dead tuples.
+- `RETURNING` saves a round trip and, with `FOR UPDATE SKIP LOCKED`, gives you a concurrent-safe queue.
+- Batch anything over a million rows, and touch rows in a consistent order to avoid deadlocks.
