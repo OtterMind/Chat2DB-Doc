@@ -1,0 +1,181 @@
+---
+title: "Postgres CREATE FUNCTION: SQL & PL/pgSQL by Example"
+description: "How to write PostgreSQL functions: CREATE FUNCTION syntax, SQL vs plpgsql, RETURNS TABLE, parameters and defaults, volatility, and functions vs procedures."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: August 27, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# Postgres CREATE FUNCTION: SQL & PL/pgSQL by Example
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="August 27, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+`CREATE FUNCTION` moves logic to where the data lives. Done well, it turns multi-round-trip application code into one atomic call; done carelessly, it hides slow queries behind an innocent-looking name. This guide covers the syntax that matters in practice: the two main languages (SQL and PL/pgSQL), returning scalars, rows and tables, parameter handling, volatility markers that affect performance, and how functions differ from procedures.
+
+## The anatomy of CREATE FUNCTION
+
+```sql
+CREATE OR REPLACE FUNCTION active_user_count(min_logins int DEFAULT 1)
+RETURNS bigint
+LANGUAGE sql
+STABLE
+AS $$
+  SELECT count(*) FROM users
+  WHERE  login_count >= min_logins AND deleted_at IS NULL;
+$$;
+
+SELECT active_user_count();      -- uses the default
+SELECT active_user_count(10);
+```
+
+Reading it top to bottom: a name plus typed parameters (with optional defaults), a return type, a language, an optional volatility marker, and a body wrapped in dollar-quoting (`$$ ... $$`) so you do not have to escape quotes inside it. `OR REPLACE` lets you redeploy the body without dropping dependencies — but it cannot change the return type or parameter types; that requires `DROP FUNCTION` first.
+
+## SQL functions vs PL/pgSQL functions
+
+**`LANGUAGE sql`** — the body is one or more plain SQL statements; the last statement's result is the return value. No variables, no control flow. Its superpower is **inlining**: simple SQL functions can be merged into the calling query by the planner, costing nothing at all.
+
+```sql
+CREATE FUNCTION gross(net numeric, rate numeric DEFAULT 0.19)
+RETURNS numeric
+LANGUAGE sql
+IMMUTABLE
+RETURN net * (1 + rate);   -- PG14+ compact form, dependency-tracked
+```
+
+**`LANGUAGE plpgsql`** — a real procedural language: variables, `IF`, loops, exception handling.
+
+```sql
+CREATE OR REPLACE FUNCTION transfer(from_id int, to_id int, amount numeric)
+RETURNS numeric
+LANGUAGE plpgsql
+AS $$
+DECLARE
+  new_balance numeric;
+BEGIN
+  IF amount <= 0 THEN
+    RAISE EXCEPTION 'amount must be positive, got %', amount;
+  END IF;
+
+  UPDATE accounts SET balance = balance - amount
+  WHERE  id = from_id
+  RETURNING balance INTO new_balance;
+
+  IF new_balance < 0 THEN
+    RAISE EXCEPTION 'insufficient funds on account %', from_id;
+  END IF;
+
+  UPDATE accounts SET balance = balance + amount WHERE id = to_id;
+  RETURN new_balance;
+END;
+$$;
+```
+
+A function body always runs inside the caller's transaction — if `transfer()` raises, both `UPDATE`s roll back together. That atomicity is the single best reason to put multi-statement logic in a function.
+
+Rule of thumb: use `LANGUAGE sql` whenever the body is a single expression or query (it inlines and optimizes better); reach for plpgsql when you need branching, loops, or exceptions.
+
+## Returning rows and tables
+
+Scalar returns are the simple case. Three ways to return sets:
+
+**`RETURNS TABLE`** — declare the output columns inline; the function is then queried like a table:
+
+```sql
+CREATE OR REPLACE FUNCTION top_customers(since date, limit_n int DEFAULT 10)
+RETURNS TABLE (customer_id int, customer_name text, total numeric)
+LANGUAGE sql
+STABLE
+AS $$
+  SELECT c.id, c.name, sum(o.amount)
+  FROM   customers c
+  JOIN   orders o ON o.customer_id = c.id
+  WHERE  o.created_at >= since
+  GROUP  BY c.id, c.name
+  ORDER  BY sum(o.amount) DESC
+  LIMIT  limit_n;
+$$;
+
+SELECT * FROM top_customers('2026-01-01');
+SELECT customer_name FROM top_customers('2026-06-01', 3) WHERE total > 1000;
+```
+
+**`RETURNS SETOF existing_table`** — return whole rows of a known table type.
+
+**`OUT` parameters** — equivalent to `RETURNS TABLE`, slightly older style:
+
+```sql
+CREATE FUNCTION order_stats(OUT order_count bigint, OUT revenue numeric)
+LANGUAGE sql STABLE
+AS $$ SELECT count(*), coalesce(sum(amount), 0) FROM orders $$;
+```
+
+In plpgsql set-returning functions, produce rows with `RETURN QUERY` (append a query's result) or `RETURN NEXT` (append one row inside a loop).
+
+## Volatility: the marker everyone forgets
+
+Every function is `VOLATILE`, `STABLE`, or `IMMUTABLE` — and the default, `VOLATILE`, is the worst for performance:
+
+- **`IMMUTABLE`** — same inputs, same output, forever (pure math/formatting). Can be pre-evaluated at plan time and used in index expressions.
+- **`STABLE`** — same output within one statement (reads tables but does not change them). Evaluated once per statement instead of once per row.
+- **`VOLATILE`** — may do anything (`random()`, `now()` per-call semantics, writes). Re-evaluated on every row, and blocks many optimizations.
+
+Marking a read-only helper `STABLE` can be the difference between one execution and a million. But do not lie: an `IMMUTABLE` function that actually reads a table gives wrong-but-cached results and corrupts index expressions built on it.
+
+Also useful: `STRICT` (return NULL immediately if any argument is NULL, skipping the body) and `SECURITY DEFINER` (run with the owner's privileges — set a safe `search_path` when you use it: `SET search_path = pg_catalog, pg_temp`).
+
+## Function vs procedure
+
+Since PostgreSQL 11 there are also procedures:
+
+```sql
+CREATE PROCEDURE archive_old_orders(cutoff date)
+LANGUAGE plpgsql
+AS $$
+BEGIN
+  LOOP
+    DELETE FROM orders
+    WHERE  ctid IN (SELECT ctid FROM orders
+                    WHERE created_at < cutoff LIMIT 10000);
+    EXIT WHEN NOT FOUND;
+    COMMIT;   -- procedures may commit; functions may not
+  END LOOP;
+END;
+$$;
+
+CALL archive_old_orders('2024-01-01');
+```
+
+The differences: procedures are invoked with `CALL`, return nothing, and — crucially — can `COMMIT`/`ROLLBACK` inside, which makes them the right tool for batch jobs that should not hold one giant transaction. Functions return values, compose inside queries (`SELECT f(x) FROM ...`), and always run atomically within the calling statement's transaction. If it computes, make it a function; if it orchestrates batches, make it a procedure.
+
+## Managing and inspecting functions
+
+```sql
+-- Find a function and see its definition
+\df+ transfer                              -- psql
+SELECT pg_get_functiondef('transfer(int,int,numeric)'::regprocedure);
+
+-- Drop (must name parameter types if overloaded)
+DROP FUNCTION IF EXISTS transfer(int, int, numeric);
+
+-- Grant execution to the app role only
+REVOKE EXECUTE ON FUNCTION transfer(int,int,numeric) FROM PUBLIC;
+GRANT  EXECUTE ON FUNCTION transfer(int,int,numeric) TO app_rw;
+```
+
+Note that PostgreSQL supports **overloading** — `transfer(int, int, numeric)` and `transfer(uuid, uuid, numeric)` are different functions — which is why `DROP FUNCTION transfer;` fails with "function name is not unique" when overloads exist.
+
+For iterating on function bodies, a client with a decent editor beats psql's `\e`. [Chat2DB](https://chat2db.ai/download) (free, with a browser version at [app.chat2db.ai](https://app.chat2db.ai/)) shows functions in the schema tree with their definitions, and its AI assistant is good at the fiddly parts — generating a `RETURNS TABLE` signature to match an existing query, or explaining why the planner did not inline something.
+
+## Pitfalls checklist
+
+- **Cannot change a return type with `OR REPLACE`** — drop and recreate, inside one transaction to avoid a window where the function is missing.
+- **plpgsql variable shadowing** — a variable named like a column makes `WHERE id = id` always true. Prefix parameters (`p_id`) or use `#variable_conflict error`.
+- **Set-returning function in a WHERE clause** — `WHERE id IN (SELECT * FROM f())`, not `WHERE id = f()`.
+- **Default `VOLATILE` on read-only helpers** — mark them `STABLE`.
+- **`SECURITY DEFINER` without `SET search_path`** — a privilege-escalation classic.
+
+Functions are PostgreSQL's unit of reusable, atomic logic. Start with single-purpose `LANGUAGE sql` helpers marked `STABLE` or `IMMUTABLE`, graduate to plpgsql when you need control flow, and reach for procedures when the job is batch orchestration — that division keeps both the planner and the next maintainer happy.

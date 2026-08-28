@@ -1,0 +1,198 @@
+---
+title: "Postgres Helm Chart: Deploy PostgreSQL on Kubernetes"
+description: "Deploy PostgreSQL on Kubernetes with the Bitnami Helm chart: install, values.yaml, persistence, HA replication, backups, and when to use an operator."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: August 27, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# Postgres Helm Chart: Deploy PostgreSQL on Kubernetes
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="August 27, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+A Helm chart is the fastest route to PostgreSQL on Kubernetes: one command gives you a StatefulSet, a persistent volume, a Service and a generated password. It is also easy to deploy something that loses data on the first node failure. This guide walks through the Bitnami PostgreSQL chart — the de facto standard — with production-minded values, covers the HA variant, and is honest about when you should skip Helm charts entirely and use an operator like CloudNativePG instead.
+
+## Quick start
+
+```bash
+helm repo add bitnami https://charts.bitnami.com/bitnami
+helm repo update
+
+helm install my-postgres bitnami/postgresql \
+  --namespace db --create-namespace
+```
+
+What this creates:
+
+- A **StatefulSet** with one pod (`my-postgres-postgresql-0`) running the PostgreSQL image
+- A **PersistentVolumeClaim** (8Gi by default) holding `PGDATA`
+- A ClusterIP **Service** `my-postgres-postgresql.db.svc.cluster.local:5432`
+- A **Secret** with a generated password for the `postgres` superuser
+
+Retrieve the password and connect from inside the cluster:
+
+```bash
+export POSTGRES_PASSWORD=$(kubectl get secret --namespace db \
+  my-postgres-postgresql -o jsonpath="{.data.postgres-password}" | base64 -d)
+
+kubectl run pg-client --rm -it --namespace db \
+  --image bitnami/postgresql --env="PGPASSWORD=$POSTGRES_PASSWORD" -- \
+  psql -h my-postgres-postgresql -U postgres
+```
+
+For access from your laptop, port-forward:
+
+```bash
+kubectl port-forward --namespace db svc/my-postgres-postgresql 5432:5432
+```
+
+Then any client on `localhost:5432` works — for example [Chat2DB](https://chat2db.ai/download) (free; or the browser version at [app.chat2db.ai](https://app.chat2db.ai/)) to inspect schemas and run queries against the in-cluster database.
+
+## A values.yaml worth deploying
+
+The defaults are a demo. This is a reasonable single-instance production baseline:
+
+```yaml
+# values.yaml
+auth:
+  enablePostgresUser: true
+  existingSecret: my-postgres-credentials   # don't let Helm generate/rotate passwords
+  database: app_db
+  username: app_user
+
+primary:
+  resources:
+    requests: { cpu: "1",  memory: 2Gi }
+    limits:   { cpu: "2",  memory: 2Gi }   # memory limit = request avoids OOM surprises
+  persistence:
+    enabled: true
+    size: 50Gi
+    storageClass: fast-ssd                  # a real SSD class, not the cluster default
+  extendedConfiguration: |
+    max_connections = 200
+    shared_buffers = 512MB
+    wal_level = replica
+  podAntiAffinity: {}                       # see HA section
+
+metrics:
+  enabled: true                             # postgres_exporter sidecar for Prometheus
+
+volumePermissions:
+  enabled: true                             # fixes fsGroup issues on some storage classes
+```
+
+```bash
+kubectl create secret generic my-postgres-credentials --namespace db \
+  --from-literal=postgres-password='<superuser-pw>' \
+  --from-literal=password='<app-user-pw>'
+
+helm upgrade --install my-postgres bitnami/postgresql \
+  --namespace db -f values.yaml
+```
+
+Three of these settings save real pain:
+
+- **`existingSecret`** — otherwise `helm upgrade` on a chart that regenerates secrets can leave the running database and the Secret out of sync, and the app locks itself out.
+- **`persistence.storageClass`** — databases on network-attached default storage (or worse, `emptyDir` when persistence is off) are how data disappears.
+- **`extendedConfiguration`** — the chart's PostgreSQL defaults are stock; at minimum size `shared_buffers` to ~25% of the pod's memory limit.
+
+## Upgrades and version pinning
+
+Pin both chart and app versions in automation:
+
+```bash
+helm upgrade --install my-postgres bitnami/postgresql \
+  --version 16.7.27 \
+  --set image.tag=17.5.0-debian-12-r0 \
+  -f values.yaml
+```
+
+Two warnings from the trenches:
+
+1. **Never let a chart bump cross a PostgreSQL major version silently.** The data directory will not start under the new binary (`database files are incompatible with server`), and the pod crash-loops. Major upgrades need `pg_upgrade` or dump/restore — do them deliberately.
+2. Bitnami moved older image tags to a legacy repository in 2025; if pulls start failing, check `image.repository` — the charts themselves continue to work, but unpinned setups broke when tags moved.
+
+## High availability options
+
+The single-instance chart restarts the pod on failure — with a good storage class that means a minute or two of downtime, which is acceptable for many internal services. When it is not, you have two Helm-native options:
+
+**Chart-level replication** (same `bitnami/postgresql` chart):
+
+```yaml
+architecture: replication
+readReplicas:
+  replicaCount: 2
+  persistence:
+    size: 50Gi
+primary:
+  podAntiAffinity:
+    type: hard        # never schedule primary and replicas on the same node
+```
+
+This gives you streaming replicas and a read Service — but **failover is manual**: if the primary pod's node dies, a human promotes a replica.
+
+**`bitnami/postgresql-ha` chart** — adds repmgr for automatic failover and Pgpool-II for connection routing. It works, but you are now operating three moving systems configured through one values file, and debugging split-brain or Pgpool quirks is on you.
+
+**The honest recommendation:** if you need automatic failover, use a Kubernetes **operator** instead of a Helm chart — CloudNativePG (CNCF), Zalando's postgres-operator, or Crunchy PGO. Operators treat replication, failover, switchover and backups as first-class reconciled state rather than templated config. A minimal CloudNativePG cluster is barely more YAML than the chart values above and handles node loss without a human. Use the plain Helm chart for dev, CI, and small single-instance workloads; use an operator when the database is critical.
+
+## Backups
+
+A PVC is not a backup — it dies with the storage class, the namespace deletion, or the fat-fingered `helm uninstall`. Minimum viable backup via CronJob:
+
+```yaml
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: pg-dump
+  namespace: db
+spec:
+  schedule: "0 2 * * *"
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          restartPolicy: OnFailure
+          containers:
+            - name: dump
+              image: bitnami/postgresql:17
+              command: ["/bin/sh", "-c"]
+              args:
+                - pg_dump -h my-postgres-postgresql -U app_user -d app_db -Fc
+                  -f /backup/app_db_$(date +%Y%m%d).dump
+              env:
+                - name: PGPASSWORD
+                  valueFrom:
+                    secretKeyRef: { name: my-postgres-credentials, key: password }
+              volumeMounts: [{ name: backup, mountPath: /backup }]
+          volumes:
+            - name: backup
+              persistentVolumeClaim: { claimName: pg-backup-pvc }
+```
+
+Better: ship dumps to object storage, or — another point for operators — CloudNativePG and PGO do continuous WAL archiving to S3 with point-in-time recovery as a config stanza.
+
+## Resizing the volume later
+
+Disk fills up eventually, and StatefulSet PVCs do not resize through `helm upgrade` alone. If the storage class has `allowVolumeExpansion: true`, edit the PVC directly:
+
+```bash
+kubectl patch pvc data-my-postgres-postgresql-0 --namespace db \
+  -p '{"spec":{"resources":{"requests":{"storage":"100Gi"}}}}'
+```
+
+Then update `primary.persistence.size` in `values.yaml` to match so future installs agree with reality. Filesystem expansion happens online on most CSI drivers; `kubectl get pvc -w` shows when the new capacity lands. If the storage class does not allow expansion, the path is: backup, create a bigger PVC, restore — one more reason the backup CronJob above is not optional.
+
+## Troubleshooting quick hits
+
+- **Pod `Pending`** — no PV could be bound: `kubectl describe pvc` in the namespace; usually a missing/mistyped `storageClass`.
+- **CrashLoop with `password authentication failed` after reinstall** — old PVC retained the previous password; either reuse the original secret or delete the PVC (data loss!) for a fresh init.
+- **`chmod: changing permissions ... Operation not permitted`** — storage class ignores fsGroup; set `volumePermissions.enabled: true`.
+- **Replica pods stuck `remaining connection slots are reserved`** — raise `max_connections` in `extendedConfiguration`; replication and metrics consume slots too.
+
+## Summary
+
+`helm install bitnami/postgresql` is a legitimate way to run PostgreSQL on Kubernetes when you add four things: an existing secret, a real storage class with enough space, tuned `extendedConfiguration`, and scheduled backups off-cluster. Pin your versions, never cross a major version by accident, and the single-instance chart will serve dev and modest production loads well. The moment the requirement becomes "survives node failure without a human", move to CloudNativePG or another operator — that is the tool actually designed for that job.

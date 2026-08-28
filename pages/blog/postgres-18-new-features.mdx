@@ -1,0 +1,160 @@
+---
+title: "PostgreSQL 18 New Features: What Changed vs Postgres 17"
+description: "PostgreSQL 18 explained: async I/O, B-tree skip scan, uuidv7(), virtual generated columns, OAuth login, faster upgrades — and whether to upgrade from 17."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: August 27, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# PostgreSQL 18 New Features: What Changed vs Postgres 17
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="August 27, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+PostgreSQL 18 shipped in September 2025, and after nearly a year of minor releases it is now the version new projects should default to. It is an unusually infrastructure-heavy release: the headline change is a new asynchronous I/O subsystem that speeds up the reads almost every workload depends on, alongside quality-of-life SQL features like `uuidv7()`, virtual generated columns and temporal constraints. This post walks through what actually matters when comparing Postgres 17 vs 18, with runnable examples.
+
+## Asynchronous I/O: the headline change
+
+Every prior PostgreSQL issued synchronous, one-block-at-a-time read requests and leaned on the OS to prefetch intelligently. PostgreSQL 18 introduces a real async I/O layer controlled by `io_method`:
+
+```ini
+# postgresql.conf
+io_method = worker     # default: background I/O worker processes
+#io_method = io_uring  # Linux 5.1+: kernel async I/O, lowest overhead
+#io_method = sync      # pre-18 behaviour, the escape hatch
+```
+
+Sequential scans, bitmap heap scans and VACUUM issue batched, overlapping reads. On cloud storage — where individual read latency is high but parallel throughput is plentiful — benchmarks routinely show **2–3× faster sequential scans**. Check what a running server uses:
+
+```sql
+SHOW io_method;
+SELECT * FROM pg_aios;   -- in-flight async I/O requests (new view)
+```
+
+You do not need to change queries to benefit; this is a free upgrade for scan-heavy and analytics workloads.
+
+## B-tree skip scan
+
+Before 18, a multicolumn index on `(tenant_id, created_at)` was useless for a query that filtered only on `created_at`. PostgreSQL 18's skip scan can use the index anyway when the leading column has few distinct values:
+
+```sql
+CREATE INDEX orders_tenant_created_idx ON orders (tenant_id, created_at);
+
+-- PG17: sequential scan. PG18: index skip scan.
+EXPLAIN SELECT * FROM orders WHERE created_at >= now() - interval '1 day';
+```
+
+Internally it iterates over each distinct `tenant_id` and range-scans within it. This removes a whole class of "we need a second index just for this filter" duplication — fewer indexes, less write amplification.
+
+## uuidv7(): time-ordered UUIDs, finally built in
+
+Random UUIDv4 primary keys scatter inserts across the whole B-tree, causing cache misses and index bloat. UUIDv7 embeds a millisecond timestamp in the high bits, so new keys are nearly sequential:
+
+```sql
+CREATE TABLE events (
+  id      uuid PRIMARY KEY DEFAULT uuidv7(),
+  payload jsonb NOT NULL
+);
+
+SELECT uuidv7();
+-- 019930a1-8f2c-7cc3-9f1e-4a5b6c7d8e9f  (sortable by creation time)
+
+-- Extract the embedded timestamp
+SELECT uuid_extract_timestamp(uuidv7());
+```
+
+Before 18 this needed the `pg_uuidv7` extension or application-side generation. Now it is one function, and it is the right default for new UUID primary keys.
+
+## Virtual generated columns
+
+Generated columns arrived in PostgreSQL 12, but only `STORED` — computed at write time and occupying disk. PostgreSQL 18 adds `VIRTUAL`, computed at read time, **and makes it the default**:
+
+```sql
+CREATE TABLE products (
+  price_cents int NOT NULL,
+  tax_rate    numeric NOT NULL DEFAULT 0.19,
+  gross_cents numeric GENERATED ALWAYS AS (price_cents * (1 + tax_rate)) -- VIRTUAL by default
+);
+
+-- Explicitly stored, as before:
+-- gross_cents numeric GENERATED ALWAYS AS (...) STORED
+```
+
+Virtual columns cost nothing on write and no disk space; stored ones remain the choice when you need to index the computed value. Watch this in migrations: DDL written for 17 that relied on the old implicit `STORED` behaviour must now say it explicitly.
+
+## RETURNING old and new rows
+
+`UPDATE ... RETURNING` in 17 could only return the new row. 18 exposes both:
+
+```sql
+UPDATE accounts
+SET    balance = balance - 100
+WHERE  id = 42
+RETURNING old.balance AS before, new.balance AS after;
+
+--  before | after
+-- --------+-------
+--    500  |  400
+```
+
+This turns audit-style "log what changed" statements into a single round trip — previously you needed a CTE re-reading the row or a trigger.
+
+## Temporal constraints: WITHOUT OVERLAPS
+
+Booking-style schemas can now enforce "no overlapping ranges per key" declaratively:
+
+```sql
+CREATE TABLE room_bookings (
+  room_id int,
+  during  tstzrange,
+  PRIMARY KEY (room_id, during WITHOUT OVERLAPS)
+);
+
+INSERT INTO room_bookings VALUES (1, '[2026-09-01 10:00, 2026-09-01 12:00)');
+INSERT INTO room_bookings VALUES (1, '[2026-09-01 11:00, 2026-09-01 13:00)');
+-- ERROR: conflicting key value violates exclusion constraint
+```
+
+The same worked in 17 via a manual `EXCLUDE USING gist` constraint with `btree_gist`; 18 makes it standard SQL:2011 syntax, and foreign keys gain a matching `PERIOD` form.
+
+## Faster, statistics-preserving pg_upgrade
+
+Two upgrade pain points disappear in 18:
+
+- `pg_upgrade` now **carries planner statistics over**, so you no longer face a post-upgrade window of terrible query plans while `ANALYZE` rebuilds everything from scratch.
+- A new `--swap` mode moves data directories into place instead of copying/linking, making upgrades of large clusters dramatically faster. `--jobs` parallelism also improved.
+
+This matters for 17 → 18 itself: the upgrade downtime story is the best it has ever been.
+
+## OAuth 2.0 authentication
+
+`pg_hba.conf` gains an `oauth` method: clients present a bearer token from your identity provider instead of a password, validated by a server-side validator module. Together with SCRAM this finally lets enterprises put PostgreSQL logins behind the same SSO as everything else — no more shared service passwords.
+
+## Smaller but notable
+
+- **EXPLAIN ANALYZE shows buffers by default** — no more remembering `(BUFFERS)`; it also reports index lookup counts and CPU/WAL details with `VERBOSE`.
+- **Parallel GIN index builds** — big JSONB/full-text indexes build much faster.
+- **Data checksums on by default** in new `initdb` clusters — silent corruption gets detected instead of propagated.
+- **`ONLY` in VACUUM/ANALYZE** for partitioned parents, and autovacuum can now analyze partition parents automatically.
+- **Protocol 3.2** — the first wire-protocol bump in years, groundwork for future features (fully backward compatible).
+
+## Postgres 17 vs 18: should you upgrade?
+
+| Area | PostgreSQL 17 | PostgreSQL 18 |
+| --- | --- | --- |
+| Read I/O | Synchronous, OS prefetch | Async (`worker`/`io_uring`), 2–3× faster scans |
+| Multicolumn index, non-leading filter | Not used | Skip scan |
+| Time-ordered UUIDs | Extension needed | `uuidv7()` built in |
+| Generated columns | `STORED` only | `VIRTUAL` (default) + `STORED` |
+| UPDATE RETURNING | New values only | `old.*` and `new.*` |
+| Upgrade statistics | Lost, re-ANALYZE needed | Preserved |
+| SSO login | LDAP/Kerberos/RADIUS | + OAuth 2.0 |
+
+Practical guidance: new projects should start on 18 without hesitation. Existing 17 clusters should schedule the upgrade opportunistically — 17 is supported until late 2029, so there is no urgency, but the async I/O gains alone justify it for I/O-bound workloads, and the statistics-preserving `pg_upgrade` makes the window shorter than any previous major upgrade. Test `io_method = io_uring` on Linux staging before enabling it in production; the `worker` default is the safe choice.
+
+A quick way to explore a new 18 instance — run `EXPLAIN` plans, compare query timing before and after, inspect the new catalog views like `pg_aios` — is [Chat2DB](https://chat2db.ai/download), a free AI database client that speaks fluent PostgreSQL and can explain unfamiliar plan nodes (like skip scans) in plain language. The web version at [app.chat2db.ai](https://app.chat2db.ai/) works without installing anything.
+
+PostgreSQL 18 is not a flashy release — it is a faster, easier-to-operate one. Those tend to be the versions people stay on the longest.

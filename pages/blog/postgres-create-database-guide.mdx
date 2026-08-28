@@ -1,0 +1,216 @@
+---
+title: "Postgres CREATE DATABASE: Syntax, Options & Common Errors"
+description: "How to create a database in PostgreSQL: CREATE DATABASE syntax, owner, encoding, locale and template options, createdb, and fixes for common errors."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: August 27, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# Postgres CREATE DATABASE: Syntax, Options & Common Errors
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="August 27, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+`CREATE DATABASE` looks like the simplest statement in PostgreSQL, and in the happy path it is. But the options you pick at creation time — owner, encoding, locale, template — are some of the hardest things to change later, and a handful of errors (`permission denied to create database`, `source database "template1" is being accessed by other users`, `new collation is incompatible`) trip up almost everyone at some point. This guide covers the syntax, the options that actually matter, and the fixes.
+
+## The basic statement
+
+```sql
+CREATE DATABASE app_db;
+```
+
+That creates a database named `app_db` owned by the role that ran the statement, cloned from the `template1` template database, with the encoding and locale the cluster was initialized with.
+
+A production-grade version is more explicit:
+
+```sql
+CREATE DATABASE app_db
+  OWNER      app_owner
+  ENCODING   'UTF8'
+  LC_COLLATE 'en_US.UTF-8'
+  LC_CTYPE   'en_US.UTF-8'
+  TEMPLATE   template0
+  CONNECTION LIMIT -1;
+```
+
+Two rules before anything else:
+
+- `CREATE DATABASE` cannot run inside a transaction block. If your migration tool wraps everything in `BEGIN ... COMMIT`, database creation has to happen outside it. Attempting it inside a transaction fails with `ERROR: CREATE DATABASE cannot run inside a transaction block`.
+- You need the `CREATEDB` privilege or superuser. Grant it with `ALTER ROLE deploy_user CREATEDB;`.
+
+## Creating the database and its owner together
+
+The most common real-world sequence is a database plus a dedicated role that owns it:
+
+```sql
+CREATE ROLE app_owner LOGIN PASSWORD 'change-me';
+CREATE DATABASE app_db OWNER app_owner;
+
+-- Lock down public access (PostgreSQL 15+ already restricts the public schema)
+REVOKE ALL ON DATABASE app_db FROM PUBLIC;
+GRANT  CONNECT ON DATABASE app_db TO app_owner;
+```
+
+On PostgreSQL 14 and earlier, also revoke the legacy `public` schema write access after connecting to the new database:
+
+```sql
+\c app_db
+REVOKE CREATE ON SCHEMA public FROM PUBLIC;
+```
+
+Verify the result:
+
+```sql
+SELECT datname, pg_get_userbyid(datdba) AS owner,
+       pg_encoding_to_char(encoding)   AS encoding,
+       datcollate, datctype
+FROM   pg_database
+WHERE  datname = 'app_db';
+```
+
+## Encoding and locale: decide once, live with it forever
+
+`ENCODING`, `LC_COLLATE` and `LC_CTYPE` are fixed at creation time. Changing them later means dump, drop, recreate, restore. The safe defaults in 2026 are simple:
+
+- **Encoding**: `UTF8`, always. There is no good reason for `SQL_ASCII` or `LATIN1` in a new database.
+- **Collation**: `en_US.UTF-8` (or your language's UTF-8 locale) for human-friendly sorting, or `C` for byte-order sorting that is faster and immune to OS locale-version changes.
+
+The catch: if the template database's locale differs from what you request, you must clone from `template0`:
+
+```sql
+CREATE DATABASE app_db
+  ENCODING   'UTF8'
+  LC_COLLATE 'C'
+  LC_CTYPE   'C'
+  TEMPLATE   template0;
+```
+
+Requesting a different locale while cloning `template1` fails with `ERROR: new collation (C) is incompatible with the collation of the template database (en_US.UTF-8)`. `template0` is the pristine, never-modified template that accepts any compatible locale; `template1` is the default template that may already contain locale-dependent objects.
+
+PostgreSQL 15+ also supports ICU collations, which behave consistently across operating systems:
+
+```sql
+CREATE DATABASE app_db
+  TEMPLATE        template0
+  LOCALE_PROVIDER icu
+  ICU_LOCALE      'en-US'
+  LC_COLLATE      'en_US.UTF-8'
+  LC_CTYPE        'en_US.UTF-8';
+```
+
+## Using templates as database seeds
+
+Any database can be a template. This is a cheap way to stamp out pre-seeded databases — for example in test suites:
+
+```sql
+-- Prepare a seed database once
+CREATE DATABASE test_seed;
+-- ... run migrations and load fixtures into test_seed ...
+
+-- Each test worker gets a fast copy
+CREATE DATABASE test_worker_1 TEMPLATE test_seed;
+CREATE DATABASE test_worker_2 TEMPLATE test_seed;
+```
+
+Cloning copies the files directly, which is far faster than replaying migrations. The constraint: **nobody may be connected to the template while it is being cloned**, or you get `ERROR: source database "test_seed" is being accessed by other users`. Kick connections first:
+
+```sql
+SELECT pg_terminate_backend(pid)
+FROM   pg_stat_activity
+WHERE  datname = 'test_seed' AND pid <> pg_backend_pid();
+```
+
+## createdb: the shell equivalent
+
+`createdb` ships with PostgreSQL and is a thin wrapper around `CREATE DATABASE`:
+
+```bash
+createdb --owner=app_owner --encoding=UTF8 --template=template0 app_db
+
+# equivalent to psql -c 'CREATE DATABASE ...'
+```
+
+It is convenient in provisioning scripts because it returns a non-zero exit code on failure and reads standard `PG*` environment variables (`PGHOST`, `PGUSER`, `PGPASSWORD`).
+
+## Common errors and their fixes
+
+**`ERROR: permission denied to create database`** — your role lacks `CREATEDB`:
+
+```sql
+ALTER ROLE deploy_user CREATEDB;
+```
+
+**`ERROR: database "app_db" already exists`** — PostgreSQL has no `CREATE DATABASE IF NOT EXISTS`. The standard workaround runs the creation conditionally from the shell:
+
+```bash
+psql -tAc "SELECT 1 FROM pg_database WHERE datname = 'app_db'" | grep -q 1 \
+  || createdb app_db
+```
+
+Or in SQL via `\gexec` in psql:
+
+```sql
+SELECT 'CREATE DATABASE app_db'
+WHERE NOT EXISTS (SELECT FROM pg_database WHERE datname = 'app_db')\gexec
+```
+
+**`ERROR: source database "template1" is being accessed by other users`** — some session (often a connection pooler or a GUI) is sitting on `template1`. Find and terminate it:
+
+```sql
+SELECT pid, usename, application_name FROM pg_stat_activity WHERE datname = 'template1';
+SELECT pg_terminate_backend(pid) FROM pg_stat_activity
+WHERE  datname = 'template1' AND pid <> pg_backend_pid();
+```
+
+Configure your pooler to never use `template1` as its maintenance database.
+
+**`CREATE DATABASE cannot run inside a transaction block`** — run it with autocommit, outside `BEGIN`. In migration frameworks, mark the migration as non-transactional (Flyway: a `.sql` file with `-- flyway:executeInTransaction=false`; Alembic: `op.execute` with `autocommit_block`).
+
+## Renaming, reassigning, dropping
+
+These are `ALTER`/`DROP` companions you will need eventually:
+
+```sql
+-- Rename (no connections allowed on the target)
+ALTER DATABASE app_db RENAME TO app_db_old;
+
+-- Change owner
+ALTER DATABASE app_db OWNER TO new_owner;
+
+-- Limit connections (0 = block new connections, useful before maintenance)
+ALTER DATABASE app_db CONNECTION LIMIT 200;
+
+-- Drop, kicking out active sessions first (PostgreSQL 13+)
+DROP DATABASE app_db WITH (FORCE);
+```
+
+`WITH (FORCE)` terminates existing connections instead of failing with `database is being accessed by other users` — the pre-13 alternative is the `pg_terminate_backend` query shown earlier.
+
+## Checking what exists
+
+```sql
+-- All databases with size and owner
+SELECT d.datname,
+       pg_get_userbyid(d.datdba)                  AS owner,
+       pg_size_pretty(pg_database_size(d.datname)) AS size
+FROM   pg_database d
+WHERE  NOT d.datistemplate
+ORDER  BY pg_database_size(d.datname) DESC;
+```
+
+In psql, `\l+` prints the same list. If you prefer a GUI, [Chat2DB](https://chat2db.ai/download) shows every database in the cluster with its schemas and objects in a tree, and its AI assistant can generate statements like the conditional-create pattern above from a plain-English prompt — there is also a browser version at [app.chat2db.ai](https://app.chat2db.ai/) that needs no install.
+
+## A provisioning checklist
+
+For every new production database:
+
+1. `CREATE ROLE app_owner LOGIN` — a dedicated owner, not `postgres`.
+2. `CREATE DATABASE ... OWNER app_owner ENCODING 'UTF8' TEMPLATE template0` with an explicit locale.
+3. `REVOKE ALL ON DATABASE ... FROM PUBLIC; GRANT CONNECT` to the roles that need it.
+4. Create separate `app_rw` / `app_ro` roles for the application and analysts rather than connecting as the owner.
+5. Record the locale settings somewhere — they are the one thing a future major-version upgrade or replica rebuild must reproduce exactly.
+
+Get those five right on day one and you will never need the painful dump-and-recreate cycle that fixing encoding or ownership later requires.

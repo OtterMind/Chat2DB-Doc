@@ -1,0 +1,129 @@
+---
+title: "Postgres Checkpoints & the Checkpointer: A Tuning Guide"
+description: "What PostgreSQL checkpoints do, how the checkpointer works, tuning checkpoint_timeout, max_wal_size and completion_target, and diagnosing I/O spikes."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: August 27, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# Postgres Checkpoints & the Checkpointer: A Tuning Guide
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="August 27, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+Every few minutes, a background process called the **checkpointer** flushes all modified data pages from PostgreSQL's shared buffers to disk. Tuned badly, it is the invisible cause of two very visible problems: periodic latency spikes that line up suspiciously with a clock, and painfully long crash recovery. Tuned well, nobody ever thinks about it. This guide explains what checkpoints actually do, how to read the checkpointer's statistics, and which of the handful of settings are worth changing.
+
+## What a checkpoint is
+
+PostgreSQL writes data changes twice: first to the write-ahead log (WAL, sequential and fast, flushed at commit), and later to the actual table and index files (random I/O, deferred). Dirty pages accumulate in `shared_buffers` until a checkpoint writes them all out and records: *"everything up to WAL position X is safely in the data files."*
+
+That position is where crash recovery starts. The two consequences drive all tuning:
+
+- **Checkpoints cost I/O now.** Writing gigabytes of dirty pages competes with your queries.
+- **Checkpoint spacing costs recovery time later.** After a crash, PostgreSQL replays all WAL since the last completed checkpoint. Checkpoints every 30 minutes can mean many minutes of replay before the database accepts connections.
+
+There is a third, sneakier cost: **full-page writes**. After each checkpoint, the first modification of every page writes the entire 8 kB page into WAL (torn-page protection). Frequent checkpoints therefore inflate WAL volume dramatically — often the dominant effect on busy systems.
+
+## When checkpoints happen
+
+Two triggers, and telling them apart is the whole diagnostic game:
+
+1. **Timed** — every `checkpoint_timeout` (default 5 minutes). This is the healthy kind.
+2. **Requested (WAL-pressure)** — WAL since the last checkpoint approached `max_wal_size` (default 1 GB). The checkpointer starts early and hurries. This is the kind that causes latency spikes.
+
+Check which kind you are getting (PostgreSQL 15+; on 17+ this data moved to its own view):
+
+```sql
+-- PostgreSQL 17+
+SELECT num_timed, num_requested,
+       write_time, sync_time, buffers_written
+FROM   pg_stat_checkpointer;
+
+-- PostgreSQL 15/16: same counters on pg_stat_bgwriter
+-- SELECT checkpoints_timed, checkpoints_req FROM pg_stat_bgwriter;
+```
+
+**Rule of thumb: `num_requested` should be a small fraction of `num_timed`.** If requested checkpoints dominate, `max_wal_size` is too small for your write rate — the most common checkpoint misconfiguration in the wild.
+
+Also turn on checkpoint logging; it is low-volume and pure gold:
+
+```sql
+ALTER SYSTEM SET log_checkpoints = on;   -- default on since PG15
+SELECT pg_reload_conf();
+```
+
+```
+LOG: checkpoint starting: wal
+LOG: checkpoint complete: wrote 41285 buffers (25.2%); ...
+     write=239.812 s, sync=1.021 s, total=241.1 s;
+     distance=1027 MB, estimate=1027 MB
+```
+
+`starting: wal` means WAL-pressure; `starting: time` means timed. A steady stream of `starting: wal` lines confirms the diagnosis.
+
+## The four settings that matter
+
+```sql
+ALTER SYSTEM SET checkpoint_timeout = '15min';          -- default 5min
+ALTER SYSTEM SET max_wal_size = '8GB';                  -- default 1GB
+ALTER SYSTEM SET checkpoint_completion_target = 0.9;    -- default since PG14
+ALTER SYSTEM SET min_wal_size = '1GB';
+SELECT pg_reload_conf();   -- all four are reloadable
+```
+
+**`checkpoint_timeout`** — how far apart timed checkpoints are. Raising it from 5 to 15–30 minutes reduces total I/O (pages dirtied repeatedly get written once, not several times) and slashes full-page-write WAL volume. The price is longer crash recovery. 15 minutes is a sane production default; go to 30 if your recovery-time objective allows.
+
+**`max_wal_size`** — the WAL budget between checkpoints. Size it so your normal write rate fits inside `checkpoint_timeout` without triggering early. Estimate your WAL rate:
+
+```sql
+-- Run twice, a few minutes apart, and compute MB/minute
+SELECT pg_current_wal_lsn();
+SELECT pg_size_pretty(pg_wal_lsn_diff('0/9B3A1C80', '0/8F000000'));  -- later - earlier
+```
+
+If you generate 300 MB/min and want 15-minute checkpoints, you need max_wal_size comfortably above 4.5 GB — say 8 GB, since it is a soft limit and spikes happen. Disk cost: WAL directory will actually use up to roughly that size. This is not "wasted" space; it is buying smooth I/O.
+
+**`checkpoint_completion_target = 0.9`** — spread the writes over 90% of the interval instead of blasting them out at the start. It is the default since PostgreSQL 14; on older versions still at 0.5, raise it. This single setting is why modern checkpoints are a gentle slope rather than a cliff.
+
+**`min_wal_size`** — how much WAL to recycle rather than delete during quiet periods; mostly matters for avoiding file-creation churn on bursty workloads.
+
+## Diagnosing "latency spikes every N minutes"
+
+The classic symptom: p99 latency jumps on a regular period. Confirm it is checkpoints, not something else:
+
+1. `log_checkpoints = on`, then line up spike timestamps with `checkpoint complete` lines.
+2. Check `sync=` in the log line. Large sync times (seconds) mean the OS accumulated too much dirty data and fsync flushed it all at once — on Linux, lowering `vm.dirty_background_bytes` (e.g. to 256 MB) makes the kernel write earlier and smoother.
+3. Check the `wrote N buffers (X%)` figure. Consistently huge percentages with small `shared_buffers` may mean `shared_buffers` is undersized for the working set, pushing flush work around the system.
+
+Then apply the standard fix — longer `checkpoint_timeout`, bigger `max_wal_size` — and verify with before/after numbers from `pg_stat_checkpointer` (reset with `SELECT pg_stat_reset_shared('checkpointer');`).
+
+Bulk loads deserve a note: a massive `COPY` will blow through any WAL budget and force rapid checkpoints. For load jobs, temporarily raising `max_wal_size` (it is reloadable!) is standard practice; some teams also run a manual `CHECKPOINT;` right before taking backups or starting a load so the timed cycle starts fresh.
+
+## What not to touch
+
+- **`CHECKPOINT` (the command) in cron** — forcing extra checkpoints only adds I/O and full-page writes. The checkpointer schedules better than your crontab.
+- **Turning off `full_page_writes`** — protects against torn pages; disable only on storage that guarantees atomic 8 kB writes (few do). Corruption risk is not a tuning strategy.
+- **The background writer as a substitute** — `bgwriter_*` settings smooth buffer eviction for backends; they do not replace checkpoint tuning and rarely need changing.
+
+## A worked baseline
+
+For a write-heavy OLTP server with SSD storage, 64 GB RAM, `shared_buffers = 16GB`:
+
+```ini
+checkpoint_timeout            = 15min
+max_wal_size                  = 16GB
+min_wal_size                  = 2GB
+checkpoint_completion_target  = 0.9
+log_checkpoints               = on
+```
+
+Expected behaviour afterwards: `pg_stat_checkpointer` shows nearly all timed checkpoints, checkpoint log lines report writes spread over ~13 minutes with sub-second sync times, and the periodic latency sawtooth flattens out.
+
+Watching these counters over time is easier with a client that keeps your diagnostic queries handy — [Chat2DB](https://chat2db.ai/download) (free desktop app, or [app.chat2db.ai](https://app.chat2db.ai/) in the browser) lets you save the WAL-rate and checkpointer queries above and re-run them against any environment, and its AI assistant can interpret a `checkpoint complete` log line if you paste it in.
+
+## Summary
+
+Checkpoints trade I/O now against recovery time later, and the checkpointer's job is to make that trade smoothly. The tuning recipe is short: make sure checkpoints are timed rather than WAL-forced (`pg_stat_checkpointer`), space them out (`checkpoint_timeout = 15min`), give WAL room to breathe (`max_wal_size` sized from your measured WAL rate), and let `checkpoint_completion_target = 0.9` spread the writes. Everything else is verification.

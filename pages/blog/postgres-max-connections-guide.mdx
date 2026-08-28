@@ -1,0 +1,172 @@
+---
+title: "Postgres max_connections: Check, Increase & Tune It Right"
+description: "How to check and increase max_connections in PostgreSQL, count current connections, fix 'too many clients already', and size the limit with pooling."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: August 27, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# Postgres max_connections: Check, Increase & Tune It Right
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="August 27, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+`FATAL: sorry, too many clients already` is one of those PostgreSQL errors that always arrives at the worst moment — a traffic spike, a deploy, a runaway job. The reflex fix is to raise `max_connections`, and sometimes that is right. But PostgreSQL uses a process per connection, so the limit exists for good reasons, and the durable fix is usually a combination of a modest limit, a connection pooler, and finding whatever is leaking connections. This guide covers all of it: checking, increasing, monitoring, and sizing.
+
+## Check the current limit and usage
+
+```sql
+SHOW max_connections;
+-- 100  (the default)
+
+-- How many are in use right now, and by whom
+SELECT count(*) AS total,
+       count(*) FILTER (WHERE state = 'active')              AS active,
+       count(*) FILTER (WHERE state = 'idle')                AS idle,
+       count(*) FILTER (WHERE state = 'idle in transaction') AS idle_in_tx
+FROM   pg_stat_activity;
+
+-- Headroom, accounting for slots reserved for superusers
+SELECT current_setting('max_connections')::int
+     - current_setting('superuser_reserved_connections')::int
+     - count(*) AS slots_left
+FROM   pg_stat_activity;
+```
+
+Note `superuser_reserved_connections` (default 3): ordinary users hit "too many clients" at 97 of 100, by design, so an admin can still get in to fix things. PostgreSQL 16+ also has `reserved_connections` for a `pg_use_reserved_connections` role.
+
+Break usage down by application and database — this is the query that finds the culprit:
+
+```sql
+SELECT datname, usename, application_name, state, count(*)
+FROM   pg_stat_activity
+GROUP  BY 1, 2, 3, 4
+ORDER  BY count(*) DESC;
+```
+
+## Increase max_connections
+
+`max_connections` cannot be changed at runtime — it sets shared-memory sizes at startup, so it requires a **restart**, not a reload:
+
+```sql
+ALTER SYSTEM SET max_connections = 300;
+```
+
+```bash
+sudo systemctl restart postgresql        # Debian/Ubuntu
+# brew services restart postgresql@18    # macOS/Homebrew
+```
+
+Verify afterwards with `SHOW max_connections;`. On managed platforms the same setting lives in the parameter/flag console (RDS parameter groups, Cloud SQL flags, Azure server parameters) and typically defaults to a value derived from instance memory.
+
+Two settings should scale along with it:
+
+```sql
+-- work_mem is per sort/hash PER CONNECTION; 300 connections × high work_mem = OOM
+SHOW work_mem;
+
+-- if you raise max_connections a lot, check shared memory limits on old kernels
+SHOW shared_buffers;
+```
+
+A common sizing rule: worst-case memory ≈ `shared_buffers + max_connections × (work_mem × a few)`. If raising the limit would push that past the machine's RAM, you need a pooler, not a bigger limit.
+
+## Why "just raise it to 5000" backfires
+
+Each PostgreSQL connection is an OS process with its own memory. Hundreds of **active** processes contend for CPU, locks and I/O; thousands of mostly-idle ones waste memory and slow snapshot-taking for everyone. Benchmarks consistently show throughput peaking when active connections are a small multiple of CPU cores, then *degrading* as more are added.
+
+The practical ceiling for `max_connections` on a typical server is a few hundred. Past that, the correct architecture is:
+
+**Application ⇄ pooler (PgBouncer) ⇄ PostgreSQL**
+
+PgBouncer in transaction mode multiplexes thousands of client connections onto a few dozen server connections:
+
+```ini
+; pgbouncer.ini (the parts that matter)
+[databases]
+app_db = host=127.0.0.1 port=5432 dbname=app_db
+
+[pgbouncer]
+pool_mode = transaction
+max_client_conn = 5000
+default_pool_size = 25
+```
+
+With that in place, `max_connections = 100` on the server happily serves five thousand app connections. Managed equivalents: RDS Proxy, Cloud SQL's managed pooler, Supabase's pgbouncer/pgcat layer.
+
+## Find and fix connection leaks
+
+If usage climbs steadily until it hits the wall, something opens connections and never closes them. The `pg_stat_activity` breakdown above tells you which service; these two states tell you what kind of bug:
+
+- **`idle`** in large numbers — an app pool sized too big, or many app instances each with their own pool (10 pods × pool of 20 = 200 connections doing nothing).
+- **`idle in transaction`** — code that ran `BEGIN`, then went off to do something else and never committed. These are worse than idle: they hold locks and block VACUUM from cleaning dead rows.
+
+Automatic guard rails, available since PostgreSQL 14:
+
+```sql
+-- Kill transactions that sit idle for 5 minutes
+ALTER SYSTEM SET idle_in_transaction_session_timeout = '5min';
+
+-- Kill fully idle sessions after an hour (PG14+)
+ALTER SYSTEM SET idle_session_timeout = '1h';
+
+SELECT pg_reload_conf();  -- both are reloadable, no restart
+```
+
+And the manual kill switch for an incident:
+
+```sql
+-- Terminate everything idle-in-transaction for over 10 minutes
+SELECT pg_terminate_backend(pid)
+FROM   pg_stat_activity
+WHERE  state = 'idle in transaction'
+  AND  state_change < now() - interval '10 minutes';
+```
+
+You can also cap a single database or role rather than the whole cluster:
+
+```sql
+ALTER DATABASE analytics CONNECTION LIMIT 20;
+ALTER ROLE etl_user     CONNECTION LIMIT 5;
+```
+
+That stops one noisy tenant from starving everyone else — exceeding these gives `FATAL: too many connections for database "analytics"` instead of exhausting the global pool.
+
+## Monitoring that prevents the 3 a.m. page
+
+Alert on percentage used, not the absolute number:
+
+```sql
+SELECT round(100.0 * count(*) / current_setting('max_connections')::int, 1)
+       AS pct_used
+FROM   pg_stat_activity;
+```
+
+Page at 80%. Also worth graphing: connections by `state`, and the age of the oldest `idle in transaction` session:
+
+```sql
+SELECT max(now() - state_change) AS oldest_idle_in_tx
+FROM   pg_stat_activity
+WHERE  state = 'idle in transaction';
+```
+
+Running these ad hoc during an incident is much easier in a client that keeps history and formats results — [Chat2DB](https://chat2db.ai/download) (free desktop client, or [app.chat2db.ai](https://app.chat2db.ai/) in the browser) is handy here: its AI assistant will also write variants of these monitoring queries on request, e.g. "show connections grouped by client address that have been open more than an hour".
+
+## Sizing cheat sheet
+
+| Situation | Recommendation |
+| --- | --- |
+| Small app, single server | Default 100 is fine; fix leaks rather than raising it |
+| Many app instances / serverless functions | PgBouncer or a managed proxy in transaction mode; keep server limit ~100–200 |
+| Big machine (64+ GB), no pooler yet | Up to ~300–500, watch `work_mem × connections` memory math |
+| "Too many clients" during deploys | Old and new app versions overlap → double pools; lower app pool size or drain first |
+| Analytics users blocking the app | Per-database/per-role `CONNECTION LIMIT` |
+
+One more source of surprise consumption: background infrastructure. Replication connections (`SELECT count(*) FROM pg_stat_replication;`), logical-replication workers, postgres_fdw connections from other databases, and monitoring agents all occupy slots. On a cluster with streaming replicas plus a couple of exporters, 10–15 slots can be spoken for before the first application connects — budget for them when sizing.
+
+## Summary
+
+Check usage with `pg_stat_activity`, raise `max_connections` via `ALTER SYSTEM` plus a restart when there is genuine headroom to give, and treat any steady climb as a leak to fix, not a limit to raise. Past a few hundred connections, the answer is always the same: put PgBouncer (or your cloud's proxy) in front, cap idle transactions with timeouts, and let a small number of hot server connections do the work of thousands of client ones.
