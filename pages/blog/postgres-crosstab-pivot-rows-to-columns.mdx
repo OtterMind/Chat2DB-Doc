@@ -1,0 +1,219 @@
+---
+title: "Postgres Pivot: Rows to Columns with crosstab and FILTER"
+description: "Three ways to pivot rows to columns in PostgreSQL: FILTER aggregates, portable CASE WHEN, and tablefunc's crosstab(), with working SQL and pitfalls."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: August 29, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# Postgres Pivot: Rows to Columns with crosstab and FILTER
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="August 29, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+Relational data is stored long and thin: one row per fact. Reports want it short and wide: one row per entity, one column per category. Converting between the two is called **pivoting** (rows to columns), and PostgreSQL gives you three ways to do it — conditional aggregation with `FILTER`, the portable `CASE WHEN` form, and the `crosstab()` function from the `tablefunc` extension. This guide builds all three on the same dataset, explains when each one wins, and covers the traps that catch almost everyone the first time (misaligned crosstab columns, `NULL` instead of `0`, and the impossibility of truly dynamic columns).
+
+## The example dataset
+
+All queries below run against this table:
+
+```sql
+CREATE TABLE sales (
+    id       bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    region   text    NOT NULL,
+    quarter  text    NOT NULL,   -- 'Q1' .. 'Q4'
+    amount   numeric NOT NULL
+);
+
+INSERT INTO sales (region, quarter, amount) VALUES
+('EMEA', 'Q1', 1200), ('EMEA', 'Q1',  800), ('EMEA', 'Q2', 1500),
+('EMEA', 'Q3', 1100), ('EMEA', 'Q4', 2100),
+('APAC', 'Q1',  900), ('APAC', 'Q2', 1300), ('APAC', 'Q2',  700),
+('APAC', 'Q4', 1800),
+('AMER', 'Q1', 2500), ('AMER', 'Q2', 2400), ('AMER', 'Q3', 2600),
+('AMER', 'Q4', 3100);
+```
+
+The long form is what you `GROUP BY`; the report we want looks like this:
+
+```
+ region |  q1  |  q2  |  q3  |  q4  | total
+--------+------+------+------+------+-------
+ AMER   | 2500 | 2400 | 2600 | 3100 | 10600
+ APAC   |  900 | 2000 | NULL | 1800 |  4700
+ EMEA   | 2000 | 1500 | 1100 | 2100 |  6700
+```
+
+## Method 1: aggregate FILTER (the modern default)
+
+Since PostgreSQL 9.4, any aggregate accepts a `FILTER (WHERE ...)` clause that restricts which rows it sees. One filtered aggregate per output column gives you a pivot:
+
+```sql
+SELECT
+  region,
+  SUM(amount) FILTER (WHERE quarter = 'Q1') AS q1,
+  SUM(amount) FILTER (WHERE quarter = 'Q2') AS q2,
+  SUM(amount) FILTER (WHERE quarter = 'Q3') AS q3,
+  SUM(amount) FILTER (WHERE quarter = 'Q4') AS q4,
+  SUM(amount)                               AS total
+FROM sales
+GROUP BY region
+ORDER BY region;
+```
+
+Why this should be your default:
+
+- **It is one ordinary `GROUP BY` query.** The planner treats it like any aggregation — a single sequential scan (or index scan) over the table, no extension, no function call boundary.
+- **Multiple row keys and multiple measures are trivial.** Add `rep` next to `region`, or add `COUNT(*) FILTER (...)` columns beside the sums. `crosstab()` handles neither well.
+- **It composes.** You can wrap it in a CTE, join it, or feed it to a window function.
+
+`FILTER` is SQL-standard (SQL:2003) and also supported by SQLite 3.30+ and DuckDB — but not by MySQL or SQL Server, which brings us to the portable form.
+
+## Method 2: CASE WHEN inside the aggregate (runs anywhere)
+
+Before `FILTER`, everyone wrote conditional aggregation with `CASE`:
+
+```sql
+SELECT
+  region,
+  SUM(CASE WHEN quarter = 'Q1' THEN amount END) AS q1,
+  SUM(CASE WHEN quarter = 'Q2' THEN amount END) AS q2,
+  SUM(CASE WHEN quarter = 'Q3' THEN amount END) AS q3,
+  SUM(CASE WHEN quarter = 'Q4' THEN amount END) AS q4,
+  SUM(amount)                                   AS total
+FROM sales
+GROUP BY region;
+```
+
+The trick: a `CASE` without an `ELSE` returns `NULL` for non-matching rows, and aggregates ignore `NULL`s, so each `SUM` only adds up its own quarter. For counting, `COUNT(CASE WHEN quarter = 'Q1' THEN 1 END)` counts only matching rows — do not write `COUNT(*)` with a `CASE` around the whole expression, and do not use `SUM(CASE ... THEN 1 ELSE 0 END)` unless you actually want `0` instead of `NULL` for empty groups.
+
+Performance is identical to `FILTER` in PostgreSQL; the planner produces the same aggregation node. Choose `CASE` when the query must also run on MySQL or SQL Server; choose `FILTER` when it's PostgreSQL-only, because it reads better.
+
+## Method 3: crosstab() from tablefunc
+
+The `tablefunc` extension ships with PostgreSQL (in `contrib`), so enabling it needs no downloads:
+
+```sql
+CREATE EXTENSION IF NOT EXISTS tablefunc;
+```
+
+`crosstab()` takes a query returning `(row_id, category, value)` and pivots it. **Always use the two-argument form**, where the second query pins the category list:
+
+```sql
+SELECT *
+FROM crosstab(
+  $$ SELECT region, quarter, SUM(amount)
+     FROM sales
+     GROUP BY 1, 2
+     ORDER BY 1, 2 $$,
+  $$ VALUES ('Q1'), ('Q2'), ('Q3'), ('Q4') $$
+) AS ct (
+  region text,
+  q1 numeric,
+  q2 numeric,
+  q3 numeric,
+  q4 numeric
+);
+```
+
+Details that matter:
+
+- The **column definition list** (`AS ct (...)`) is mandatory: `crosstab` returns `SETOF record`, so PostgreSQL cannot infer the output shape. Types must be compatible with what the source query produces.
+- The source query **must be sorted** `ORDER BY 1, 2` — crosstab consumes rows sequentially and starts a new output row whenever the row id changes.
+- The **one-argument form is a trap.** Without the category query, missing combinations shift values left into the wrong columns: if APAC has no Q3 row, its Q4 value lands in the `q3` column. The two-argument form fills gaps with `NULL` correctly.
+
+When is `crosstab()` actually better? Mostly when you have *many* categories and want the source query to stay a compact three-column shape, or when you're pivoting a `(key, attribute, value)` EAV table. For routine reporting, Method 1 is easier to read, easier to maintain, and doesn't require the extension to exist in every environment (managed services all have it, but CI images may not).
+
+## NULL vs 0, and row totals
+
+All three methods return `NULL` for empty cells — APAC simply has no Q3 sales. `SUM` over zero rows is `NULL` by definition. If the report needs zeros:
+
+```sql
+SELECT
+  region,
+  COALESCE(SUM(amount) FILTER (WHERE quarter = 'Q1'), 0) AS q1,
+  COALESCE(SUM(amount) FILTER (WHERE quarter = 'Q2'), 0) AS q2,
+  COALESCE(SUM(amount) FILTER (WHERE quarter = 'Q3'), 0) AS q3,
+  COALESCE(SUM(amount) FILTER (WHERE quarter = 'Q4'), 0) AS q4,
+  SUM(amount) AS total
+FROM sales
+GROUP BY region;
+```
+
+For column totals (a grand-total row), add `GROUPING SETS`:
+
+```sql
+SELECT
+  COALESCE(region, 'TOTAL') AS region,
+  SUM(amount) FILTER (WHERE quarter = 'Q1') AS q1,
+  SUM(amount) FILTER (WHERE quarter = 'Q2') AS q2,
+  SUM(amount) FILTER (WHERE quarter = 'Q3') AS q3,
+  SUM(amount) FILTER (WHERE quarter = 'Q4') AS q4,
+  SUM(amount) AS total
+FROM sales
+GROUP BY GROUPING SETS ((region), ())
+ORDER BY region;
+```
+
+## Why SQL can't pivot dynamically (and what to do instead)
+
+Every SQL query must declare its output columns before execution — the planner, prepared statements, and drivers all depend on a fixed shape. So "pivot on whatever distinct values exist" is impossible in a single static statement, in any method above.
+
+Practical options:
+
+1. **Generate the SQL in application code.** Run `SELECT DISTINCT quarter FROM sales ORDER BY 1`, then build the `FILTER` query string. This is the most common and most debuggable approach.
+2. **Generate it in plpgsql** with `EXECUTE format(...)` returning a cursor or writing to a temp table.
+3. **Return JSON instead of columns.** If the consumer can handle JSON, the shape problem disappears:
+
+```sql
+SELECT region,
+       jsonb_object_agg(quarter, total ORDER BY quarter) AS by_quarter
+FROM (
+  SELECT region, quarter, SUM(amount) AS total
+  FROM sales
+  GROUP BY 1, 2
+) s
+GROUP BY region;
+-- EMEA | {"Q1": 2000, "Q2": 1500, "Q3": 1100, "Q4": 2100}
+```
+
+`jsonb_object_agg` is the closest thing PostgreSQL has to a truly dynamic pivot, and for APIs it's often the best answer.
+
+## Unpivot: columns back to rows
+
+The reverse direction comes up when importing spreadsheet-shaped data. A `LATERAL` join against a `VALUES` list melts columns into rows without the `unnest`-of-arrays gymnastics:
+
+```sql
+SELECT p.region, v.quarter, v.amount
+FROM pivoted p
+CROSS JOIN LATERAL (
+  VALUES ('Q1', p.q1), ('Q2', p.q2), ('Q3', p.q3), ('Q4', p.q4)
+) AS v (quarter, amount)
+WHERE v.amount IS NOT NULL;
+```
+
+## Choosing a method
+
+| Situation | Use |
+|---|---|
+| PostgreSQL-only reporting query | `FILTER` aggregates |
+| Must also run on MySQL / SQL Server | `CASE WHEN` aggregates |
+| Many categories, EAV-shaped source | `crosstab()` two-argument form |
+| Unknown/dynamic categories | Build SQL from `SELECT DISTINCT`, or `jsonb_object_agg` |
+| Columns back to rows | `CROSS JOIN LATERAL (VALUES ...)` |
+
+If you'd rather not hand-write a column per category, our free [SQL Pivot Generator](https://chat2db.ai/tools/sql-pivot-generator) produces the `FILTER`, `CASE` and `crosstab()` variants from a form. And for iterating on pivot queries against a live database — with schema-aware autocomplete and AI that can draft the conditional aggregates for you — try [Chat2DB](https://chat2db.ai/download), or use the web version at [app.chat2db.ai](https://app.chat2db.ai/).
+
+## FAQ
+
+**Does PostgreSQL have a PIVOT keyword like SQL Server?**
+No. SQL Server's `PIVOT`/`UNPIVOT` and Oracle's `PIVOT` are proprietary syntax. PostgreSQL covers the same ground with `FILTER` aggregates and `crosstab()`; the queries are slightly longer but strictly more flexible (multiple measures, expressions as categories).
+
+**Why are my crosstab values in the wrong columns?**
+You used the one-argument form with gaps in the data, or the source query isn't `ORDER BY 1, 2`. Switch to the two-argument form with an explicit `VALUES` category list — it aligns every value and fills gaps with `NULL`.
+
+**Which is faster, FILTER or crosstab?**
+For typical data, they're comparable — both scan the source once. `FILTER` gives the planner more freedom (parallel aggregation works normally), while `crosstab` hides the query inside a function call. Benchmark on your data, but readability should usually decide, and that favors `FILTER`.

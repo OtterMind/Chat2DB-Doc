@@ -1,0 +1,197 @@
+---
+title: "Postgres Epoch to Timestamp: to_timestamp & extract(epoch)"
+description: "Convert unix epoch to timestamp in PostgreSQL with to_timestamp(), go back with extract(epoch), handle milliseconds, time zones and bigint columns."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: August 29, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# Postgres Epoch to Timestamp: to_timestamp & extract(epoch)
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="August 29, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+Unix epoch time — the number of seconds since 1970-01-01 00:00:00 UTC — is everywhere: JWT `exp` claims, Kafka message timestamps, JavaScript's `Date.now()`, log shippers, IoT payloads. Sooner or later a bigint column full of epochs meets a PostgreSQL query that needs real dates. The conversion is two functions, but the details (milliseconds vs seconds, `timestamp` vs `timestamptz`, session time zones) produce more subtle bugs than almost any other date task. This guide covers both directions with runnable SQL and the traps in between.
+
+## Epoch → timestamp: to_timestamp()
+
+The single-argument form of `to_timestamp()` takes **double precision seconds** and returns a `timestamptz`:
+
+```sql
+SELECT to_timestamp(1700000000);
+--        to_timestamp
+-- ------------------------
+--  2023-11-14 22:13:20+00      (displayed in your session TimeZone)
+```
+
+Fractional seconds are preserved:
+
+```sql
+SELECT to_timestamp(1700000000.123);
+--  2023-11-14 22:13:20.123+00
+```
+
+Because the return type is `timestamptz`, the *instant* is exact and unambiguous; only the way it is **displayed** depends on your session:
+
+```sql
+SET TimeZone = 'Asia/Tokyo';
+SELECT to_timestamp(1700000000);   -- 2023-11-15 07:13:20+09  (same instant)
+
+SET TimeZone = 'UTC';
+SELECT to_timestamp(1700000000);   -- 2023-11-14 22:13:20+00
+```
+
+If you need a plain `timestamp` (no time zone) pinned to UTC — for example to compare against a `timestamp` column that stores UTC by convention:
+
+```sql
+SELECT to_timestamp(1700000000) AT TIME ZONE 'UTC';
+--  2023-11-14 22:13:20
+```
+
+### Milliseconds and microseconds
+
+`to_timestamp()` wants seconds. Feeding it milliseconds silently produces dates around the year 55835 — a bug you'll spot immediately — or, worse, values that overflow. Divide first, keeping the fraction:
+
+```sql
+-- JavaScript Date.now() / Java System.currentTimeMillis(): 13 digits
+SELECT to_timestamp(1700000000123 / 1000.0);
+--  2023-11-14 22:13:20.123+00
+
+-- Microseconds (PostgreSQL internals, some tracing systems): 16 digits
+SELECT to_timestamp(1700000000123456 / 1000000.0);
+```
+
+Rule of thumb by digit count for current dates: 10 digits = seconds, 13 = milliseconds, 16 = microseconds. Use `/ 1000.0` (with the decimal point), not `/ 1000` — integer division would truncate the sub-second part.
+
+## Timestamp → epoch: extract(epoch FROM ...)
+
+The reverse direction uses `extract` (or the equivalent `date_part`):
+
+```sql
+SELECT extract(epoch FROM timestamptz '2023-11-14 22:13:20+00');
+--  1700000000.000000
+
+SELECT extract(epoch FROM now())::bigint          AS epoch_s;
+SELECT (extract(epoch FROM now()) * 1000)::bigint AS epoch_ms;
+```
+
+`extract(epoch ...)` returns `numeric` (with fractional seconds), so cast to `bigint` when the consumer expects an integer.
+
+It also works on intervals, returning the interval's total length in seconds — handy for "how many seconds between two timestamps":
+
+```sql
+SELECT extract(epoch FROM interval '2 hours 30 minutes');  -- 9000
+
+SELECT extract(epoch FROM ('2026-08-29 12:00'::timestamptz
+                         - '2026-08-29 09:30'::timestamptz));  -- 9000
+```
+
+## The timestamp-without-time-zone trap
+
+This is the one that corrupts data pipelines. For a `timestamptz`, the epoch is exact — the value *is* an instant. For a plain `timestamp`, PostgreSQL has to decide what instant it represents, and it assumes **your session time zone**:
+
+```sql
+SET TimeZone = 'America/New_York';
+SELECT extract(epoch FROM timestamp '2023-11-14 22:13:20');
+--  1700018000  ← interpreted as 22:13 New York time, not UTC!
+```
+
+If the column stores UTC wall-clock times (the common convention), qualify it explicitly before extracting:
+
+```sql
+SELECT extract(epoch FROM (ts_col AT TIME ZONE 'UTC'));
+```
+
+Here `AT TIME ZONE 'UTC'` converts the plain timestamp into a `timestamptz` by declaring "this value is UTC" — after which the epoch is correct regardless of session settings. The same trap exists in reverse: comparing `to_timestamp(...)` (a `timestamptz`) against a plain `timestamp` column triggers an implicit conversion using the session zone.
+
+## Working with bigint epoch columns
+
+Suppose events arrive with epochs and you keep the raw value:
+
+```sql
+CREATE TABLE events (
+    id            bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    created_epoch bigint NOT NULL,   -- seconds since 1970-01-01 UTC
+    payload       jsonb
+);
+```
+
+**Filtering by date range** — convert the *boundaries* to epoch, not the column to timestamp, so an index on `created_epoch` stays usable:
+
+```sql
+SELECT *
+FROM   events
+WHERE  created_epoch >= extract(epoch FROM timestamptz '2026-08-01 00:00+00')::bigint
+AND    created_epoch <  extract(epoch FROM timestamptz '2026-09-01 00:00+00')::bigint;
+```
+
+Writing `WHERE to_timestamp(created_epoch) >= '2026-08-01'` instead forces a function call on every row and ignores the plain index (you'd need an expression index on `to_timestamp(created_epoch)` to fix that).
+
+**Readable queries without rewriting the app** — add a stored generated column:
+
+```sql
+ALTER TABLE events
+  ADD COLUMN created_at timestamptz
+  GENERATED ALWAYS AS (to_timestamp(created_epoch)) STORED;
+
+CREATE INDEX ON events (created_at);
+```
+
+Now reports can `GROUP BY date_trunc('day', created_at)` naturally while ingestion keeps writing bigints.
+
+**Grouping epochs by day directly:**
+
+```sql
+SELECT date_trunc('day', to_timestamp(created_epoch) AT TIME ZONE 'UTC') AS day,
+       count(*)
+FROM   events
+GROUP  BY 1
+ORDER  BY 1;
+```
+
+## Should you store epoch bigint or timestamptz?
+
+Store `timestamptz` unless an external contract forces epochs:
+
+- **Same size.** Both are 8 bytes; there is no storage saving in bigint.
+- **Readability.** `WHERE created_at >= '2026-08-01'` beats mentally decoding 1754006400 in every psql session.
+- **Semantics.** Date arithmetic (`+ interval '1 day'`), `date_trunc`, time zone conversion and range types all work natively on `timestamptz`.
+- **Same index behaviour.** B-tree over `timestamptz` is exactly as fast as over `bigint`.
+
+The legitimate reasons for bigint epochs: interop with systems that only speak epoch (many metrics stores), or append-only ingestion where you defer all interpretation. Even then, the generated-column pattern above gives you both.
+
+Note that `to_timestamp` also has a two-argument form — `to_timestamp('2026#08#29', 'YYYY#MM#DD')` — for parsing *strings* with a format template. Don't confuse the two: epoch conversion always uses the one-argument numeric form.
+
+## Quick reference
+
+```sql
+-- epoch seconds → timestamptz
+SELECT to_timestamp(1700000000);
+-- epoch ms → timestamptz
+SELECT to_timestamp(1700000000123 / 1000.0);
+-- timestamptz → epoch seconds
+SELECT extract(epoch FROM now())::bigint;
+-- timestamptz → epoch ms
+SELECT (extract(epoch FROM now()) * 1000)::bigint;
+-- plain UTC timestamp → epoch (safe under any session TimeZone)
+SELECT extract(epoch FROM (ts_col AT TIME ZONE 'UTC'));
+-- seconds between two timestamps
+SELECT extract(epoch FROM (t2 - t1));
+-- MySQL equivalents: FROM_UNIXTIME(e), UNIX_TIMESTAMP(ts)
+```
+
+For one-off conversions while debugging, our free [Epoch & Unix Timestamp Converter](https://chat2db.ai/tools/postgres-epoch-converter) detects seconds/milliseconds/microseconds automatically and emits these SQL snippets ready to paste. When you're exploring epoch columns in a real database, [Chat2DB](https://chat2db.ai/download) (or the web version at [app.chat2db.ai](https://app.chat2db.ai/)) gives you an AI-assisted SQL editor that writes the conversion boilerplate for you.
+
+## FAQ
+
+**Why does to_timestamp(1700000000000) give year 55835?**
+You passed milliseconds where seconds are expected — 1.7 trillion seconds really is fifty millennia away. Divide by 1000.0 first.
+
+**How do I get the epoch of midnight today in UTC?**
+`SELECT extract(epoch FROM date_trunc('day', now() AT TIME ZONE 'UTC') AT TIME ZONE 'UTC')::bigint;` — truncate in UTC, then declare the result as UTC before extracting.
+
+**Is extract(epoch ...) affected by leap seconds?**
+No. Unix time (and PostgreSQL) pretend leap seconds don't exist: every day is exactly 86400 seconds. Differences between two epochs are therefore off by the number of intervening leap seconds — irrelevant for almost all applications.

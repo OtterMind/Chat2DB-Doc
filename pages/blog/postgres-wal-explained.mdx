@@ -1,0 +1,147 @@
+---
+title: "Postgres WAL Explained: How the Write-Ahead Log Works"
+description: "What the PostgreSQL write-ahead log is, how WAL files work, key settings like wal_level and max_wal_size, and how to monitor, tune and clean up WAL."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: August 29, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# Postgres WAL Explained: How the Write-Ahead Log Works
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="August 29, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+Every durable thing PostgreSQL does — surviving a crash, replicating to a standby, restoring to 3:47 last Tuesday, streaming changes to Kafka — is built on one mechanism: the **write-ahead log (WAL)**. It is also behind two of the most common operational emergencies: a disk filled by `pg_wal`, and a primary that "can't keep up" with its own commit latency. This guide explains what WAL actually is, how the files behave, which settings matter, and the queries you need to monitor it.
+
+## The core idea: log first, data files later
+
+When you `UPDATE` a row, PostgreSQL does **not** write the table file. It:
+
+1. Modifies the page in shared memory (`shared_buffers`), marking it dirty.
+2. Appends a compact change record to the WAL buffer.
+3. On `COMMIT`, flushes the WAL record to disk (`fsync`) — this sequential append is the only I/O your transaction waits for.
+
+The dirty data page is written back later — by the background writer, or in bulk at the next [checkpoint](https://chat2db.ai/blog/postgres-checkpoint-tuning-guide). If the server crashes in between, recovery starts from the last checkpoint and **replays** WAL records to reconstruct every committed change. That's the write-ahead rule: *the log record must reach disk before the data page it describes*.
+
+This design turns many random writes into one sequential stream — the reason a database can commit thousands of transactions per second on ordinary disks, and the same design used by virtually every serious database (MySQL calls it the redo log).
+
+## WAL files on disk
+
+WAL lives in `$PGDATA/pg_wal/` (called `pg_xlog` before v10) as fixed-size segment files, 16 MB each by default:
+
+```
+000000010000000A0000004F
+└──┬───┘└──┬───┘└──┬───┘
+timeline   log     segment
+```
+
+The stream position is an **LSN** (Log Sequence Number) like `A/4F2C5D80` — a byte offset into this virtual infinite stream. You'll meet LSNs in replication monitoring, `pg_stat_replication`, and backup tooling.
+
+Useful introspection:
+
+```sql
+SELECT pg_current_wal_lsn();                  -- where the stream is now
+SELECT pg_walfile_name(pg_current_wal_lsn()); -- which segment that is
+
+-- How much WAL is generated per interval? Run twice and diff:
+SELECT pg_size_pretty(
+  pg_wal_lsn_diff(pg_current_wal_lsn(), 'A/4F2C5D80')  -- earlier LSN
+);
+
+-- Segments currently on disk
+SELECT count(*), pg_size_pretty(sum(size)) FROM pg_ls_waldir();
+```
+
+Segments are recycled, not deleted: once a checkpoint guarantees a segment is no longer needed for crash recovery (and no replica or archive still needs it), it's renamed for future reuse. So `pg_wal` size fluctuating around `max_wal_size` is normal; *unbounded growth* is not — see below.
+
+## The settings that matter
+
+```sql
+SELECT name, setting, unit FROM pg_settings
+WHERE  name IN ('wal_level','fsync','synchronous_commit','max_wal_size',
+                'min_wal_size','wal_compression','archive_mode','wal_buffers');
+```
+
+- **`wal_level`** — how much detail is logged. `minimal` (crash recovery only), `replica` (default; physical replication + archiving), `logical` (adds what logical decoding/CDC needs). Changing it requires a restart; replication slots refuse to work below the level they need.
+- **`synchronous_commit`** — whether `COMMIT` waits for the WAL flush. Setting it to `off` for a session (`SET synchronous_commit = off;`) makes commits return before fsync: you risk losing the last few hundred milliseconds of transactions on a crash, but **never** corruption. Excellent for bulk loads and low-value writes.
+- **`fsync`** — never turn this off in production. Unlike `synchronous_commit = off`, `fsync = off` *can* corrupt the cluster on power loss.
+- **`max_wal_size`** — soft cap on WAL kept between checkpoints. Reaching it forces an early checkpoint; on write-heavy systems raise it (4–16 GB is common) so checkpoints stay timed rather than triggered.
+- **`wal_compression`** — compresses full-page images (`lz4` is a good choice on PG14+); cheap CPU for meaningfully less WAL on update-heavy workloads.
+
+A related gotcha: after a checkpoint, the *first* change to each page logs a **full-page image** (~8 kB) rather than a small delta, to protect against torn writes. That's why WAL volume spikes right after every checkpoint, and why more frequent checkpoints *increase* total WAL.
+
+## Monitoring WAL generation
+
+PostgreSQL 14+ has a dedicated view:
+
+```sql
+SELECT wal_records, wal_fpi,                  -- records vs full-page images
+       pg_size_pretty(wal_bytes) AS wal_bytes,
+       wal_buffers_full,                      -- WAL buffer overflowed this often
+       stats_reset
+FROM   pg_stat_wal;
+```
+
+If `wal_fpi` dominates, checkpoints are too frequent (raise `max_wal_size` / `checkpoint_timeout`) or enable `wal_compression`. If `wal_buffers_full` climbs steadily, raise `wal_buffers` (e.g. 64 MB).
+
+Per-query WAL cost shows up in `EXPLAIN (ANALYZE, WAL)`:
+
+```sql
+EXPLAIN (ANALYZE, WAL, COSTS OFF)
+UPDATE accounts SET balance = balance + 1 WHERE id = 42;
+--  WAL: records=3 fpi=1 bytes=8456
+```
+
+## "pg_wal is full" — the classic emergency
+
+WAL grows without bound for exactly three reasons. Find which one before deleting anything:
+
+```sql
+-- 1. A forgotten or broken replication slot pins WAL forever
+SELECT slot_name, active, wal_status,
+       pg_size_pretty(pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn)) AS retained
+FROM   pg_replication_slots;
+
+-- 2. archive_command is failing, so segments can't be recycled
+SELECT archived_count, failed_count, last_failed_wal, last_failed_time
+FROM   pg_stat_archiver;
+
+-- 3. wal_keep_size / max_wal_size simply set very high
+SHOW wal_keep_size;
+```
+
+Fixes, in order of frequency seen in the wild: drop the dead slot (`SELECT pg_drop_replication_slot('old_slot');`), repair the archive command (or set `archive_mode = off` if you truly don't archive), or lower the retention settings. **Never `rm` files inside `pg_wal`** — deleting a segment that recovery or a replica still needs makes the cluster or standby unrecoverable. On PG13+, `max_slot_wal_keep_size` caps how much a slot may retain, converting "disk full at 3 a.m." into "slot invalidated, alert fired" — set it.
+
+## What WAL enables
+
+Everything below is just consumers of the same stream:
+
+- **Crash recovery** — replay from the last checkpoint (automatic).
+- **Streaming replication** — standbys apply WAL as it's produced; `pg_stat_replication` shows how far behind each is in bytes: `pg_wal_lsn_diff(pg_current_wal_lsn(), replay_lsn)`.
+- **Point-in-time recovery (PITR)** — base backup + archived WAL replayed up to a target time. See our [PITR guide](https://chat2db.ai/blog/postgres-point-in-time-recovery-guide).
+- **Logical decoding / CDC** — `wal_level = logical` lets tools like Debezium translate WAL into row-level change events.
+
+## Practical tuning checklist
+
+1. `wal_level = replica` (or `logical` only if you actually decode); leave `fsync = on`.
+2. Raise `max_wal_size` until `pg_stat_bgwriter`'s forced checkpoints stop (`checkpoints_req` ≈ 0 growth).
+3. Enable `wal_compression = lz4`.
+4. Use `synchronous_commit = off` per-session for bulk loads; batch small writes into fewer transactions — each commit is an fsync.
+5. Set `max_slot_wal_keep_size` so a dead slot can't fill the disk.
+6. Alert on `pg_replication_slots.active = false` and `pg_stat_archiver.failed_count`.
+
+Watching WAL behaviour is much easier with a client that keeps these monitoring queries at hand. [Chat2DB](https://chat2db.ai/download) lets you save them as snippets, chart the results, and its AI assistant will write the `pg_wal_lsn_diff` arithmetic for you — also available in the browser at [app.chat2db.ai](https://app.chat2db.ai/).
+
+## FAQ
+
+**Can I move pg_wal to another disk?**
+Yes — stop the server, move the directory, leave a symlink (or use `initdb --waldir` for new clusters). Putting WAL on separate storage isolates its sequential writes from data-file random I/O; on shared NVMe it matters less than it used to.
+
+**Does read-only traffic generate WAL?**
+Mostly no, but reads can set hint bits and freeze tuples, producing some WAL — which is why even a SELECT-only replica-promotion test shows trickles of WAL.
+
+**How is WAL different from the MySQL binlog?**
+WAL is a *physical* page-level redo log used for recovery and physical replication; the binlog is a separate *logical* event log. PostgreSQL uses one stream for both jobs (logical decoding extracts row events from the same WAL), so there's no double-write penalty for enabling replication.

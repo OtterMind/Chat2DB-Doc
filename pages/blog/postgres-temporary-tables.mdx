@@ -1,0 +1,173 @@
+---
+title: "Postgres Temp Tables: Syntax, Scope, Performance, Pitfalls"
+description: "CREATE TEMPORARY TABLE in PostgreSQL: session scope, ON COMMIT options, performance vs CTEs, why temp tables bloat catalogs, and better alternatives."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: August 29, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# Postgres Temp Tables: Syntax, Scope, Performance, Pitfalls
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="August 29, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+Temporary tables are the scratch paper of SQL: stage an import, break a monstrous query into steps, snapshot intermediate results while debugging. PostgreSQL's implementation is convenient — automatic cleanup, per-session isolation, zero WAL — but it has sharp edges that surprise people coming from SQL Server or Oracle: temp tables are invisible to autovacuum's statistics collector on other backends, they don't work in connection-pooled environments the way you'd hope, and heavy churn bloats the system catalogs. Here's how they actually behave and when to reach for something else.
+
+## The basics
+
+```sql
+CREATE TEMPORARY TABLE staging_orders (
+    order_id  bigint,
+    customer  text,
+    total     numeric
+);
+-- TEMP is an accepted abbreviation; both create the same thing
+
+INSERT INTO staging_orders
+SELECT id, customer_name, amount
+FROM   raw_import
+WHERE  imported_at::date = current_date;
+
+SELECT customer, sum(total)
+FROM   staging_orders
+GROUP  BY customer;
+```
+
+Key behaviours:
+
+- **Session-scoped.** The table lives in a schema like `pg_temp_3`, visible only to your session (not just your transaction — unless you say so, see `ON COMMIT`). Two sessions can each have their own `staging_orders` with different shapes; neither sees the other's.
+- **Auto-dropped** when the session ends. No cleanup job needed.
+- **Name shadowing.** A temp table named `orders` shadows a real `orders` for unqualified references in your session, because `pg_temp` is implicitly first on the search path. This is a classic source of "why is this query suddenly returning nothing" — and also a SQL-injection-hardening consideration inside `SECURITY DEFINER` functions.
+- **Not WAL-logged.** Writes to temp tables skip the write-ahead log entirely, which makes them fast — and means they can never be replicated: they simply don't exist on standbys, and you cannot create them on a hot-standby replica... though you *can* on a logical replica.
+
+You can also create-and-fill in one statement:
+
+```sql
+CREATE TEMP TABLE top_customers AS
+SELECT customer_id, sum(total) AS lifetime
+FROM   orders
+GROUP  BY customer_id
+ORDER  BY lifetime DESC
+LIMIT  1000;
+```
+
+## ON COMMIT: choosing the lifetime
+
+```sql
+CREATE TEMP TABLE t (...) ON COMMIT PRESERVE ROWS;  -- default: keep until session ends
+CREATE TEMP TABLE t (...) ON COMMIT DELETE ROWS;    -- empty the table at each commit
+CREATE TEMP TABLE t (...) ON COMMIT DROP;           -- drop at end of this transaction
+```
+
+`ON COMMIT DROP` is the right choice inside a single transaction-scoped job — the table cannot leak. `ON COMMIT DELETE ROWS` suits pooled connections where the same session serves many logical requests: the structure persists, the data doesn't. (Note the truncation happens at *every* commit, including ones you didn't expect from your ORM's autocommit.)
+
+## Performance: the good and the bad
+
+**Good:** no WAL, no fsync on commit for their data, and buffered in per-backend `temp_buffers` (default 8 MB — raise it *before first use* of any temp table in the session):
+
+```sql
+SET temp_buffers = '256MB';
+```
+
+**Bad #1 — no autoanalyze.** Autovacuum cannot see into other backends' temp tables. After loading a meaningful amount of data, the planner is flying blind (it assumes defaults), which produces terrible join plans. Fix is one word:
+
+```sql
+ANALYZE staging_orders;
+```
+
+If a query using a temp table is slow, this is the first thing to check — an `EXPLAIN` showing `rows=2550` estimated vs millions actual on a temp scan is the signature.
+
+**Bad #2 — catalog churn.** Every `CREATE TEMP TABLE` inserts rows into `pg_class`, `pg_attribute`, `pg_depend`, etc., and drops delete them. An application creating temp tables hundreds of times per second bloats these shared catalogs, and that bloat slows *everything* (every query does catalog lookups). Symptoms: growing `pg_catalog` table sizes, rising planning times. If your workload does this, reuse one table per session with `ON COMMIT DELETE ROWS`, or restructure (see alternatives).
+
+**Bad #3 — disk spill location.** Large temp tables live in the database's default tablespace unless `temp_tablespaces` points elsewhere; they compete with real data for disk. Monitor per-database temp usage:
+
+```sql
+SELECT datname,
+       temp_files,
+       pg_size_pretty(temp_bytes) AS temp_written
+FROM   pg_stat_database
+WHERE  datname = current_database();
+```
+
+(That view counts spill files from sorts/hashes too, but a sudden jump after a temp-table-heavy deploy is telling.)
+
+## Temp tables vs CTEs vs unlogged tables
+
+| | Temp table | CTE (`WITH`) | Unlogged table |
+|---|---|---|---|
+| Lifetime | Session/transaction | One query | Permanent |
+| Visible to other sessions | No | — | Yes |
+| Can be indexed | Yes | No | Yes |
+| Has statistics (`ANALYZE`) | Yes (manual) | No | Yes (auto) |
+| WAL | None | — | None (truncated on crash) |
+| Works through a pooler (transaction mode) | No | Yes | Yes |
+
+Rules of thumb:
+
+- **Used once, no index needed** → a CTE or subquery. Since PostgreSQL 12, CTEs inline into the main query by default, so they're no longer an optimization fence unless you add `MATERIALIZED`.
+- **Reused several times in a session, needs an index, or you want to `ANALYZE` an intermediate result** → temp table. Add the index after loading, not before:
+
+```sql
+CREATE TEMP TABLE dupes AS SELECT ...;
+CREATE INDEX ON dupes (customer_id);
+ANALYZE dupes;
+```
+
+- **Shared staging area for multiple sessions / an ETL pipeline step that survives reconnects** → unlogged table. Same no-WAL speed, but visible everywhere and persistent (emptied only by a crash):
+
+```sql
+CREATE UNLOGGED TABLE staging_orders (LIKE orders INCLUDING DEFAULTS);
+```
+
+## The connection pooler trap
+
+With PgBouncer in **transaction pooling** mode, consecutive statements from your application may run on *different* server sessions. A temp table created in one statement simply doesn't exist for the next:
+
+```
+ERROR:  relation "staging_orders" does not exist
+```
+
+Options: use session pooling for the jobs that need temp tables, wrap the whole unit in a single transaction (temp table + work + `ON COMMIT DROP`), or switch to an unlogged table keyed by a job/run ID:
+
+```sql
+CREATE UNLOGGED TABLE IF NOT EXISTS staging_orders (
+    run_id uuid NOT NULL,
+    ...
+);
+DELETE FROM staging_orders WHERE run_id = $1;  -- your run's rows only
+```
+
+## Housekeeping and inspection
+
+```sql
+-- Your session's temp tables
+SELECT relname, pg_size_pretty(pg_total_relation_size(oid))
+FROM   pg_class
+WHERE  relpersistence = 't'
+AND    relnamespace = pg_my_temp_schema();
+
+-- Temp tables from ALL sessions (as superuser: spot leaks from long-lived sessions)
+SELECT n.nspname, c.relname, pg_size_pretty(pg_total_relation_size(c.oid))
+FROM   pg_class c
+JOIN   pg_namespace n ON n.oid = c.relnamespace
+WHERE  c.relpersistence = 't'
+ORDER  BY pg_total_relation_size(c.oid) DESC;
+```
+
+An orphaned `pg_temp_NN` schema holding gigabytes usually points at an application that opens a connection, builds temp tables, and then idles for days. The space is reclaimed when that session disconnects (or, after a crash, at the next startup).
+
+Working through staged data is considerably nicer in a client that shows temp tables in the schema tree next to real ones and lets AI draft the staging SQL. [Chat2DB](https://chat2db.ai/download) does both — or use it without installing anything at [app.chat2db.ai](https://app.chat2db.ai/).
+
+## FAQ
+
+**Do I need to drop temporary tables manually?**
+No — they vanish at session end (or transaction end with `ON COMMIT DROP`). Manual `DROP TABLE` is only needed when you want to recreate one with a different shape mid-session.
+
+**Why is my temp table slower than the same query without it?**
+Almost always missing statistics — run `ANALYZE your_temp_table` after loading. Second suspect: `temp_buffers` too small for the table, causing it to spill; raise it before the session first touches a temp table.
+
+**Can two concurrent jobs use the same temp table name?**
+Yes. Each session gets a private `pg_temp_N` schema, so identical names never collide across sessions. That's precisely why they're unusable through transaction-mode poolers, where "your session" changes under you.

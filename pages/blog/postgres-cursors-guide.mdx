@@ -1,0 +1,165 @@
+---
+title: "Postgres Cursors: DECLARE, FETCH, and When to Use Them"
+description: "How PostgreSQL cursors work: DECLARE and FETCH in SQL, plpgsql cursor loops, WITH HOLD, driver-level streaming, and when keyset pagination beats them."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: August 29, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# Postgres Cursors: DECLARE, FETCH, and When to Use Them
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="August 29, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+Run `SELECT * FROM events` on a 200-million-row table and your client tries to buffer 200 million rows in memory — most drivers fetch entire result sets by default. A **cursor** is the SQL-level answer: it holds a query open on the server and hands you rows in batches, keeping client memory flat no matter how large the result. Cursors also power row-by-row processing in plpgsql and cross-call result streaming via `WITH HOLD`. They're also frequently misused where a plain `LIMIT` or keyset pagination would be better. This guide covers all the forms with runnable SQL, plus the tradeoffs that decide when a cursor is the right tool.
+
+## SQL-level cursors: DECLARE / FETCH / CLOSE
+
+A cursor lives inside a transaction (by default) and is consumed with `FETCH`:
+
+```sql
+BEGIN;
+
+DECLARE big_scan CURSOR FOR
+    SELECT id, payload
+    FROM   events
+    ORDER  BY id;
+
+FETCH 1000 FROM big_scan;   -- first thousand rows
+FETCH 1000 FROM big_scan;   -- next thousand
+FETCH ALL  FROM big_scan;   -- everything remaining (careful!)
+
+CLOSE big_scan;
+COMMIT;
+```
+
+`FETCH` directions worth knowing:
+
+```sql
+FETCH NEXT FROM big_scan;        -- one row forward (default)
+FETCH FORWARD 500 FROM big_scan;
+FETCH PRIOR FROM big_scan;       -- backwards — needs SCROLL
+FETCH ABSOLUTE 42 FROM big_scan; -- jump to row 42 — needs SCROLL
+MOVE FORWARD 10000 IN big_scan;  -- reposition without returning rows
+```
+
+Backward movement requires declaring `SCROLL CURSOR`, which may force PostgreSQL to materialize results to support rewinding; plain (`NO SCROLL`) cursors are cheaper. 
+
+Two properties make cursors attractive for batch jobs:
+
+- **Flat memory**: the server executes the plan incrementally; the client holds one batch at a time.
+- **A consistent snapshot**: the whole scan sees the data as of the cursor's snapshot, even while other transactions write.
+
+And one property bites: **a cursor pins its transaction** (and thus its snapshot) open. A cursor consumed slowly over hours holds back vacuum's cleanup horizon for the entire database — the same damage as any long-running transaction. Consume promptly, or use `WITH HOLD`.
+
+## WITH HOLD: outliving the transaction
+
+```sql
+BEGIN;
+DECLARE report CURSOR WITH HOLD FOR
+    SELECT * FROM monthly_rollup ORDER BY region;
+COMMIT;                        -- cursor SURVIVES the commit
+
+FETCH 100 FROM report;         -- works outside the transaction
+CLOSE report;                  -- until you close it (or the session ends)
+```
+
+At `COMMIT`, PostgreSQL runs the cursor's query to completion and **materializes the result** (spilling to temp files if large — watch `temp_bytes` in `pg_stat_database`). Cost up front, but no snapshot is pinned afterward. This is the tool for "open a result, then feed it to something slow" without blocking vacuum. Rolled-back transactions discard their holdable cursors.
+
+## Cursors in plpgsql
+
+Most explicit cursor code in the wild lives in functions. The concise form is `FOR ... IN` over a query — which uses an internal cursor automatically and batches sensibly:
+
+```sql
+CREATE OR REPLACE FUNCTION archive_old_events() RETURNS bigint
+LANGUAGE plpgsql AS $$
+DECLARE
+    rec   record;
+    moved bigint := 0;
+BEGIN
+    FOR rec IN
+        SELECT id FROM events
+        WHERE  created_at < now() - interval '2 years'
+    LOOP
+        INSERT INTO events_archive SELECT * FROM events WHERE id = rec.id;
+        DELETE FROM events WHERE id = rec.id;
+        moved := moved + 1;
+    END LOOP;
+    RETURN moved;
+END $$;
+```
+
+Explicit cursors add control — parameters, `EXIT` conditions, and the ability to return the cursor itself:
+
+```sql
+CREATE OR REPLACE FUNCTION user_orders(p_user bigint)
+RETURNS refcursor
+LANGUAGE plpgsql AS $$
+DECLARE
+    c refcursor := 'user_orders_cur';
+BEGIN
+    OPEN c FOR SELECT * FROM orders WHERE user_id = p_user ORDER BY id;
+    RETURN c;   -- caller FETCHes from 'user_orders_cur' in the same txn
+END $$;
+
+BEGIN;
+SELECT user_orders(42);
+FETCH ALL FROM user_orders_cur;
+COMMIT;
+```
+
+Returning `refcursor` is how functions hand back *multiple* result sets, and how legacy Oracle code (`SYS_REFCURSOR`) usually lands in Postgres.
+
+An anti-pattern to recognize: row-by-row `UPDATE` loops over a cursor where one set-based statement would do. `UPDATE events SET archived = true WHERE created_at < ...` beats a million iterations by orders of magnitude. Reach for cursor loops only when per-row logic genuinely can't be expressed in SQL — or to batch commits (process N rows, `COMMIT`, continue — possible in procedures since PG11 with `CALL`).
+
+## Driver-level cursors: the setting everyone misses
+
+You rarely need `DECLARE` by hand for "stream a big query" — drivers wrap it (or the equivalent portal) behind one setting:
+
+- **JDBC**: `stmt.setFetchSize(1000)` *and* `autoCommit = false` — otherwise the driver silently fetches everything.
+- **psycopg2/3**: named cursors — `conn.cursor(name='big', withhold=False)`; set `itersize`.
+- **Node (pg)**: the `pg-cursor` / `pg-query-stream` packages.
+- **Go (pgx)**: rows are streamed by default.
+
+If your exporter OOMs on a big `SELECT`, this — not more RAM — is the fix.
+
+## Cursor vs LIMIT/OFFSET vs keyset pagination
+
+Cursors get proposed for pagination because "FETCH 20 at a time" sounds like pages. Compare honestly:
+
+| | Server cursor | LIMIT/OFFSET | Keyset (`WHERE id > last`) |
+|---|---|---|---|
+| Works across HTTP requests | ✗ (needs sticky session+txn) | ✓ | ✓ |
+| Cost of page N | Flat | Grows with N (scans+discards) | Flat |
+| Consistent snapshot across pages | ✓ | ✗ | ✗ (but stable ordering) |
+| Holds server resources | ✓ | ✗ | ✗ |
+
+For stateless APIs, use [keyset pagination](https://chat2db.ai/blog/keyset-pagination-postgres-guide). Cursors win inside *one job*: ETL, exports, report generation — anywhere a single session drains a huge, consistent result.
+
+## Operational notes
+
+```sql
+-- What cursors are open right now (pins snapshots!)
+SELECT name, statement, is_holdable, creation_time
+FROM   pg_cursors;
+```
+
+- Planner nuance: for cursors, PostgreSQL optimizes for *fast startup* (governed by `cursor_tuple_fraction`, default 0.1) — it may pick an index scan over a faster-in-total hash join, expecting you might not fetch everything. If a cursor's plan looks odd versus the plain query, that's why.
+- Long-lived cursors show up as long-running transactions in monitoring: check `pg_stat_activity.backend_xid`/`xmin` age, and see our [kill/cancel guide](https://chat2db.ai/blog/postgres-kill-query-cancel-terminate) when one must die.
+- `idle_in_transaction_session_timeout` will kill sessions dawdling between FETCHes — a feature, not a bug; size it to your batch cadence.
+
+Stepping through cursor-based procedures is far easier in a client that keeps the transaction open while you experiment. [Chat2DB](https://chat2db.ai/download) gives you session-scoped SQL consoles (so DECLARE/FETCH sequences just work), an AI assistant that can convert a row-by-row loop into set-based SQL, and a browser version at [app.chat2db.ai](https://app.chat2db.ai/).
+
+## FAQ
+
+**Why does FETCH say "cursor does not exist"?**
+The transaction that declared it ended — non-holdable cursors die at COMMIT/ROLLBACK. Either FETCH inside the same transaction, or declare `WITH HOLD`. In psql, autocommit means a bare `DECLARE` without `BEGIN` commits (and closes the cursor) immediately.
+
+**Are cursors faster than running the full query?**
+No — the same plan executes either way; cursors change *delivery*, not computation (and `cursor_tuple_fraction` may even pick a slower-in-total plan). Their value is bounded memory and a stable snapshot, not speed.
+
+**Can I keep a cursor open across connections?**
+No. Cursors (even `WITH HOLD`) are session objects. Across connections you need keyset pagination, a temp-to-real staging table, or re-running the query.

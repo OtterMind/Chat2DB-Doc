@@ -1,0 +1,157 @@
+---
+title: "pgAudit: Set Up Postgres Audit Logging the Right Way"
+description: "Install and configure pgAudit for PostgreSQL: session vs object auditing, pgaudit.log settings, log volume control, RDS/Cloud SQL setup, and alternatives."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: August 29, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# pgAudit: Set Up Postgres Audit Logging the Right Way
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="August 29, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+`log_statement = all` is not an audit trail. It misses statement text inside functions, can't tell you *which table* a dynamic query touched, logs passwords in plain text, and produces output no auditor can filter. **pgAudit** — the PostgreSQL Audit Extension — exists precisely for compliance-grade logging: it hooks into the executor, classifies every operation, resolves what was actually executed (even inside `DO` blocks and plpgsql), and emits structured, greppable audit records. It's the mechanism behind audit requirements for SOC 2, PCI-DSS, HIPAA and government deployments, and it ships as a supported extension on RDS, Aurora, Cloud SQL and Azure. Here's how to set it up without drowning in logs.
+
+## Installing
+
+pgAudit is packaged everywhere PostgreSQL is:
+
+```bash
+# Debian/Ubuntu (match your server major version)
+sudo apt install postgresql-16-pgaudit
+```
+
+It must be loaded at server start, then created as an extension:
+
+```sql
+-- postgresql.conf
+shared_preload_libraries = 'pgaudit'
+
+-- after restart:
+CREATE EXTENSION pgaudit;
+SELECT extversion FROM pg_extension WHERE extname = 'pgaudit';
+```
+
+Managed services expose the same thing through parameter groups: on **RDS/Aurora** add `pgaudit` to `shared_preload_libraries` in the parameter group and reboot; on **Cloud SQL** set the `cloudsql.enable_pgaudit` flag; on **Azure Flexible Server** add it via `azure.extensions` + `shared_preload_libraries`.
+
+## Session auditing: pgaudit.log
+
+The main switch is `pgaudit.log`, which takes classes of statements to record:
+
+| Class | Covers |
+|---|---|
+| `READ` | SELECT, COPY ... TO |
+| `WRITE` | INSERT, UPDATE, DELETE, TRUNCATE, COPY ... FROM |
+| `DDL` | CREATE/ALTER/DROP (except roles) |
+| `ROLE` | GRANT, REVOKE, CREATE/ALTER/DROP ROLE |
+| `FUNCTION` | Function calls, DO blocks |
+| `MISC` | DISCARD, FETCH, SET, CHECKPOINT... |
+| `ALL` | Everything |
+
+A sane compliance baseline logs everything *except* reads and writes (schema and privilege changes are low-volume, high-value):
+
+```sql
+ALTER SYSTEM SET pgaudit.log = 'ddl, role';
+SELECT pg_reload_conf();
+```
+
+Or scope it to where it belongs — audit the application role, not every migration tool and monitoring agent:
+
+```sql
+ALTER ROLE app_user SET pgaudit.log = 'write, ddl, role';
+ALTER DATABASE payments SET pgaudit.log = 'read, write, ddl, role';
+```
+
+A logged event looks like:
+
+```
+AUDIT: SESSION,1,1,DDL,CREATE TABLE,TABLE,public.orders,
+  "CREATE TABLE orders (id bigint, total numeric)",<not logged>
+```
+
+Structured fields: audit type, statement/substatement IDs, class, command, object type, object name, statement text, parameters. That's what makes downstream filtering (CloudWatch, Loki, Splunk) actually workable.
+
+Supporting knobs worth setting:
+
+```sql
+SET pgaudit.log_catalog = off;      -- skip queries that only touch pg_catalog (psql/GUI chatter)
+SET pgaudit.log_parameter = off;    -- keep bind parameters (possible PII!) out of logs
+SET pgaudit.log_statement = on;     -- include statement text (off = metadata only)
+SET pgaudit.log_relation = on;      -- one entry PER TABLE touched by a statement
+```
+
+`pgaudit.log_relation = on` is the flag auditors like — a `SELECT` joining five tables yields five entries, so "who read `payments.cards`" becomes a grep — at the price of multiplying volume.
+
+## Object auditing: only the sensitive tables
+
+Session auditing answers "log everything of class X." Object auditing answers the more surgical requirement: *log every read/write of these specific tables*. It works through a role's privileges:
+
+```sql
+CREATE ROLE auditor NOLOGIN;
+ALTER SYSTEM SET pgaudit.role = 'auditor';
+SELECT pg_reload_conf();
+
+-- Audit reads+writes on the sensitive table only
+GRANT SELECT, INSERT, UPDATE, DELETE ON payments.cards TO auditor;
+```
+
+Now any statement touching `payments.cards` in a way the `auditor` role has been granted gets an `OBJECT` audit record — regardless of who ran it — while the rest of the database logs nothing. This is *the* pattern for PCI-style "audit access to cardholder data" without logging your entire OLTP stream.
+
+```
+AUDIT: OBJECT,3,1,READ,SELECT,TABLE,payments.cards,
+  "SELECT pan_last4 FROM payments.cards WHERE id = $1",<not logged>
+```
+
+## Keeping log volume survivable
+
+The reason pgAudit deployments fail: someone sets `pgaudit.log = 'all'`, `log_parameter = on`, `log_relation = on` on a busy OLTP database and generates hundreds of GB per day, adding real overhead (every audited statement is extra formatting + I/O). Practical rules:
+
+1. **Never audit `READ, WRITE` globally on OLTP.** Use object auditing for the handful of sensitive tables instead.
+2. **Exempt noise generators**: `ALTER ROLE datadog_agent SET pgaudit.log = 'none';` (requires care with your auditors — document it).
+3. **Keep `log_catalog = off`** or every GUI refresh floods the log.
+4. Send `log_destination = csvlog` or JSON (PG15+: `jsonlog`) to make ingestion structured, and ship logs off-host — an audit log that a compromised host can delete fails its one job.
+5. Watch the logging collector's throughput; if the log disk is the bottleneck, it backpressures queries.
+
+## What pgAudit does not do
+
+- **No SELECT-result capture.** It logs that a query read a table, not the rows returned.
+- **No tamper-proof storage.** It writes to the server log; immutability comes from shipping to WORM/external storage.
+- **No login auditing.** That's core PostgreSQL: `log_connections = on`, `log_disconnections = on`.
+- **Not a substitute for RLS/permissions** — it observes; it doesn't prevent.
+
+### Alternatives and complements
+
+- **`log_statement = 'ddl'`** — zero-install poor-man's DDL audit; fine for change tracking, insufficient for compliance (misses function-internal DDL, no classification).
+- **Trigger-based audit tables** (e.g. the classic audit trigger writing old/new row JSONB) — captures *data* changes with values, queryable in SQL; costs write amplification per transaction and can't see SELECTs. Many teams run pgAudit *plus* a trigger audit on the few tables where row history matters. Our [Postgres trigger generator](https://chat2db.ai/tools/postgres-trigger-generator) can scaffold exactly that JSONB audit trigger.
+- **pgaudit_analyze** — companion tool that loads audit logs back into a database for SQL-based review.
+
+## Verifying your setup
+
+```sql
+-- 1. Confirm loading and settings
+SHOW shared_preload_libraries;
+SELECT name, setting FROM pg_settings WHERE name LIKE 'pgaudit.%';
+
+-- 2. Generate a test event
+CREATE TABLE audit_smoke_test (id int);
+DROP TABLE audit_smoke_test;
+```
+
+Then confirm the two `AUDIT: SESSION,...,DDL,...` lines appear in the current log file (`SELECT pg_current_logfile();`). Do this after every parameter-group change on managed services — a reboot that silently dropped `shared_preload_libraries` is a finding you want to make yourself, not receive.
+
+Reviewing audit configuration across a fleet is easier with a client that can run these catalog queries everywhere: [Chat2DB](https://chat2db.ai/download) manages connections to all your PostgreSQL instances (and 20+ other databases) in one place, with AI to draft the verification SQL — also usable directly in the browser at [app.chat2db.ai](https://app.chat2db.ai/).
+
+## FAQ
+
+**Does pgAudit slow down PostgreSQL?**
+The hook itself is cheap; the cost is proportional to how much you log. `ddl, role` auditing is unmeasurable on most systems. `all` with `log_relation` on a hot OLTP box can cost double-digit percentages and saturate log I/O — scope first, then measure.
+
+**How do I audit only one user's activity?**
+`ALTER ROLE suspicious_user SET pgaudit.log = 'all';` — per-role settings override the instance default, in both directions (you can also silence roles with `'none'`).
+
+**Can users evade pgAudit?**
+Not from SQL: the executor hook sees statements inside functions, DO blocks and EXECUTE, which is exactly what `log_statement` misses. Evasion requires superuser (who can change the settings — which is itself a `ROLE`-class audited action) or filesystem access to the logs, which is why logs must ship off-host.
