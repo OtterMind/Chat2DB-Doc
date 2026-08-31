@@ -1,0 +1,277 @@
+---
+title: "Postgres numeric vs decimal vs float: Which to Use"
+description: "Understand PostgreSQL numeric, decimal, real and double precision: exact vs approximate storage, rounding, performance and the right money type."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: August 31, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# Postgres numeric vs decimal vs float: Which to Use
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="August 31, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+Picking a numeric type in PostgreSQL looks like a small decision and turns into an expensive one when a financial report is off by a cent, or when a `sum()` over a large table takes ten times longer than it should. The types are not interchangeable: some store values exactly, others store the nearest binary approximation, and the difference shows up in comparisons, aggregates and rounding.
+
+## The types at a glance
+
+| Type | Aliases | Storage | Exact? | Range |
+| --- | --- | --- | --- | --- |
+| `smallint` | `int2` | 2 bytes | Yes | −32,768 to 32,767 |
+| `integer` | `int`, `int4` | 4 bytes | Yes | ±2.1 billion |
+| `bigint` | `int8` | 8 bytes | Yes | ±9.2 quintillion |
+| `numeric(p,s)` | `decimal(p,s)` | variable | Yes | up to 131,072 digits before the point |
+| `real` | `float4` | 4 bytes | No | ~6 decimal digits precision |
+| `double precision` | `float8` | 8 bytes | No | ~15 decimal digits precision |
+
+Two facts settle most confusion up front.
+
+**`decimal` and `numeric` are the same type.** `decimal` is an alias PostgreSQL keeps for SQL-standard compatibility. There is no behavioural difference at all, no performance difference, and nothing to choose between them. Pick one for consistency in your schema — most Postgres codebases write `numeric`.
+
+**`float` is ambiguous.** Bare `float` and `float(p)` with p ≤ 24 mean `real`; `float(p)` with p between 25 and 53 means `double precision`. Write the type you actually mean.
+
+## Exact vs approximate: the actual difference
+
+`numeric` stores values in base-10000 digit groups. What you insert is what you get back, always.
+
+`real` and `double precision` are IEEE 754 binary floating point. Many decimal fractions have no exact binary representation, exactly as 1/3 has no exact decimal representation. The classic demonstration:
+
+```sql
+SELECT 0.1::float8 + 0.2::float8 = 0.3::float8 AS float_equal,
+       0.1::numeric + 0.2::numeric = 0.3::numeric AS numeric_equal;
+```
+
+```
+ float_equal | numeric_equal
+-------------+---------------
+ f           | t
+```
+
+The float sum is `0.30000000000000004`. This is not a PostgreSQL quirk — it is how binary floating point works everywhere, in every language.
+
+Watch it compound over an aggregate:
+
+```sql
+CREATE TABLE payments (
+  amount_float   double precision,
+  amount_numeric numeric(12,2)
+);
+
+INSERT INTO payments
+SELECT 0.1, 0.1 FROM generate_series(1, 1000000);
+
+SELECT sum(amount_float)   AS float_total,
+       sum(amount_numeric) AS numeric_total
+FROM   payments;
+```
+
+The numeric total is exactly `100000.00`. The float total is off in the last digits. On a million payments, that is a reconciliation ticket.
+
+Floats also produce values that break assumptions elsewhere:
+
+```sql
+SELECT 'NaN'::float8, 'Infinity'::float8, '-Infinity'::float8;
+SELECT 'NaN'::float8 = 'NaN'::float8;   -- true in Postgres, unlike IEEE 754
+```
+
+## Precision and scale, and what happens when you exceed them
+
+`numeric(p, s)` means at most `p` significant digits total, with `s` of them after the decimal point. So `numeric(12,2)` holds ten digits before the point and two after.
+
+Values are **rounded** to the declared scale on insert, not truncated:
+
+```sql
+CREATE TABLE t (v numeric(6,2));
+INSERT INTO t VALUES (1234.567);
+SELECT v FROM t;   -- 1234.57
+```
+
+But exceeding the *precision* is an error, not a rounding:
+
+```sql
+INSERT INTO t VALUES (12345.67);
+-- ERROR:  numeric field overflow
+-- DETAIL:  A field with precision 6, scale 2 must round to an absolute value less than 10^4.
+```
+
+That distinction bites during data loads. Size `p` for the largest value you will ever store, not the largest you have today.
+
+Unconstrained `numeric` — no precision or scale — accepts any value and stores whatever scale it was given:
+
+```sql
+CREATE TABLE u (v numeric);
+INSERT INTO u VALUES (1234.5678901234567890);
+SELECT v FROM u;   -- 1234.5678901234567890, preserved exactly
+```
+
+Useful for scientific data where you do not know the scale in advance. For money, declare the scale — it enforces a business rule at the database level.
+
+## Performance: the real cost of numeric
+
+`numeric` is exact because it is implemented in software. Integers and floats use CPU instructions. The difference is not subtle:
+
+```sql
+-- Rough comparison; run on your own hardware
+EXPLAIN (ANALYZE, TIMING OFF)
+SELECT sum(amount_numeric) FROM payments;
+
+EXPLAIN (ANALYZE, TIMING OFF)
+SELECT sum(amount_float) FROM payments;
+```
+
+Expect `numeric` arithmetic to be several times slower than `float8`, and `numeric` storage to be larger — it is variable-length with a header, versus a fixed 8 bytes.
+
+This matters for wide analytical scans. It rarely matters for a transactional table where you touch a few hundred rows per request. Do not prematurely trade correctness for a speed difference you cannot measure in your actual workload.
+
+### The integer-cents alternative
+
+For high-volume financial systems where `numeric` shows up in profiles, storing minor units in a `bigint` gives you exact arithmetic at integer speed:
+
+```sql
+CREATE TABLE ledger (
+  id          bigserial PRIMARY KEY,
+  amount_cents bigint NOT NULL,
+  currency    char(3) NOT NULL,
+  -- Expose a readable view without a second stored column
+  amount numeric(19,2) GENERATED ALWAYS AS (amount_cents / 100.0) STORED
+);
+
+INSERT INTO ledger (amount_cents, currency) VALUES (129999, 'USD');
+SELECT amount_cents, amount FROM ledger;
+```
+
+The cost is discipline: every read and write must agree on the scaling factor, and currencies with three minor digits (or zero, like JPY) need handling. Reach for this only when you have measured a problem.
+
+## Casting and division traps
+
+Integer division truncates. This is the single most common numeric bug in SQL:
+
+```sql
+SELECT 7 / 2;                  -- 3       (integer division)
+SELECT 7 / 2.0;                -- 3.5     (numeric literal promotes)
+SELECT 7::numeric / 2;         -- 3.5000000000000000
+SELECT 7::float8 / 2;          -- 3.5
+```
+
+Computing a percentage from two integer columns silently yields zeros:
+
+```sql
+-- Wrong: integer division floors to 0 before the multiply
+SELECT successes / attempts * 100 AS pct FROM stats;
+
+-- Right
+SELECT round(successes::numeric / NULLIF(attempts, 0) * 100, 2) AS pct FROM stats;
+```
+
+The `NULLIF` guards division by zero, which raises an error rather than returning NULL.
+
+Note also that `round()` with two arguments only exists for `numeric`. On a double you must cast:
+
+```sql
+SELECT round(1.2345::float8, 2);           -- ERROR: function round(double precision, integer) does not exist
+SELECT round(1.2345::float8::numeric, 2);  -- 1.23
+```
+
+And rounding rules differ between the two types. `numeric` rounds half away from zero; `double precision` rounds half to even (banker's rounding):
+
+```sql
+SELECT round(0.5::numeric), round(1.5::numeric), round(2.5::numeric);   -- 1, 2, 3
+SELECT round(0.5::float8),  round(1.5::float8),  round(2.5::float8);    -- 0, 2, 2
+```
+
+If a report has to match another system's totals, this alone can explain a discrepancy.
+
+## Choosing, by use case
+
+**Money, prices, tax, anything audited:** `numeric(p,s)`. Non-negotiable. `numeric(19,4)` is a good general choice — it covers large amounts and the four decimal places that tax and FX calculations need. Use `numeric(12,2)` when two places genuinely suffice.
+
+```sql
+CREATE TABLE orders (
+  id       bigserial PRIMARY KEY,
+  subtotal numeric(19,4) NOT NULL CHECK (subtotal >= 0),
+  tax      numeric(19,4) NOT NULL DEFAULT 0,
+  total    numeric(19,4) GENERATED ALWAYS AS (subtotal + tax) STORED
+);
+```
+
+**Counts, ids, quantities:** integer types. `integer` unless you might exceed 2.1 billion, then `bigint`. Do not use `numeric` for a counter.
+
+**Scientific measurements, sensor readings, ML features:** `double precision`. The inputs already carry measurement error far larger than float representation error, and you want the speed and fixed width for large scans.
+
+**Ratios and percentages derived at query time:** compute in `numeric` if the inputs are exact and the output is reported to users; `double precision` if it feeds a statistical model.
+
+**Unknown scale, arbitrary precision:** unconstrained `numeric`.
+
+## Checking what your schema currently uses
+
+```sql
+SELECT c.table_name,
+       c.column_name,
+       c.data_type,
+       c.numeric_precision,
+       c.numeric_scale
+FROM   information_schema.columns c
+WHERE  c.table_schema = 'public'
+  AND  c.data_type IN ('numeric','real','double precision','integer','bigint','smallint')
+ORDER  BY c.table_name, c.ordinal_position;
+```
+
+Look specifically for float columns holding money — a `double precision` named `price`, `amount`, `total` or `balance` is almost always a bug waiting to be discovered by finance.
+
+Changing one is a rewrite of the table, so plan it:
+
+```sql
+-- Locks the table and rewrites it; do it in a maintenance window
+ALTER TABLE orders ALTER COLUMN total TYPE numeric(19,4) USING total::numeric(19,4);
+```
+
+Browsing types across a large schema is faster in a client that shows them inline; [Chat2DB](https://chat2db.ai/download) lists column types alongside the data and can explain or generate the migration SQL for you — there is a browser version at [app.chat2db.ai](https://app.chat2db.ai).
+
+## Aggregates and NULL handling
+
+One more difference worth knowing: `sum()` and `avg()` return different types depending on the input, and this propagates into your application's type mapping.
+
+```sql
+SELECT pg_typeof(sum(x)) FROM (SELECT 1::int AS x) t;        -- bigint
+SELECT pg_typeof(sum(x)) FROM (SELECT 1::bigint AS x) t;     -- numeric
+SELECT pg_typeof(sum(x)) FROM (SELECT 1::float8 AS x) t;     -- double precision
+SELECT pg_typeof(avg(x)) FROM (SELECT 1::int AS x) t;        -- numeric
+```
+
+Summing `bigint` promotes to `numeric` to avoid overflow, and `avg()` over integers returns `numeric` rather than a float. A JDBC or ORM layer that expects a `long` back from `sum()` on a `bigint` column will be surprised by that.
+
+Remember too that all aggregates skip NULLs, so `avg()` divides by the count of non-null values, not the row count:
+
+```sql
+-- These differ whenever amount contains NULLs
+SELECT avg(amount)              AS avg_ignoring_nulls,
+       sum(amount) / count(*)   AS avg_treating_null_as_zero,
+       avg(COALESCE(amount, 0)) AS avg_explicit_zero
+FROM   payments;
+```
+
+Decide deliberately which one your business logic means, and write it explicitly rather than relying on the default.
+
+## Migrating a float column to numeric safely
+
+If you have found a `double precision` money column, the fix is a type change — but a naive cast bakes in the accumulated representation error. Round to the intended scale as part of the conversion:
+
+```sql
+-- Check the damage first: rows whose stored value is not exactly 2dp
+SELECT count(*) FROM orders
+WHERE  total::numeric <> round(total::numeric, 2);
+
+-- Convert, rounding to the business scale
+ALTER TABLE orders
+  ALTER COLUMN total TYPE numeric(19,4)
+  USING round(total::numeric, 4);
+```
+
+This rewrites the table and holds an `ACCESS EXCLUSIVE` lock for the duration, so schedule it. On a large, busy table the lower-impact route is to add a new column, backfill it in batches, swap the names inside a short transaction, and drop the old column afterwards.
+
+## Wrapping up
+
+`decimal` and `numeric` are the same thing, and they are the only exact decimal types PostgreSQL offers. `real` and `double precision` are fast, compact approximations that will eventually disagree with a spreadsheet. The rule is simple enough to memorise: money and anything an auditor might look at gets `numeric` with an explicit precision and scale; measurements and anything feeding a statistical calculation gets `double precision`; counts get integers. Then watch for integer division, cast before rounding a float, and remember the two types round halves differently.

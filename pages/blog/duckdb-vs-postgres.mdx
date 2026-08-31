@@ -1,0 +1,211 @@
+---
+title: "DuckDB vs Postgres: When to Use Each (2026)"
+description: "A practical DuckDB vs PostgreSQL comparison: row vs column storage, concurrency, analytical speed, and running both with the postgres extension."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: August 31, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# DuckDB vs Postgres: When to Use Each (2026)
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="August 31, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+"Should we use DuckDB or Postgres?" is a question that usually has the wrong shape. The two systems are built for different halves of a workload, and the teams who get the most out of them run both — Postgres holding the data of record, DuckDB doing the scanning. This article explains why, with the architectural reasons behind each difference and the SQL to wire them together.
+
+## The one-paragraph answer
+
+PostgreSQL is a row-oriented, multi-process, client/server OLTP database: many concurrent connections, small reads and writes, ACID transactions, durability, replication. DuckDB is a column-oriented, in-process, single-writer OLAP engine: one process, vectorised execution, aggregate scans over millions of rows, no server to run. If your query touches a handful of rows by primary key, Postgres wins. If it scans a hundred million rows to compute five aggregates, DuckDB frequently wins by an order of magnitude.
+
+## Architecture: where the difference comes from
+
+### Storage layout
+
+Postgres stores rows contiguously in 8 KB pages. Fetching one order — every column of it — means one page read. But `SELECT avg(amount) FROM orders` still reads every page, dragging along every column you did not ask for.
+
+DuckDB stores data in columns, compressed per column. The same average reads only the `amount` column, at a compression ratio row storage cannot reach, because a column of similar values compresses far better than a row of mixed types.
+
+### Execution model
+
+Postgres executes a query one tuple at a time through an iterator tree. That is the right choice when a query touches ten rows; the per-tuple overhead is invisible.
+
+DuckDB uses vectorised execution: operators pass batches of ~2048 values, so the per-tuple overhead amortises and the inner loops become tight, cache-friendly, SIMD-friendly code. Across a large scan the difference compounds dramatically.
+
+### Process model
+
+Postgres is a server. It forks a backend per connection, coordinates through shared buffers and WAL, and supports many concurrent readers and writers with MVCC.
+
+DuckDB runs inside your process — Python, R, Java, the CLI, a Lambda. There is no server, no port, no connection pool. One process may hold the database file for writing; others can attach read-only. That is a real limitation for an application backend, and a non-issue for analysis.
+
+## A benchmark you can reproduce
+
+Generate ten million rows and run the same aggregate in both. In Postgres:
+
+```sql
+CREATE TABLE events (
+  id          bigserial PRIMARY KEY,
+  user_id     int         NOT NULL,
+  event_type  text        NOT NULL,
+  amount      numeric(12,2),
+  created_at  timestamptz NOT NULL
+);
+
+INSERT INTO events (user_id, event_type, amount, created_at)
+SELECT (random() * 100000)::int,
+       (ARRAY['view','click','purchase','refund'])[1 + (random() * 3)::int],
+       (random() * 500)::numeric(12,2),
+       now() - (random() * 365) * INTERVAL '1 day'
+FROM   generate_series(1, 10000000);
+
+VACUUM ANALYZE events;
+
+EXPLAIN (ANALYZE, BUFFERS)
+SELECT event_type,
+       date_trunc('month', created_at) AS month,
+       count(*)     AS n,
+       sum(amount)  AS revenue
+FROM   events
+GROUP  BY 1, 2
+ORDER  BY 1, 2;
+```
+
+The same data in DuckDB:
+
+```sql
+CREATE TABLE events AS
+SELECT (random() * 100000)::int AS user_id,
+       ['view','click','purchase','refund'][1 + (random() * 3)::int] AS event_type,
+       (random() * 500)::DECIMAL(12,2) AS amount,
+       now() - (random() * 365) * INTERVAL 1 DAY AS created_at
+FROM   range(10000000);
+
+SELECT event_type,
+       date_trunc('month', created_at) AS month,
+       count(*)    AS n,
+       sum(amount) AS revenue
+FROM   events
+GROUP  BY 1, 2
+ORDER  BY 1, 2;
+```
+
+Now flip the workload — a single-row lookup:
+
+```sql
+-- Postgres: index scan, sub-millisecond
+SELECT * FROM events WHERE id = 7431902;
+```
+
+DuckDB has no B-tree primary key index in the Postgres sense; it relies on zone maps and full column scans. On this query Postgres is the faster system by a wide margin, and it is not close.
+
+Run both on your own hardware and data. The shape of the result — DuckDB dominating wide aggregate scans, Postgres dominating point lookups and concurrent writes — is what matters, not any specific number.
+
+## Feature comparison
+
+| Dimension | PostgreSQL | DuckDB |
+| --- | --- | --- |
+| Storage | Row-oriented | Column-oriented, compressed |
+| Execution | Tuple-at-a-time | Vectorised batches |
+| Deployment | Client/server | In-process library |
+| Concurrent writers | Many (MVCC) | One process |
+| Concurrent readers | Many | Many (read-only attach) |
+| Point lookups | Excellent (B-tree) | Poor (scan + zone maps) |
+| Large aggregates | Moderate | Excellent |
+| Transactions | Full ACID, WAL, PITR | ACID within the process |
+| Replication | Streaming + logical | None built in |
+| Extensions | ~1000s incl. PostGIS, pgvector | Growing set, incl. spatial, vss |
+| Reads Parquet/CSV directly | Via extensions | Native, first-class |
+| User management | Roles, RLS, grants | None (file permissions) |
+
+## The part most comparisons miss: use both
+
+DuckDB's `postgres` extension lets it query a live PostgreSQL database directly. This is the setup that makes the whole "vs" framing dissolve.
+
+```sql
+INSTALL postgres;
+LOAD postgres;
+
+ATTACH 'host=localhost port=5432 dbname=app user=analyst password=secret'
+  AS pg (TYPE postgres, READ_ONLY);
+
+-- Query Postgres tables from DuckDB; predicates push down to the server
+SELECT status, count(*)
+FROM   pg.public.orders
+WHERE  created_at >= DATE '2026-01-01'
+GROUP  BY 1;
+```
+
+Two patterns follow.
+
+**Pull once, analyse many times.** Copy a slice into DuckDB's own storage so repeated exploration does not hammer production:
+
+```sql
+CREATE TABLE local_orders AS
+SELECT * FROM pg.public.orders WHERE created_at >= DATE '2026-01-01';
+
+-- Every subsequent query runs at column-store speed against the local copy
+SELECT date_trunc('week', created_at) AS week,
+       count(*)      AS orders,
+       sum(total)    AS revenue,
+       avg(total)    AS aov
+FROM   local_orders
+GROUP  BY 1
+ORDER  BY 1;
+```
+
+**Join warehouse files to operational rows.** Parquet on S3 joined to live Postgres dimensions, in one query, with no ETL:
+
+```sql
+SELECT c.segment,
+       count(*)        AS sessions,
+       sum(f.duration) AS total_seconds
+FROM   read_parquet('s3://logs/sessions/2026/*.parquet') f
+JOIN   pg.public.customers c ON c.id = f.customer_id
+GROUP  BY 1;
+```
+
+Going the other direction, exporting DuckDB results back into Postgres is a `COPY`:
+
+```sql
+COPY (SELECT * FROM monthly_summary) TO 'summary.parquet' (FORMAT parquet);
+```
+
+```bash
+psql -d app -c "\copy monthly_summary FROM 'summary.csv' WITH (FORMAT csv, HEADER)"
+```
+
+Managing both from one client saves a lot of context switching. [Chat2DB](https://chat2db.ai/download) connects to DuckDB and PostgreSQL side by side, with AI assistance for translating a question into the right dialect for whichever engine you are pointed at.
+
+## Choosing, concretely
+
+**Use PostgreSQL when** you are backing an application, need many concurrent writers, depend on transactional guarantees across requests, need row-level security or fine-grained grants, need replication and point-in-time recovery, or your access pattern is dominated by indexed lookups.
+
+**Use DuckDB when** you are analysing data rather than serving it: ad-hoc exploration of Parquet or CSV files, notebook analytics, a local step in a data pipeline, embedded analytics inside an application, or CI-time checks over test fixtures. It is also the pragmatic choice when your dataset is a few hundred gigabytes and spinning up a warehouse feels absurd.
+
+**Use both when** — as is usually the case — the data of record lives in Postgres and the questions you ask of it are analytical. Postgres keeps the truth; DuckDB scans it.
+
+## Common misconceptions
+
+**"DuckDB is just SQLite for analytics."** The comparison is fair for the embedded, single-file, zero-config part and misleading everywhere else. SQLite is row-oriented and OLTP-shaped; DuckDB's entire engine is built for scans.
+
+**"DuckDB can't handle data larger than RAM."** It can. Larger-than-memory operators spill to disk, so joins and aggregations complete on datasets several times the size of RAM — slower than in-memory, but they finish.
+
+**"Postgres can be made to do analytics with the right indexes."** Partially. Partitioning, BRIN indexes, materialised views and columnar extensions all help, and for many workloads that is enough. But you are optimising a row store toward a job a column store does natively, and past a certain data volume the architecture wins.
+
+## Operational differences that catch people out
+
+Beyond raw performance, a handful of practical differences decide whether a given plan will work.
+
+**Backups.** Postgres has `pg_dump`, WAL archiving, point-in-time recovery and physical replicas. DuckDB has a file — you back it up by copying it, and you must not copy it while a writer is active. For a derived analytical database this is usually fine, because you can rebuild it from source. For anything irreplaceable, it is not a backup strategy.
+
+**Concurrency in practice.** DuckDB permits one process to hold the database file for writing. Multiple readers can attach read-only, so a common deployment is one job that rebuilds the file and several consumers that read it. Trying to have two services write the same file will fail, and no amount of retry logic fixes it.
+
+**Type system differences.** DuckDB is broadly Postgres-compatible in syntax, which lulls people into assuming full parity. It is not identical: sequence and identity column behaviour differs, `numeric` precision limits differ, and Postgres extension types like PostGIS geometry or pgvector's `vector` have DuckDB analogues rather than drop-in equivalents. Port schemas deliberately rather than assuming a copy-paste will work.
+
+**Security model.** Postgres has roles, grants, row-level security and per-column privileges. DuckDB has file permissions. If different people should see different rows, that logic has to live in Postgres or in the application — DuckDB cannot enforce it.
+
+## Wrapping up
+
+DuckDB and Postgres disagree on nearly every design decision because they were built for different questions. Postgres answers "what is the current state of this record, and can a thousand clients change it safely?" DuckDB answers "what does this pattern look like across a hundred million rows?" Pick by question shape, and when the answer is "both" — which it usually is — let the `postgres` extension put them in the same query.

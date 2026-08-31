@@ -1,0 +1,393 @@
+---
+title: "Running DuckDB in Docker: A Practical Guide"
+description: "How to run DuckDB in Docker: official and custom images, persisting the database with volumes, running the UI in a container, and DuckDB in CI."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: August 31, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# Running DuckDB in Docker: A Practical Guide
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="August 31, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+DuckDB is an embedded database, which makes "run it in Docker" a slightly odd request at first glance — there is no server to daemonise. But containerising it is genuinely useful: reproducible analysis environments, CI jobs that validate data, pipeline steps that need a specific DuckDB version, and a shareable image with your extensions pre-installed. The catch is that the embedded model changes what the container needs to get right, and volume and permission mistakes are where people lose an afternoon.
+
+## The mental model
+
+A containerised Postgres is a long-running server you connect to over a port. A containerised DuckDB is a **command-line tool that operates on files**. The container is ephemeral; what matters is that the database file and the data it reads live on a volume that outlives it.
+
+Get that backwards — write to a path inside the container's writable layer — and your database silently disappears when the container exits.
+
+## The quickest start
+
+```bash
+docker run -it --rm duckdb/duckdb:latest
+```
+
+That drops you into a DuckDB shell with an in-memory database. Useful for a scratch query, useless for anything you want to keep.
+
+The version-pinned form, which is what you should actually use:
+
+```bash
+docker run -it --rm duckdb/duckdb:v1.2.1
+```
+
+Pin the tag. DuckDB's storage format and extension binaries are version-specific, and `latest` moving under a pipeline is a bad afternoon.
+
+## Persisting data with volumes
+
+Mount a host directory and keep both the database file and your source data inside it:
+
+```bash
+mkdir -p ./data
+
+docker run -it --rm \
+  -v "$PWD/data:/data" \
+  -w /data \
+  duckdb/duckdb:v1.2.1 \
+  duckdb /data/analytics.duckdb
+```
+
+Now `analytics.duckdb` lives on the host. Verify it survives:
+
+```sql
+CREATE TABLE t AS SELECT range AS id, range * 2 AS doubled FROM range(1000);
+.quit
+```
+
+```bash
+ls -la ./data/analytics.duckdb
+```
+
+### Fixing the permission problem
+
+Container images often run as root, so files the container creates end up owned by root on the host — and then your editor cannot write to them. Map your own UID in:
+
+```bash
+docker run -it --rm \
+  -u "$(id -u):$(id -g)" \
+  -v "$PWD/data:/data" \
+  -w /data \
+  duckdb/duckdb:v1.2.1 \
+  duckdb /data/analytics.duckdb
+```
+
+On macOS with Docker Desktop this is usually unnecessary because the file-sharing layer handles ownership; on Linux it is essential.
+
+### Caching extensions
+
+Extensions download into `~/.duckdb/extensions/`. Without a volume for it, every container run re-downloads `httpfs` and friends:
+
+```bash
+docker run -it --rm \
+  -v "$PWD/data:/data" \
+  -v duckdb_ext:/root/.duckdb \
+  duckdb/duckdb:v1.2.1 \
+  duckdb /data/analytics.duckdb
+```
+
+Better still, bake them into the image so runtime needs no network at all.
+
+## A custom image
+
+Most real uses want Python bindings and a fixed extension set:
+
+```dockerfile
+FROM python:3.12-slim
+
+ARG DUCKDB_VERSION=1.2.1
+
+RUN pip install --no-cache-dir \
+      duckdb==${DUCKDB_VERSION} \
+      pandas pyarrow
+
+# Pre-install extensions at build time so runtime works offline
+RUN python -c "\
+import duckdb; \
+con = duckdb.connect(); \
+[con.execute(f'INSTALL {e}') for e in ('httpfs','postgres','json','parquet','icu')]"
+
+WORKDIR /app
+COPY . /app
+
+ENTRYPOINT ["python"]
+```
+
+Build and run:
+
+```bash
+docker build -t my-duckdb:1.2.1 .
+docker run --rm -v "$PWD/data:/data" my-duckdb:1.2.1 analyze.py
+```
+
+Where `analyze.py` is an ordinary script:
+
+```python
+import duckdb
+
+con = duckdb.connect("/data/analytics.duckdb")
+con.execute("LOAD httpfs")
+
+con.execute("""
+    CREATE OR REPLACE TABLE daily AS
+    SELECT date_trunc('day', created_at) AS day,
+           event_type,
+           count(*)    AS n,
+           sum(amount) AS revenue
+    FROM   read_parquet('/data/events/*.parquet')
+    GROUP  BY 1, 2
+""")
+
+print(con.sql("SELECT * FROM daily ORDER BY day DESC LIMIT 10"))
+```
+
+Note the `LOAD` at runtime even though `INSTALL` happened at build time — installation persists to disk, loading does not persist across processes.
+
+## Running the DuckDB UI in a container
+
+The UI binds to localhost by default, which is unreachable from outside the container. Widen the bind address and publish the port:
+
+```bash
+docker run -it --rm \
+  -p 4213:4213 \
+  -v "$PWD/data:/data" \
+  duckdb/duckdb:v1.2.1 \
+  duckdb /data/analytics.duckdb \
+    -c "SET ui_remote_host='0.0.0.0'; INSTALL ui; LOAD ui; CALL start_ui_server();"
+```
+
+Then open `http://localhost:4213`. Keep this on a trusted network — the UI has no authentication of its own, so exposing that port publicly hands anyone a shell into your data.
+
+## docker-compose for an analysis environment
+
+A setup that pairs DuckDB with MinIO for local S3 testing:
+
+```yaml
+services:
+  duckdb:
+    build: .
+    volumes:
+      - ./data:/data
+      - ./notebooks:/notebooks
+      - duckdb_ext:/root/.duckdb
+    environment:
+      AWS_ACCESS_KEY_ID: minioadmin
+      AWS_SECRET_ACCESS_KEY: minioadmin
+    ports:
+      - "4213:4213"
+    depends_on:
+      - minio
+    stdin_open: true
+    tty: true
+
+  minio:
+    image: minio/minio:latest
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - minio_data:/data
+
+volumes:
+  duckdb_ext:
+  minio_data:
+```
+
+Pointing DuckDB at MinIO from inside the compose network:
+
+```sql
+INSTALL httpfs; LOAD httpfs;
+
+CREATE SECRET minio (
+  TYPE s3,
+  KEY_ID 'minioadmin',
+  SECRET 'minioadmin',
+  ENDPOINT 'minio:9000',
+  URL_STYLE 'path',
+  USE_SSL false
+);
+
+SELECT count(*) FROM 's3://test-bucket/events/*.parquet';
+```
+
+The `ENDPOINT` uses the service name, not `localhost` — inside the network, `localhost` is the DuckDB container itself.
+
+## Attaching to a Postgres container
+
+A very common pattern: DuckDB doing analysis over a Postgres that is also in compose.
+
+```yaml
+  postgres:
+    image: postgres:17
+    environment:
+      POSTGRES_PASSWORD: secret
+      POSTGRES_DB: app
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+```
+
+```sql
+INSTALL postgres; LOAD postgres;
+
+ATTACH 'host=postgres port=5432 dbname=app user=postgres password=secret'
+  AS pg (TYPE postgres, READ_ONLY);
+
+SELECT status, count(*) FROM pg.public.orders GROUP BY 1;
+```
+
+Again, the host is the service name. If you also want to browse those databases interactively from your machine rather than through a container shell, a client like [Chat2DB](https://chat2db.ai/download) connects to the published ports directly and speaks both DuckDB and PostgreSQL.
+
+## DuckDB in CI
+
+Data validation in a pipeline is a natural fit — no service to wait on, no health check, just a binary and some files:
+
+```yaml
+name: validate-data
+on: [push]
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    container:
+      image: duckdb/duckdb:v1.2.1
+    steps:
+      - uses: actions/checkout@v4
+      - name: Assert no null customer ids
+        run: |
+          duckdb -c "
+            SELECT count(*) AS bad
+            FROM read_csv('fixtures/orders.csv')
+            WHERE customer_id IS NULL
+          " -csv -noheader | grep -qx '0' \
+            || { echo 'Found null customer_id values'; exit 1; }
+      - name: Assert referential integrity
+        run: |
+          duckdb -c "
+            SELECT count(*) AS orphans
+            FROM read_csv('fixtures/orders.csv') o
+            LEFT JOIN read_csv('fixtures/customers.csv') c
+              ON c.id = o.customer_id
+            WHERE c.id IS NULL
+          " -csv -noheader | grep -qx '0' \
+            || { echo 'Orphan orders found'; exit 1; }
+```
+
+Give the container a memory limit that matches the runner, or a large aggregate will get OOM-killed rather than spilling to disk:
+
+```bash
+docker run --rm -m 2g my-duckdb:1.2.1 \
+  duckdb -c "SET memory_limit='1500MB'; SELECT ..."
+```
+
+Set DuckDB's limit slightly below the container's so DuckDB spills before the kernel intervenes.
+
+## Common problems
+
+**The database file is empty after the container exits.** You wrote to a path that was not on a mounted volume. Check with `docker inspect` that the mount landed where you think.
+
+**`IO Error: Cannot open file ... Permission denied`.** UID mismatch between container and host. Add `-u "$(id -u):$(id -g)"`.
+
+**Extensions re-download every run.** No volume on `~/.duckdb`. Mount one, or bake extensions into the image.
+
+**`Out of Memory Error` in a container with plenty of host RAM.** DuckDB sizes its memory limit from what it detects, which may not respect the cgroup limit. Set `SET memory_limit` explicitly.
+
+**Two containers writing the same file.** DuckDB allows a single writer process. Give each writer its own file, or attach read-only from all but one.
+
+## Multi-stage builds for a smaller image
+
+The `python:3.12-slim` base above is convenient but carries a full Python toolchain. When you only need the CLI plus extensions, a multi-stage build produces something much smaller to ship around a cluster:
+
+```dockerfile
+FROM debian:bookworm-slim AS fetch
+ARG DUCKDB_VERSION=1.2.1
+RUN apt-get update && apt-get install -y --no-install-recommends curl unzip ca-certificates \
+ && curl -fsSL -o /tmp/duckdb.zip \
+      "https://github.com/duckdb/duckdb/releases/download/v${DUCKDB_VERSION}/duckdb_cli-linux-amd64.zip" \
+ && unzip /tmp/duckdb.zip -d /usr/local/bin \
+ && chmod +x /usr/local/bin/duckdb
+
+# Warm the extension cache in the build stage
+RUN duckdb -c "INSTALL httpfs; INSTALL json; INSTALL parquet; INSTALL icu;"
+
+FROM debian:bookworm-slim
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates \
+ && rm -rf /var/lib/apt/lists/*
+COPY --from=fetch /usr/local/bin/duckdb /usr/local/bin/duckdb
+COPY --from=fetch /root/.duckdb /root/.duckdb
+WORKDIR /data
+ENTRYPOINT ["duckdb"]
+```
+
+Two details matter. `ca-certificates` must be present in the final stage or every HTTPS read fails with a TLS error that looks unrelated to networking. And copying the extension cache forward is what carries the pre-installed extensions into the runtime image — without it, the build-stage `INSTALL` was wasted.
+
+## Passing SQL into a container cleanly
+
+Long SQL on a `docker run` command line becomes unreadable and quoting-hostile fast. Mount a file and use `-f`, or `-init` for setup that should run before an interactive session:
+
+```bash
+cat > queries/daily.sql <<'SQL'
+CREATE OR REPLACE TABLE daily AS
+SELECT date_trunc('day', created_at) AS day, count(*) AS n
+FROM   read_parquet('/data/events/*.parquet')
+GROUP  BY 1;
+
+SELECT * FROM daily ORDER BY day DESC LIMIT 7;
+SQL
+
+docker run --rm \
+  -v "$PWD/data:/data" \
+  -v "$PWD/queries:/queries:ro" \
+  duckdb/duckdb:v1.2.1 \
+  duckdb /data/analytics.duckdb -f /queries/daily.sql
+```
+
+Mounting the query directory read-only is a small habit worth keeping — it makes it impossible for a script to accidentally rewrite the queries it was given.
+
+## Choosing between the CLI image and a language image
+
+There are two reasonable base images and the choice is not obvious at first.
+
+The official `duckdb/duckdb` CLI image is small and right when the container's job is to execute SQL: a CI assertion, a scheduled aggregation, a file conversion step. Everything is expressible as `-c` or `-f`, and there is no interpreter to keep patched.
+
+A language base — `python:3.12-slim`, or a JVM image if you use the JDBC driver — is right when the container runs a program that happens to use DuckDB. That covers anything with branching logic, error handling, API calls, or output that is not a table. Do not try to force that into shell and SQL; you will end up with an unmaintainable entrypoint script.
+
+A useful middle ground for data pipelines is to install the Python package and use it purely as a driver, keeping the actual logic in mounted `.sql` files. That gives you real error handling and retries in Python while keeping the SQL reviewable on its own:
+
+```python
+import pathlib, duckdb
+
+con = duckdb.connect("/data/analytics.duckdb")
+for path in sorted(pathlib.Path("/queries").glob("*.sql")):
+    print(f"running {path.name}")
+    con.execute(path.read_text())
+```
+
+## Health checks and exit codes
+
+Because DuckDB containers are usually batch jobs rather than services, the thing to get right is the exit code — an orchestrator can only retry what reports failure correctly.
+
+The CLI returns non-zero when a statement errors, so a plain `-f` invocation already fails properly. What catches people out is a query that succeeds but returns the *wrong* answer; that exits 0. Assertions therefore need to convert a data condition into a process failure explicitly:
+
+```bash
+docker run --rm -v "$PWD/data:/data" duckdb/duckdb:v1.2.1 \
+  duckdb -c "
+    SELECT CASE WHEN count(*) = 0
+                THEN 'ok'
+                ELSE error('found ' || count(*) || ' rows with null ids')
+           END
+    FROM read_parquet('/data/events/*.parquet') WHERE id IS NULL;"
+```
+
+The `error()` function raises, which gives a non-zero exit and a readable message in the container log — cleaner than piping output to `grep` and hoping the format never changes.
+
+## Wrapping up
+
+Containerising DuckDB is mostly about respecting its embedded nature: the container is a disposable execution environment, and every byte you care about — the `.duckdb` file, the source data, the extension cache — belongs on a volume. Pin the version, bake extensions in at build time, set a memory limit that matches the container's, and use the service name rather than `localhost` when attaching to other containers. Do that and you get a reproducible analysis environment that behaves identically on a laptop and in CI.

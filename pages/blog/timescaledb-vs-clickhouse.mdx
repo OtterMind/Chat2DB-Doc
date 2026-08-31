@@ -1,0 +1,367 @@
+---
+title: "TimescaleDB vs ClickHouse: Time-Series Database Guide"
+description: "Compare TimescaleDB and ClickHouse for time-series data: architecture, ingest, compression, SQL support, joins, updates and how to choose."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: August 31, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# TimescaleDB vs ClickHouse: Time-Series Database Guide
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="August 31, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+Both TimescaleDB and ClickHouse handle time-stamped data at scale, both speak SQL, and both will happily ingest millions of rows per second on decent hardware. They arrive there from opposite directions, and that difference determines which one fits your workload.
+
+TimescaleDB is a PostgreSQL extension: you get the entire Postgres feature set, and time-series capability is layered on top. ClickHouse is a purpose-built columnar OLAP database: it gave up transactional guarantees and flexible updates in exchange for scan speed that is very hard to match.
+
+## Architecture
+
+### TimescaleDB: Postgres, extended
+
+TimescaleDB adds *hypertables* — a logical table transparently partitioned into chunks by time (and optionally by a space dimension like `device_id`).
+
+```sql
+CREATE EXTENSION IF NOT EXISTS timescaledb;
+
+CREATE TABLE metrics (
+  time        timestamptz NOT NULL,
+  device_id   int         NOT NULL,
+  temperature double precision,
+  humidity    double precision
+);
+
+SELECT create_hypertable('metrics', 'time', chunk_time_interval => INTERVAL '1 day');
+
+-- Optional space partitioning across 4 hash buckets
+SELECT add_dimension('metrics', 'device_id', number_partitions => 4);
+```
+
+To your application it is one table. Underneath, each chunk is a real Postgres table with its own indexes, and the planner prunes chunks that fall outside the query's time range. Everything Postgres does — foreign keys, `JOIN`s to normal tables, transactions, `UPDATE`, row-level security, PostGIS, pgvector — keeps working.
+
+### ClickHouse: columnar MergeTree
+
+ClickHouse stores each column in its own sorted, compressed file. The `MergeTree` family sorts data by an `ORDER BY` key and writes immutable parts that background threads merge over time.
+
+```sql
+CREATE TABLE metrics (
+  time        DateTime64(3),
+  device_id   UInt32,
+  temperature Float64,
+  humidity    Float64
+)
+ENGINE = MergeTree
+PARTITION BY toYYYYMM(time)
+ORDER BY (device_id, time);
+```
+
+The `ORDER BY` clause is the single most consequential decision in a ClickHouse schema. It defines the sparse primary index, the physical sort order, and therefore what gets skipped at query time. Put the column you filter by most first — usually the entity id, then time. Getting it wrong means full scans on queries that should have skipped 99% of the data.
+
+## Ingest
+
+Both are fast; the failure modes differ.
+
+TimescaleDB inherits Postgres write mechanics: WAL, MVCC, per-row overhead. `COPY` into a hypertable is the fast path.
+
+```sql
+COPY metrics FROM '/data/metrics.csv' WITH (FORMAT csv, HEADER);
+```
+
+```sql
+-- Batched inserts also work well
+INSERT INTO metrics (time, device_id, temperature, humidity)
+SELECT now() - (s || ' seconds')::interval,
+       (random() * 1000)::int,
+       20 + random() * 15,
+       40 + random() * 40
+FROM   generate_series(1, 1000000) s;
+```
+
+ClickHouse strongly prefers large batches. Thousands of tiny inserts create thousands of parts and the merge process falls behind, producing the infamous `Too many parts` error.
+
+```sql
+INSERT INTO metrics VALUES (now(), 1, 21.5, 55.0), (now(), 2, 22.1, 54.2) /* ...thousands more... */;
+```
+
+Use asynchronous inserts when the client genuinely cannot batch:
+
+```sql
+SET async_insert = 1;
+SET wait_for_async_insert = 0;
+```
+
+The rule of thumb: aim for at least ~10,000 rows or ~10 MB per insert, and no more than roughly one insert per second per table.
+
+## Compression
+
+TimescaleDB compresses per chunk, converting row storage into a columnar layout after data ages past a threshold:
+
+```sql
+ALTER TABLE metrics SET (
+  timescaledb.compress,
+  timescaledb.compress_segmentby = 'device_id',
+  timescaledb.compress_orderby   = 'time DESC'
+);
+
+SELECT add_compression_policy('metrics', INTERVAL '7 days');
+
+-- Check what you actually gained
+SELECT * FROM hypertable_compression_stats('metrics');
+```
+
+Compressed chunks are queryable but historically restricted for updates — plan your mutation window around the policy interval.
+
+ClickHouse compresses everything from the start, per column, with codecs you can tune. Delta plus a general codec is extremely effective on monotonically increasing timestamps and slowly changing sensor readings:
+
+```sql
+CREATE TABLE metrics (
+  time        DateTime64(3) CODEC(Delta, ZSTD(1)),
+  device_id   UInt32        CODEC(Delta, ZSTD(1)),
+  temperature Float64       CODEC(Gorilla, ZSTD(1)),
+  humidity    Float64       CODEC(Gorilla, ZSTD(1))
+)
+ENGINE = MergeTree
+ORDER BY (device_id, time);
+```
+
+```sql
+SELECT table,
+       formatReadableSize(sum(data_compressed_bytes))   AS compressed,
+       formatReadableSize(sum(data_uncompressed_bytes)) AS uncompressed,
+       round(sum(data_uncompressed_bytes) / sum(data_compressed_bytes), 1) AS ratio
+FROM   system.parts
+WHERE  active AND table = 'metrics'
+GROUP  BY table;
+```
+
+Both achieve large reductions on typical time-series data. ClickHouse generally goes further, particularly with the specialised codecs.
+
+## Continuous aggregation
+
+This is where both shine, with different ergonomics.
+
+TimescaleDB's continuous aggregates are incrementally refreshed materialised views:
+
+```sql
+CREATE MATERIALIZED VIEW metrics_hourly
+WITH (timescaledb.continuous) AS
+SELECT time_bucket('1 hour', time) AS bucket,
+       device_id,
+       avg(temperature) AS avg_temp,
+       max(temperature) AS max_temp,
+       count(*)         AS readings
+FROM   metrics
+GROUP  BY bucket, device_id;
+
+SELECT add_continuous_aggregate_policy('metrics_hourly',
+  start_offset      => INTERVAL '3 days',
+  end_offset        => INTERVAL '1 hour',
+  schedule_interval => INTERVAL '1 hour');
+```
+
+Querying the view transparently combines materialised history with real-time data at the edge — you do not have to union anything yourself.
+
+ClickHouse uses materialised views that fire on insert, writing into an aggregating target table:
+
+```sql
+CREATE TABLE metrics_hourly (
+  bucket    DateTime,
+  device_id UInt32,
+  avg_temp  AggregateFunction(avg, Float64),
+  max_temp  AggregateFunction(max, Float64),
+  readings  AggregateFunction(count)
+)
+ENGINE = AggregatingMergeTree
+ORDER BY (device_id, bucket);
+
+CREATE MATERIALIZED VIEW metrics_hourly_mv TO metrics_hourly AS
+SELECT toStartOfHour(time) AS bucket,
+       device_id,
+       avgState(temperature) AS avg_temp,
+       maxState(temperature) AS max_temp,
+       countState()          AS readings
+FROM   metrics
+GROUP  BY bucket, device_id;
+
+-- Read with the matching -Merge combinators
+SELECT bucket, device_id,
+       avgMerge(avg_temp) AS avg_temp,
+       maxMerge(max_temp) AS max_temp,
+       countMerge(readings) AS readings
+FROM   metrics_hourly
+GROUP  BY bucket, device_id
+ORDER  BY bucket DESC;
+```
+
+The State/Merge pattern is powerful but a genuine learning curve, and the view only sees rows inserted after it was created — backfilling history is a separate manual step.
+
+## Time-series query ergonomics
+
+TimescaleDB provides hyperfunctions that make common patterns terse:
+
+```sql
+-- 5-minute buckets with gap filling and interpolation
+SELECT time_bucket_gapfill('5 minutes', time) AS bucket,
+       device_id,
+       interpolate(avg(temperature)) AS temp,
+       locf(avg(humidity))           AS humidity
+FROM   metrics
+WHERE  time > now() - INTERVAL '1 day'
+  AND  time <= now()
+GROUP  BY bucket, device_id
+ORDER  BY bucket;
+
+-- First and last value in each bucket, without a window function
+SELECT time_bucket('1 hour', time) AS bucket,
+       device_id,
+       first(temperature, time) AS opening,
+       last(temperature, time)  AS closing
+FROM   metrics
+GROUP  BY bucket, device_id;
+```
+
+ClickHouse has its own dense set:
+
+```sql
+SELECT toStartOfFiveMinute(time) AS bucket,
+       device_id,
+       avg(temperature) AS temp
+FROM   metrics
+WHERE  time > now() - INTERVAL 1 DAY
+GROUP  BY bucket, device_id
+ORDER  BY bucket
+WITH FILL STEP toIntervalMinute(5);
+
+-- Sequence and funnel analysis, hard to express in standard SQL
+SELECT device_id,
+       windowFunnel(3600)(time, temperature > 30, temperature > 40) AS level
+FROM   metrics
+GROUP  BY device_id;
+
+SELECT quantilesTDigest(0.5, 0.95, 0.99)(temperature) FROM metrics;
+```
+
+Both are good. TimescaleDB's are more standard-SQL-shaped; ClickHouse's go further into analytical territory.
+
+## Updates, deletes and joins
+
+This is the sharpest practical divide.
+
+TimescaleDB does normal Postgres `UPDATE` and `DELETE`, transactionally, with foreign keys and joins to relational tables that behave exactly as you expect:
+
+```sql
+UPDATE metrics SET temperature = 21.0
+WHERE device_id = 42 AND time = '2026-08-31 10:00:00+00';
+
+SELECT m.time, m.temperature, d.location, d.model
+FROM   metrics m
+JOIN   devices d ON d.id = m.device_id
+WHERE  m.time > now() - INTERVAL '1 hour';
+```
+
+ClickHouse treats mutations as asynchronous, expensive background rewrites of whole parts:
+
+```sql
+ALTER TABLE metrics UPDATE temperature = 21.0
+WHERE device_id = 42 AND time = '2026-08-31 10:00:00';
+
+-- It is asynchronous; watch for completion
+SELECT * FROM system.mutations WHERE table = 'metrics' AND NOT is_done;
+```
+
+Do not build a workload around that. Joins are also weaker: ClickHouse historically favours denormalised tables and dictionary lookups over large joins.
+
+```sql
+CREATE DICTIONARY devices_dict (
+  id       UInt32,
+  location String,
+  model    String
+)
+PRIMARY KEY id
+SOURCE(POSTGRESQL(host 'pg' db 'app' table 'devices' user 'ro' password 'x'))
+LAYOUT(HASHED())
+LIFETIME(3600);
+
+SELECT time,
+       temperature,
+       dictGet('devices_dict', 'location', device_id) AS location
+FROM   metrics
+WHERE  time > now() - INTERVAL 1 HOUR;
+```
+
+## Head to head
+
+| Dimension | TimescaleDB | ClickHouse |
+| --- | --- | --- |
+| Foundation | PostgreSQL extension | Purpose-built columnar OLAP |
+| Storage | Row (hot) → columnar (compressed) | Columnar throughout |
+| SQL dialect | Full PostgreSQL | ClickHouse SQL (SQL-like, many extensions) |
+| Transactions | Full ACID | Limited; no multi-statement transactions |
+| Updates/deletes | Normal SQL, immediate | Async mutations, expensive |
+| Joins | Full relational, planner-optimised | Weaker; prefers denormalisation/dictionaries |
+| Ingest style | Batched or row-by-row | Large batches required |
+| Ecosystem | Entire Postgres world | Its own, growing fast |
+| Constraints/FKs | Yes | No |
+| Scale-out | Replication, read replicas | Native sharding + replication |
+| Best at | Mixed relational + time-series | Massive analytical scans |
+
+## Choosing
+
+**Pick TimescaleDB when** the time-series data lives alongside relational data you also need — users, devices, orders, billing. When you need real transactions, foreign keys, or updates. When your team already runs Postgres and every existing tool, driver, ORM, backup script and dashboard should keep working. When correctness matters more than the last factor of scan speed.
+
+**Pick ClickHouse when** the workload is overwhelmingly append-only analytics: logs, events, metrics, clickstream at very high volume. When queries scan billions of rows and latency targets are aggressive. When you can denormalise and can live without joins and updates. When storage cost at petabyte scale is a line item you actually care about.
+
+**Consider both** — many teams run Postgres/TimescaleDB for operational and recent data, and ship older data into ClickHouse for long-horizon analytics. Working across two SQL dialects daily is friction; a client that speaks both, like [Chat2DB](https://chat2db.ai/download), removes some of it by generating dialect-correct SQL for whichever connection you are on. There is a web version at [app.chat2db.ai](https://app.chat2db.ai) too.
+
+## Retention and downsampling
+
+Both systems expect old raw data to age out, and both make it declarative rather than a cron job full of `DELETE` statements.
+
+TimescaleDB drops whole chunks, which is far cheaper than deleting rows because it is a table drop rather than an MVCC operation:
+
+```sql
+SELECT add_retention_policy('metrics', INTERVAL '90 days');
+
+-- Inspect what the scheduler is doing
+SELECT * FROM timescaledb_information.jobs;
+SELECT * FROM timescaledb_information.job_stats ORDER BY last_run_started_at DESC;
+```
+
+The usual pattern keeps raw data for a few months and continuous aggregates for years, with a longer retention on the rollup:
+
+```sql
+SELECT add_retention_policy('metrics', INTERVAL '90 days');
+SELECT add_retention_policy('metrics_hourly', INTERVAL '5 years');
+```
+
+ClickHouse expresses the same idea as a TTL on the table, and can move data between storage tiers rather than only deleting it:
+
+```sql
+ALTER TABLE metrics
+  MODIFY TTL time + INTERVAL 90 DAY DELETE,
+             time + INTERVAL 30 DAY TO VOLUME 'cold';
+```
+
+It can also downsample in place, replacing raw rows with aggregates once they age past a threshold:
+
+```sql
+ALTER TABLE metrics
+  MODIFY TTL time + INTERVAL 30 DAY
+  GROUP BY device_id, toStartOfHour(time)
+  SET temperature = avg(temperature), humidity = avg(humidity);
+```
+
+That last form has no direct TimescaleDB equivalent; there you would keep the continuous aggregate and drop the raw chunks underneath it.
+
+## Operational weight
+
+TimescaleDB is a Postgres extension, so it inherits Postgres operations wholesale: `pg_dump` and physical backups, streaming replicas, connection pooling with PgBouncer, existing monitoring, existing runbooks. If your team already operates Postgres, the marginal operational cost is close to zero.
+
+ClickHouse is a separate system with its own clustering model (shards, replicas, and ClickHouse Keeper for coordination), its own backup tooling, and its own failure modes — `Too many parts`, merge backlogs, and memory limits on large `GROUP BY` operations are the ones you will meet first. It scales further horizontally, but it is a genuinely new thing to run.
+
+## Wrapping up
+
+The choice is less about time-series features — both have excellent ones — and more about what surrounds the time-series data. If it needs to join, update and transact with the rest of your relational model, TimescaleDB keeps you inside PostgreSQL and gives you partitioning, compression and continuous aggregates without leaving. If it is a firehose of immutable events that you scan constantly and rarely modify, ClickHouse's columnar engine and codecs will cost less and answer faster. Match the tool to the shape of your writes, not just the size of your data.

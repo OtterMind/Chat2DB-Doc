@@ -1,0 +1,452 @@
+---
+title: "How to Check Table and Database Size in PostgreSQL"
+description: "Find PostgreSQL database, table, index and schema sizes with pg_total_relation_size, understand TOAST and bloat, and reclaim wasted disk space."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: August 31, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# How to Check Table and Database Size in PostgreSQL
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="August 31, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+The disk fills up, and the first question is always the same: what is actually taking the space? PostgreSQL answers this well, but the functions have overlapping names and subtly different meanings, and the total you get from one rarely matches the total from another. This guide covers each level — cluster, database, schema, table, index, TOAST — and what to do once you have found the culprit.
+
+## Database size
+
+```sql
+SELECT pg_size_pretty(pg_database_size('mydb'));
+```
+
+Every database in the cluster, largest first:
+
+```sql
+SELECT datname,
+       pg_size_pretty(pg_database_size(datname)) AS size,
+       pg_database_size(datname) AS bytes
+FROM   pg_database
+WHERE  datistemplate = false
+ORDER  BY bytes DESC;
+```
+
+Keep the raw bytes column around — `pg_size_pretty` returns text, so ordering by it sorts alphabetically and puts "9 GB" after "500 MB".
+
+The `psql` shortcut for the same thing:
+
+```
+\l+
+```
+
+## Table size — and the three functions that differ
+
+This is where people get tripped up. PostgreSQL offers three size functions for a table and they measure different things:
+
+- `pg_relation_size(t)` — the main data fork only. No indexes, no TOAST.
+- `pg_table_size(t)` — main fork plus TOAST plus the free space and visibility maps. Still no indexes.
+- `pg_total_relation_size(t)` — everything: table, TOAST, and all indexes.
+
+Seeing them side by side makes the relationship obvious:
+
+```sql
+SELECT relname AS table,
+       pg_size_pretty(pg_relation_size(c.oid))        AS heap_only,
+       pg_size_pretty(pg_table_size(c.oid))           AS heap_plus_toast,
+       pg_size_pretty(pg_indexes_size(c.oid))         AS indexes,
+       pg_size_pretty(pg_total_relation_size(c.oid))  AS total
+FROM   pg_class c
+JOIN   pg_namespace n ON n.oid = c.relnamespace
+WHERE  c.relkind = 'r'
+  AND  n.nspname = 'public'
+ORDER  BY pg_total_relation_size(c.oid) DESC
+LIMIT  20;
+```
+
+If `total` is much larger than `heap_plus_toast`, your indexes are the problem, not your data. That is common and often fixable.
+
+### The standard "biggest tables" query
+
+The one worth keeping in a snippet file:
+
+```sql
+SELECT n.nspname AS schema,
+       c.relname AS name,
+       CASE c.relkind
+         WHEN 'r' THEN 'table'
+         WHEN 'm' THEN 'matview'
+         WHEN 'i' THEN 'index'
+         WHEN 'p' THEN 'partitioned table'
+         WHEN 't' THEN 'toast'
+       END AS type,
+       pg_size_pretty(pg_total_relation_size(c.oid)) AS total_size,
+       pg_size_pretty(pg_relation_size(c.oid))       AS data_size,
+       pg_size_pretty(pg_indexes_size(c.oid))        AS index_size,
+       c.reltuples::bigint AS approx_rows
+FROM   pg_class c
+JOIN   pg_namespace n ON n.oid = c.relnamespace
+WHERE  n.nspname NOT IN ('pg_catalog', 'information_schema')
+  AND  c.relkind IN ('r','m','p')
+ORDER  BY pg_total_relation_size(c.oid) DESC
+LIMIT  25;
+```
+
+`reltuples` is an estimate maintained by `ANALYZE` and vacuum, not a live count. It is usually close enough for triage and free, whereas `count(*)` scans the table.
+
+The `psql` equivalents:
+
+```
+\dt+
+\di+
+\dm+
+```
+
+## Index size
+
+Indexes routinely consume more space than the tables they serve. Find the largest:
+
+```sql
+SELECT n.nspname   AS schema,
+       t.relname   AS table,
+       i.relname   AS index,
+       pg_size_pretty(pg_relation_size(i.oid)) AS size,
+       idx.indisunique AS is_unique,
+       idx.indisvalid  AS is_valid
+FROM   pg_index idx
+JOIN   pg_class i ON i.oid = idx.indexrelid
+JOIN   pg_class t ON t.oid = idx.indrelid
+JOIN   pg_namespace n ON n.oid = t.relnamespace
+WHERE  n.nspname NOT IN ('pg_catalog','information_schema')
+ORDER  BY pg_relation_size(i.oid) DESC
+LIMIT  25;
+```
+
+Then find the ones nobody uses — often the fastest space win available:
+
+```sql
+SELECT s.schemaname,
+       s.relname AS table,
+       s.indexrelname AS index,
+       pg_size_pretty(pg_relation_size(s.indexrelid)) AS size,
+       s.idx_scan AS scans
+FROM   pg_stat_user_indexes s
+JOIN   pg_index i ON i.indexrelid = s.indexrelid
+WHERE  s.idx_scan = 0
+  AND  NOT i.indisunique
+  AND  NOT i.indisprimary
+ORDER  BY pg_relation_size(s.indexrelid) DESC;
+```
+
+Two cautions before you drop anything. `idx_scan` counts since the last stats reset — check `pg_stat_get_db_stat_reset_time()` and make sure the window covers a full business cycle including monthly jobs. And an index may exist to enforce a constraint or support a foreign key even with zero scans recorded.
+
+```sql
+SELECT stats_reset FROM pg_stat_database WHERE datname = current_database();
+```
+
+Drop safely without locking out writes:
+
+```sql
+DROP INDEX CONCURRENTLY idx_orders_unused;
+```
+
+## Schema size
+
+Useful in a multi-tenant database where each tenant owns a schema:
+
+```sql
+SELECT n.nspname AS schema,
+       pg_size_pretty(sum(pg_total_relation_size(c.oid))) AS size,
+       count(*) FILTER (WHERE c.relkind = 'r') AS tables
+FROM   pg_class c
+JOIN   pg_namespace n ON n.oid = c.relnamespace
+WHERE  n.nspname NOT IN ('pg_catalog','information_schema')
+  AND  n.nspname NOT LIKE 'pg_toast%'
+GROUP  BY n.nspname
+ORDER  BY sum(pg_total_relation_size(c.oid)) DESC;
+```
+
+## TOAST: where large values hide
+
+When a row exceeds roughly 2 KB, PostgreSQL moves large values — long `text`, `jsonb`, `bytea` — into a separate TOAST table, compressed. This means a table with a modest `pg_relation_size` can be enormous overall.
+
+```sql
+SELECT c.relname AS table,
+       pg_size_pretty(pg_relation_size(c.oid))   AS main,
+       pg_size_pretty(pg_relation_size(t.oid))   AS toast,
+       pg_size_pretty(pg_total_relation_size(c.oid)) AS total
+FROM   pg_class c
+LEFT   JOIN pg_class t ON t.oid = c.reltoastrelid
+JOIN   pg_namespace n ON n.oid = c.relnamespace
+WHERE  n.nspname = 'public' AND c.relkind = 'r'
+  AND  t.oid IS NOT NULL
+ORDER  BY pg_relation_size(t.oid) DESC NULLS LAST
+LIMIT  20;
+```
+
+To find which column is responsible, measure the average width of the suspects:
+
+```sql
+SELECT avg(pg_column_size(payload))::int AS avg_payload_bytes,
+       max(pg_column_size(payload))      AS max_payload_bytes,
+       avg(pg_column_size(description))::int AS avg_description_bytes
+FROM   events;
+```
+
+`pg_column_size()` reports the compressed, on-disk size — which is why it is often much smaller than `length()` suggests for repetitive JSON.
+
+## Bloat: size that is not data
+
+Because of MVCC, updated and deleted rows leave dead tuples behind. Autovacuum marks that space reusable but does not return it to the operating system. A table that has absorbed heavy update traffic can be several times larger than the live data in it.
+
+Check dead tuples first:
+
+```sql
+SELECT schemaname,
+       relname,
+       n_live_tup,
+       n_dead_tup,
+       round(100.0 * n_dead_tup / NULLIF(n_live_tup + n_dead_tup, 0), 1) AS dead_pct,
+       pg_size_pretty(pg_total_relation_size(relid)) AS total_size,
+       last_autovacuum,
+       last_autoanalyze
+FROM   pg_stat_user_tables
+WHERE  n_dead_tup > 1000
+ORDER  BY n_dead_tup DESC
+LIMIT  20;
+```
+
+A dead percentage above roughly 20% on a large table, combined with a `last_autovacuum` that is old or null, means autovacuum is not keeping up.
+
+For a precise measurement, `pgstattuple` inspects the actual pages:
+
+```sql
+CREATE EXTENSION IF NOT EXISTS pgstattuple;
+
+SELECT * FROM pgstattuple('public.orders');
+SELECT * FROM pgstatindex('public.idx_orders_created_at');
+```
+
+It scans the whole relation, so run it off-peak on large tables.
+
+### Reclaiming the space
+
+`VACUUM FULL` rewrites the table compactly and returns space to the OS, but takes an `ACCESS EXCLUSIVE` lock — nothing can read or write it for the duration:
+
+```sql
+VACUUM FULL VERBOSE ANALYZE orders;
+```
+
+`pg_repack` does the same rebuild with only a brief lock at the end, which is what you want on a production system:
+
+```bash
+pg_repack -d mydb -t public.orders --no-superuser-check
+```
+
+For index bloat specifically, a concurrent reindex avoids the exclusive lock entirely:
+
+```sql
+REINDEX INDEX CONCURRENTLY idx_orders_created_at;
+REINDEX TABLE CONCURRENTLY orders;
+```
+
+Before any of this, make sure the space is actually reclaimable — a long-running transaction or an inactive replication slot pins dead tuples and blocks vacuum:
+
+```sql
+-- Old transactions holding back the vacuum horizon
+SELECT pid, state, age(clock_timestamp(), xact_start) AS xact_age, left(query, 80)
+FROM   pg_stat_activity
+WHERE  xact_start IS NOT NULL
+ORDER  BY xact_start
+LIMIT  10;
+
+-- Inactive slots retaining WAL and blocking cleanup
+SELECT slot_name, active, restart_lsn,
+       pg_size_pretty(pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn)) AS retained_wal
+FROM   pg_replication_slots;
+```
+
+An abandoned replication slot is a classic cause of a disk that fills for no visible reason.
+
+## Things the size functions do not include
+
+`pg_database_size` covers that database's files. Cluster-level disk usage also includes:
+
+```sql
+-- WAL currently on disk
+SELECT pg_size_pretty(sum(size)) AS wal_size FROM pg_ls_waldir();
+
+-- Temporary files spilled by queries exceeding work_mem
+SELECT datname, temp_files, pg_size_pretty(temp_bytes) AS temp_bytes
+FROM   pg_stat_database
+WHERE  temp_bytes > 0
+ORDER  BY temp_bytes DESC;
+```
+
+Growing `temp_bytes` means queries are spilling sorts and hashes to disk — a `work_mem` tuning signal as much as a storage one.
+
+## Tracking growth over time
+
+A single measurement tells you what is big; a series tells you what is growing. A lightweight snapshot table:
+
+```sql
+CREATE TABLE IF NOT EXISTS size_history (
+  captured_at timestamptz NOT NULL DEFAULT now(),
+  schema_name text NOT NULL,
+  table_name  text NOT NULL,
+  total_bytes bigint NOT NULL,
+  PRIMARY KEY (captured_at, schema_name, table_name)
+);
+
+INSERT INTO size_history (schema_name, table_name, total_bytes)
+SELECT n.nspname, c.relname, pg_total_relation_size(c.oid)
+FROM   pg_class c
+JOIN   pg_namespace n ON n.oid = c.relnamespace
+WHERE  n.nspname NOT IN ('pg_catalog','information_schema')
+  AND  c.relkind IN ('r','m','p');
+```
+
+Then the growth report:
+
+```sql
+SELECT schema_name,
+       table_name,
+       pg_size_pretty(max(total_bytes) - min(total_bytes)) AS growth,
+       pg_size_pretty(max(total_bytes)) AS current_size
+FROM   size_history
+WHERE  captured_at > now() - INTERVAL '30 days'
+GROUP  BY 1, 2
+HAVING max(total_bytes) - min(total_bytes) > 0
+ORDER  BY max(total_bytes) - min(total_bytes) DESC
+LIMIT  20;
+```
+
+Schedule the insert daily with `pg_cron` or an external scheduler. Running these checks from a GUI that charts the results is more useful than eyeballing text — [Chat2DB](https://chat2db.ai/download) will run the query and plot the trend, and can generate variants of these catalog queries from a plain-language description.
+
+## Row size and column ordering
+
+Sometimes a table is larger than expected not because of bloat or TOAST but because of padding. PostgreSQL aligns columns on their natural boundaries, so a poorly ordered definition wastes bytes on every single row.
+
+```sql
+-- Wasteful: bool(1) + padding(7) + int8(8) + int4(4) + padding(4) + int8(8)
+CREATE TABLE bad (
+  flag   boolean,
+  id     bigint,
+  count  integer,
+  amount bigint
+);
+
+-- Compact: widest first, narrowest last
+CREATE TABLE good (
+  id     bigint,
+  amount bigint,
+  count  integer,
+  flag   boolean
+);
+```
+
+Measure the difference directly:
+
+```sql
+SELECT pg_column_size(ROW(true, 1::bigint, 1::int, 1::bigint)) AS bad_bytes,
+       pg_column_size(ROW(1::bigint, 1::bigint, 1::int, true)) AS good_bytes;
+```
+
+The saving is a handful of bytes per row, which is irrelevant on a thousand rows and meaningful on a billion. The ordering rule is simple: declare fixed-width columns from widest to narrowest, then variable-length columns such as `text`, `jsonb` and `bytea` last.
+
+You can inspect the layout of an existing table with:
+
+```sql
+SELECT a.attname,
+       t.typname,
+       a.attlen,
+       a.attalign,
+       a.attnum
+FROM   pg_attribute a
+JOIN   pg_type t ON t.oid = a.atttypid
+WHERE  a.attrelid = 'public.orders'::regclass
+  AND  a.attnum > 0
+  AND  NOT a.attisdropped
+ORDER  BY a.attnum;
+```
+
+## Partitioned tables
+
+`pg_total_relation_size` on a partitioned parent returns only the parent's own storage, which is empty — the data lives in the partitions. To get the real total, sum across the partition tree:
+
+```sql
+SELECT parent.relname AS partitioned_table,
+       count(*)       AS partitions,
+       pg_size_pretty(sum(pg_total_relation_size(child.oid))) AS total_size
+FROM   pg_inherits i
+JOIN   pg_class parent ON parent.oid = i.inhparent
+JOIN   pg_class child  ON child.oid  = i.inhrelid
+GROUP  BY parent.relname
+ORDER  BY sum(pg_total_relation_size(child.oid)) DESC;
+```
+
+And to find the individual partitions worth dropping or archiving:
+
+```sql
+SELECT child.relname AS partition,
+       pg_size_pretty(pg_total_relation_size(child.oid)) AS size,
+       pg_get_expr(child.relpartbound, child.oid) AS bounds
+FROM   pg_inherits i
+JOIN   pg_class parent ON parent.oid = i.inhparent
+JOIN   pg_class child  ON child.oid  = i.inhrelid
+WHERE  parent.relname = 'events'
+ORDER  BY pg_total_relation_size(child.oid) DESC;
+```
+
+Dropping an old partition returns its space immediately and requires no vacuum — one of the strongest arguments for partitioning a large time-series table in the first place.
+
+## Estimating before you commit
+
+Two questions come up constantly during design: how big will this table get, and how much will this index cost? Both are answerable before you build anything.
+
+For a table, the on-disk size is roughly the row count multiplied by the row width plus per-tuple overhead. PostgreSQL charges 23 bytes of header per tuple, rounded up to an 8-byte boundary, plus a 4-byte item pointer in the page, and each 8 KB page reserves 24 bytes for its own header. Rather than doing that arithmetic by hand, build a small sample and extrapolate:
+
+```sql
+CREATE TEMP TABLE sample AS
+SELECT gs AS id,
+       md5(gs::text) AS token,
+       now() - (gs || ' seconds')::interval AS created_at,
+       (random() * 1000)::numeric(12,2) AS amount
+FROM   generate_series(1, 100000) gs;
+
+SELECT pg_size_pretty(pg_relation_size('sample'))                          AS sample_size,
+       pg_relation_size('sample') / 100000.0                               AS bytes_per_row,
+       pg_size_pretty((pg_relation_size('sample') / 100000.0 * 50000000)::bigint)
+         AS projected_at_50m_rows;
+```
+
+The projection ignores index overhead and future bloat, so treat it as a floor rather than a forecast. In practice, budgeting roughly double the heap size for a table with two or three indexes is a reasonable planning heuristic.
+
+For an index specifically, build it on the sample and measure:
+
+```sql
+CREATE INDEX sample_token_idx ON sample (token);
+SELECT pg_size_pretty(pg_relation_size('sample_token_idx'));
+```
+
+This is the cheapest way to settle an argument about whether a composite index on three wide text columns is affordable — build it against a hundred thousand representative rows and multiply.
+
+## Free space and what vacuum can reuse
+
+A table can be large without being bloated in a way that a rewrite would fix, and `pg_freespacemap` tells you the difference:
+
+```sql
+CREATE EXTENSION IF NOT EXISTS pg_freespacemap;
+
+SELECT count(*)                                       AS pages,
+       pg_size_pretty(sum(avail)::bigint)             AS reusable_space,
+       round(100.0 * sum(avail) / (count(*) * 8192), 1) AS pct_free
+FROM   pg_freespace('public.orders');
+```
+
+High reusable space means a previous vacuum already reclaimed the tuples and Postgres will fill that space with new rows — no action needed, and a `VACUUM FULL` here would be wasted effort and a wasted lock. Low reusable space alongside a high dead-tuple count is the signal that vacuum is genuinely falling behind.
+
+## Wrapping up
+
+Start at the top and narrow down: `pg_database_size` to see which database, the `pg_total_relation_size` ranking to see which tables, then split that into heap, TOAST and index components to see which part. If indexes dominate, hunt for unused ones. If TOAST dominates, find the wide column. If neither explains it, you are looking at bloat — check dead tuples, confirm nothing is pinning the vacuum horizon, and rebuild with `pg_repack` or a concurrent reindex rather than taking an exclusive lock on a live table.

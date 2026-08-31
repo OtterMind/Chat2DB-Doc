@@ -1,0 +1,313 @@
+---
+title: "How to Restore a PostgreSQL Database From a Dump"
+description: "Restore a PostgreSQL database from a dump with pg_restore or psql: pick the right tool per format, use parallel jobs and fix ownership errors."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: August 31, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# How to Restore a PostgreSQL Database From a Dump
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="August 31, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+Restoring a PostgreSQL dump is one of those tasks that is trivial when it works and deeply confusing when it does not. The confusion nearly always traces back to one fact: `pg_dump` produces two fundamentally different kinds of output, and only one of them can be read by `pg_restore`. Get that straight and most of the remaining problems — ownership errors, ignored parallelism, half-finished restores — have short answers.
+
+## First: which kind of dump do you have?
+
+`pg_dump` writes either a **plain SQL script** or an **archive**.
+
+```bash
+pg_dump -d mydb -f mydb.sql          # plain: a SQL script
+pg_dump -d mydb -Fc -f mydb.dump     # custom archive
+pg_dump -d mydb -Fd -f mydb_dir      # directory archive
+pg_dump -d mydb -Ft -f mydb.tar      # tar archive
+```
+
+A plain dump is just SQL statements. You replay it with `psql`. An archive has a table of contents, which is what enables selective restore, reordering and parallelism — and it must be read by `pg_restore`.
+
+If you are not sure what you have, look:
+
+```bash
+file mydb.dump
+head -c 100 mydb.dump | xxd | head -3
+```
+
+A custom archive starts with the magic bytes `PGDMP`. A plain dump starts with readable SQL comments. You can also just try to list it — this only succeeds on an archive:
+
+```bash
+pg_restore -l mydb.dump | head -20
+```
+
+If that returns `input file does not appear to be a valid archive`, you have a plain SQL script and need `psql`.
+
+Building the exact command with the right flags for your case is fiddly enough that we made a [pg_restore command generator](https://chat2db.ai/tools/pg-restore-command-generator) — pick your format and options and it writes the command plus a verification runbook.
+
+## Restoring a plain SQL dump
+
+```bash
+createdb -h localhost -U postgres mydb
+psql -h localhost -U postgres -d mydb -f mydb.sql
+```
+
+By default `psql` continues past errors, which can leave you with a partially restored database that looks fine until something breaks weeks later. Two flags fix that.
+
+```bash
+psql -h localhost -U postgres -d mydb \
+     --single-transaction \
+     -v ON_ERROR_STOP=1 \
+     -f mydb.sql
+```
+
+`ON_ERROR_STOP=1` aborts on the first error. `--single-transaction` wraps everything so a failure rolls the whole thing back — you end up with an empty database rather than a mystery. For a large dump this holds one long transaction, which is fine for a restore into a fresh database but will bloat WAL; skip it if the dump is enormous and you would rather resume manually.
+
+For a compressed plain dump, stream it:
+
+```bash
+gunzip -c mydb.sql.gz | psql -h localhost -U postgres -d mydb -v ON_ERROR_STOP=1
+```
+
+## Restoring an archive with pg_restore
+
+The basic form:
+
+```bash
+createdb -h localhost -U postgres mydb
+pg_restore -h localhost -U postgres -d mydb -v mydb.dump
+```
+
+Or let `pg_restore` create the database for you. Note the subtlety: with `-C`, the `-d` argument is the database `pg_restore` *connects to* in order to issue `CREATE DATABASE`, not the target:
+
+```bash
+pg_restore -h localhost -U postgres -C -d postgres -v mydb.dump
+```
+
+### Parallel restore
+
+This is the single biggest speedup available, and it only works on custom and directory archives:
+
+```bash
+pg_restore -h localhost -U postgres -d mydb -j 8 -v mydb.dump
+```
+
+`-j 8` restores table data and builds indexes across 8 concurrent connections. Start with the number of CPU cores on the database server. Index creation dominates most restores and parallelises well.
+
+Two constraints: `-j` does nothing for a plain dump (there is no table of contents to schedule from), and it is incompatible with `--single-transaction`, because multiple connections cannot share one transaction.
+
+### Restoring into a database that already has objects
+
+```bash
+pg_restore -h localhost -U postgres -d mydb -c --if-exists -v mydb.dump
+```
+
+`-c` drops each object before recreating it. Always pair it with `--if-exists`, otherwise every object that is not already present produces an error. If you want a genuinely clean slate, dropping and recreating the database is more predictable:
+
+```bash
+dropdb -h localhost -U postgres --if-exists mydb
+createdb -h localhost -U postgres mydb
+pg_restore -h localhost -U postgres -d mydb -j 8 mydb.dump
+```
+
+## Fixing ownership and permission errors
+
+The most common restore failure looks like this:
+
+```
+pg_restore: error: could not execute query: ERROR:  role "app_prod" does not exist
+Command was: ALTER TABLE public.orders OWNER TO app_prod;
+```
+
+The dump recorded ownership from the source machine, and those roles do not exist on the target. Two flags skip that entirely:
+
+```bash
+pg_restore -h localhost -U postgres -d mydb -O -x -v mydb.dump
+```
+
+`-O` skips `ALTER ... OWNER TO` — everything ends up owned by the connecting user. `-x` skips `GRANT`/`REVOKE`. This is exactly what you want when restoring a production dump into a local database or a managed service where you cannot create arbitrary roles.
+
+If you would rather preserve the ownership model, create the roles first:
+
+```sql
+-- On the source, generate the role definitions
+-- pg_dumpall -g > roles.sql
+CREATE ROLE app_prod WITH LOGIN PASSWORD 'x';
+CREATE ROLE readonly;
+```
+
+```bash
+psql -d postgres -f roles.sql
+pg_restore -d mydb mydb.dump
+```
+
+Note that `pg_dump` never includes roles — they are cluster-level. `pg_dumpall -g` (globals only) is how you get them.
+
+## Selective restore
+
+An archive lets you restore parts of it.
+
+```bash
+# One table
+pg_restore -d mydb -t orders mydb.dump
+
+# One schema
+pg_restore -d mydb -n reporting mydb.dump
+
+# Schema only, no data — useful for spinning up an empty copy
+pg_restore -d mydb -s mydb.dump
+
+# Data only, into a database whose schema already exists
+pg_restore -d mydb -a mydb.dump
+```
+
+For anything more complex, drive it from a list file:
+
+```bash
+pg_restore -l mydb.dump > objects.list
+# Comment out unwanted lines by prefixing them with a semicolon
+pg_restore -d mydb -L objects.list mydb.dump
+```
+
+This is also how you control ordering when a restore hits a dependency problem you need to work around.
+
+## Handling extensions
+
+Restores into a fresh cluster frequently fail on extensions the source had installed:
+
+```
+ERROR:  type "vector" does not exist
+```
+
+The dump contains `CREATE EXTENSION vector;`, but the extension's shared library is not installed on the target machine. Installing the extension binary is a package-manager step, not a SQL one:
+
+```bash
+# example: pgvector on Debian/Ubuntu for PG 17
+sudo apt-get install postgresql-17-pgvector
+```
+
+```sql
+CREATE EXTENSION IF NOT EXISTS vector;
+```
+
+Check what the dump expects before you start:
+
+```bash
+pg_restore -l mydb.dump | grep -i extension
+```
+
+## Verifying the restore
+
+`pg_restore` exits 0 even when individual objects failed, unless you pass `-e` or `--single-transaction`. So do not treat a clean exit as success — check.
+
+```sql
+-- Table list with sizes
+\dt+
+
+-- Row counts per table (exact, may be slow on huge tables)
+SELECT schemaname, relname, n_live_tup
+FROM   pg_stat_user_tables
+ORDER  BY n_live_tup DESC;
+
+-- Did every index come back?
+SELECT schemaname, tablename, indexname FROM pg_indexes
+WHERE  schemaname NOT IN ('pg_catalog','information_schema')
+ORDER  BY tablename;
+
+-- Invalid indexes: a failed CREATE INDEX leaves these behind
+SELECT c.relname
+FROM   pg_index i
+JOIN   pg_class c ON c.oid = i.indexrelid
+WHERE  NOT i.indisvalid;
+
+-- Sequences out of sync is a classic post-restore bug
+SELECT schemaname, sequencename, last_value FROM pg_sequences;
+```
+
+That last one matters. If you restored data only (`-a`) into a schema whose sequences were already created, the sequences may be behind the data and your next insert will collide on the primary key. Fix it:
+
+```sql
+SELECT setval(
+  pg_get_serial_sequence('public.orders', 'id'),
+  COALESCE((SELECT max(id) FROM public.orders), 1)
+);
+```
+
+Finally, run `ANALYZE` — statistics are not carried in the dump, and until you do, the planner is working blind:
+
+```sql
+ANALYZE;
+```
+
+Browsing the restored schema and spot-checking counts is quicker in a GUI than in `psql`; [Chat2DB](https://chat2db.ai/download) will connect to the restored database and let you compare object lists and row counts against the source side by side.
+
+## Version compatibility
+
+`pg_restore` must be at least as new as the server it restores *into*, and dumps taken with a newer `pg_dump` may not restore into an older server. When restoring a PG 17 dump, use PG 17 client tools even if your distro's default is older:
+
+```bash
+/usr/lib/postgresql/17/bin/pg_restore --version
+```
+
+Restoring an old dump into a new server generally works. The reverse generally does not.
+
+## Speeding up a large restore
+
+For a one-off restore into a database you can afford to lose if it crashes, these settings help substantially:
+
+```sql
+ALTER SYSTEM SET maintenance_work_mem = '2GB';   -- faster index builds
+ALTER SYSTEM SET max_wal_size = '8GB';           -- fewer checkpoints
+ALTER SYSTEM SET checkpoint_timeout = '30min';
+ALTER SYSTEM SET autovacuum = off;               -- re-enable after!
+SELECT pg_reload_conf();
+```
+
+Do **not** set `fsync = off` on a machine holding data you care about — a crash mid-restore can corrupt the cluster, not just the restoring database. It is only defensible on a throwaway instance.
+
+Reset everything afterwards:
+
+```sql
+ALTER SYSTEM RESET ALL;
+SELECT pg_reload_conf();
+ANALYZE;
+```
+
+## Restoring into a different database name
+
+There is a common misconception that a dump is tied to its source database name. For archive formats it is not — the name only appears in the `CREATE DATABASE` statement that `-C` emits, so restoring into any target you like is just a matter of naming it:
+
+```bash
+createdb -U postgres mydb_staging
+pg_restore -U postgres -d mydb_staging -O -x -j 4 prod.dump
+```
+
+Plain SQL dumps are slightly stickier. If the dump was taken with `--create`, it contains `CREATE DATABASE` and `\connect` lines that will send you back to the original name. Either take the dump without `--create`, or strip those lines before replaying:
+
+```bash
+grep -v -E '^(CREATE DATABASE|\\connect)' prod.sql \
+  | psql -d mydb_staging -v ON_ERROR_STOP=1
+```
+
+## Cloning a database between servers
+
+You do not need an intermediate file at all. Piping `pg_dump` straight into `pg_restore` is the quickest way to clone a database between servers, because nothing touches local disk:
+
+```bash
+pg_dump -h prod.example.com -U readonly -d app -Fc \
+  | pg_restore -h localhost -U postgres -d app_local -O -x -c --if-exists
+```
+
+The trade-off is that you lose parallelism on the restore side — `-j` needs a seekable file, and a pipe is not seekable. For large databases, writing a directory-format dump and restoring it with `-j` is usually faster overall despite the extra disk round trip:
+
+```bash
+pg_dump -h prod.example.com -U readonly -d app -Fd -j 4 -f /tmp/app_dump
+pg_restore -h localhost -U postgres -d app_local -j 8 -O -x /tmp/app_dump
+```
+
+Note that `pg_dump -Fd -j` takes multiple snapshots-consistent connections against the source, so the source server needs enough spare connections and `max_worker_processes` headroom to serve them.
+
+## Wrapping up
+
+Almost every restore problem comes down to a small set of causes: using `pg_restore` on a plain SQL script (or `psql` on an archive), missing roles producing ownership errors, `-j` silently ignored because the format does not support it, or a "successful" restore that quietly skipped objects because nothing was set to stop on error. Identify the format first, use `-O -x` when the target cluster does not share the source's roles, use `-j` on custom and directory archives, pass `-e` or `--single-transaction` so failures are loud, and always verify with row counts, index validity and sequence values before calling it done.

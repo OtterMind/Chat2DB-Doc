@@ -1,0 +1,341 @@
+---
+title: "DuckDB Extensions: Install, Load and Use Them"
+description: "A practical guide to DuckDB extensions: how INSTALL and LOAD work, core vs community repos, httpfs, postgres, spatial and vss, plus offline installs."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: August 31, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# DuckDB Extensions: Install, Load and Use Them
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="August 31, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+DuckDB ships as a small binary on purpose. Most of what makes it interesting — reading S3, attaching to PostgreSQL, geospatial types, vector similarity search, Iceberg tables — arrives through extensions that download on demand. Understanding how that mechanism works turns a lot of confusing errors into two-line fixes.
+
+## How INSTALL and LOAD differ
+
+These are two separate steps and conflating them causes most extension problems.
+
+`INSTALL` downloads the extension binary once and caches it on disk, typically under `~/.duckdb/extensions/<version>/<platform>/`. It persists across sessions.
+
+`LOAD` links the cached binary into the *current* session. It does not persist. A new process needs `LOAD` again.
+
+```sql
+INSTALL httpfs;   -- downloads once, cached on disk
+LOAD httpfs;      -- required in every new session
+```
+
+Many extensions autoload: if you query an `s3://` path without loading anything, DuckDB recognises the pattern and pulls in `httpfs` for you. Autoloading is convenient interactively and unreliable in production, where a sandbox may block the download. Be explicit in scripts.
+
+Check what is installed and loaded:
+
+```sql
+SELECT extension_name, installed, loaded, install_mode, description
+FROM   duckdb_extensions()
+ORDER  BY installed DESC, extension_name;
+```
+
+Turn autoloading off when you want failures to be loud rather than silent:
+
+```sql
+SET autoinstall_known_extensions = false;
+SET autoload_known_extensions = false;
+```
+
+## Core vs community extensions
+
+**Core extensions** are maintained by the DuckDB team, signed, and served from the official repository. `httpfs`, `postgres`, `mysql`, `sqlite`, `json`, `parquet`, `icu`, `fts` and `spatial` are here. A plain `INSTALL name;` gets them.
+
+**Community extensions** are third-party, distributed through a separate repository with its own review process. They need the repository named explicitly:
+
+```sql
+INSTALL h3 FROM community;
+LOAD h3;
+```
+
+**Unsigned extensions** — something you built yourself, or a binary handed to you — require the database to start in unsigned mode, which is a deliberate speed bump:
+
+```bash
+duckdb -unsigned
+```
+
+```sql
+LOAD '/path/to/my_extension.duckdb_extension';
+```
+
+Only do that for code you trust. An extension runs as native code in your process with your permissions.
+
+## The extensions worth knowing
+
+### httpfs — remote files and object storage
+
+This is the one that turns DuckDB from a local tool into something that queries your data lake.
+
+```sql
+INSTALL httpfs;
+LOAD httpfs;
+
+-- Plain HTTPS needs nothing else
+SELECT * FROM 'https://example.com/data/prices.parquet' LIMIT 10;
+```
+
+S3 and compatible stores need credentials, supplied through the secrets manager:
+
+```sql
+CREATE SECRET s3_prod (
+  TYPE s3,
+  KEY_ID 'AKIA...',
+  SECRET 'xxx',
+  REGION 'us-east-1'
+);
+
+SELECT count(*) FROM 's3://my-bucket/events/year=2026/*/*.parquet';
+```
+
+Use `CREATE PERSISTENT SECRET` to store it in the local secret store so it survives a restart. To pick up credentials from the environment or an instance profile instead of hardcoding them:
+
+```sql
+CREATE SECRET (TYPE s3, PROVIDER credential_chain);
+```
+
+The same extension covers R2, GCS and MinIO through `ENDPOINT` and `URL_STYLE`:
+
+```sql
+CREATE SECRET minio (
+  TYPE s3,
+  KEY_ID 'minioadmin', SECRET 'minioadmin',
+  ENDPOINT 'localhost:9000',
+  URL_STYLE 'path',
+  USE_SSL false
+);
+```
+
+### postgres, mysql, sqlite — attach live databases
+
+Query another database as if its tables were local:
+
+```sql
+INSTALL postgres; LOAD postgres;
+ATTACH 'host=localhost dbname=app user=analyst password=secret'
+  AS pg (TYPE postgres, READ_ONLY);
+
+SELECT status, count(*) FROM pg.public.orders GROUP BY 1;
+```
+
+`READ_ONLY` is worth making a habit when the target is production. Filters and projections push down to the remote server, so this is not a blind full-table pull.
+
+The MySQL and SQLite equivalents follow the same shape:
+
+```sql
+INSTALL mysql; LOAD mysql;
+ATTACH 'host=localhost user=root database=shop' AS mysqldb (TYPE mysql);
+
+INSTALL sqlite; LOAD sqlite;
+ATTACH 'legacy.db' AS legacy (TYPE sqlite);
+```
+
+Once attached, you can join across all of them in one query — a Postgres table to a MySQL table to a Parquet file — which is the fastest ad-hoc integration path most people ever find. For day-to-day work across those same databases with a proper UI and AI-assisted SQL, a dedicated client like [Chat2DB](https://chat2db.ai/download) covers the interactive side; there is also a web version at [app.chat2db.ai](https://app.chat2db.ai).
+
+### spatial — geometry types and functions
+
+```sql
+INSTALL spatial; LOAD spatial;
+
+-- Read a GeoJSON, Shapefile or GeoPackage directly
+SELECT * FROM ST_Read('districts.geojson') LIMIT 5;
+
+CREATE TABLE stores AS
+SELECT name, ST_Point(lon, lat) AS geom FROM 'stores.csv';
+
+-- Stores within 5 km of a point
+SELECT name
+FROM   stores
+WHERE  ST_DWithin(geom, ST_Point(13.4050, 52.5200), 0.05);
+
+-- Spatial join: which district is each store in?
+SELECT s.name, d.district_name
+FROM   stores s
+JOIN   ST_Read('districts.geojson') d ON ST_Contains(d.geom, s.geom);
+```
+
+### vss — vector similarity search
+
+Approximate nearest neighbour search over embedding columns, useful for a local RAG prototype:
+
+```sql
+INSTALL vss; LOAD vss;
+
+CREATE TABLE docs (id INTEGER, content VARCHAR, embedding FLOAT[384]);
+
+-- HNSW index; persistence for these needs an explicit opt-in
+SET hnsw_enable_experimental_persistence = true;
+CREATE INDEX idx_docs ON docs USING HNSW (embedding) WITH (metric = 'cosine');
+
+SELECT id, content,
+       array_cosine_distance(embedding, ?::FLOAT[384]) AS distance
+FROM   docs
+ORDER  BY distance
+LIMIT  10;
+```
+
+### fts — full-text search
+
+```sql
+INSTALL fts; LOAD fts;
+
+PRAGMA create_fts_index('docs', 'id', 'content');
+
+SELECT d.id, d.content, fts_main_docs.match_bm25(d.id, 'duckdb extensions') AS score
+FROM   docs d
+WHERE  score IS NOT NULL
+ORDER  BY score DESC
+LIMIT  10;
+```
+
+### iceberg and delta — open table formats
+
+```sql
+INSTALL iceberg; LOAD iceberg;
+SELECT count(*) FROM iceberg_scan('s3://warehouse/db/table');
+
+INSTALL delta; LOAD delta;
+SELECT * FROM delta_scan('s3://warehouse/delta/events') LIMIT 100;
+```
+
+### icu — time zones and collations
+
+Without `icu`, DuckDB's time zone support is limited. With it, named zones and locale-aware sorting work:
+
+```sql
+INSTALL icu; LOAD icu;
+SET TimeZone = 'Europe/Berlin';
+
+SELECT now() AT TIME ZONE 'America/New_York';
+SELECT * FROM names ORDER BY name COLLATE de;
+```
+
+## Installing without internet access
+
+Air-gapped environments and locked-down CI runners cannot reach the extension repository. Two options.
+
+Point `INSTALL` at a location you control — an internal mirror or an S3 bucket you have populated:
+
+```sql
+SET custom_extension_repository = 'https://mirror.internal/duckdb-extensions';
+INSTALL httpfs;
+```
+
+Or ship the `.duckdb_extension` file with your image and load it by path (requires `-unsigned` for non-core builds):
+
+```sql
+LOAD '/opt/duckdb/extensions/httpfs.duckdb_extension';
+```
+
+Note that extension binaries are built per DuckDB version *and* per platform. A file cached for 1.1.3 on `linux_amd64` will not load into 1.2.1 on `osx_arm64` — mirror the matrix you actually deploy.
+
+## Troubleshooting
+
+**`Extension "x" not found`.** Either the name is wrong, or it is a community extension and you omitted `FROM community`. Check the spelling against `duckdb_extensions()`.
+
+**`Extension ... was built for DuckDB version 'v1.1.3', but we can only load extensions built for DuckDB version 'v1.2.1'`.** Your cache is stale after an upgrade. Force a refresh with `FORCE INSTALL httpfs;`, or clear `~/.duckdb/extensions/`.
+
+**`IO Error: Connection error for HTTP HEAD`.** No route to the repository, or a proxy in the way. Set `SET http_proxy = 'http://proxy:3128';` or use a custom repository.
+
+**`Invalid Input Error: Initialization function ... not found`.** An unsigned or mismatched binary. Confirm the platform triple matches your machine.
+
+**It works in the CLI but not in Python.** Different processes, different sessions. The Python client needs its own `LOAD`, and if it runs as a different user it has a different extension cache directory.
+
+## Writing extension usage into a reproducible script
+
+Interactive sessions tolerate autoloading. Scripts should not, because a missing extension will surface as a confusing parse error rather than a clear "not installed" message. Make the requirements explicit at the top of every script:
+
+```python
+import duckdb
+
+REQUIRED = ["httpfs", "postgres", "json", "icu"]
+
+con = duckdb.connect("analytics.duckdb")
+for ext in REQUIRED:
+    con.execute(f"INSTALL {ext}")
+    con.execute(f"LOAD {ext}")
+```
+
+`INSTALL` on an already-installed extension is cheap and idempotent, so there is no cost to running it every time. If you want the script to fail loudly when the environment is not prepared — the right behaviour in production — check first instead of installing:
+
+```python
+sql = (
+    "SELECT extension_name FROM duckdb_extensions() "
+    "WHERE extension_name IN ('httpfs','postgres','json','icu') AND NOT installed"
+)
+missing = [row[0] for row in con.execute(sql).fetchall()]
+if missing:
+    raise RuntimeError(f"Missing DuckDB extensions: {missing}")
+```
+
+## Managing secrets properly
+
+Secrets deserve more care than the inline examples above suggest. DuckDB's secrets manager supports both temporary secrets, which live only in the session, and persistent ones written to the local secret store:
+
+```sql
+-- Session-scoped: disappears when the process exits
+CREATE SECRET tmp_s3 (TYPE s3, KEY_ID '...', SECRET '...', REGION 'us-east-1');
+
+-- Written to the local secret store, survives restarts
+CREATE PERSISTENT SECRET prod_s3 (TYPE s3, KEY_ID '...', SECRET '...', REGION 'us-east-1');
+```
+
+Scope them so different buckets use different credentials, and DuckDB picks the right one automatically by prefix:
+
+```sql
+CREATE SECRET raw_bucket     (TYPE s3, SCOPE 's3://raw-data', KEY_ID '...', SECRET '...');
+CREATE SECRET curated_bucket (TYPE s3, SCOPE 's3://curated',  KEY_ID '...', SECRET '...');
+
+SELECT which_secret('s3://raw-data/events.parquet', 's3');
+```
+
+Inspect and clean up with:
+
+```sql
+SELECT name, type, scope, persistent FROM duckdb_secrets();
+DROP SECRET prod_s3;
+```
+
+Prefer `PROVIDER credential_chain` in any environment that already has an IAM role or a credentials file — it avoids materialising a long-lived key anywhere you would then have to rotate.
+
+## Version pinning and upgrades
+
+Extension binaries are compiled against a specific DuckDB version and platform. The cache directory encodes both, which is why an upgrade appears to "lose" your extensions — they are still on disk, just under the previous version's path, and DuckDB correctly refuses to load a binary built for a different ABI.
+
+The practical consequences are worth internalising before you hit them in a pipeline at 3am.
+
+First, pin DuckDB itself everywhere. A `requirements.txt` with a bare `duckdb` will silently pick up a new minor version, invalidate every cached extension, and turn a previously offline-capable job into one that needs network access on first run.
+
+```
+duckdb==1.2.1
+```
+
+Second, after any upgrade, refresh rather than debug. `FORCE INSTALL` re-downloads even when a cached copy exists:
+
+```sql
+FORCE INSTALL httpfs;
+FORCE INSTALL postgres;
+```
+
+Third, if you mirror extensions internally, mirror the full matrix of versions and platforms you deploy to. An `osx_arm64` developer laptop and a `linux_amd64` CI runner need different binaries for the same extension and version, and discovering that halfway through a release is unpleasant.
+
+You can see exactly which platform DuckDB thinks it is running on:
+
+```sql
+PRAGMA platform;
+SELECT * FROM duckdb_extensions() WHERE installed;
+```
+
+Finally, be aware that community extensions move independently of core DuckDB releases. An extension that worked against 1.2.0 may not yet have a build for 1.2.1 on the day that version lands. If a community extension is load-bearing for you, check its availability before upgrading the engine, not after.
+
+## Wrapping up
+
+DuckDB's extension system is the reason a small binary can query S3, attach to PostgreSQL, do spatial joins and run vector search. Remember the two-step model — `INSTALL` once to disk, `LOAD` in every session — name the repository for community extensions, be explicit rather than relying on autoload in production code, and mirror the version/platform matrix when you deploy somewhere without internet. Everything else is just picking the extension that matches the data you have.

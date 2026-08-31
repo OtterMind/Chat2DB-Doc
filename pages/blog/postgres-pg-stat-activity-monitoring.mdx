@@ -1,0 +1,355 @@
+---
+title: "pg_stat_activity: Monitor Postgres Connections & Queries"
+description: "Use pg_stat_activity to find long-running queries, idle in transaction sessions, blocking locks and connection pressure in PostgreSQL."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: August 31, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# pg_stat_activity: Monitor Postgres Connections & Queries
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="August 31, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+When PostgreSQL is misbehaving right now — queries hanging, connections exhausted, a migration that will not acquire its lock — `pg_stat_activity` is the first place to look. It is a live view with one row per server process, and knowing how to read it turns a vague "the database is slow" into a specific PID you can do something about.
+
+## What the view contains
+
+One row per backend, including autovacuum workers and background processes. The columns that matter most:
+
+| Column | Meaning |
+| --- | --- |
+| `pid` | Process id — what you pass to cancel or terminate |
+| `datname` | Database the backend is connected to |
+| `usename` | Connected role |
+| `application_name` | Whatever the client set; invaluable if clients set it |
+| `client_addr` | Client IP (null for local socket connections) |
+| `backend_start` | When the connection was established |
+| `xact_start` | When the current transaction began |
+| `query_start` | When the current query began |
+| `state_change` | When `state` last changed |
+| `state` | active / idle / idle in transaction / idle in transaction (aborted) |
+| `wait_event_type`, `wait_event` | What the backend is blocked on, if anything |
+| `backend_type` | client backend, autovacuum worker, walsender, etc. |
+| `query` | Current query, or the last one if idle |
+
+Two things to know about `query`. It is truncated at `track_activity_query_size` bytes (1024 by default), so long statements get cut off — raise it if you routinely inspect big queries. And when `state` is `idle`, `query` shows the *last* statement executed, not something currently running. Reading an idle backend's query as if it were live is a common misdiagnosis.
+
+## The everyday query
+
+Current activity, longest-running first, excluding your own session and background workers:
+
+```sql
+SELECT pid,
+       usename,
+       application_name,
+       client_addr,
+       state,
+       wait_event_type,
+       wait_event,
+       age(clock_timestamp(), query_start) AS query_age,
+       age(clock_timestamp(), xact_start)  AS xact_age,
+       left(query, 120) AS query
+FROM   pg_stat_activity
+WHERE  backend_type = 'client backend'
+  AND  pid <> pg_backend_pid()
+  AND  state <> 'idle'
+ORDER  BY xact_start NULLS LAST;
+```
+
+Use `clock_timestamp()` rather than `now()`. `now()` returns the transaction start time, so in a long-lived monitoring transaction it goes stale; `clock_timestamp()` is the real wall clock.
+
+## Finding long-running queries
+
+```sql
+SELECT pid,
+       usename,
+       application_name,
+       age(clock_timestamp(), query_start) AS running_for,
+       wait_event_type,
+       wait_event,
+       query
+FROM   pg_stat_activity
+WHERE  state = 'active'
+  AND  backend_type = 'client backend'
+  AND  query_start < clock_timestamp() - INTERVAL '30 seconds'
+ORDER  BY query_start;
+```
+
+To stop one, cancel first — it aborts the query but leaves the connection alive:
+
+```sql
+SELECT pg_cancel_backend(12345);
+```
+
+If it does not respond (some operations are not interruptible at every point), terminate the whole backend:
+
+```sql
+SELECT pg_terminate_backend(12345);
+```
+
+`pg_terminate_backend` rolls back the transaction and drops the connection. It is safe for the database's integrity — the client will see a connection error — but it is not free: a poorly configured connection pool may reconnect and immediately re-run the same expensive query.
+
+Cancel everything a specific application is running, when a runaway report is the problem:
+
+```sql
+SELECT pg_cancel_backend(pid)
+FROM   pg_stat_activity
+WHERE  application_name = 'nightly-report'
+  AND  state = 'active'
+  AND  query_start < clock_timestamp() - INTERVAL '10 minutes';
+```
+
+## Idle in transaction: the quiet killer
+
+A backend in `idle in transaction` holds an open transaction while doing nothing. That transaction pins the vacuum horizon, so dead tuples across the whole database cannot be cleaned up, and it may hold locks that block DDL. A forgotten one is a genuine outage cause.
+
+```sql
+SELECT pid,
+       usename,
+       application_name,
+       client_addr,
+       state,
+       age(clock_timestamp(), state_change) AS idle_for,
+       age(clock_timestamp(), xact_start)   AS xact_age,
+       left(query, 120) AS last_query
+FROM   pg_stat_activity
+WHERE  state IN ('idle in transaction', 'idle in transaction (aborted)')
+ORDER  BY xact_start;
+```
+
+The real fix is in the application: shorten transactions, do not make network calls inside them, ensure the ORM commits or rolls back on every path. As a safety net, have the server reap them:
+
+```sql
+-- Kill transactions idle for more than 5 minutes
+ALTER SYSTEM SET idle_in_transaction_session_timeout = '5min';
+
+-- Also cap runaway statements (careful: applies to migrations too)
+ALTER SYSTEM SET statement_timeout = '60s';
+
+SELECT pg_reload_conf();
+```
+
+Set `statement_timeout` per role or per session rather than globally if long maintenance jobs need an exemption:
+
+```sql
+ALTER ROLE app_web SET statement_timeout = '30s';
+ALTER ROLE migrations SET statement_timeout = 0;
+```
+
+## Finding what is blocking what
+
+`pg_stat_activity` alone tells you a backend is waiting on a `Lock`. To find the blocker, use `pg_blocking_pids()`:
+
+```sql
+SELECT blocked.pid          AS blocked_pid,
+       blocked.usename      AS blocked_user,
+       left(blocked.query, 80) AS blocked_query,
+       blocked.wait_event_type,
+       blocked.wait_event,
+       blocking.pid         AS blocking_pid,
+       blocking.usename     AS blocking_user,
+       blocking.state       AS blocking_state,
+       age(clock_timestamp(), blocking.xact_start) AS blocking_xact_age,
+       left(blocking.query, 80) AS blocking_query
+FROM   pg_stat_activity blocked
+JOIN   LATERAL unnest(pg_blocking_pids(blocked.pid)) AS bp(pid) ON true
+JOIN   pg_stat_activity blocking ON blocking.pid = bp.pid
+WHERE  cardinality(pg_blocking_pids(blocked.pid)) > 0;
+```
+
+Note that the blocker is frequently `idle in transaction` — it is not running anything, it is just holding a lock it acquired earlier and never released.
+
+For the specific lock objects involved:
+
+```sql
+SELECT l.pid,
+       l.locktype,
+       l.mode,
+       l.granted,
+       c.relname AS relation,
+       left(a.query, 80) AS query
+FROM   pg_locks l
+LEFT   JOIN pg_class c ON c.oid = l.relation
+LEFT   JOIN pg_stat_activity a ON a.pid = l.pid
+WHERE  NOT l.granted
+ORDER  BY l.pid;
+```
+
+This is what to run when an `ALTER TABLE` seems to hang forever — it is almost always waiting for an `ACCESS EXCLUSIVE` lock behind a long-running read.
+
+## Connection pressure
+
+Are you close to `max_connections`?
+
+```sql
+SELECT count(*) AS total,
+       count(*) FILTER (WHERE state = 'active')              AS active,
+       count(*) FILTER (WHERE state = 'idle')                AS idle,
+       count(*) FILTER (WHERE state LIKE 'idle in transaction%') AS idle_in_txn,
+       current_setting('max_connections')::int               AS max_connections,
+       round(100.0 * count(*) / current_setting('max_connections')::int, 1) AS pct_used
+FROM   pg_stat_activity
+WHERE  backend_type = 'client backend';
+```
+
+Break it down by source to find which service is over-provisioning its pool:
+
+```sql
+SELECT COALESCE(application_name, '(unset)') AS app,
+       client_addr,
+       datname,
+       count(*) AS connections,
+       count(*) FILTER (WHERE state = 'active') AS active
+FROM   pg_stat_activity
+WHERE  backend_type = 'client backend'
+GROUP  BY 1, 2, 3
+ORDER  BY connections DESC;
+```
+
+If `idle` dominates and the count is high, you have a pooling problem, not a database problem. Each Postgres connection is a process with real memory overhead; the answer is PgBouncer or a properly sized application pool, not raising `max_connections`.
+
+Make this query useful by having every client set `application_name` in its connection string:
+
+```
+postgresql://user:pass@host:5432/db?application_name=checkout-api
+```
+
+Without it, `(unset)` rows tell you nothing.
+
+## Wait events: what is it actually doing?
+
+```sql
+SELECT wait_event_type,
+       wait_event,
+       count(*) AS backends,
+       left(min(query), 60) AS example_query
+FROM   pg_stat_activity
+WHERE  state = 'active' AND wait_event IS NOT NULL
+GROUP  BY 1, 2
+ORDER  BY backends DESC;
+```
+
+Rough interpretation of the common types:
+
+- `Lock` — waiting on a row or table lock. Chase it with `pg_blocking_pids()`.
+- `LWLock` — internal contention, often buffer-related. High `BufferContent` or `WALWrite` counts suggest I/O or checkpoint pressure.
+- `IO` — reading from or writing to disk. Frequent `DataFileRead` means the working set does not fit in `shared_buffers`.
+- `Client` with `ClientRead` — the *server* is waiting for the *client*. Combined with `idle in transaction`, this is an application holding a transaction open.
+- `IPC` — waiting on another backend, e.g. a parallel worker.
+- No wait event on an active backend — it is genuinely burning CPU.
+
+## Historical view: pg_stat_statements
+
+`pg_stat_activity` is a snapshot. To know which queries consume the most time overall, you need `pg_stat_statements`:
+
+```sql
+CREATE EXTENSION IF NOT EXISTS pg_stat_statements;
+```
+
+Requires `shared_preload_libraries = 'pg_stat_statements'` and a restart. Then:
+
+```sql
+SELECT calls,
+       round(total_exec_time::numeric, 1) AS total_ms,
+       round(mean_exec_time::numeric, 2)  AS mean_ms,
+       rows,
+       round(100.0 * shared_blks_hit /
+             NULLIF(shared_blks_hit + shared_blks_read, 0), 1) AS cache_hit_pct,
+       left(query, 100) AS query
+FROM   pg_stat_statements
+ORDER  BY total_exec_time DESC
+LIMIT  20;
+```
+
+Order by `total_exec_time`, not `mean_exec_time`. A 5 ms query called two million times an hour costs far more than a 20-second report run nightly, and it is the one worth optimising.
+
+## A quick health-check script
+
+Four checks worth running when something feels wrong:
+
+```sql
+-- 1. Anything running longer than a minute
+SELECT count(*) AS long_queries FROM pg_stat_activity
+WHERE state = 'active' AND query_start < clock_timestamp() - INTERVAL '1 minute';
+
+-- 2. Anything idle in transaction longer than a minute
+SELECT count(*) AS stuck_txns FROM pg_stat_activity
+WHERE state LIKE 'idle in transaction%'
+  AND state_change < clock_timestamp() - INTERVAL '1 minute';
+
+-- 3. Anything blocked
+SELECT count(*) AS blocked FROM pg_stat_activity
+WHERE cardinality(pg_blocking_pids(pid)) > 0;
+
+-- 4. Connection headroom
+SELECT current_setting('max_connections')::int - count(*) AS free_slots
+FROM pg_stat_activity;
+```
+
+Non-zero results in the first three, or a small number in the fourth, tell you where to dig next. Keeping these as saved queries in a client you already have open makes the check a ten-second habit rather than a fire drill — [Chat2DB](https://chat2db.ai/download) stores them per connection and will explain an unfamiliar execution plan alongside; there is a browser version at [app.chat2db.ai](https://app.chat2db.ai).
+
+## Permissions
+
+A non-superuser sees only their own queries; other backends show up with `query` and most columns as null. To let a monitoring role see everything without granting superuser, use the built-in role:
+
+```sql
+CREATE ROLE monitoring WITH LOGIN PASSWORD 'x';
+GRANT pg_read_all_stats TO monitoring;
+
+-- To let it cancel and terminate backends too (PG 13+ / 14+)
+GRANT pg_signal_backend TO monitoring;
+```
+
+## Watching a specific problem unfold
+
+For a problem you can reproduce, sampling the view repeatedly is far more informative than a single look. A crude but effective sampler:
+
+```bash
+while true; do
+  psql -d mydb -At -c "
+    SELECT now()::time(0), state, wait_event_type, wait_event, count(*)
+    FROM pg_stat_activity
+    WHERE backend_type = 'client backend'
+    GROUP BY 1,2,3,4 ORDER BY 5 DESC;"
+  sleep 2
+done
+```
+
+Watching the distribution shift over ten or twenty samples tells you whether backends are piling up on locks, on I/O, or simply on CPU — a distinction a single snapshot frequently gets wrong because you happened to catch an unrepresentative moment.
+
+To sample inside the database instead, snapshot `pg_stat_activity` into a real table on a schedule and you have a poor man's wait-event profiler:
+
+```sql
+CREATE TABLE activity_samples AS
+SELECT now() AS sampled_at, pid, state, wait_event_type, wait_event, query
+FROM   pg_stat_activity WHERE false;
+
+-- Run on a schedule, e.g. every second via pg_cron
+INSERT INTO activity_samples
+SELECT now(), pid, state, wait_event_type, wait_event, left(query, 200)
+FROM   pg_stat_activity
+WHERE  backend_type = 'client backend' AND state = 'active';
+```
+
+Then aggregate the samples to see where time actually went:
+
+```sql
+SELECT COALESCE(wait_event_type, 'CPU') AS category,
+       COALESCE(wait_event, 'running')  AS event,
+       count(*) AS samples,
+       round(100.0 * count(*) / sum(count(*)) OVER (), 1) AS pct
+FROM   activity_samples
+WHERE  sampled_at > now() - INTERVAL '1 hour'
+GROUP  BY 1, 2
+ORDER  BY samples DESC;
+```
+
+Put a retention policy on that table, or your diagnostic tool becomes the thing filling the disk.
+
+## Wrapping up
+
+`pg_stat_activity` answers the "what is happening right now" half of PostgreSQL monitoring, and most incidents resolve inside it: a long-running query you can cancel, an `idle in transaction` session blocking vacuum and DDL, a lock chain you can trace with `pg_blocking_pids()`, or a connection count that reveals a misconfigured pool. Set `application_name` on every client so the view is actually readable, add `idle_in_transaction_session_timeout` and `statement_timeout` as guardrails, and pair it with `pg_stat_statements` for the historical picture that a snapshot cannot give you.
