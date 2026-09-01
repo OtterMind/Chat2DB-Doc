@@ -1,0 +1,252 @@
+---
+title: "Iceberg vs Delta Lake: Table Format Comparison 2026"
+description: "Apache Iceberg vs Delta Lake compared: metadata design, schema and partition evolution, engine support, concurrency, and how to choose between them in 2026."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: September 1, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# Iceberg vs Delta Lake: Table Format Comparison 2026
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="September 1, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+Apache Iceberg and Delta Lake solve the same problem: a pile of Parquet files in object storage is not a table. Without a layer above them you get no atomic writes, no consistent reads while a job is writing, no schema enforcement, and a `LIST` call on a prefix with a million objects every time you query.
+
+Both formats add a transaction log over those Parquet files. They differ in how that log is structured, and those structural choices drive everything else — how they scale, how they evolve, and which engines can write to them.
+
+## The one-paragraph answer
+
+Choose **Iceberg** if you want the widest engine support, hidden partitioning that survives layout changes, and a format that is now the default across most of the ecosystem — including Snowflake, BigQuery, Databricks, Trino, Flink and DuckDB. Choose **Delta Lake** if you are primarily on Databricks or Spark, where its tooling, liquid clustering and change data feed are deeply integrated. In 2026 the gap has narrowed sharply: Delta Lake 3.x ships UniForm, which writes Iceberg metadata alongside Delta metadata, and Databricks supports both natively. The format is decreasingly a lock-in decision.
+
+## How each one tracks a table
+
+### Delta Lake
+
+A Delta table is a directory of Parquet files plus a `_delta_log/` directory of ordered JSON commit files:
+
+```
+events/
+  part-00000-....parquet
+  part-00001-....parquet
+  _delta_log/
+    00000000000000000000.json
+    00000000000000000001.json
+    00000000000000000010.checkpoint.parquet
+```
+
+Each JSON commit records actions — `add` a file, `remove` a file, change `metaData`, set `protocol`. The current table state is the log replayed from the last checkpoint forward. Checkpoints are written every 10 commits by default to keep replay bounded.
+
+Atomicity comes from the commit file name: a writer attempting version 11 tries to create `00000000000000000011.json`. If it already exists, the writer lost the race, re-reads, and retries. This requires a storage system with atomic put-if-absent, which is why Delta on S3 historically needed a coordinating service — a limitation resolved by S3's conditional writes.
+
+### Iceberg
+
+Iceberg uses a tree rather than a linear log:
+
+```
+events/
+  data/
+    00000-0-....parquet
+  metadata/
+    v3.metadata.json           <- table metadata: schema, partition specs, snapshot list
+    snap-8273...-1.avro        <- manifest list for one snapshot
+    8f2a...-m0.avro            <- manifest: file paths + per-column statistics
+```
+
+- **Metadata file** — current schema, partition specs, sort orders, and the list of snapshots.
+- **Manifest list** — one per snapshot, pointing at the manifests, with partition value ranges for each.
+- **Manifest** — lists data files with per-file, per-column min/max, null counts and row counts.
+
+Atomicity comes from a **catalog** performing a compare-and-swap on the pointer to the current metadata file. The catalog is a real component you must choose: the REST catalog (now the standard), AWS Glue, Nessie, Hive Metastore, or JDBC.
+
+### Why the structure matters
+
+Planning a query means finding which files to read. Iceberg does this by descending the tree, using the manifest list's partition ranges to skip whole manifests, then per-file column statistics to skip files. It never lists the storage prefix, and planning cost scales with matching files rather than table size.
+
+Delta replays the log to build state, then filters on per-file statistics in the log. Checkpoints keep this bounded, and Delta's `deltalog` statistics support the same file skipping — but very large tables with many commits make replay heavier.
+
+In practice both plan quickly for typical tables. The difference shows on tables with tens of thousands of partitions and very frequent commits, where Iceberg's tree scales more gracefully.
+
+## Partitioning: the biggest practical difference
+
+This is where Iceberg's design pays off most visibly.
+
+**Delta Lake uses Hive-style partitioning.** Partition values appear in the directory path, and queries must filter on the partition column to prune:
+
+```sql
+-- Delta: this prunes
+SELECT * FROM events WHERE event_date = '2026-09-01';
+
+-- This scans everything, even though event_ts implies event_date
+SELECT * FROM events WHERE event_ts >= '2026-09-01';
+```
+
+You end up storing a derived `event_date` column purely so queries can filter on it, and every query author has to know to use it.
+
+**Iceberg has hidden partitioning.** The partition is a transformation of a real column, recorded in metadata:
+
+```sql
+CREATE TABLE events (
+  event_ts   timestamp,
+  user_id    bigint,
+  event_type string,
+  payload    string
+)
+USING iceberg
+PARTITIONED BY (days(event_ts), bucket(16, user_id));
+```
+
+Now a filter on `event_ts` prunes automatically, because Iceberg knows the partition is `days(event_ts)`:
+
+```sql
+SELECT count(*) FROM events
+WHERE event_ts >= TIMESTAMP '2026-09-01 00:00:00';
+```
+
+Better, **partition evolution** changes the layout without rewriting data:
+
+```sql
+ALTER TABLE events REPLACE PARTITION FIELD days(event_ts) WITH hours(event_ts);
+```
+
+Old files keep their daily partitioning, new files use hourly, and Iceberg plans across both. In Delta, changing partitioning means rewriting the table — although Delta's answer, **liquid clustering**, sidesteps the problem differently:
+
+```sql
+ALTER TABLE events CLUSTER BY (event_ts, user_id);
+```
+
+Liquid clustering replaces partitioning with incremental clustering that can be changed at any time, which solves the same problem for Delta users on recent runtimes.
+
+## Schema evolution
+
+Both formats support adding, dropping, renaming and reordering columns without rewriting data, and both track columns by ID rather than by position — so a dropped-then-re-added column name never resurrects old data.
+
+Iceberg additionally allows safe type widening (`int` → `long`, `float` → `double`, `decimal` precision increases) as a metadata-only change, and enforces schema compatibility rules at the format level. Delta enforces schema on write and supports `mergeSchema` for controlled evolution; column mapping (required for rename and drop) must be enabled explicitly:
+
+```sql
+ALTER TABLE events SET TBLPROPERTIES (
+  'delta.columnMapping.mode' = 'name',
+  'delta.minReaderVersion' = '2',
+  'delta.minWriterVersion' = '5'
+);
+```
+
+## Time travel and rollback
+
+Both keep historical snapshots and both let you read them.
+
+Delta:
+
+```sql
+SELECT * FROM events VERSION AS OF 42;
+SELECT * FROM events TIMESTAMP AS OF '2026-08-30 12:00:00';
+
+RESTORE TABLE events TO VERSION AS OF 42;
+```
+
+Iceberg:
+
+```sql
+SELECT * FROM events VERSION AS OF 8273618297318;   -- snapshot id
+SELECT * FROM events FOR TIMESTAMP AS OF TIMESTAMP '2026-08-30 12:00:00';
+
+CALL system.rollback_to_snapshot('db.events', 8273618297318);
+```
+
+Iceberg also has **branching and tagging**, which Delta does not:
+
+```sql
+ALTER TABLE events CREATE BRANCH audit_2026q3;
+ALTER TABLE events CREATE TAG eoy_2026 RETAIN 365 DAYS;
+```
+
+Branches let a job write and validate on a branch, then fast-forward the main branch only if the data passes checks — a write-audit-publish pattern that is otherwise awkward to build.
+
+## Concurrency and updates
+
+Both use optimistic concurrency: a writer reads the current state, stages files, then attempts to commit; conflicting commits retry.
+
+Both support row-level operations:
+
+```sql
+MERGE INTO events t
+USING staged s ON t.id = s.id
+WHEN MATCHED THEN UPDATE SET *
+WHEN NOT MATCHED THEN INSERT *;
+```
+
+For deletes and updates, both offer **copy-on-write** (rewrite affected files, fast reads, slow writes) and **merge-on-read** (write delete files, fast writes, slower reads until compaction). Iceberg lets you set the mode per operation:
+
+```sql
+ALTER TABLE events SET TBLPROPERTIES (
+  'write.delete.mode' = 'merge-on-read',
+  'write.update.mode' = 'merge-on-read',
+  'write.merge.mode'  = 'copy-on-write'
+);
+```
+
+Iceberg v3, finalised in 2025, standardises deletion vectors — the same technique Delta uses — so the read overhead of merge-on-read is now comparable between the two.
+
+Maintenance is required either way. Iceberg:
+
+```sql
+CALL system.rewrite_data_files('db.events');
+CALL system.expire_snapshots('db.events', TIMESTAMP '2026-08-01 00:00:00');
+CALL system.remove_orphan_files('db.events');
+```
+
+Delta:
+
+```sql
+OPTIMIZE events ZORDER BY (user_id);
+VACUUM events RETAIN 168 HOURS;
+```
+
+Skipping this is the single most common cause of "our lakehouse got slow": small files accumulate, and file counts, not data volume, dominate query planning.
+
+## Ecosystem support in 2026
+
+| Engine | Iceberg | Delta Lake |
+|---|---|---|
+| Spark | Read + write | Read + write (native) |
+| Databricks | Read + write | Read + write (native) |
+| Snowflake | Read + write | Read (external tables) |
+| BigQuery | Read + write (BigLake) | Read |
+| Trino / Athena | Read + write | Read + write |
+| Flink | Read + write | Limited |
+| DuckDB | Read (+ write, evolving) | Read |
+| ClickHouse | Read | Read |
+| Dremio | Read + write | Read |
+
+Iceberg's advantage is breadth, particularly for writes from non-Spark engines. Delta's advantage is depth inside Databricks and Spark.
+
+UniForm blurs this: a Delta table can publish Iceberg metadata for the same Parquet files, so Iceberg readers see an Iceberg table without data duplication.
+
+```sql
+CREATE TABLE events (...) USING DELTA
+TBLPROPERTIES ('delta.universalFormat.enabledFormats' = 'iceberg');
+```
+
+## Choosing
+
+Pick **Iceberg** when:
+
+- Several engines read and write the same tables.
+- Partition layout will need to change as the data grows.
+- You want branch/tag semantics for validation before publish.
+- You want to avoid coupling the storage format to one vendor's runtime.
+
+Pick **Delta Lake** when:
+
+- Databricks or Spark is your primary compute and will stay that way.
+- You want liquid clustering, change data feed and Unity Catalog integration.
+- Your team already knows the Delta tooling and the migration cost is not worth it.
+
+And in either case, the operational work is the same: compact small files, expire old snapshots, remove orphans, and monitor file counts per partition. Whichever format you inspect the results with, a SQL client that speaks to Trino, Spark SQL, Snowflake and Postgres in one place makes cross-checking a lakehouse table against its source much less tedious — [Chat2DB](https://chat2db.ai/download) covers those engines, with a web version at [app.chat2db.ai](https://app.chat2db.ai).
+
+## Summary
+
+Iceberg's tree-structured metadata, catalog-based commits, hidden partitioning and partition evolution make it the more flexible format and the broader ecosystem standard. Delta Lake's linear log is simpler, superbly integrated with Spark and Databricks, and has closed most functional gaps with liquid clustering, deletion vectors and UniForm. Neither choice is a trap in 2026 — but if you are starting fresh with multiple query engines in play, Iceberg is the safer default.

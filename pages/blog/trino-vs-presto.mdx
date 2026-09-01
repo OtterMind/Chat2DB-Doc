@@ -1,0 +1,197 @@
+---
+title: "Trino vs Presto: The Fork, the Differences, the Choice"
+description: "Trino vs Presto explained: why the project forked, how PrestoDB and Trino diverged, connector and SQL differences, and which engine to deploy in 2026."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: September 1, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# Trino vs Presto: The Fork, the Differences, the Choice
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="September 1, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+If you have searched for "Presto" recently you have probably ended up on a Trino page, or vice versa, and come away unsure whether they are the same thing. They started as the same thing. They are not any more.
+
+This article covers what happened, how the two projects actually differ today, and how to choose — including the case where the choice is already made for you by a cloud provider.
+
+## The short history
+
+Presto was built at Facebook in 2012 as a distributed SQL engine for querying the Hive warehouse interactively, replacing Hive-on-MapReduce for analyst queries. It was open-sourced in 2013.
+
+In 2018 the original creators — Martin Traverso, Dain Sundstrom, David Phillips and Eric Hwang — left Facebook and forked the project as **PrestoSQL**, taking most of the active contributors with them. Facebook kept the **PrestoDB** name and codebase and moved it under the Linux Foundation as the Presto Foundation.
+
+In December 2020, after a trademark dispute, PrestoSQL renamed itself **Trino**. So:
+
+- **Trino** — formerly PrestoSQL, governed by the Trino Software Foundation, developed by the original authors and Starburst.
+- **Presto / PrestoDB** — the Linux Foundation project, driven largely by Meta, Uber, IBM and Ahana (now part of IBM).
+
+"Presto" in casual conversation, in job postings, and in most blog posts written after 2021 usually means Trino. AWS Athena is built on Trino (engine version 3), and the Presto engine option remains for older workloads.
+
+## What they still share
+
+Both are the same architecture, and if you know one you know the shape of the other:
+
+- **Coordinator + workers.** The coordinator parses SQL, plans, and schedules; workers execute stages and exchange data.
+- **In-memory, pipelined execution.** Data streams between stages rather than materialising to disk between them. Fast, and historically fragile for very large joins.
+- **Storage-agnostic connectors.** The engine owns no data. Connectors expose Hive/Iceberg/Delta tables, Postgres, MySQL, Cassandra, Kafka, Elasticsearch, MongoDB and more.
+- **Federated queries.** One SQL statement can join a Postgres table to an Iceberg table to a Kafka topic.
+- **ANSI SQL** with window functions, CTEs, arrays, maps and lambda expressions.
+
+A federated query looks the same on both:
+
+```sql
+SELECT c.region,
+       count(*)      AS orders,
+       sum(o.amount) AS revenue
+FROM iceberg.analytics.orders o
+JOIN postgresql.public.customers c ON c.id = o.customer_id
+WHERE o.order_ts >= TIMESTAMP '2026-09-01 00:00:00'
+GROUP BY c.region
+ORDER BY revenue DESC;
+```
+
+Catalog configuration is also nearly identical — a properties file per catalog:
+
+```properties
+# etc/catalog/iceberg.properties
+connector.name=iceberg
+iceberg.catalog.type=rest
+iceberg.rest-catalog.uri=https://catalog.example.com
+fs.native-s3.enabled=true
+s3.region=eu-central-1
+```
+
+```properties
+# etc/catalog/postgresql.properties
+connector.name=postgresql
+connection-url=jdbc:postgresql://db.internal:5432/app
+connection-user=readonly
+connection-password=${ENV:PG_PASSWORD}
+```
+
+## Where they diverged
+
+Six years of independent development produced real differences.
+
+### Release pace and Java baseline
+
+Trino releases roughly weekly, with version numbers in the 470s+ as of 2026, and requires a recent JDK — currently Java 23+. Presto releases less frequently with a longer support tail and a more conservative Java requirement. Trino's pace means features arrive quickly and also that upgrades are frequent; the project maintains a clear breaking-changes list per release.
+
+### Fault-tolerant execution
+
+Trino added **fault-tolerant execution** (project Tardigrade) — a mode where intermediate results are checkpointed to an exchange store so a failed task or worker is retried rather than failing the whole query:
+
+```properties
+retry-policy=TASK
+exchange.base-directories=s3://my-bucket/trino-exchange
+fault-tolerant-execution-task-memory=5GB
+```
+
+This makes Trino viable for long ETL jobs, not just interactive queries — the historical dividing line between Trino/Presto and Spark. Presto's answer is different: it has invested in **materialised intermediate exchanges** and, more significantly, in **Presto on Velox** (Prestissimo), a C++ worker replacing the Java worker.
+
+### Native execution
+
+Presto's Velox-based native worker is the most substantial architectural divergence. Velox is a C++ vectorised execution library, also used by Meta in Spark and other systems, and it delivers large CPU efficiency gains on scan- and filter-heavy workloads. Trino has pursued performance within the JVM instead, and both are fast; the difference shows up more in cost-per-query at very large scale than in interactive latency.
+
+### Connector coverage
+
+Trino has the broader and more actively maintained connector set — notably richer Iceberg and Delta Lake support, including writes, `MERGE`, table maintenance procedures and materialised views:
+
+```sql
+-- Trino: Iceberg maintenance from SQL
+ALTER TABLE iceberg.analytics.orders EXECUTE optimize(file_size_threshold => '128MB');
+ALTER TABLE iceberg.analytics.orders EXECUTE expire_snapshots(retention_threshold => '7d');
+ALTER TABLE iceberg.analytics.orders EXECUTE remove_orphan_files(retention_threshold => '7d');
+```
+
+Presto supports Iceberg and Delta too, with a smaller surface of write and maintenance operations.
+
+### SQL and function differences
+
+Mostly compatible, with edges. Trino removed some legacy behaviours the fork inherited and added functions Presto lacks. Common gotchas when porting queries:
+
+```sql
+-- Trino requires the standard cast syntax in places Presto is lenient
+SELECT CAST(json_extract(payload, '$.user_id') AS bigint) FROM events;
+
+-- Trino: table functions
+SELECT * FROM TABLE(postgresql.system.query(query => 'SELECT * FROM app.pg_stat_activity'));
+
+-- Trino: MERGE on connectors that support it
+MERGE INTO iceberg.analytics.dim_user t
+USING staging.updates s ON t.id = s.id
+WHEN MATCHED THEN UPDATE SET name = s.name
+WHEN NOT MATCHED THEN INSERT (id, name) VALUES (s.id, s.name);
+```
+
+Trino also enforces stricter type checking in comparisons, which surfaces latent bugs when migrating.
+
+### Security and governance
+
+Both support file-based and system access control. Trino has more mature fine-grained authorisation through Open Policy Agent integration and, commercially, Starburst's built-in access control. Presto integrates with Apache Ranger, favoured in Hadoop-heritage estates.
+
+## Performance
+
+Neither is categorically faster. What matters far more than the engine choice:
+
+1. **Table format and file layout.** Sorted, well-compacted Parquet with statistics beats every engine tuning knob. Ten thousand small files will make either engine look terrible.
+2. **Whether the join order is right.** Enable the cost-based optimiser and keep table statistics fresh:
+
+```sql
+ANALYZE iceberg.analytics.orders;
+SHOW STATS FOR iceberg.analytics.orders;
+```
+
+3. **Memory configuration.** The classic Trino/Presto failure is `Query exceeded per-node memory limit`:
+
+```properties
+query.max-memory-per-node=20GB
+query.max-memory=100GB
+memory.heap-headroom-per-node=8GB
+```
+
+4. **Dynamic filtering**, on by default in Trino, which pushes join keys from the build side into the probe side scan and can eliminate most of the data read.
+
+Read the plan before tuning anything:
+
+```sql
+EXPLAIN (TYPE DISTRIBUTED)
+SELECT ... ;
+
+EXPLAIN ANALYZE
+SELECT ... ;
+```
+
+`EXPLAIN ANALYZE` reports per-stage wall time, rows and bytes — enough to see whether time goes to the scan, the exchange or a spilling join.
+
+## Which to choose in 2026
+
+**Choose Trino** if you are starting fresh. It has the larger community, faster development, better Iceberg and Delta support, fault-tolerant execution for ETL, and it is what AWS Athena runs. Documentation, Stack Overflow answers and recent blog posts overwhelmingly target Trino.
+
+**Choose or stay on Presto** if:
+
+- You are already running PrestoDB at scale and the migration cost is not justified.
+- You want the Velox native worker's CPU efficiency and are prepared for the operational work.
+- Your platform vendor ships Presto and supports it.
+
+**The choice may not be yours.** AWS Athena is serverless Trino. Starburst Galaxy and Enterprise are commercial Trino. IBM watsonx.data builds on Presto. Google BigLake and Dataproc offer Trino. Picking a managed service usually picks the engine.
+
+## Migrating from Presto to Trino
+
+If you decide to move:
+
+1. **Test the SQL.** Most queries run unchanged. Watch for implicit casts, `TIMESTAMP` semantics (Trino follows the SQL standard more strictly), and any use of removed legacy functions.
+2. **Rewrite catalog properties.** Names changed — `hive.metastore.uri` conventions, S3 filesystem properties moved to `fs.native-s3.*` in recent Trino.
+3. **Redo access control.** Ranger-based policies need an equivalent in Trino's file-based rules or OPA.
+4. **Re-tune memory.** The settings look similar but the defaults and accounting differ.
+5. **Run both in parallel** against the same catalogs for a period and diff query results — the connectors read the same files, so a genuine result difference points at a semantic gap worth understanding before you cut over.
+
+For that comparison step, and for day-to-day work against a Trino or Presto cluster next to the operational databases feeding it, a client that holds several connections at once is genuinely useful — [Chat2DB](https://chat2db.ai/download) connects to Trino, Postgres, MySQL, ClickHouse and 20+ other engines, and runs in the browser at [app.chat2db.ai](https://app.chat2db.ai).
+
+## Summary
+
+Trino and Presto are the same engine forked in 2018 and diverged since. Trino, built by the original authors, moves faster, has broader and deeper connectors — especially for Iceberg and Delta — offers fault-tolerant execution for ETL workloads, and powers AWS Athena and Starburst. Presto continues under the Linux Foundation with Meta and IBM behind it, and its Velox-based native worker is a genuinely different bet on execution efficiency. For a new deployment in 2026, Trino is the default; for an existing Presto estate, migrate when you need something Trino has, not on principle.

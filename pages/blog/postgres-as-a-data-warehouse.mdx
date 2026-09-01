@@ -1,0 +1,232 @@
+---
+title: "Postgres as a Data Warehouse: How Far It Really Goes"
+description: "Can Postgres be your data warehouse? A look at partitioning, BRIN indexes, columnar extensions, parallel query limits, and when to move to ClickHouse or DuckDB."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: September 1, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# Postgres as a Data Warehouse: How Far It Really Goes
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="September 1, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+Every analytics stack starts the same way: someone points a BI tool at the production Postgres. It works, until a dashboard query starts taking 90 seconds and locks up the connection pool during business hours.
+
+The question is not whether Postgres *can* be a data warehouse — it can, further than most people assume — but where the ceiling is and how to recognise you are approaching it. This article maps the practical limits and the techniques that raise them.
+
+## What "warehouse workload" means
+
+Analytical queries have a shape that is the opposite of transactional queries:
+
+- They scan millions of rows and return dozens.
+- They read a few columns out of a wide table.
+- They aggregate, group and window rather than look up by key.
+- They are read-mostly, loaded in batches rather than row by row.
+- Latency budgets are seconds, not milliseconds, but concurrency is low.
+
+Postgres is a row store. Reading `SUM(amount)` from a 40-column table means reading all 40 columns off disk, because they live together in the same 8 KB pages. A columnar engine reads only the `amount` column. That single architectural fact drives most of the difference — and most of the workarounds below are ways to read fewer pages.
+
+## Technique 1: partition by time
+
+Almost every warehouse table is time-series shaped. Declarative range partitioning lets the planner skip whole partitions:
+
+```sql
+CREATE TABLE events (
+  id          bigint GENERATED ALWAYS AS IDENTITY,
+  occurred_at timestamptz NOT NULL,
+  user_id     bigint NOT NULL,
+  event_type  text NOT NULL,
+  properties  jsonb
+) PARTITION BY RANGE (occurred_at);
+
+CREATE TABLE events_2026_08 PARTITION OF events
+  FOR VALUES FROM ('2026-08-01') TO ('2026-09-01');
+
+CREATE TABLE events_2026_09 PARTITION OF events
+  FOR VALUES FROM ('2026-09-01') TO ('2026-10-01');
+```
+
+A query with a constant time filter touches one partition:
+
+```sql
+EXPLAIN (ANALYZE, BUFFERS)
+SELECT event_type, count(*)
+FROM events
+WHERE occurred_at >= '2026-09-01' AND occurred_at < '2026-09-08'
+GROUP BY event_type;
+```
+
+Look for `Partitions removed: 11` or a plan that only lists one child table. Pruning happens at plan time for constants and at execution time for parameters, so both prepared statements and BI-generated SQL benefit.
+
+Partitioning also makes retention nearly free. Dropping a month is a metadata operation:
+
+```sql
+ALTER TABLE events DETACH PARTITION events_2025_09;
+DROP TABLE events_2025_09;
+```
+
+Compare that to `DELETE FROM events WHERE occurred_at < ...`, which writes a WAL record per row and leaves the table bloated until vacuum catches up.
+
+Keep partitions in the hundreds, not thousands. Planning time grows with the number of partitions, and a table split into 3,000 daily partitions can spend more time planning than executing.
+
+## Technique 2: BRIN indexes on naturally ordered columns
+
+A B-tree index on `occurred_at` over 500 million rows costs many gigabytes. A BRIN index stores the min and max value per range of pages — typically 128 pages, 1 MB — and is measured in megabytes:
+
+```sql
+CREATE INDEX events_occurred_brin ON events
+  USING brin (occurred_at) WITH (pages_per_range = 64);
+```
+
+BRIN only works when physical row order correlates with the column's value order, which is exactly true for append-only event data. Check first:
+
+```sql
+SELECT attname, correlation
+FROM pg_stats
+WHERE tablename = 'events_2026_09' AND attname = 'occurred_at';
+```
+
+A correlation above roughly 0.9 means BRIN will prune effectively. Below that, the index reads nearly every block and adds nothing. If data arrives out of order, `CLUSTER` on the timestamp during a maintenance window restores the correlation.
+
+## Technique 3: pre-aggregate with materialised views
+
+Nothing beats not scanning the rows. If a dashboard asks the same five questions, answer them once:
+
+```sql
+CREATE MATERIALIZED VIEW daily_event_rollup AS
+SELECT date_trunc('day', occurred_at) AS day,
+       event_type,
+       count(*)                        AS events,
+       count(DISTINCT user_id)         AS unique_users
+FROM events
+GROUP BY 1, 2;
+
+CREATE UNIQUE INDEX ON daily_event_rollup (day, event_type);
+```
+
+The unique index is what makes concurrent refresh possible, so dashboards never see an empty view mid-refresh:
+
+```sql
+REFRESH MATERIALIZED VIEW CONCURRENTLY daily_event_rollup;
+```
+
+`CONCURRENTLY` is slower than a plain refresh — it computes the new result and diffs it — but it takes only a `SHARE UPDATE EXCLUSIVE` lock instead of blocking readers.
+
+For incremental rollups, keep a watermark and merge only new data:
+
+```sql
+INSERT INTO daily_event_rollup (day, event_type, events, unique_users)
+SELECT date_trunc('day', occurred_at), event_type,
+       count(*), count(DISTINCT user_id)
+FROM events
+WHERE occurred_at >= (SELECT coalesce(max(day), '-infinity') FROM daily_event_rollup)
+GROUP BY 1, 2
+ON CONFLICT (day, event_type)
+DO UPDATE SET events = EXCLUDED.events,
+              unique_users = EXCLUDED.unique_users;
+```
+
+## Technique 4: tune for scans, not for OLTP
+
+Warehouse settings differ from transactional defaults:
+
+```sql
+-- Per-session, for a reporting role or a BI connection
+SET work_mem = '256MB';                  -- hash aggregates and sorts stay in memory
+SET max_parallel_workers_per_gather = 8; -- more workers per scan
+SET effective_io_concurrency = 200;      -- NVMe; keeps prefetch busy
+SET jit = on;                            -- helps long aggregate-heavy queries
+```
+
+Do this per role rather than globally, so OLTP traffic keeps its own settings:
+
+```sql
+CREATE ROLE analytics LOGIN;
+ALTER ROLE analytics SET work_mem = '256MB';
+ALTER ROLE analytics SET max_parallel_workers_per_gather = 8;
+ALTER ROLE analytics SET statement_timeout = '10min';
+```
+
+`work_mem` is per sort or hash node, per worker — a query with three hash joins and eight workers can use 24 times the setting. That is why raising it globally is dangerous and raising it for a low-concurrency reporting role is not.
+
+Confirm the effect with `EXPLAIN (ANALYZE, BUFFERS)`: `Sort Method: external merge  Disk: 412MB` means you spilled and more `work_mem` will help; `quicksort  Memory: 84MB` means you did not.
+
+## Technique 5: separate the workload
+
+Run analytics on a physical replica so a runaway `GROUP BY` cannot slow down checkout:
+
+```sql
+-- On the standby: let long queries run without being cancelled by replay
+ALTER SYSTEM SET max_standby_streaming_delay = '15min';
+ALTER SYSTEM SET hot_standby_feedback = on;
+SELECT pg_reload_conf();
+```
+
+`hot_standby_feedback = on` prevents the primary from vacuuming rows a standby query still needs — which stops query cancellations but can cause bloat on the primary if reports run for hours. It is a trade you should make consciously.
+
+Reporting also benefits from a separate connection route; pointing BI tools and ad-hoc SQL clients at the replica keeps the primary's connection slots for the application. When you need to work across both — comparing a rollup on the replica against the source table on the primary — a client that keeps multiple connections side by side helps; [Chat2DB](https://chat2db.ai/download) does this across Postgres, MySQL, ClickHouse and 20+ other engines, with a web version at [app.chat2db.ai](https://app.chat2db.ai).
+
+## Technique 6: columnar, without leaving Postgres
+
+Two options add column storage to the ecosystem:
+
+**Citus columnar** gives compressed, columnar storage for append-only tables in a single-node Postgres:
+
+```sql
+CREATE EXTENSION IF NOT EXISTS citus;
+
+CREATE TABLE events_archive (
+  occurred_at timestamptz,
+  user_id     bigint,
+  event_type  text,
+  amount      numeric
+) USING columnar;
+```
+
+Compression of 5–10x is typical, and scans read only the referenced columns. The limitation is fundamental: columnar tables do not support `UPDATE`, `DELETE` or indexes. They suit cold partitions you only append to and read from.
+
+**pg_duckdb** embeds DuckDB's vectorised engine inside Postgres, so analytical queries — including queries over Parquet files in object storage — run in DuckDB while the data of record stays in Postgres:
+
+```sql
+CREATE EXTENSION IF NOT EXISTS pg_duckdb;
+
+SELECT event_type, count(*)
+FROM read_parquet('s3://bucket/events/2026/09/*.parquet')
+GROUP BY event_type;
+```
+
+This is the most practical "warehouse in Postgres" answer in 2026 for teams whose hot data is small and whose cold data is already in object storage.
+
+## Where the ceiling actually is
+
+Rough guidance, assuming decent hardware and the techniques above:
+
+- **Under ~100 GB of analytical data**: plain Postgres with partitioning and materialised views is comfortable. Do not add a warehouse.
+- **100 GB – 1 TB**: still workable, but you will be actively managing partitions, rollups and `work_mem`. Expect single-query latencies of seconds to a minute on full scans.
+- **1 TB – 10 TB**: Postgres alone struggles. Cold partitions in columnar storage, aggressive pre-aggregation, or an external engine for the raw layer become necessary.
+- **Beyond 10 TB, or high-concurrency BI on raw data**: use a purpose-built engine.
+
+The signals that you have crossed the line, in order of how often they show up:
+
+1. Dashboard queries scan more than a few hundred million rows and cannot be pre-aggregated because filters are ad-hoc.
+2. `work_mem` is tuned and queries still spill to disk.
+3. Batch loads and long-running reports fight over I/O.
+4. Autovacuum cannot keep up with the ingest rate on the biggest tables.
+5. You are adding partitions faster than the planner is comfortable with.
+
+## What to move to
+
+- **DuckDB** for single-node analytics over Parquet, especially embedded in a pipeline or notebook. It reads directly from Postgres via its `postgres` extension, so migration is incremental.
+- **ClickHouse** for high-ingest, high-concurrency analytical serving — event analytics, observability, product metrics.
+- **Iceberg or Delta Lake on object storage**, queried by Trino, Spark or DuckDB, when several engines need the same data and you want to avoid lock-in.
+- **A managed cloud warehouse** when the operational burden matters more than the bill.
+
+None of these replace Postgres; they sit next to it. Postgres keeps the transactional data of record, and a change-data-capture pipeline or a scheduled export feeds the analytical store.
+
+## Summary
+
+Postgres handles far more analytical work than its reputation suggests, provided you partition by time, index with BRIN where correlation allows, pre-aggregate into materialised views, tune `work_mem` and parallelism for a reporting role, and keep that role off the primary. Those five moves comfortably cover hundreds of gigabytes. Past roughly a terabyte of raw analytical data — or as soon as ad-hoc scans stop fitting in your latency budget — add a columnar engine rather than fighting the row store.

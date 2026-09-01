@@ -1,0 +1,200 @@
+---
+title: "Redis vs Memcached: Which Cache Should You Use?"
+description: "Redis vs Memcached compared on data structures, memory efficiency, threading, persistence, eviction and clustering, plus when Memcached is still better."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: September 1, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# Redis vs Memcached: Which Cache Should You Use?
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="September 1, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+The received wisdom is "Redis does everything Memcached does, plus more, so use Redis". That is mostly true and occasionally wrong in a way that costs real money. Memcached is still deployed at enormous scale by companies that could trivially switch, and their reasons are worth understanding before you default.
+
+This article compares the two on the dimensions that actually differ, and gives a decision rule.
+
+## What each one is
+
+**Memcached** is a distributed in-memory key-value cache, released in 2003. Keys map to opaque byte blobs, capped at 1 MB by default. It is multi-threaded, has no persistence, no replication, and no server-side clustering — the client shards across nodes with consistent hashing. Roughly 20,000 lines of C that have been doing one job for twenty years.
+
+**Redis** is an in-memory data structure server, released in 2009. Values are typed: strings, hashes, lists, sets, sorted sets, streams, bitmaps, HyperLogLogs, geospatial indexes and (in Redis 8) vector sets. It has optional persistence, replication, Sentinel-based failover, server-side clustering, Lua and function scripting, transactions, and pub/sub.
+
+## Side by side
+
+| | Memcached | Redis |
+|---|---|---|
+| Data types | Strings only (opaque blobs) | 10+ typed structures |
+| Max value size | 1 MB default (tunable) | 512 MB |
+| Threading | Multi-threaded from the start | Single-threaded command loop + I/O threads |
+| Persistence | None | RDB snapshots, AOF, or both |
+| Replication | None (client-side sharding) | Async replication, Sentinel, Cluster |
+| Eviction | LRU (segmented) | 8 policies, incl. LRU, LFU, TTL, random |
+| Memory allocator | Slab allocator | jemalloc |
+| Atomic operations | incr/decr, CAS, add, append | Everything, plus Lua scripts and MULTI/EXEC |
+| Server-side scripting | No | Lua, Functions |
+| Pub/sub | No | Yes, plus Streams |
+| Licence | BSD | AGPLv3 / RSALv2 / SSPLv1 (BSD via Valkey) |
+
+## Where Memcached genuinely wins
+
+### Multi-threading
+
+Memcached uses all cores for command processing. Redis executes commands on one thread; its I/O threading parallelises reading and writing sockets, not command execution.
+
+On a 16-core machine serving a pure `GET`/`SET` workload, Memcached scales close to linearly across cores. A single Redis instance saturates one core and then stops. Getting the same throughput from Redis means running multiple instances or a cluster — more processes to operate, more memory fragmentation, more moving parts.
+
+If your workload is genuinely "get and set blobs at very high rates on big machines", Memcached does it with less hardware.
+
+### Memory efficiency for simple caching
+
+Memcached's slab allocator pre-allocates fixed-size chunks and assigns items to the closest-fitting slab class. This causes some internal fragmentation but has very low per-item overhead — roughly 50–60 bytes including the key.
+
+Redis carries more per-key overhead: the dictionary entry, the `robj` wrapper, expiry metadata, and jemalloc bookkeeping. For a cache of a hundred million small string values, that difference is measured in gigabytes.
+
+Check yours:
+
+```bash
+# Memcached
+echo "stats" | nc localhost 11211 | grep -E "bytes|curr_items|evictions"
+echo "stats slabs" | nc localhost 11211
+
+# Redis
+redis-cli INFO memory | grep -E "used_memory_human|mem_fragmentation_ratio"
+redis-cli MEMORY USAGE some:key
+```
+
+### Operational simplicity
+
+Memcached has no persistence to configure, no replication to fail over, no cluster topology to reshard, no `maxmemory-policy` to get wrong. It starts, it caches, it evicts when full. When a node dies the client hashes around it and the cache warms again.
+
+That is a genuine advantage. A large share of Redis production incidents come from features a pure cache does not need: AOF rewrite pauses, `BGSAVE` fork memory spikes on write-heavy instances, Sentinel split-brain during network partitions, and cluster resharding gone wrong.
+
+### Predictable behaviour under memory pressure
+
+Memcached is a cache and behaves like one: when full, it evicts. Redis's default `maxmemory-policy` is `noeviction`, which means a full Redis starts **rejecting writes** with `OOM command not allowed`. Teams that deploy Redis as a cache and forget to set the policy discover this during a traffic spike.
+
+```
+# redis.conf — for a pure cache, always set these
+maxmemory 8gb
+maxmemory-policy allkeys-lru
+```
+
+## Where Redis wins
+
+### Data structures that remove application code
+
+This is the real reason Redis dominates. Operations that would require read-modify-write round trips in Memcached are single atomic commands:
+
+```bash
+# Leaderboard — a sorted set, not a serialise/deserialise cycle
+ZADD leaderboard 4820 "user:1001"
+ZINCRBY leaderboard 50 "user:1001"
+ZREVRANGE leaderboard 0 9 WITHSCORES
+ZREVRANK leaderboard "user:1001"
+
+# Sliding-window rate limit, atomic, no race
+ZREMRANGEBYSCORE ratelimit:user:42 -inf 1788230000
+ZADD ratelimit:user:42 1788230060 "req-abc"
+ZCARD ratelimit:user:42
+EXPIRE ratelimit:user:42 60
+
+# Partial update of a cached object without fetching it
+HSET user:1001 last_seen 1788230060 status "online"
+HGETALL user:1001
+
+# Deduplicate a huge stream in 12 KB of memory
+PFADD daily:uniques:2026-09-01 "user:1001" "user:1002"
+PFCOUNT daily:uniques:2026-09-01
+```
+
+With Memcached, the leaderboard means fetching the whole structure, mutating it in the application, and writing it back — with a lost-update race unless you use CAS and retry. That is a lot of code and a lot of latency to avoid one dependency.
+
+### Atomicity beyond a single key
+
+`MULTI`/`EXEC` batches commands, and Lua scripts execute atomically on the server:
+
+```lua
+-- Atomic "decrement stock if available", one round trip, no race
+local stock = tonumber(redis.call('GET', KEYS[1]) or '0')
+if stock >= tonumber(ARGV[1]) then
+  return redis.call('DECRBY', KEYS[1], ARGV[1])
+end
+return -1
+```
+
+```bash
+redis-cli --eval reserve.lua stock:sku-42 , 3
+```
+
+Memcached offers `incr`, `decr` and CAS. Anything more complex belongs in the application, with the concurrency bugs that implies.
+
+### Persistence and replication
+
+A Memcached restart means an empty cache and a thundering herd against your database. Redis can restore from an RDB snapshot in seconds and can keep a replica warm for failover.
+
+Whether you want this is a design decision, not a given. A cache that survives restarts can also serve *stale* data after a restart, which is occasionally worse than an empty one.
+
+### Pub/sub, streams and expiry semantics
+
+Redis's `EXPIRE`, keyspace notifications, `Streams` with consumer groups and pub/sub cover coordination patterns Memcached simply has no answer for. Memcached has TTLs but no way to learn that a key expired.
+
+## The 2026 licence footnote
+
+Redis is AGPLv3 / RSALv2 / SSPLv1. Memcached is BSD. If your organisation prohibits copyleft or non-OSI licences, Memcached is unaffected and **Valkey** — the BSD-licensed Linux Foundation fork of Redis 7.2 — gives you Redis semantics under a permissive licence. In many "we cannot use Redis for licence reasons" conversations, Valkey is the answer rather than Memcached.
+
+## Benchmark your own workload
+
+Both ship or have standard load generators. Test with your real value sizes and access pattern:
+
+```bash
+# memtier_benchmark works against both
+memtier_benchmark -s 127.0.0.1 -p 11211 -P memcache_text \
+  --ratio=1:10 -d 512 -c 50 -t 4 --test-time=60
+
+memtier_benchmark -s 127.0.0.1 -p 6379 -P redis \
+  --ratio=1:10 -d 512 -c 50 -t 4 --test-time=60
+```
+
+Vary `-d` (value size) and `-t` (threads). The result usually shows Memcached ahead on raw throughput per core on large machines, and the two comparable on a small instance where one core is the ceiling anyway.
+
+Watch eviction rate and hit rate in production, which matter far more than benchmark throughput:
+
+```bash
+echo "stats" | nc localhost 11211 | grep -E "get_hits|get_misses|evictions"
+redis-cli INFO stats | grep -E "keyspace_hits|keyspace_misses|evicted_keys"
+```
+
+A hit rate below ~80% usually means the cache is too small or the TTLs are too short — and no engine choice fixes that.
+
+## A decision rule
+
+**Use Memcached** when all of these hold:
+
+- The cache stores opaque blobs looked up by key. No structures, no server-side logic.
+- You need very high throughput per node and want to use all cores from one process.
+- A cold cache after restart is acceptable.
+- You want the smallest possible operational surface.
+- Per-key memory overhead matters because you hold very many small items.
+
+**Use Redis (or Valkey)** when any of these hold:
+
+- You want sorted sets, hashes, lists, streams, HyperLogLog or bitmaps.
+- You need atomic multi-step operations without application-side retry loops.
+- You want persistence, replication or automatic failover.
+- You want pub/sub, keyspace notifications or a job queue.
+- You are already running Redis for something else and a second cache system is not worth it.
+
+For most teams the second list wins, which is why Redis is the default. But it is worth being deliberate: if the honest answer is "we `SET` a JSON blob and `GET` it back", Memcached does that with fewer failure modes and less RAM.
+
+## And check the layer underneath
+
+Both caches sit in front of a database, and cache sizing questions are usually database questions: which queries are expensive, which rows are hot, which results are safe to serve stale. Looking at `pg_stat_statements` or the MySQL slow log before sizing a cache tends to change the answer — [Chat2DB](https://chat2db.ai/download) puts those alongside a SQL editor for Postgres, MySQL and 20+ other databases, with a browser version at [app.chat2db.ai](https://app.chat2db.ai).
+
+## Summary
+
+Memcached is multi-threaded, memory-efficient for simple key-value data, and operationally minimal — genuinely better when you need maximum blob-caching throughput per node and nothing else. Redis trades some per-key memory and single-threaded command execution for typed data structures, atomic server-side operations, persistence, replication and pub/sub, which usually eliminate more application complexity than they add. Default to Redis or Valkey; choose Memcached deliberately when the workload really is just blobs at very high rates.

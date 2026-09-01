@@ -1,0 +1,216 @@
+---
+title: "Postgres vs Redis: When You Actually Need a Cache"
+description: "A practical Redis vs Postgres comparison: latency, durability, data structures, and how far UNLOGGED tables, LISTEN/NOTIFY and SKIP LOCKED get you first."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: September 1, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# Postgres vs Redis: When You Actually Need a Cache
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="September 1, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+Adding Redis in front of Postgres is close to a reflex on most teams. Sometimes it is exactly right. Often it adds a second data store, a second failure mode, and a cache invalidation problem to solve a query that would have taken 2 ms with the right index.
+
+This article compares the two honestly — what each is actually good at, what the latency numbers really look like, and the four Postgres features that cover a surprising share of what people reach for Redis to do.
+
+## They are not the same category
+
+Postgres is a durable, transactional, relational database. Redis is an in-memory data structure server. The overlap is narrow: both can return a value for a key quickly.
+
+| | PostgreSQL | Redis |
+|---|---|---|
+| Primary storage | Disk, with a shared buffer cache | RAM, with optional disk persistence |
+| Durability | WAL + fsync, crash-safe by default | RDB snapshots and/or AOF; async by default |
+| Data model | Relational, plus JSONB, arrays, ranges | Strings, hashes, lists, sets, sorted sets, streams, bitmaps, HyperLogLog |
+| Transactions | Full ACID, multi-statement, rollback | MULTI/EXEC batching and Lua scripts; no rollback on error |
+| Query language | SQL, joins, aggregation, window functions | Command-per-structure; no joins |
+| Typical point-read | 0.2–2 ms | 0.05–0.3 ms |
+| Concurrency model | Process per connection, MVCC | Single-threaded command loop (plus I/O threads) |
+
+The last row matters more than people expect. Redis executes commands one at a time. A single `KEYS *` or a large `SMEMBERS` blocks every other client for the duration. Postgres, in contrast, degrades gradually under load rather than serialising behind one slow command.
+
+## The latency question, honestly
+
+The usual argument for Redis is "in-memory is faster than disk". That framing is misleading, because a warm Postgres serves reads from `shared_buffers`, which is also memory.
+
+A primary-key lookup on a well-indexed Postgres table with the page already cached costs roughly:
+
+- 0.05–0.2 ms of actual query execution,
+- plus network round trip,
+- plus connection and protocol overhead.
+
+Redis for the same lookup costs roughly 0.02–0.05 ms of execution plus the same network round trip. In a typical deployment, both are dominated by the network, and the end-to-end difference is often under half a millisecond.
+
+Where Redis genuinely wins:
+
+- **Very high request rates on tiny values.** At 100k+ ops/sec on small keys, Redis's simpler protocol and lack of MVCC bookkeeping shows.
+- **Avoiding connection pressure.** Each Postgres connection is a process with its own memory; 5,000 concurrent clients need PgBouncer. Redis handles thousands of connections in one process.
+- **Expensive-to-compute values.** If the value takes 800 ms to compute, the store you keep it in barely matters — but keeping it out of Postgres keeps that work off your primary.
+
+Where the win evaporates:
+
+- **The query is only slow because it lacks an index.** Caching a sequential scan hides a fixable problem and adds staleness.
+- **The cache hit rate is low.** A cache with a 40% hit rate adds a network hop to 60% of requests.
+- **The data changes constantly.** Invalidations then cost more than the reads save.
+
+Measure before you decide. Find your actual slow queries first:
+
+```sql
+CREATE EXTENSION IF NOT EXISTS pg_stat_statements;
+
+SELECT calls,
+       round(mean_exec_time::numeric, 2) AS mean_ms,
+       round(total_exec_time::numeric / 1000, 1) AS total_s,
+       rows / GREATEST(calls, 1) AS avg_rows,
+       left(query, 90) AS query
+FROM pg_stat_statements
+ORDER BY total_exec_time DESC
+LIMIT 15;
+```
+
+And check whether you are actually reading from disk:
+
+```sql
+SELECT sum(heap_blks_hit) * 100.0
+       / NULLIF(sum(heap_blks_hit) + sum(heap_blks_read), 0) AS cache_hit_pct
+FROM pg_statio_user_tables;
+```
+
+If that number is 99%+ and your slow queries are slow because they scan millions of rows, Redis will not help — it will just cache the answer to a query you should fix. Tools like [Chat2DB](https://chat2db.ai/download) make this loop quicker by putting `pg_stat_statements` output, the execution plan and the query editor in one place; there is also a browser version at [app.chat2db.ai](https://app.chat2db.ai).
+
+## Four things people use Redis for that Postgres already does
+
+### Session storage
+
+The classic Redis use case, and a legitimate one — but Postgres handles it well with an `UNLOGGED` table, which skips WAL writes entirely:
+
+```sql
+CREATE UNLOGGED TABLE sessions (
+  sid        text PRIMARY KEY,
+  user_id    bigint NOT NULL,
+  data       jsonb NOT NULL DEFAULT '{}',
+  expires_at timestamptz NOT NULL
+);
+
+CREATE INDEX ON sessions (expires_at);
+```
+
+`UNLOGGED` means writes do not go to the WAL, making them several times faster; the price is that the table is truncated after a crash and is not replicated to standbys. For sessions, that is usually an acceptable trade — the same trade Redis makes by default.
+
+Expiry needs a sweeper, since Postgres has no TTL:
+
+```sql
+DELETE FROM sessions
+WHERE expires_at < now() - interval '1 day';
+```
+
+Schedule it with `pg_cron` or an application job. Delete in batches on large tables so you do not hold a long transaction.
+
+### Rate limiting
+
+A fixed-window counter needs one round trip:
+
+```sql
+CREATE UNLOGGED TABLE rate_limits (
+  key        text        NOT NULL,
+  window_start timestamptz NOT NULL,
+  hits       integer     NOT NULL DEFAULT 0,
+  PRIMARY KEY (key, window_start)
+);
+
+INSERT INTO rate_limits (key, window_start, hits)
+VALUES ('user:42', date_trunc('minute', now()), 1)
+ON CONFLICT (key, window_start)
+DO UPDATE SET hits = rate_limits.hits + 1
+RETURNING hits;
+```
+
+If the returned `hits` exceeds your limit, reject the request. This is atomic, needs no Lua script, and survives a restart. At extreme rates — tens of thousands of increments per second on the same key — the row-level lock contention will hurt and Redis is genuinely better. At normal API rates it is fine.
+
+### Job queues
+
+`SELECT ... FOR UPDATE SKIP LOCKED` turns a table into a work queue with exactly-once delivery inside a transaction:
+
+```sql
+CREATE TABLE jobs (
+  id          bigserial PRIMARY KEY,
+  payload     jsonb NOT NULL,
+  run_at      timestamptz NOT NULL DEFAULT now(),
+  attempts    integer NOT NULL DEFAULT 0,
+  locked_at   timestamptz
+);
+
+CREATE INDEX jobs_pending_idx ON jobs (run_at) WHERE locked_at IS NULL;
+```
+
+Workers claim jobs without blocking each other:
+
+```sql
+WITH claimed AS (
+  SELECT id
+  FROM jobs
+  WHERE locked_at IS NULL AND run_at <= now()
+  ORDER BY run_at
+  FOR UPDATE SKIP LOCKED
+  LIMIT 10
+)
+UPDATE jobs j
+SET locked_at = now(), attempts = j.attempts + 1
+FROM claimed c
+WHERE j.id = c.id
+RETURNING j.id, j.payload;
+```
+
+`SKIP LOCKED` makes each worker step over rows another worker already holds, so ten workers pull ten disjoint batches with no coordination. The big advantage over Redis: the job is enqueued in the same transaction as the business data that produced it. No "we committed the order but the confirmation email job was lost" class of bug.
+
+### Pub/sub
+
+`LISTEN`/`NOTIFY` delivers messages to connected clients:
+
+```sql
+-- Publisher
+NOTIFY jobs_channel, '{"job_id": 12345}';
+
+-- Or from a trigger, with a payload built in SQL
+SELECT pg_notify('jobs_channel', json_build_object('id', NEW.id)::text);
+```
+
+The caveats are real: payloads are capped at 8000 bytes, messages are dropped for clients that are not connected (no persistence, no replay), and notifications are delivered at commit time. It is a good wake-up signal — "check the queue table now" — and a bad message bus. Redis Streams, or Kafka, cover the durable case.
+
+## When Redis is the right answer
+
+Reach for Redis when you need something Postgres genuinely does not have:
+
+- **Sorted sets.** Leaderboards, sliding-window rate limits and priority structures where you need `ZADD`/`ZRANGEBYSCORE` semantics at high throughput.
+- **Extremely high fan-out pub/sub.** Thousands of subscribers on a channel, where a Postgres connection per subscriber is not viable.
+- **Sub-millisecond p99 under heavy concurrency**, particularly when you would otherwise need to scale Postgres connections past what PgBouncer comfortably handles.
+- **Taking read load off a primary that is already at its limit** and cannot easily get a read replica.
+- **Probabilistic structures** — HyperLogLog for cardinality, bitmaps for daily-active-user tracking — where the memory savings are the point.
+- **Ephemeral coordination**: distributed locks, feature flag fan-out, short-lived counters that nobody will ever audit.
+
+## The cost of the second store
+
+Before adding Redis, price in what comes with it:
+
+- **Invalidation.** Every write path that touches cached data must remember to invalidate. This is where most cache bugs live, and they surface as "the UI shows the old value" reports that are hard to reproduce.
+- **Two consistency models.** Redis replication is asynchronous and, on failover, acknowledged writes can be lost. Data that matters must still land in Postgres.
+- **Operational surface.** Another service to monitor, patch, size and fail over. `maxmemory` and the eviction policy need to be set deliberately — the default `noeviction` turns a full Redis into write errors.
+- **Cold start behaviour.** After a Redis restart, every request misses. If Postgres cannot survive an unfiltered traffic burst, the cache has become load-bearing rather than a nice-to-have.
+
+## A decision rule
+
+Start with Postgres and the right indexes. Add a cache when you can point at a specific query, with a measured cost, a high hit rate, and a tolerance for staleness you can state in seconds.
+
+Concretely:
+
+- Slow query with a fixable plan → **fix the query**, not the architecture.
+- Expensive aggregate, refreshed on a schedule → **materialised view** in Postgres.
+- Session, queue, rate limit, simple key-value → **Postgres**, likely `UNLOGGED`, until it measurably hurts.
+- Sorted sets, huge fan-out, sub-millisecond p99, connection storms → **Redis**.
+
+Most applications are smaller than they think and larger than they measure. Measure first.

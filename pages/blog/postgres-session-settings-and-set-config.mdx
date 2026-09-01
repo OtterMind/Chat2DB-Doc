@@ -1,0 +1,324 @@
+---
+title: "Postgres SET, set_config and Per-Role Settings Explained"
+description: "How PostgreSQL settings work: SET vs SET LOCAL, set_config and current_setting, search_path, custom GUCs for row level security, and the precedence order."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: September 1, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# Postgres SET, set_config and Per-Role Settings Explained
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="September 1, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+PostgreSQL has no "session variables" in the sense MySQL or SQL Server users expect — there is no `@my_var`. What it has instead is a configuration system that turns out to be more useful once you understand it: every setting, including ones you invent yourself, can be set globally, per database, per role, per session or per transaction, and read back from SQL.
+
+This article covers the whole mechanism: `SET` versus `SET LOCAL`, `set_config()` and `current_setting()`, `search_path`, custom parameters for row level security and audit logging, and the precedence rules that decide which value actually wins.
+
+## The four ways to set a value
+
+### 1. `SET` — session scope
+
+```sql
+SET work_mem = '128MB';
+SET TIME ZONE 'Europe/Berlin';
+SET statement_timeout = '30s';
+```
+
+The value lasts until the session ends or you change it again. If the surrounding transaction rolls back, a `SET` issued inside it is rolled back too — a detail that surprises people.
+
+Reset to whatever the server default is:
+
+```sql
+RESET work_mem;
+RESET ALL;
+```
+
+### 2. `SET LOCAL` — transaction scope
+
+```sql
+BEGIN;
+SET LOCAL work_mem = '512MB';
+SET LOCAL statement_timeout = '5min';
+
+-- the heavy report query
+SELECT ...;
+
+COMMIT;   -- both settings revert here
+```
+
+`SET LOCAL` is the right default in application code. It cannot leak a setting into the next request that reuses the same pooled connection — which is precisely the bug that makes `SET` dangerous behind PgBouncer in transaction pooling mode.
+
+### 3. `set_config()` — the function form
+
+`SET` is a utility statement, so you cannot use a variable or an expression as the value. `set_config()` can:
+
+```sql
+-- Third argument: true = local (transaction), false = session
+SELECT set_config('work_mem', '256MB', true);
+
+-- The value can be computed
+SELECT set_config('statement_timeout', (timeout_ms)::text, true)
+FROM app_settings WHERE name = 'report_timeout';
+```
+
+This matters for application code, where the value usually comes from a parameter:
+
+```python
+cur.execute("SELECT set_config('app.current_user_id', %s, true)", (user_id,))
+```
+
+Note that the value is always text. `set_config` and `current_setting` deal in strings; casting is your job.
+
+### 4. `ALTER ROLE` / `ALTER DATABASE` — persistent defaults
+
+```sql
+-- Every session for this role starts with these
+ALTER ROLE analytics SET work_mem = '256MB';
+ALTER ROLE analytics SET statement_timeout = '10min';
+ALTER ROLE analytics SET jit = on;
+
+-- Every session connecting to this database
+ALTER DATABASE reporting SET default_transaction_read_only = on;
+
+-- The most specific form: this role, in this database
+ALTER ROLE etl IN DATABASE warehouse SET synchronous_commit = off;
+```
+
+This is the cleanest way to give an analytics role different resource settings from your OLTP application without touching `postgresql.conf`. Inspect what is configured:
+
+```sql
+SELECT rolname, rolconfig FROM pg_roles WHERE rolconfig IS NOT NULL;
+SELECT datname, datconfig FROM pg_database WHERE datconfig IS NOT NULL;
+```
+
+Remove one:
+
+```sql
+ALTER ROLE analytics RESET work_mem;
+ALTER ROLE analytics RESET ALL;
+```
+
+## Precedence: which value wins
+
+From lowest priority to highest:
+
+1. Compiled-in default.
+2. `postgresql.conf`.
+3. `postgresql.auto.conf` — written by `ALTER SYSTEM`.
+4. Command-line options to `postgres`.
+5. `ALTER DATABASE ... SET`.
+6. `ALTER ROLE ... SET`.
+7. `ALTER ROLE ... IN DATABASE ... SET`.
+8. Connection-string options (`options='-c work_mem=64MB'`).
+9. `SET` in the session.
+10. `SET LOCAL` in the transaction.
+
+`current_setting()` and `SHOW` always report the effective value at that point:
+
+```sql
+SHOW work_mem;
+SELECT current_setting('work_mem');
+```
+
+To see where a value came from, query `pg_settings`:
+
+```sql
+SELECT name, setting, unit, source, sourcefile, sourceline, context
+FROM pg_settings
+WHERE name IN ('work_mem', 'statement_timeout', 'search_path');
+```
+
+The `source` column is the answer to "why is this setting not what I put in postgresql.conf" — it will say `database`, `user`, `session` or `configuration file`.
+
+The `context` column tells you when a change can take effect:
+
+- `internal` — fixed at compile time.
+- `postmaster` — requires a server restart (`shared_buffers`, `max_connections`).
+- `sighup` — requires `SELECT pg_reload_conf()` (`log_min_duration_statement`).
+- `superuser` — settable in-session by a superuser.
+- `user` — settable in-session by anyone (`work_mem`, `search_path`).
+
+```sql
+-- Find everything that needs a restart to change
+SELECT name, setting FROM pg_settings WHERE context = 'postmaster' ORDER BY name;
+
+-- Find everything currently overridden from its default
+SELECT name, setting, boot_val, source
+FROM pg_settings
+WHERE source NOT IN ('default', 'client')
+ORDER BY name;
+```
+
+## `ALTER SYSTEM`: changing server config from SQL
+
+```sql
+ALTER SYSTEM SET log_min_duration_statement = '250ms';
+ALTER SYSTEM SET random_page_cost = 1.1;
+SELECT pg_reload_conf();
+```
+
+This writes to `postgresql.auto.conf`, which is read after `postgresql.conf` and therefore overrides it. Do not hand-edit that file; use `ALTER SYSTEM ... RESET` to undo:
+
+```sql
+ALTER SYSTEM RESET random_page_cost;
+SELECT pg_reload_conf();
+```
+
+Settings with `context = 'postmaster'` still need a full restart, no matter how you set them.
+
+## `search_path`: the setting that causes the most surprises
+
+`search_path` decides which schema an unqualified table name resolves to, and which schema `CREATE TABLE foo` writes into.
+
+```sql
+SHOW search_path;           -- "$user", public
+
+SET search_path TO tenant_42, public;
+SELECT * FROM orders;       -- tenant_42.orders if it exists, else public.orders
+```
+
+Two things worth knowing:
+
+**It is a security boundary.** A function running as `SECURITY DEFINER` inherits the caller's `search_path` unless you pin it, which allows a caller to shadow a table or operator the function relies on:
+
+```sql
+CREATE FUNCTION admin_reset(uid bigint) RETURNS void
+LANGUAGE sql
+SECURITY DEFINER
+SET search_path = pg_catalog, public   -- pin it, always
+AS $$
+  UPDATE public.users SET failed_logins = 0 WHERE id = uid;
+$$;
+```
+
+**Since PostgreSQL 15**, `CREATE` on the `public` schema is no longer granted to `PUBLIC`, so a non-owner role that relied on `search_path` resolving to `public` for table creation now gets a permission error. That change breaks a lot of older setup scripts.
+
+Multi-tenant applications often set `search_path` per request:
+
+```sql
+BEGIN;
+SELECT set_config('search_path', 'tenant_' || $1 || ', public', true);
+-- queries here see the tenant's schema
+COMMIT;
+```
+
+Using `set_config` with `is_local = true` is important here — it guarantees the next transaction on that pooled connection starts clean.
+
+## Custom parameters: the closest thing to session variables
+
+Any setting name containing a dot that PostgreSQL does not recognise is accepted as a user-defined parameter. This is the standard mechanism for passing application context into the database.
+
+```sql
+-- Set it (transaction-scoped)
+SELECT set_config('app.current_user_id', '1042', true);
+SELECT set_config('app.tenant_id', 'acme', true);
+
+-- Read it back
+SELECT current_setting('app.current_user_id')::bigint;
+
+-- Second argument true = return NULL instead of erroring when unset
+SELECT current_setting('app.tenant_id', true);
+```
+
+That `missing_ok` argument matters: without it, reading an unset custom parameter raises `unrecognized configuration parameter`, which will break a query in a connection that skipped the setup step.
+
+### Row level security
+
+This is the canonical use. The policy reads the current user from the session setting rather than trusting a `WHERE` clause the application must remember to add:
+
+```sql
+ALTER TABLE documents ENABLE ROW LEVEL SECURITY;
+
+CREATE POLICY documents_tenant_isolation ON documents
+  USING (tenant_id = current_setting('app.tenant_id', true));
+
+CREATE POLICY documents_owner_write ON documents
+  FOR UPDATE
+  USING (owner_id = current_setting('app.current_user_id', true)::bigint);
+```
+
+The application sets the context once per transaction and every query is filtered automatically:
+
+```sql
+BEGIN;
+SELECT set_config('app.tenant_id', 'acme', true);
+SELECT * FROM documents;    -- only acme's rows, enforced by the database
+COMMIT;
+```
+
+Two cautions. `current_setting(..., true)` returns NULL when unset, and `tenant_id = NULL` is NULL, so the policy denies everything — fail-closed, which is what you want. And the table owner bypasses RLS by default unless you add `ALTER TABLE documents FORCE ROW LEVEL SECURITY`.
+
+### Audit triggers
+
+The same trick gives audit tables a real actor instead of the shared database user:
+
+```sql
+CREATE OR REPLACE FUNCTION audit_changes() RETURNS trigger
+LANGUAGE plpgsql AS $$
+BEGIN
+  INSERT INTO audit_log (table_name, row_id, action, actor_id, changed_at)
+  VALUES (TG_TABLE_NAME,
+          NEW.id,
+          TG_OP,
+          nullif(current_setting('app.current_user_id', true), '')::bigint,
+          now());
+  RETURN NEW;
+END;
+$$;
+
+CREATE TRIGGER documents_audit
+AFTER INSERT OR UPDATE ON documents
+FOR EACH ROW EXECUTE FUNCTION audit_changes();
+```
+
+The `nullif(..., '')` guard handles the case where the setting exists but is empty.
+
+## Connection poolers change the rules
+
+With PgBouncer in **session pooling** mode, a client keeps the same server connection for its whole session, and plain `SET` behaves as expected.
+
+With **transaction pooling** — the mode most people run for its connection savings — the server connection is returned to the pool after every transaction. A `SET` issued in one transaction may or may not be visible in the next, and may leak into an entirely different client's transaction. This produces intermittent, impossible-looking bugs.
+
+The rules under transaction pooling:
+
+- Use `SET LOCAL` or `set_config(..., true)` for everything. Never plain `SET`.
+- Put durable defaults in `ALTER ROLE ... SET`, which is applied at connection time by the pooler's own connection.
+- Prepared statements and advisory locks that span transactions do not work either; the same reasoning applies.
+
+Verify what a session actually sees:
+
+```sql
+SELECT name, setting, source FROM pg_settings WHERE source = 'session';
+```
+
+When you are chasing a settings problem across roles, databases and sessions, having `pg_settings`, `pg_roles` and the query editor visible at once helps — [Chat2DB](https://chat2db.ai/download) keeps multiple connections open side by side across PostgreSQL, MySQL and 20+ other databases, and there is a browser version at [app.chat2db.ai](https://app.chat2db.ai).
+
+## Useful settings to control per role
+
+A few that are worth setting deliberately rather than leaving at the global default:
+
+```sql
+-- Reporting role: big sorts, long queries allowed, read-only
+ALTER ROLE analytics SET work_mem = '256MB';
+ALTER ROLE analytics SET statement_timeout = '15min';
+ALTER ROLE analytics SET default_transaction_read_only = on;
+
+-- Application role: fail fast, never hold a lock queue
+ALTER ROLE app SET statement_timeout = '10s';
+ALTER ROLE app SET lock_timeout = '2s';
+ALTER ROLE app SET idle_in_transaction_session_timeout = '30s';
+
+-- Migration role: allow long DDL, but do not block traffic forever
+ALTER ROLE migrator SET lock_timeout = '5s';
+ALTER ROLE migrator SET statement_timeout = '0';
+```
+
+`lock_timeout` on the migration role is the single most valuable one here. Without it, an `ALTER TABLE` waiting on an `ACCESS EXCLUSIVE` lock queues behind a long-running query — and every subsequent query queues behind the `ALTER`, taking the table offline. With a 5-second `lock_timeout`, the migration fails fast and retries instead.
+
+## Summary
+
+PostgreSQL settings are a single system with ten levels of precedence. `SET` is session-scoped and rolls back with its transaction; `SET LOCAL` and `set_config(..., true)` are transaction-scoped and the only safe choice behind a transaction-pooling PgBouncer; `ALTER ROLE`/`ALTER DATABASE ... SET` give persistent per-role and per-database defaults; `ALTER SYSTEM` writes server-wide config from SQL. Any dotted name you invent becomes a custom parameter, which is how application context reaches row level security policies and audit triggers. When a value is not what you expect, `pg_settings.source` tells you which level set it.

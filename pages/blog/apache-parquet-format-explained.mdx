@@ -1,0 +1,213 @@
+---
+title: "Apache Parquet Format Explained: Row Groups & Encoding"
+description: "How the Apache Parquet format works: row groups, column chunks, pages, dictionary and RLE encoding, statistics, predicate pushdown, and how to tune file layout."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: September 1, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# Apache Parquet Format Explained: Row Groups & Encoding
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="September 1, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+Parquet is the default storage format for analytical data, and most people use it without knowing what is inside. That is fine until a query that should take two seconds takes two minutes, or a 4 GB CSV becomes a 3.9 GB Parquet file instead of a 200 MB one. Both are layout problems, and both are fixable once you know how the format is put together.
+
+## Why columnar
+
+A CSV or a Postgres heap stores rows together. Reading `SUM(amount)` from a 40-column table means reading all 40 columns off disk.
+
+Parquet stores each column's values contiguously. The same query reads one column. That gives three compounding wins:
+
+1. **Less I/O** — read 1 column of 40, not 40 of 40.
+2. **Better compression** — a column of timestamps or country codes compresses far better than a row mixing integers, strings and floats, because adjacent values are similar.
+3. **Vectorised execution** — engines process a contiguous array of one type in tight loops, often with SIMD.
+
+The cost is the mirror image: fetching one complete row means touching every column chunk. Parquet is a bad choice for point lookups and a very good one for scans.
+
+## The physical layout
+
+A Parquet file is:
+
+```
+PAR1                                  <- 4-byte magic
+  Row Group 0
+    Column chunk: event_ts
+      Page 0 (header + encoded values)
+      Page 1
+    Column chunk: user_id
+      Page 0
+      ...
+    Column chunk: country
+      ...
+  Row Group 1
+    ...
+  Footer (FileMetaData, Thrift-encoded)
+    schema, row group metadata, per-column statistics, key-value metadata
+  4-byte footer length
+PAR1                                  <- 4-byte magic
+```
+
+Read it bottom-up. A reader seeks to the end, reads the last 8 bytes to find the footer length, reads the footer, and now knows the schema, where every column chunk lives, and the min/max/null-count statistics for each one. Only then does it fetch the byte ranges it actually needs. On object storage that is typically two `GET` requests for metadata plus one ranged `GET` per required column chunk.
+
+The three units to keep straight:
+
+- **Row group** — a horizontal slice of rows, all columns, typically 128 MB–1 GB. The unit of parallelism and the unit of statistics-based skipping.
+- **Column chunk** — one column's data within one row group. The unit of I/O.
+- **Page** — usually about 1 MB, the unit of encoding, compression and (with page indexes) the finest skipping granularity.
+
+## Encodings: where the compression comes from
+
+Parquet compresses in two stages. First it *encodes* values in a type-aware way, then it optionally applies a general-purpose codec. The encoding usually matters more.
+
+**Dictionary encoding** is the workhorse. For a column with few distinct values, Parquet writes the distinct values once and replaces each value with a small integer index:
+
+```
+country: ["DE","FR","DE","DE","US","FR","DE"]
+  dictionary: ["DE","FR","US"]
+  indices:    [0,1,0,0,2,1,0]
+```
+
+A `country` column across a million rows becomes a few hundred bytes of dictionary plus a tightly packed index array. Writers fall back to plain encoding when the dictionary exceeds a size limit (1 MB by default), which is why a high-cardinality string column — a UUID, a URL, a free-text field — compresses far worse than a low-cardinality one.
+
+**Run-length encoding with bit packing (RLE_DICTIONARY)** compresses those indices further. A sorted or clustered column becomes long runs of the same index, and a run of 50,000 identical values costs a few bytes. This is the single biggest reason sorting your data before writing matters.
+
+**Delta encoding** (`DELTA_BINARY_PACKED`) stores differences between consecutive values, ideal for timestamps and monotonically increasing IDs. `DELTA_BYTE_ARRAY` does the same with a shared prefix for strings, which suits sorted URLs or paths.
+
+**Byte stream split** helps floating point columns by splitting each float into its constituent bytes and storing them in separate streams, so exponent bytes — which repeat — compress together.
+
+On top of the encoding, a codec:
+
+- **Snappy** — fast, moderate ratio. The historical default.
+- **Zstd** — the modern default; better ratio than Snappy at similar decompression speed. Level 3 is a good balance.
+- **Gzip** — smaller than Snappy, noticeably slower to decompress.
+- **LZ4** — fastest, weakest ratio.
+- **Brotli** — best ratio, slowest.
+
+For most analytical data on object storage, zstd is the right answer: storage costs less, and the smaller files mean less network transfer.
+
+## Statistics and predicate pushdown
+
+Every column chunk carries min, max, null count and (optionally) distinct count in the footer. A reader evaluating `WHERE event_ts >= '2026-09-01'` compares the predicate against each row group's min/max and skips the entire row group when there is no overlap — without reading a single data page.
+
+This is why **sort order dominates query performance**. Consider 100 row groups of a table with a `event_ts` column:
+
+- Data written in timestamp order: each row group covers a narrow time range. A one-day filter reads 1–2 row groups.
+- Data written in random order: every row group's min/max spans the full range. The same filter reads all 100.
+
+Same data, same compression, 50x difference in bytes read. Sort on the column you filter on most.
+
+**Page indexes** (`ColumnIndex` and `OffsetIndex`, in the format since 2020) push this down a level, storing min/max per page so readers can skip pages inside a row group. Enable them in your writer — most modern writers do by default.
+
+**Bloom filters** handle the case statistics cannot: high-cardinality equality filters. Min/max on a UUID column tells you nothing useful, but a Bloom filter answers "is this UUID definitely not in this row group?" cheaply.
+
+```python
+import pyarrow.parquet as pq
+
+pq.write_table(
+    table,
+    "events.parquet",
+    compression="zstd",
+    compression_level=3,
+    row_group_size=1_000_000,
+    data_page_size=1024 * 1024,
+    write_statistics=True,
+    write_page_index=True,
+    use_dictionary=True,
+)
+```
+
+## Inspecting a file
+
+DuckDB is the fastest way to look inside a Parquet file:
+
+```sql
+-- Schema and encodings
+SELECT path_in_schema, type, encodings, compression,
+       total_compressed_size, total_uncompressed_size
+FROM parquet_metadata('events.parquet');
+
+-- Row groups, sizes and per-column min/max
+SELECT row_group_id, row_group_num_rows, path_in_schema, stats_min, stats_max
+FROM parquet_metadata('events.parquet')
+ORDER BY row_group_id, path_in_schema;
+
+-- File-level summary
+SELECT * FROM parquet_file_metadata('events.parquet');
+
+-- Which columns cost the most storage
+SELECT path_in_schema,
+       sum(total_compressed_size)   AS compressed,
+       sum(total_uncompressed_size) AS raw,
+       round(sum(total_uncompressed_size)::double
+             / NULLIF(sum(total_compressed_size), 0), 2) AS ratio
+FROM parquet_metadata('events.parquet')
+GROUP BY 1 ORDER BY compressed DESC;
+```
+
+That last query answers "why is this file so big?" in one shot. A ratio near 1.0 means the column is not compressing — usually a high-cardinality string that blew past the dictionary limit, or random data such as hashes and encrypted blobs.
+
+The CLI equivalent:
+
+```bash
+parquet-tools inspect events.parquet
+parquet-tools rowcount events.parquet
+```
+
+## Nested data
+
+Parquet stores nested structures — structs, lists, maps — by flattening each leaf into its own column and adding two small integers per value: the **definition level** (how deep the value is defined before hitting a null) and the **repetition level** (at which nesting level a new list element starts). This is the Dremel encoding.
+
+The practical consequence: you can read `user.address.city` without touching `user.address.street` or any other field. Deeply nested schemas cost little to store and let you project precisely. What they do cost is writer complexity and, in some engines, weaker predicate pushdown on nested fields — worth checking if you filter on them.
+
+## File sizing, the thing people get wrong
+
+Two failure modes, opposite directions:
+
+**Too many small files.** Every file requires metadata reads and a separate request. Ten thousand 2 MB files are dramatically slower to query than a hundred 200 MB files with identical content. This is the most common lakehouse performance problem, produced by streaming writers that commit every few seconds.
+
+**Row groups too large.** A 2 GB row group forces readers to buffer more and reduces parallelism, because a row group is the unit of work distribution. Very large row groups also make statistics coarser, since min/max cover more rows.
+
+Reasonable targets:
+
+- **File size**: 128 MB – 1 GB.
+- **Row group size**: 128 MB, or roughly 1 million rows for typical schemas.
+- **Page size**: 1 MB.
+- Aim for at least a handful of row groups per file so parallel readers have work to distribute.
+
+Compaction is a scheduled job, not a one-off. In Iceberg:
+
+```sql
+CALL system.rewrite_data_files(
+  table => 'db.events',
+  options => map('target-file-size-bytes', '268435456')
+);
+```
+
+In Delta Lake:
+
+```sql
+OPTIMIZE events ZORDER BY (user_id, event_ts);
+```
+
+## A practical tuning checklist
+
+When Parquet performance disappoints, work through this in order:
+
+1. **Check file sizes.** If the average file is under 32 MB, compact before doing anything else.
+2. **Check sort order.** Sort by your dominant filter column at write time. This is usually the biggest single win.
+3. **Verify statistics exist.** Some writers omit them; without min/max there is no row group skipping at all.
+4. **Enable page indexes** for finer-grained skipping.
+5. **Switch Snappy to zstd** for a typical 20–40% size reduction at comparable read speed.
+6. **Find non-compressing columns** with the ratio query above; consider dropping, hashing or splitting them out.
+7. **Add Bloom filters** for high-cardinality columns you filter by equality.
+8. **Project fewer columns.** `SELECT *` on a 200-column table defeats the entire point of the format.
+
+Because Parquet files sit alongside the databases that feed them, checking a file against its source table is a routine task. A client that queries Parquet through DuckDB or Trino in the same window as the Postgres or MySQL source makes that comparison quick — [Chat2DB](https://chat2db.ai/download) connects to those engines and 20+ others, with a browser version at [app.chat2db.ai](https://app.chat2db.ai).
+
+## Summary
+
+Parquet stores columns contiguously in row groups, splits each column chunk into pages, encodes values with dictionary, RLE, delta and bit-packing schemes, then compresses with a codec, and records min/max/null statistics in a footer that readers fetch first. Query speed comes from skipping — row groups and pages eliminated by statistics — so the two levers that matter most are sorting your data on the column you filter on and keeping files and row groups in a sensible size range. Everything else is tuning at the margins.
