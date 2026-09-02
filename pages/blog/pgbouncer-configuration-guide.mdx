@@ -1,0 +1,261 @@
+---
+title: "PgBouncer Configuration Guide: Pool Modes and Sizing"
+description: "Configure PgBouncer for PostgreSQL: pool modes explained, pool sizing math, SCRAM auth, prepared statements and the admin console queries that matter."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: September 2, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# PgBouncer Configuration Guide: Pool Modes and Sizing
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="September 2, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+PostgreSQL gives every connection its own operating system process. That process costs roughly 5–10 MB of private memory before it has done anything useful, and every one of them takes a slot in the shared snapshot machinery that has to be scanned on each transaction. This is why a Postgres instance that is perfectly happy with 100 connections falls apart at 1,000, even when those connections are idle. PgBouncer sits between your application and PostgreSQL, keeps a small pool of real server connections, and hands them out to a much larger number of client connections.
+
+The parts people get wrong are the pool mode and the pool size. This guide covers both, with a full working configuration.
+
+## What PgBouncer actually does
+
+PgBouncer is a single-process, single-threaded connection pooler that speaks the PostgreSQL wire protocol. Your application connects to PgBouncer as if it were Postgres. PgBouncer maintains its own connections to the real server and multiplexes client traffic onto them.
+
+Because it is single-threaded and does almost no work per byte, one PgBouncer process handles tens of thousands of client connections on a single core. It uses a few hundred bytes of memory per client connection instead of megabytes.
+
+The trade-off is that a pooled connection is not a private connection. Depending on the pool mode, session state you set on one query may or may not be there for the next one.
+
+## Pool modes
+
+There are three modes, set with `pool_mode`.
+
+### session
+
+A server connection is assigned to a client when the client connects and released when the client disconnects. This is the default and the safest: every session-level feature works exactly as it does against Postgres directly.
+
+It also provides almost no benefit for the classic problem, because a web app with 500 idle-in-pool clients still needs 500 server connections. Use session mode when you need `SET`, advisory locks held across transactions, `LISTEN`/`NOTIFY`, or `WITH HOLD` cursors.
+
+### transaction
+
+A server connection is assigned when a transaction begins and returned to the pool at `COMMIT` or `ROLLBACK`. This is the mode nearly everyone wants: 2,000 application clients can share 20 server connections, because only clients inside a transaction actually hold one.
+
+The cost is that anything session-scoped breaks. `SET search_path` outside a transaction lands on a random server connection. `LISTEN` never receives anything reliably. Session-level advisory locks (`pg_advisory_lock`) may be released on a different connection than the one that took them — use the transaction-scoped variants instead:
+
+```sql
+-- Wrong under transaction pooling: the unlock may hit a different backend
+SELECT pg_advisory_lock(42);
+-- ... work ...
+SELECT pg_advisory_unlock(42);
+
+-- Correct: released automatically at COMMIT/ROLLBACK
+BEGIN;
+SELECT pg_advisory_xact_lock(42);
+-- ... work ...
+COMMIT;
+```
+
+### statement
+
+A server connection is returned after every single statement. Multi-statement transactions are rejected outright. This exists for sharding proxies and write-scaling setups where every statement is autocommit. Almost nobody should choose it.
+
+## A working configuration
+
+Here is a `pgbouncer.ini` for a typical transaction-pooled setup:
+
+```ini
+[databases]
+; Alias the application sees = real connection target
+appdb = host=10.0.1.20 port=5432 dbname=appdb
+; A second alias against the same database, session-pooled, for migrations
+appdb_session = host=10.0.1.20 port=5432 dbname=appdb pool_mode=session pool_size=5
+; A wildcard: anything else is passed through to this host
+* = host=10.0.1.20 port=5432
+
+[pgbouncer]
+listen_addr = 0.0.0.0
+listen_port = 6432
+
+auth_type = scram-sha-256
+auth_file = /etc/pgbouncer/userlist.txt
+
+pool_mode = transaction
+max_client_conn = 5000
+default_pool_size = 20
+min_pool_size = 5
+reserve_pool_size = 5
+reserve_pool_timeout = 3
+max_db_connections = 80
+
+server_idle_timeout = 600
+server_lifetime = 3600
+query_wait_timeout = 120
+client_idle_timeout = 0
+
+; PgBouncer 1.21+ can track prepared statements under transaction pooling
+max_prepared_statements = 200
+
+ignore_startup_parameters = extra_float_digits,options
+
+admin_users = pgbouncer_admin
+stats_users = pgbouncer_stats
+
+logfile = /var/log/pgbouncer/pgbouncer.log
+pidfile = /var/run/pgbouncer/pgbouncer.pid
+```
+
+The `userlist.txt` holds usernames and SCRAM verifiers, which you can copy straight out of `pg_shadow`:
+
+```sql
+-- Run as superuser on the PostgreSQL server
+SELECT concat('"', usename, '" "', passwd, '"')
+FROM pg_shadow
+WHERE usename IN ('app_user', 'pgbouncer_admin');
+```
+
+That produces lines like `"app_user" "SCRAM-SHA-256$4096:..."`. Never put plaintext passwords in this file. For larger fleets, use `auth_query` instead so PgBouncer looks credentials up dynamically:
+
+```sql
+-- Create a restricted lookup function on the Postgres server
+CREATE ROLE pgbouncer_auth LOGIN PASSWORD 'set-a-strong-password';
+
+CREATE OR REPLACE FUNCTION public.pgbouncer_get_auth(p_usename text)
+RETURNS TABLE (username text, password text)
+LANGUAGE sql SECURITY DEFINER AS $$
+  SELECT usename::text, passwd::text FROM pg_shadow WHERE usename = p_usename;
+$$;
+
+REVOKE ALL ON FUNCTION public.pgbouncer_get_auth(text) FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION public.pgbouncer_get_auth(text) TO pgbouncer_auth;
+```
+
+Then in `pgbouncer.ini`:
+
+```ini
+auth_user = pgbouncer_auth
+auth_query = SELECT username, password FROM public.pgbouncer_get_auth($1)
+```
+
+## Sizing the pool
+
+The single most common mistake is setting `default_pool_size` too high. The pool is not a capacity dial — it is a concurrency limit, and PostgreSQL gets slower, not faster, past its useful concurrency.
+
+A workable starting point for a CPU-bound OLTP workload:
+
+```
+pool_size ≈ (cpu_cores × 2) + effective_spindle_count
+```
+
+On an 8-core server with NVMe storage, that is roughly 16–20 connections. Not 200. Queries that arrive when all 20 are busy wait in PgBouncer's queue, which is far cheaper than 200 backends fighting over the same 8 cores.
+
+Two more limits matter:
+
+- `max_client_conn` is how many application sockets PgBouncer accepts. Set it well above your real peak; each costs about 2 KB.
+- `max_db_connections` caps total server connections to one database across all pools, which is what protects `max_connections` on the server itself.
+
+Make the arithmetic add up. If you run four PgBouncer instances behind a load balancer, each with `default_pool_size = 20` against the same database, that is 80 server connections, plus superuser reserve, so `max_connections` on Postgres must be comfortably above that:
+
+```sql
+SHOW max_connections;
+SHOW superuser_reserved_connections;
+
+-- What is actually connected right now, grouped by state
+SELECT state, count(*)
+FROM pg_stat_activity
+WHERE backend_type = 'client backend'
+GROUP BY state
+ORDER BY count(*) DESC;
+```
+
+If that query shows dozens of connections in `idle in transaction`, no pooler will save you — fix the application code that leaves transactions open.
+
+## Prepared statements
+
+Historically, transaction pooling broke server-side prepared statements: the `PREPARE` landed on one backend and the `EXECUTE` on another. This is why so many ORM guides tell you to disable prepared statements or add `prepareThreshold=0` to the JDBC URL.
+
+Since PgBouncer 1.21, `max_prepared_statements` makes PgBouncer track named prepared statements per client and re-prepare them on whichever server connection it hands out. Set it to a value slightly above the number of distinct statements a client uses — 200 is a reasonable default. With that in place, you can leave prepared statements enabled in most drivers.
+
+If you are on an older PgBouncer, disable them explicitly:
+
+- JDBC: `prepareThreshold=0`
+- psycopg (v3): `prepare_threshold=None`
+- Npgsql: `Max Auto Prepare=0`
+
+## Reading the admin console
+
+PgBouncer exposes a virtual database called `pgbouncer` that answers `SHOW` commands. Connect to it with a user listed in `admin_users`:
+
+```bash
+psql -h 127.0.0.1 -p 6432 -U pgbouncer_admin pgbouncer
+```
+
+The four commands worth knowing:
+
+```sql
+-- Per-pool state: this is the health check
+SHOW POOLS;
+```
+
+Read it column by column. `cl_active` is clients currently attached to a server connection, `cl_waiting` is clients queued for one, `sv_active` and `sv_idle` are busy and free server connections, and `maxwait` is how long the oldest waiting client has been queued.
+
+A healthy pool has `cl_waiting = 0` and `maxwait = 0`. Sustained `maxwait` above a second means either the pool is too small or queries are too slow.
+
+```sql
+-- Aggregate traffic and latency per database
+SHOW STATS;
+
+-- Every server connection and what it is doing
+SHOW SERVERS;
+
+-- Every client connection
+SHOW CLIENTS;
+
+-- Reload pgbouncer.ini without dropping clients
+RELOAD;
+
+-- Close server connections gracefully once they are idle
+RECONNECT;
+```
+
+Set up an alert on `cl_waiting` and `maxwait` from `SHOW POOLS` — they tell you about saturation earlier than any application-level metric.
+
+## Health checks and timeouts
+
+Two settings prevent stale connections from being handed to clients:
+
+- `server_lifetime = 3600` retires a server connection an hour after it was created, which keeps memory growth from long-lived backends in check and lets failovers drain naturally.
+- `server_idle_timeout = 600` closes connections that have gone unused, so a quiet night does not hold 20 backends open.
+
+Set `query_wait_timeout` (default 120 s) to something close to your application's own timeout. Without it, a client can sit in the queue long after the user has given up.
+
+For a read replica behind PgBouncer, add:
+
+```ini
+server_check_query = select 1
+server_check_delay = 30
+```
+
+This validates a connection that has been idle longer than `server_check_delay` before reusing it.
+
+## PgBouncer or a driver pool?
+
+Application-side pools (HikariCP, `pg.Pool`, SQLAlchemy) pool per process. Ten application containers with a 20-connection pool each still open 200 server connections. PgBouncer pools across every client, which is exactly what you need for serverless functions, Kubernetes deployments that scale horizontally, or anything with many short-lived processes.
+
+The usual production layout is both: a small driver pool per process pointed at PgBouncer, and PgBouncer holding the real connections. Keep the driver pool small — its job is to avoid the TCP handshake, not to hold database capacity.
+
+When you are debugging pooling behaviour, it helps to have a client that can show `pg_stat_activity`, run `EXPLAIN` and browse the schema in one window. [Chat2DB](https://chat2db.ai/download) connects to PgBouncer exactly as it would to PostgreSQL — point it at port 6432 — and also works against MySQL, Oracle, SQL Server and 20+ other engines, or you can use the web version at [app.chat2db.ai](https://app.chat2db.ai).
+
+## A migration checklist
+
+Moving an existing application from direct connections to transaction pooling:
+
+1. Change the port from 5432 to 6432 in one non-critical service first.
+2. Grep the codebase for `SET`, `LISTEN`, `pg_advisory_lock` and `CREATE TEMP TABLE` outside transactions. Each one needs a fix or a session-mode alias.
+3. Move connection-level settings from `SET` statements into the connection string's `options` parameter, or into the `[databases]` entry so PgBouncer applies them per server connection.
+4. Set `max_prepared_statements`, or disable prepared statements in the driver.
+5. Watch `SHOW POOLS` for a day and tune `default_pool_size` from real `cl_waiting` numbers rather than a guess.
+6. Only then move the rest of the services.
+
+## Summary
+
+PgBouncer solves a specific problem: PostgreSQL's per-connection process cost. Transaction pooling is the mode that delivers the benefit, and it works as long as your application does not rely on session state. Size the pool from CPU count, not from client count; cap `max_db_connections` so no single service can exhaust the server; and watch `cl_waiting` and `maxwait` in `SHOW POOLS` as your saturation signal. Get those four things right and a single Postgres instance will comfortably serve thousands of application connections.

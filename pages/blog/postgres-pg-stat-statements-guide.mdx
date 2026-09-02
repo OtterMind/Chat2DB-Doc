@@ -1,0 +1,305 @@
+---
+title: "pg_stat_statements: Find Slow Queries in PostgreSQL"
+description: "Use pg_stat_statements to find the queries costing your PostgreSQL server the most time: setup, the queries worth memorising, and the traps to avoid."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: September 2, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# pg_stat_statements: Find Slow Queries in PostgreSQL
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="September 2, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+Most PostgreSQL performance work starts in the wrong place: someone reports that one page is slow, and an afternoon disappears into `EXPLAIN` for a query that accounts for 0.3% of the server's time. `pg_stat_statements` inverts that. It aggregates every query the server has executed, normalised by shape, with total execution time, call count, rows returned and buffer statistics. One `ORDER BY total_exec_time DESC LIMIT 20` tells you where your database actually spends its life.
+
+This guide covers installing it, the handful of queries worth memorising, and how to read the columns without drawing the wrong conclusion.
+
+## Installing it
+
+`pg_stat_statements` ships with PostgreSQL as a contrib module, but it needs a shared library loaded at server start, which means a restart.
+
+```sql
+-- Check whether it is already loaded
+SHOW shared_preload_libraries;
+```
+
+If it is not listed, add it. In `postgresql.conf`:
+
+```ini
+shared_preload_libraries = 'pg_stat_statements'
+
+# How many distinct query shapes to track. The default 5000 is low for
+# a busy application; 10000 costs roughly 2 MB of shared memory.
+pg_stat_statements.max = 10000
+
+# top = normalised top-level statements only (default and usually right)
+# all = also track statements executed inside functions and procedures
+pg_stat_statements.track = top
+
+# Include planning time as well as execution time (PostgreSQL 13+)
+pg_stat_statements.track_planning = on
+
+# Persist stats across restarts
+pg_stat_statements.save = on
+```
+
+Or from a superuser session, if your platform supports it:
+
+```sql
+ALTER SYSTEM SET shared_preload_libraries = 'pg_stat_statements';
+ALTER SYSTEM SET pg_stat_statements.max = 10000;
+ALTER SYSTEM SET pg_stat_statements.track_planning = on;
+```
+
+Restart the server, then create the extension in each database you want to inspect:
+
+```sql
+CREATE EXTENSION IF NOT EXISTS pg_stat_statements;
+```
+
+On managed services it is usually simpler. RDS and Aurora need `pg_stat_statements` added to `shared_preload_libraries` in the parameter group followed by a reboot. Cloud SQL exposes it as the `cloudsql.enable_pg_stat_statements` flag. Azure Database for PostgreSQL enables it by default. Supabase and Neon both ship with it on.
+
+Verify:
+
+```sql
+SELECT count(*) FROM pg_stat_statements;
+```
+
+## The query that matters most
+
+Sort by total time, not by mean time. A query that takes 8 ms but runs 400,000 times an hour costs far more than one that takes 3 seconds and runs twice.
+
+```sql
+SELECT
+  substring(query, 1, 90)                       AS query,
+  calls,
+  round(total_exec_time::numeric, 1)            AS total_ms,
+  round(mean_exec_time::numeric, 2)             AS mean_ms,
+  round(stddev_exec_time::numeric, 2)           AS stddev_ms,
+  rows,
+  round(100.0 * total_exec_time / sum(total_exec_time) OVER (), 1) AS pct_of_total
+FROM pg_stat_statements
+WHERE dbid = (SELECT oid FROM pg_database WHERE datname = current_database())
+ORDER BY total_exec_time DESC
+LIMIT 20;
+```
+
+The `pct_of_total` column is what makes this actionable. If the top query is 34% of all execution time, that is the one to work on. If the top twenty queries are each 2%, your problem is not a single query and you should look at connection counts, I/O or lock waits instead.
+
+Note that on PostgreSQL 12 and earlier the column is `total_time`, not `total_exec_time`. Version 13 split it into `total_exec_time` and `total_plan_time`.
+
+## Finding the different kinds of problem
+
+Different sorts surface different pathologies.
+
+Queries where the time varies wildly — usually a sign of parameter-dependent plans or lock contention:
+
+```sql
+SELECT substring(query, 1, 80) AS query,
+       calls,
+       round(mean_exec_time::numeric, 2)   AS mean_ms,
+       round(stddev_exec_time::numeric, 2) AS stddev_ms,
+       round(min_exec_time::numeric, 2)    AS min_ms,
+       round(max_exec_time::numeric, 2)    AS max_ms
+FROM pg_stat_statements
+WHERE calls > 100
+  AND stddev_exec_time > mean_exec_time
+ORDER BY stddev_exec_time DESC
+LIMIT 15;
+```
+
+Queries reading the most data, which points at missing indexes or overly wide scans:
+
+```sql
+SELECT substring(query, 1, 80) AS query,
+       calls,
+       shared_blks_hit + shared_blks_read AS total_blocks,
+       round(100.0 * shared_blks_hit /
+             nullif(shared_blks_hit + shared_blks_read, 0), 2) AS hit_pct,
+       pg_size_pretty((shared_blks_read * 8192)::bigint) AS read_from_disk
+FROM pg_stat_statements
+ORDER BY shared_blks_read DESC
+LIMIT 15;
+```
+
+A low `hit_pct` on a frequently called query means it keeps going to disk — either the working set exceeds `shared_buffers` or the query touches far more rows than it needs.
+
+Queries spilling to temporary files, which is `work_mem` being too small for a sort or hash:
+
+```sql
+SELECT substring(query, 1, 80) AS query,
+       calls,
+       temp_blks_written,
+       pg_size_pretty((temp_blks_written * 8192)::bigint) AS temp_written
+FROM pg_stat_statements
+WHERE temp_blks_written > 0
+ORDER BY temp_blks_written DESC
+LIMIT 15;
+```
+
+Queries returning huge row counts per call, which are often missing a `LIMIT` or fetching columns the application discards:
+
+```sql
+SELECT substring(query, 1, 80) AS query,
+       calls,
+       rows,
+       round(rows::numeric / nullif(calls, 0), 1) AS rows_per_call
+FROM pg_stat_statements
+WHERE calls > 20
+ORDER BY rows_per_call DESC
+LIMIT 15;
+```
+
+And, on PostgreSQL 13+, queries where planning is a meaningful share of the cost — typically very simple statements executed enormously often, where a prepared statement would help:
+
+```sql
+SELECT substring(query, 1, 80) AS query,
+       calls,
+       round(total_plan_time::numeric, 1) AS plan_ms,
+       round(total_exec_time::numeric, 1) AS exec_ms,
+       round(100.0 * total_plan_time /
+             nullif(total_plan_time + total_exec_time, 0), 1) AS plan_pct
+FROM pg_stat_statements
+WHERE calls > 1000
+ORDER BY total_plan_time DESC
+LIMIT 15;
+```
+
+## How normalisation works
+
+`pg_stat_statements` does not store literal queries. It replaces constants with placeholders, so these three:
+
+```sql
+SELECT * FROM orders WHERE customer_id = 42;
+SELECT * FROM orders WHERE customer_id = 99;
+SELECT * FROM orders WHERE customer_id = 7;
+```
+
+all become one entry:
+
+```sql
+SELECT * FROM orders WHERE customer_id = $1
+```
+
+Two consequences follow. First, the `queryid` is a hash of the parsed statement structure, so the same logical query in two databases, or with different casing and whitespace, produces different entries in older versions. Since PostgreSQL 14 the normalisation is more aggressive and covers lists of constants in `IN` clauses, so `IN (1,2,3)` and `IN (1,2,3,4)` collapse together.
+
+Second, you never see the parameter values that made a query slow. `pg_stat_statements` tells you *which* query shape is expensive; you still need `auto_explain` or `EXPLAIN (ANALYZE, BUFFERS)` with representative values to find out *why*.
+
+The natural next step is therefore:
+
+```sql
+-- Enable auto_explain to capture plans of slow executions with real parameters
+-- in postgresql.conf:
+--   session_preload_libraries = 'auto_explain'
+--   auto_explain.log_min_duration = '500ms'
+--   auto_explain.log_analyze = on
+--   auto_explain.log_buffers = on
+--   auto_explain.log_nested_statements = on
+```
+
+Be careful with `auto_explain.log_analyze` on a busy system: it adds instrumentation overhead to every query that gets logged, and with `log_timing` on it can be significant.
+
+## Resetting and measuring a window
+
+Cumulative totals since the last restart are almost useless for answering "what changed after this deploy?". Reset and measure a window instead:
+
+```sql
+-- Reset everything (superuser, or a role with pg_read_all_stats + EXECUTE)
+SELECT pg_stat_statements_reset();
+
+-- ... let the workload run for 15 minutes ...
+
+SELECT substring(query, 1, 90) AS query,
+       calls,
+       round(total_exec_time::numeric, 1) AS total_ms
+FROM pg_stat_statements
+ORDER BY total_exec_time DESC
+LIMIT 20;
+```
+
+Since PostgreSQL 12 you can reset selectively:
+
+```sql
+-- Reset one query shape, for one user, in one database
+SELECT pg_stat_statements_reset(
+  (SELECT oid FROM pg_roles WHERE rolname = 'app_user'),
+  (SELECT oid FROM pg_database WHERE datname = 'appdb'),
+  1234567890123456789   -- queryid
+);
+```
+
+Better still, snapshot the view periodically and diff it, which is what monitoring tools do internally:
+
+```sql
+CREATE TABLE IF NOT EXISTS pgss_snapshot AS
+SELECT now() AS captured_at, * FROM pg_stat_statements WITH NO DATA;
+
+INSERT INTO pgss_snapshot
+SELECT now(), * FROM pg_stat_statements;
+
+-- Delta between the two most recent snapshots
+WITH bounds AS (
+  SELECT max(captured_at) AS newest,
+         max(captured_at) FILTER (WHERE captured_at < (SELECT max(captured_at) FROM pgss_snapshot)) AS previous
+  FROM pgss_snapshot
+),
+n AS (SELECT s.* FROM pgss_snapshot s, bounds b WHERE s.captured_at = b.newest),
+p AS (SELECT s.* FROM pgss_snapshot s, bounds b WHERE s.captured_at = b.previous)
+SELECT substring(n.query, 1, 80) AS query,
+       n.calls - coalesce(p.calls, 0) AS calls_delta,
+       round((n.total_exec_time - coalesce(p.total_exec_time, 0))::numeric, 1) AS ms_delta
+FROM n LEFT JOIN p ON n.queryid = p.queryid AND n.dbid = p.dbid
+ORDER BY ms_delta DESC
+LIMIT 20;
+```
+
+If you would rather not build the snapshot tooling yourself, a GUI client that keeps several result tabs open makes the manual version bearable — [Chat2DB](https://chat2db.ai/download) can hold the `pg_stat_statements` query, an `EXPLAIN ANALYZE` and the table definition side by side, and it speaks MySQL, Oracle and SQL Server too if your estate is mixed. The web version at [app.chat2db.ai](https://app.chat2db.ai) works the same way.
+
+## Traps worth knowing
+
+**The tracked-statement limit.** When more than `pg_stat_statements.max` distinct shapes appear, the least-executed entries are evicted. Applications that build SQL by string concatenation instead of using parameters generate a new shape per request and blow the table out, hiding your real top queries. Check for it:
+
+```sql
+SELECT count(*) AS tracked, current_setting('pg_stat_statements.max') AS max_allowed
+FROM pg_stat_statements;
+```
+
+If `tracked` is pinned at the maximum, either raise the limit or fix the query construction. PostgreSQL 14+ also exposes a `dealloc` counter in `pg_stat_statements_info` that counts evictions:
+
+```sql
+SELECT * FROM pg_stat_statements_info;
+```
+
+**Non-superusers see redacted rows.** By default other users' queries appear as `<insufficient privilege>`. Grant `pg_read_all_stats` to give a monitoring role full visibility:
+
+```sql
+GRANT pg_read_all_stats TO monitoring_user;
+```
+
+**Utility statements count too.** `pg_stat_statements.track_utility` defaults to on, so `COMMIT`, `BEGIN`, `SET` and DDL appear in the list. A top entry of `COMMIT` with a large total time usually means slow `fsync` on the WAL device, not a query problem.
+
+**It measures time in the backend only.** Network latency, connection setup and client-side processing are invisible. A query that reports 2 ms in `pg_stat_statements` but takes 90 ms in the application is a network, pooling or ORM problem.
+
+## What the overhead actually is
+
+The question that stops people enabling it in production is cost. The honest answer is that the overhead is small but not zero: each executed statement takes a shared lock on the hash table and updates counters, which measurements have generally put in the low single-digit percentage range for typical OLTP workloads. The cost scales with statement rate rather than with query duration, so a workload of millions of tiny statements per minute feels it more than one running long analytical queries.
+
+Two settings change that number meaningfully. `pg_stat_statements.track = all` adds tracking for every statement nested inside functions and procedures, which multiplies the counter updates on a function-heavy schema — leave it at `top` unless you specifically need it. And `pg_stat_statements.track_planning = on` adds a second timing path and contention on the same entry; it is useful when diagnosing plan-time costs, but it is reasonable to turn it on for an investigation and back off afterwards.
+
+Set against that, the alternative is worse. Without it you are guessing, and guessing usually costs more engineering hours than the few percent costs in CPU. Essentially every managed PostgreSQL provider enables it by default, which is a fair signal about the risk.
+
+## A workflow that works
+
+1. `SELECT pg_stat_statements_reset();` at the start of a representative window.
+2. After 15–30 minutes of real traffic, run the top-by-`total_exec_time` query.
+3. Take the top three entries. For each, get a real plan with `EXPLAIN (ANALYZE, BUFFERS)` using plausible parameter values.
+4. Fix the biggest one — usually a missing index, an unnecessary sort, or a query fetching far more rows than the application uses.
+5. Reset and measure again. If `pct_of_total` for that shape dropped and total server time dropped with it, the fix was real.
+
+## Summary
+
+`pg_stat_statements` answers the only question that matters at the start of a performance investigation: where does the time go. Install it with `shared_preload_libraries`, raise `pg_stat_statements.max` beyond the default, and sort by `total_exec_time` rather than `mean_exec_time`. Use the buffer and temp-file columns to classify what kind of problem each top query has, reset before measuring a window so the numbers describe now rather than the last three months, and pair it with `auto_explain` when you need the parameter values behind a slow execution.

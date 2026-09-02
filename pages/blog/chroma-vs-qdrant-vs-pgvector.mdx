@@ -1,0 +1,251 @@
+---
+title: "Chroma vs Qdrant vs pgvector for RAG in 2026"
+description: "Compare Chroma, Qdrant and pgvector for retrieval augmented generation: indexing, filtering, hybrid search, operations and cost, with working code for each."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: September 2, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# Chroma vs Qdrant vs pgvector for RAG in 2026
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="September 2, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+Choosing a vector store for a RAG application is mostly a question about operations, not about vector math. All three of these do approximate nearest neighbour search well enough that retrieval quality is dominated by your chunking and embedding choices, not by the index. What differs is how much infrastructure you take on, how well metadata filtering works, and what happens when the corpus grows by two orders of magnitude.
+
+Here is an honest comparison of Chroma, Qdrant and pgvector, with the code you would actually write for each.
+
+## The short answer
+
+**pgvector** if you already run PostgreSQL. Your embeddings live next to the rows they describe, joins and filters are ordinary SQL, and there is no second system to back up, secure or upgrade. Good to roughly 10 million vectors on a well-provisioned instance.
+
+**Qdrant** if vector search is a core workload: tens of millions of vectors, demanding filtered search, quantization to control memory, or a need to scale horizontally.
+
+**Chroma** if you are prototyping, building something local-first, or want the shortest path from a folder of documents to a working retriever.
+
+Now the detail.
+
+## Chroma
+
+Chroma is designed for developer ergonomics. It runs embedded in your Python process against a local directory, or as a server, and it handles embedding generation for you if you want it to.
+
+```python
+import chromadb
+from chromadb.utils import embedding_functions
+
+client = chromadb.PersistentClient(path="./chroma-data")
+
+collection = client.get_or_create_collection(
+    name="docs",
+    embedding_function=embedding_functions.SentenceTransformerEmbeddingFunction(
+        model_name="all-MiniLM-L6-v2"
+    ),
+    metadata={"hnsw:space": "cosine"},
+)
+
+collection.add(
+    ids=["doc-1", "doc-2"],
+    documents=[
+        "PgBouncer pools PostgreSQL connections in transaction mode.",
+        "GIN indexes accelerate tsvector lookups in PostgreSQL.",
+    ],
+    metadatas=[
+        {"source": "ops-guide", "section": "pooling", "year": 2026},
+        {"source": "db-guide", "section": "search", "year": 2026},
+    ],
+)
+
+results = collection.query(
+    query_texts=["how do I pool connections?"],
+    n_results=5,
+    where={"year": {"$gte": 2025}},
+    where_document={"$contains": "PostgreSQL"},
+)
+```
+
+That is the whole setup — no schema, no index tuning, no server. The `where` filter handles metadata and `where_document` does a substring match on the text.
+
+The strengths are obvious: minutes to a working prototype, no infrastructure, and a genuinely pleasant API. The limits show up in production. Chroma is single-node; there is no sharding or replication story comparable to Qdrant's. Its persistence layer has changed shape across versions, and upgrades have historically required attention to data migration. Filtered search performance falls off with complex predicates over large collections.
+
+Chroma Cloud exists for teams that want the API without running the server, which addresses the operational side but not the single-node ceiling.
+
+## Qdrant
+
+Qdrant is a purpose-built vector database written in Rust, with a REST and gRPC API, sharding, replication, and the most developed filtering story of the three.
+
+```python
+from qdrant_client import QdrantClient
+from qdrant_client.models import (
+    Distance, VectorParams, PointStruct, Filter,
+    FieldCondition, MatchValue, Range, PayloadSchemaType,
+    ScalarQuantization, ScalarQuantizationConfig, ScalarType,
+)
+
+client = QdrantClient(url="http://localhost:6333")
+
+client.create_collection(
+    collection_name="docs",
+    vectors_config=VectorParams(size=768, distance=Distance.COSINE),
+    # Cut memory roughly 4x by storing int8 vectors, rescoring with the originals
+    quantization_config=ScalarQuantization(
+        scalar=ScalarQuantizationConfig(type=ScalarType.INT8, always_ram=True)
+    ),
+)
+
+# Payload indexes make filters fast — this is the step people skip
+client.create_payload_index("docs", "source", field_schema=PayloadSchemaType.KEYWORD)
+client.create_payload_index("docs", "year", field_schema=PayloadSchemaType.INTEGER)
+
+client.upsert(
+    collection_name="docs",
+    points=[
+        PointStruct(id=1, vector=embedding_1,
+                    payload={"source": "ops-guide", "section": "pooling", "year": 2026}),
+        PointStruct(id=2, vector=embedding_2,
+                    payload={"source": "db-guide", "section": "search", "year": 2026}),
+    ],
+)
+
+hits = client.query_points(
+    collection_name="docs",
+    query=query_embedding,
+    limit=5,
+    query_filter=Filter(must=[
+        FieldCondition(key="source", match=MatchValue(value="ops-guide")),
+        FieldCondition(key="year", range=Range(gte=2025)),
+    ]),
+    with_payload=True,
+).points
+```
+
+The filtering deserves the attention. Most HNSW implementations handle filters badly: they either pre-filter (losing the index and scanning) or post-filter (searching for `k` results and discarding most of them, so a selective filter returns almost nothing). Qdrant's filterable HNSW builds additional graph links that respect payload indexes, so a filtered search stays a graph traversal. If your retrieval is scoped per tenant, per document set or per date range — which describes most real RAG systems — this matters a great deal.
+
+Scalar quantization is the other production feature. Storing int8 instead of float32 cuts memory roughly fourfold, with the original vectors kept on disk for rescoring the top candidates. On a 20 million vector collection that is the difference between one machine and four.
+
+The cost is that Qdrant is another service: another deployment, another backup, another upgrade path, another set of credentials. That is a real burden for a small team, and it is why the default recommendation is not "always Qdrant".
+
+## pgvector
+
+pgvector is a PostgreSQL extension. Vectors are a column type, indexes are ordinary indexes, and queries are SQL.
+
+```sql
+CREATE EXTENSION IF NOT EXISTS vector;
+
+CREATE TABLE documents (
+  id          bigserial PRIMARY KEY,
+  tenant_id   bigint NOT NULL,
+  source      text NOT NULL,
+  section     text,
+  year        int,
+  content     text NOT NULL,
+  embedding   vector(768),
+  created_at  timestamptz NOT NULL DEFAULT now()
+);
+
+-- HNSW: better recall/latency than IVFFlat, builds slower, no training step
+CREATE INDEX documents_embedding_hnsw
+  ON documents USING hnsw (embedding vector_cosine_ops)
+  WITH (m = 16, ef_construction = 64);
+
+-- Index the columns you filter on, so the planner has a choice
+CREATE INDEX documents_tenant_idx ON documents (tenant_id, year);
+```
+
+Retrieval is a query, so filters, joins and ordering are whatever SQL can express:
+
+```sql
+-- Raise the search list size for better recall (per session)
+SET hnsw.ef_search = 100;
+
+SELECT id,
+       content,
+       source,
+       1 - (embedding <=> $1) AS cosine_similarity
+FROM documents
+WHERE tenant_id = $2
+  AND year >= 2025
+ORDER BY embedding <=> $1
+LIMIT 5;
+```
+
+The `<=>` operator is cosine distance; `<->` is L2 and `<#>` is negative inner product. Use the operator that matches the `ops` class in your index, or the index is ignored.
+
+Hybrid search — combining lexical and vector retrieval — is where pgvector quietly wins, because the other half of the hybrid is already in the same database:
+
+```sql
+-- Reciprocal rank fusion over full text search and vector search
+WITH semantic AS (
+  SELECT id, ROW_NUMBER() OVER (ORDER BY embedding <=> $1) AS rank
+  FROM documents
+  WHERE tenant_id = $3
+  ORDER BY embedding <=> $1
+  LIMIT 50
+),
+lexical AS (
+  SELECT id, ROW_NUMBER() OVER (
+           ORDER BY ts_rank_cd(to_tsvector('english', content),
+                               websearch_to_tsquery('english', $2)) DESC) AS rank
+  FROM documents
+  WHERE tenant_id = $3
+    AND to_tsvector('english', content) @@ websearch_to_tsquery('english', $2)
+  LIMIT 50
+)
+SELECT d.id,
+       d.content,
+       COALESCE(1.0 / (60 + s.rank), 0) + COALESCE(1.0 / (60 + l.rank), 0) AS rrf_score
+FROM documents d
+LEFT JOIN semantic s ON s.id = d.id
+LEFT JOIN lexical  l ON l.id = d.id
+WHERE s.id IS NOT NULL OR l.id IS NOT NULL
+ORDER BY rrf_score DESC
+LIMIT 10;
+```
+
+Doing that across two separate systems means two queries, two network round trips and fusion code in your application. Here it is one statement against one consistent snapshot.
+
+The limits are real too. Index builds are single-threaded per index by default and slow on large tables — budget hours, not minutes, for tens of millions of rows, and raise `maintenance_work_mem` substantially before starting. HNSW indexes want to be in memory; a 10 million × 768-dimension index is roughly 30 GB of vectors plus graph overhead, which has to fit alongside everything else PostgreSQL is caching. And a filtered query can fall back to a sequential scan when the planner decides the filter is selective enough, which is sometimes right and sometimes catastrophic.
+
+Check what actually happened:
+
+```sql
+EXPLAIN (ANALYZE, BUFFERS)
+SELECT id FROM documents
+WHERE tenant_id = 42
+ORDER BY embedding <=> $1
+LIMIT 5;
+```
+
+Look for `Index Scan using documents_embedding_hnsw`. If you see `Seq Scan`, either the filter defeated the index or `ef_search` is not set. For inspecting indexes, plans and vector columns side by side, [Chat2DB](https://chat2db.ai/download) handles pgvector columns and connects to MySQL, MongoDB and 20+ other engines too; the web version is at [app.chat2db.ai](https://app.chat2db.ai).
+
+## Head to head
+
+**Setup effort.** Chroma: minutes, no server. pgvector: one `CREATE EXTENSION` if you already run Postgres, otherwise a database to operate. Qdrant: a service to deploy and run.
+
+**Filtered search.** Qdrant is clearly best, thanks to filterable HNSW plus payload indexes. pgvector is good when the planner cooperates and you have indexed the filter columns. Chroma is adequate at small scale.
+
+**Hybrid lexical + vector.** pgvector wins outright — full text search is in the same database and the fusion is one query. Qdrant has sparse vector support for hybrid retrieval, which works well but needs you to generate sparse representations. Chroma offers substring matching, not real lexical ranking.
+
+**Scale ceiling.** Chroma: single node, comfortable in the low millions. pgvector: roughly 10 million vectors on a large instance before index maintenance and memory dominate. Qdrant: hundreds of millions with sharding and quantization.
+
+**Operational cost.** pgvector adds nothing if Postgres is already there. Chroma adds little if embedded. Qdrant adds a real system with its own on-call implications.
+
+**Consistency with your data.** pgvector is transactional: an embedding and the row it describes commit together. Chroma and Qdrant both require you to keep a separate store in sync, with the usual outbox or CDC machinery and the usual drift.
+
+## How to decide
+
+Ask three questions in order.
+
+**Do you already run PostgreSQL?** If yes, start with pgvector. The consistency and the absence of a second system are worth more than a benchmark difference you will not notice below a few million vectors. Move only when you have measured a specific problem.
+
+**Will filtered search dominate?** If every query is scoped by tenant, collection or date and those filters are selective, Qdrant's filterable HNSW is a genuine architectural advantage rather than a marginal speedup.
+
+**How large will the corpus actually get?** Be honest. Most internal RAG systems index a few hundred thousand chunks and never grow past a million. That is small. Do not build for a hundred million vectors you will never have.
+
+A path that works: prototype in Chroma to get retrieval quality right, move to pgvector for production because the data is already in Postgres, and migrate the vector workload to Qdrant only when a measurement — not an anticipation — says pgvector is the bottleneck.
+
+## Summary
+
+All three do approximate nearest neighbour search competently, so choose on operations. pgvector keeps embeddings transactionally consistent with your data, makes hybrid lexical-plus-vector retrieval a single SQL statement, and adds no new system — the right default for anyone already on PostgreSQL. Qdrant is the specialist: filterable HNSW, quantization and horizontal scale for workloads where vector search is the product. Chroma gets you from documents to a working retriever fastest, and is best treated as a prototyping and local-first tool rather than a production destination.

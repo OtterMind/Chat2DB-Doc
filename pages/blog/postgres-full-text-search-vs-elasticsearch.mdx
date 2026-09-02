@@ -1,0 +1,216 @@
+---
+title: "Postgres Full Text Search vs Elasticsearch in 2026"
+description: "When PostgreSQL full text search is enough and when you need Elasticsearch: feature comparison, real SQL, scaling limits and a decision checklist."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: September 2, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# Postgres Full Text Search vs Elasticsearch in 2026
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="September 2, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+Adding Elasticsearch to a stack is a bigger decision than it looks. You are not adding a search box; you are adding a distributed system with its own cluster, its own memory profile, its own failure modes, and — the part that hurts most — a copy of your data that has to be kept in sync with the copy that is authoritative. PostgreSQL has had full text search since 8.3, and for a surprising share of applications it is enough.
+
+This is the honest comparison: what each does well, where Postgres genuinely runs out, and how to decide without rewriting the search layer twice.
+
+## What PostgreSQL gives you
+
+Postgres full text search is built on two types. A `tsvector` is a sorted list of normalised lexemes with their positions; a `tsquery` is a boolean expression over lexemes. The `@@` operator asks whether the vector matches the query.
+
+```sql
+CREATE EXTENSION IF NOT EXISTS unaccent;
+
+CREATE TABLE articles (
+  id          bigserial PRIMARY KEY,
+  title       text NOT NULL,
+  body        text NOT NULL,
+  published_at timestamptz NOT NULL DEFAULT now(),
+  status      text NOT NULL DEFAULT 'draft'
+);
+
+-- A stored generated column keeps the vector in sync automatically (PG 12+)
+ALTER TABLE articles
+  ADD COLUMN search_vector tsvector
+  GENERATED ALWAYS AS (
+    setweight(to_tsvector('english', coalesce(title, '')), 'A')
+    || setweight(to_tsvector('english', coalesce(body, '')), 'B')
+  ) STORED;
+
+CREATE INDEX articles_search_idx ON articles USING GIN (search_vector);
+```
+
+Searching, ranking and highlighting are then one query:
+
+```sql
+SELECT id,
+       title,
+       ts_rank_cd('{0.1, 0.2, 0.4, 1.0}', search_vector, q) AS rank,
+       ts_headline('english', body, q,
+                   'StartSel=<mark>, StopSel=</mark>, MaxFragments=2, MinWords=10, MaxWords=30') AS snippet
+FROM articles, websearch_to_tsquery('english', $1) AS q
+WHERE search_vector @@ q
+  AND status = 'published'
+ORDER BY rank DESC, id DESC
+LIMIT 20;
+```
+
+`websearch_to_tsquery` is the function to use for user input: it understands quoted phrases, `or`, and a leading `-` for exclusion, and it never throws a syntax error on strange input.
+
+What you get out of the box: stemming and stop words for around 25 languages, phrase search with the `<->` distance operator, weighting by field, relevance ranking, highlighted snippets, prefix matching, and index support through GIN. Add `pg_trgm` and you also get typo tolerance and similarity ranking.
+
+The decisive property is that search results are transactionally consistent with your data. There is no lag, no reindex job, no "the record was deleted but still shows in search" bug class.
+
+## What Elasticsearch gives you that Postgres does not
+
+Five things, and it is worth being precise about them because they are the only real reasons to take on a second datastore.
+
+**BM25 relevance out of the box.** Postgres ranking functions, `ts_rank` and `ts_rank_cd`, are frequency-based and do not normalise for document length the way BM25 does. On a corpus with wildly varying document lengths, Elasticsearch results simply rank better without tuning. You can approximate BM25 in SQL, but you are writing it yourself.
+
+**Aggregations and faceting at scale.** Counting matching documents per category, per price bucket, per date histogram — all in the same round trip as the search, over millions of documents. In Postgres this is a `GROUP BY` over the matched set, which is fine for thousands of rows and slow for millions.
+
+**Horizontal scale-out of the search index itself.** Elasticsearch shards an index across nodes and queries them in parallel. Postgres full text search scales up with a bigger machine and out only with read replicas that each hold the whole index.
+
+**Rich analysis chains.** Custom tokenizers, character filters, synonym graphs, edge n-grams for autocomplete, per-field analyzers, language detection. Postgres has dictionaries and configurations, which cover the common cases but are far less flexible.
+
+**Search-specific features.** "More like this", suggesters, percolators, learning-to-rank plugins, and — since 8.x — native vector search combined with lexical scoring in a single hybrid query.
+
+## Where PostgreSQL actually runs out
+
+Vague answers help nobody, so here are the concrete limits.
+
+**Index size and memory.** A GIN index on a tsvector is roughly 20–50% of the text size it indexes. If your corpus is 200 GB of text, expect a 40–100 GB index that wants to live in the page cache. That is the point at which a dedicated search cluster with its own memory budget starts to look reasonable.
+
+**Write amplification.** Every update to an indexed column rewrites the tsvector and touches the GIN index. GIN buffers this in a pending list, which is why a write-heavy table shows a periodic latency spike when the list is flushed. Turning `fastupdate` off makes writes uniformly slower but predictable:
+
+```sql
+ALTER INDEX articles_search_idx SET (fastupdate = off);
+```
+
+**Ranking a large match set.** `ORDER BY ts_rank_cd(...) DESC LIMIT 20` must compute a rank for every matching row before it can sort. If a common term matches 2 million rows, Postgres computes 2 million ranks. Elasticsearch's scoring is fused into the index traversal and can short-circuit. This, not raw lookup speed, is usually what makes Postgres search feel slow.
+
+**Faceted navigation.** An e-commerce sidebar showing counts for twelve facets requires twelve aggregate queries over the match set, or one query with twelve `FILTER` clauses. It works, but the cost grows with the match set rather than with the result page.
+
+As a rough dividing line: below about 10 million documents with modest write rates and no faceting requirement, Postgres is usually the better engineering choice. Above roughly 50 million documents, or with heavy faceting, or with a search team that needs to iterate on relevance weekly, Elasticsearch earns its operational cost. Between those numbers it genuinely depends on your query patterns.
+
+## The cost nobody budgets: synchronisation
+
+If you choose Elasticsearch, the search index is a derived copy, and keeping derived copies correct is the hard part of the project.
+
+The naive approach — write to Postgres, then write to Elasticsearch in the same request handler — fails the first time the second write errors after the first succeeded. You get documents that exist in the database and not in search, or the reverse.
+
+The approaches that actually work:
+
+**Outbox table plus a worker.** Write the change and an outbox row in the same transaction; a worker reads the outbox and pushes to Elasticsearch, marking rows done.
+
+```sql
+CREATE TABLE search_outbox (
+  id          bigserial PRIMARY KEY,
+  entity_type text NOT NULL,
+  entity_id   bigint NOT NULL,
+  operation   text NOT NULL CHECK (operation IN ('upsert', 'delete')),
+  created_at  timestamptz NOT NULL DEFAULT now(),
+  processed_at timestamptz
+);
+
+CREATE INDEX search_outbox_pending_idx
+  ON search_outbox (id) WHERE processed_at IS NULL;
+
+CREATE OR REPLACE FUNCTION queue_search_update() RETURNS trigger
+LANGUAGE plpgsql AS $$
+BEGIN
+  INSERT INTO search_outbox (entity_type, entity_id, operation)
+  VALUES (TG_TABLE_NAME,
+          COALESCE(NEW.id, OLD.id),
+          CASE WHEN TG_OP = 'DELETE' THEN 'delete' ELSE 'upsert' END);
+  RETURN COALESCE(NEW, OLD);
+END
+$$;
+
+CREATE TRIGGER articles_search_outbox
+AFTER INSERT OR UPDATE OR DELETE ON articles
+FOR EACH ROW EXECUTE FUNCTION queue_search_update();
+```
+
+The worker claims batches without blocking itself:
+
+```sql
+WITH claimed AS (
+  SELECT id, entity_type, entity_id, operation
+  FROM search_outbox
+  WHERE processed_at IS NULL
+  ORDER BY id
+  LIMIT 500
+  FOR UPDATE SKIP LOCKED
+)
+UPDATE search_outbox o
+SET processed_at = now()
+FROM claimed c
+WHERE o.id = c.id
+RETURNING c.entity_type, c.entity_id, c.operation;
+```
+
+**Change data capture.** Debezium reads the WAL through a logical replication slot and streams changes to Kafka, from which a connector writes to Elasticsearch. More infrastructure, but no triggers and no application changes, and it captures writes that bypass your application entirely.
+
+Either way, you also need a periodic full reconciliation job, because eventually something will drift.
+
+That entire body of work does not exist if search stays in Postgres. It is the largest hidden line item in the comparison.
+
+## A middle path
+
+Before jumping to a cluster, three things usually buy a lot of runway.
+
+**Filter first, rank second.** If your search always runs inside a tenant or a category, put that column in the index with `btree_gin` so the match set is small before ranking starts:
+
+```sql
+CREATE EXTENSION IF NOT EXISTS btree_gin;
+CREATE INDEX articles_tenant_search_idx
+  ON articles USING GIN (tenant_id, search_vector);
+```
+
+**Materialise the search table.** Keep a narrow table of `(id, search_vector, rank_boost, tenant_id)` separate from the wide content table. The GIN index then covers a much smaller relation and stays in cache.
+
+**Use `pg_trgm` for the autocomplete path** rather than trying to make full text search do prefix matching well:
+
+```sql
+CREATE EXTENSION IF NOT EXISTS pg_trgm;
+CREATE INDEX articles_title_trgm_idx ON articles USING GIN (title gin_trgm_ops);
+
+SELECT id, title, similarity(title, $1) AS score
+FROM articles
+WHERE title % $1
+ORDER BY score DESC
+LIMIT 10;
+```
+
+There is also ParadeDB, a Postgres extension that implements BM25 scoring and Tantivy-backed indexing inside the database. It closes part of the relevance gap without a second datastore, at the cost of an extension your managed provider may not support.
+
+When you are benchmarking these options, being able to run `EXPLAIN (ANALYZE, BUFFERS)` against several variants and compare timings side by side matters more than any single number. [Chat2DB](https://chat2db.ai/download) keeps multiple result tabs and plans open at once and connects to PostgreSQL, MySQL, Oracle and 20+ other engines; the browser version is at [app.chat2db.ai](https://app.chat2db.ai).
+
+## Decision checklist
+
+Choose PostgreSQL full text search when:
+
+- Search is a feature of your application, not the product itself.
+- The corpus is under roughly 10 million documents and grows predictably.
+- Results must be consistent with the data the moment a transaction commits.
+- Your team is small and every additional system has a real on-call cost.
+- Filters (tenant, status, category) narrow the match set before ranking.
+
+Choose Elasticsearch (or OpenSearch) when:
+
+- Search relevance is a product surface you iterate on continuously.
+- You need faceted navigation with counts over large match sets.
+- The corpus is tens of millions of documents or more.
+- You need analysis features Postgres cannot express: synonym graphs, custom analyzers per language, learning-to-rank.
+- You are already running it for logs and the marginal operational cost is low.
+
+And a practical rule: start in Postgres. The migration from Postgres full text search to Elasticsearch is a normal project. The migration from a prematurely adopted Elasticsearch cluster back to Postgres, after two years of relevance tuning nobody documented, is not.
+
+## Summary
+
+PostgreSQL full text search covers stemming, phrase queries, weighting, ranking and highlighting with index support, and it does so with zero synchronisation cost because the index lives in the same transaction as the data. Elasticsearch wins on BM25 relevance, faceted aggregations, horizontal scale and analysis flexibility — real advantages that come bundled with a second datastore and the permanent job of keeping it in sync. Size the corpus, look at whether you need facets, and be honest about the sync work before adding the cluster.

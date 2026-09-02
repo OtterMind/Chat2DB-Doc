@@ -1,0 +1,302 @@
+---
+title: "PgBouncer with Docker Compose: A Working Setup"
+description: "Run PgBouncer next to PostgreSQL in Docker Compose: image choice, config mounts, SCRAM auth, health checks, Kubernetes sidecars and how to verify pooling works."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: September 2, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# PgBouncer with Docker Compose: A Working Setup
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="September 2, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+Running PgBouncer in Docker looks trivial until the first `password authentication failed` at 2 a.m. The friction is almost always in three places: how the image builds its configuration, how SCRAM verifiers get into the user list, and whether the container is actually ready when the application starts. This guide gives you a Compose stack that works, then explains each moving part so you can adapt it.
+
+## Choosing an image
+
+There is no official PgBouncer image from the PgBouncer project. Two are widely used:
+
+- `edoburu/pgbouncer` — small, actively maintained, generates `pgbouncer.ini` from environment variables, and supports `AUTH_TYPE=scram-sha-256`. Good for straightforward setups.
+- `bitnami/pgbouncer` — more configuration surface, non-root by default, and consistent with the rest of the Bitnami charts if you already use them.
+
+You can also build your own in about six lines, which is what I recommend once your configuration is non-trivial, because then the config file is plain text you own rather than an environment-variable template:
+
+```dockerfile
+FROM alpine:3.20
+RUN apk add --no-cache pgbouncer postgresql16-client \
+ && mkdir -p /var/log/pgbouncer /var/run/pgbouncer \
+ && chown -R pgbouncer:pgbouncer /var/log/pgbouncer /var/run/pgbouncer /etc/pgbouncer
+USER pgbouncer
+EXPOSE 6432
+CMD ["pgbouncer", "/etc/pgbouncer/pgbouncer.ini"]
+```
+
+Including `postgresql-client` is deliberate: it gives you `psql` inside the container for health checks and for querying the admin console.
+
+## The Compose file
+
+```yaml
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: app_user
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}
+      POSTGRES_DB: appdb
+      # Force SCRAM so the verifier we copy into userlist.txt matches
+      POSTGRES_INITDB_ARGS: "--auth-host=scram-sha-256"
+    command:
+      - postgres
+      - -c
+      - max_connections=100
+      - -c
+      - shared_buffers=256MB
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U app_user -d appdb"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    networks: [backend]
+
+  pgbouncer:
+    build: ./pgbouncer
+    depends_on:
+      postgres:
+        condition: service_healthy
+    volumes:
+      - ./pgbouncer/pgbouncer.ini:/etc/pgbouncer/pgbouncer.ini:ro
+      - ./pgbouncer/userlist.txt:/etc/pgbouncer/userlist.txt:ro
+    ports:
+      - "6432:6432"
+    healthcheck:
+      test: ["CMD-SHELL", "psql -h 127.0.0.1 -p 6432 -U pgbouncer_admin -d pgbouncer -tAc 'SHOW LISTS' >/dev/null"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
+    restart: unless-stopped
+    networks: [backend]
+
+  app:
+    build: ./app
+    depends_on:
+      pgbouncer:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgres://app_user:${POSTGRES_PASSWORD}@pgbouncer:6432/appdb
+    networks: [backend]
+
+volumes:
+  pgdata:
+
+networks:
+  backend:
+```
+
+Three details in there matter more than they look:
+
+`depends_on` with `condition: service_healthy` is what stops PgBouncer from starting before Postgres accepts connections. Plain `depends_on` only waits for the container to start, not for the database to be ready.
+
+The Postgres port is deliberately not published. Only PgBouncer is reachable from the host, which means nothing can accidentally bypass the pool.
+
+The health check queries the PgBouncer admin console rather than opening a TCP socket. A listening socket proves the process started; `SHOW LISTS` proves it can serve queries.
+
+## The configuration file
+
+`./pgbouncer/pgbouncer.ini`:
+
+```ini
+[databases]
+appdb = host=postgres port=5432 dbname=appdb
+
+[pgbouncer]
+listen_addr = 0.0.0.0
+listen_port = 6432
+
+auth_type = scram-sha-256
+auth_file = /etc/pgbouncer/userlist.txt
+
+pool_mode = transaction
+max_client_conn = 2000
+default_pool_size = 20
+min_pool_size = 5
+reserve_pool_size = 5
+reserve_pool_timeout = 3
+max_db_connections = 50
+
+server_lifetime = 3600
+server_idle_timeout = 600
+query_wait_timeout = 120
+
+max_prepared_statements = 200
+ignore_startup_parameters = extra_float_digits,options
+
+admin_users = pgbouncer_admin
+stats_users = pgbouncer_stats
+
+; In containers, log to stderr so `docker logs` works
+logfile =
+pidfile =
+```
+
+Setting `logfile` and `pidfile` to empty is the container-specific part. With a logfile configured, output goes to a file inside the container that nobody ever reads; empty sends it to stderr where Docker collects it.
+
+`host=postgres` uses the Compose service name — Docker's embedded DNS resolves it on the `backend` network. This is why PgBouncer needs to be on the same network as Postgres.
+
+## Getting SCRAM verifiers into userlist.txt
+
+This is where most setups fail. With `auth_type = scram-sha-256`, the `userlist.txt` must contain the SCRAM verifier exactly as Postgres stores it — not the password.
+
+Start Postgres first, then generate the file:
+
+```bash
+docker compose up -d postgres
+
+docker compose exec -T postgres \
+  psql -U app_user -d appdb -tAc \
+  "SELECT concat('\"', usename, '\" \"', passwd, '\"') FROM pg_shadow WHERE passwd IS NOT NULL" \
+  > pgbouncer/userlist.txt
+
+cat pgbouncer/userlist.txt
+```
+
+You should see something like:
+
+```
+"app_user" "SCRAM-SHA-256$4096:kJ9x...$...:...="
+```
+
+Now create the admin user PgBouncer's health check uses:
+
+```sql
+-- Runs against Postgres, but the role only needs to exist for PgBouncer auth
+CREATE ROLE pgbouncer_admin LOGIN PASSWORD 'another-strong-password';
+CREATE ROLE pgbouncer_stats LOGIN PASSWORD 'a-third-strong-password';
+```
+
+Then regenerate `userlist.txt` so it includes all three roles, and start the rest of the stack:
+
+```bash
+docker compose up -d
+```
+
+A more maintainable alternative for anything long-lived is `auth_query`, which lets PgBouncer look credentials up on demand instead of keeping a copy:
+
+```sql
+CREATE ROLE pgbouncer_auth LOGIN PASSWORD 'strong-password';
+
+CREATE OR REPLACE FUNCTION public.pgbouncer_get_auth(p_usename text)
+RETURNS TABLE (username text, password text)
+LANGUAGE sql SECURITY DEFINER AS $$
+  SELECT usename::text, passwd::text FROM pg_shadow WHERE usename = p_usename;
+$$;
+
+REVOKE ALL ON FUNCTION public.pgbouncer_get_auth(text) FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION public.pgbouncer_get_auth(text) TO pgbouncer_auth;
+```
+
+```ini
+auth_user = pgbouncer_auth
+auth_query = SELECT username, password FROM public.pgbouncer_get_auth($1)
+```
+
+With `auth_query`, `userlist.txt` only needs the `pgbouncer_auth` role itself plus your admin users. Rotating an application password no longer means regenerating a file and restarting a container.
+
+## Verifying that pooling actually works
+
+Start the stack and open the admin console:
+
+```bash
+docker compose exec pgbouncer psql -h 127.0.0.1 -p 6432 -U pgbouncer_admin pgbouncer
+```
+
+```sql
+SHOW POOLS;
+SHOW SERVERS;
+SHOW STATS;
+```
+
+Then prove the multiplexing with a load generator. `pgbench` is already in the Postgres image:
+
+```bash
+# Initialise the schema through PgBouncer
+docker compose exec postgres pgbench -h pgbouncer -p 6432 -U app_user -i -s 10 appdb
+
+# 100 client connections, 4 threads, 30 seconds
+docker compose exec postgres pgbench -h pgbouncer -p 6432 -U app_user \
+  -c 100 -j 4 -T 30 --protocol=extended appdb
+```
+
+While that runs, check the real backend count on Postgres:
+
+```sql
+SELECT count(*) AS server_backends
+FROM pg_stat_activity
+WHERE backend_type = 'client backend'
+  AND datname = 'appdb';
+```
+
+With 100 pgbench clients and `default_pool_size = 20`, this should report about 20, not 100. That number is the whole point of the exercise. If it reports 100, check that `pool_mode` really is `transaction` — a stale bind mount of `pgbouncer.ini` is the usual culprit:
+
+```sql
+SHOW CONFIG;
+```
+
+## Common failures
+
+**`password authentication failed for user "app_user"`** — the verifier in `userlist.txt` does not match `pg_shadow`. Regenerate it. This happens every time the Postgres volume is recreated, because a new cluster generates a new random salt.
+
+**`no such database: appdb`** — the alias is missing from the `[databases]` section. PgBouncer does not pass through unknown database names unless you add a `* = host=...` wildcard entry.
+
+**`server login has been failing`** — PgBouncer reached Postgres but could not authenticate. Check `docker compose logs pgbouncer`; the message names the role.
+
+**Prepared statement errors from an ORM** — either upgrade to PgBouncer 1.21+ and set `max_prepared_statements`, or disable prepared statements in the driver (`prepareThreshold=0` for JDBC, `prepare_threshold=None` for psycopg 3, `Max Auto Prepare=0` for Npgsql).
+
+**Config changes not taking effect** — a bind-mounted file is read once at start. Either `docker compose restart pgbouncer` or issue `RELOAD;` in the admin console.
+
+To inspect what is happening on both sides — pool state on 6432 and `pg_stat_activity` on 5432 — a GUI client saves a lot of terminal juggling. [Chat2DB](https://chat2db.ai/download) connects to PgBouncer the same way it connects to Postgres, so you can keep both connections open side by side; there is also a browser version at [app.chat2db.ai](https://app.chat2db.ai) if you would rather not install anything.
+
+## Sizing the pool inside a container
+
+The pool size is the setting people get wrong most often, and containers make it easier to get wrong because it is tempting to scale the PgBouncer service instead of tuning it.
+
+`default_pool_size` is a concurrency limit on PostgreSQL, not a capacity dial. PostgreSQL executes queries in per-connection processes, so past the point where every core is busy, additional concurrent backends make throughput worse rather than better. A reasonable starting point for an OLTP workload is roughly twice the number of CPU cores available to the Postgres container, plus a small allowance for I/O wait. On a four-core container that is 8–12 connections, not 100.
+
+The trap in Compose and Kubernetes is replica count. If you scale the `pgbouncer` service to three replicas, each with `default_pool_size = 20`, you now have 60 server connections against a `max_connections` you set for one instance. Two settings guard against this:
+
+```ini
+; Total server connections to one database, across every pool in this process
+max_db_connections = 50
+; Client sockets this process will accept — cheap, set it generously
+max_client_conn = 2000
+```
+
+Divide `default_pool_size` by the replica count when you scale out, and keep `replicas × max_db_connections` comfortably below the server's `max_connections` minus `superuser_reserved_connections`. Check the current state from Postgres itself:
+
+```sql
+SELECT current_setting('max_connections') AS max_conn,
+       count(*) FILTER (WHERE backend_type = 'client backend') AS in_use
+FROM pg_stat_activity;
+```
+
+If that count sits close to the limit while `SHOW POOLS` reports idle server connections, the mismatch is in your arithmetic, not in PgBouncer.
+
+## Running it in Kubernetes
+
+The Compose layout maps to two Kubernetes patterns.
+
+As a **sidecar**, PgBouncer runs in the same pod as the application and listens on localhost. Connection count then scales with pod count, which is fine for a handful of replicas and gives you the lowest possible latency.
+
+As a **deployment**, PgBouncer runs as its own service with two or three replicas behind a ClusterIP. This is the right shape when you have many application pods, because the total backend count is `replicas × default_pool_size` regardless of how many application pods exist. Remember to divide `default_pool_size` by the replica count so the total still fits inside `max_connections`.
+
+Either way, mount `pgbouncer.ini` from a ConfigMap and `userlist.txt` from a Secret, and keep the same `SHOW LISTS` readiness probe from the Compose file.
+
+## Summary
+
+A PgBouncer container needs four things done correctly: a health-gated dependency on Postgres so it does not start too early, a SCRAM verifier in `userlist.txt` that matches `pg_shadow` (or `auth_query` so you never have to sync one), empty `logfile` and `pidfile` so output reaches `docker logs`, and a readiness probe that queries the admin console rather than poking the socket. Verify with `pgbench` and a `pg_stat_activity` count — if 100 clients produce 20 backends, the setup is doing its job.

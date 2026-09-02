@@ -1,0 +1,299 @@
+---
+title: "MongoDB GridFS: How It Works and When to Use It"
+description: "A practical GridFS guide: how files split into chunks, the driver APIs, indexes and performance, range requests, and when object storage wins instead."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: September 2, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# MongoDB GridFS: How It Works and When to Use It
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="September 2, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+MongoDB documents have a hard limit of 16 MB. GridFS is the convention the drivers implement for storing anything larger: it splits a file into chunks, stores each chunk as its own document, and keeps a metadata document that ties them together. It is not a separate storage engine and it is not magic — it is two collections and an agreed layout, which is why understanding it takes about ten minutes and saves a lot of debugging later.
+
+## How GridFS is laid out
+
+A GridFS bucket is two collections, named after the bucket (`fs` by default):
+
+- `fs.files` — one document per file: length, chunk size, upload date, filename, and arbitrary metadata.
+- `fs.chunks` — one document per chunk: a reference to the file, a sequence number, and the binary payload.
+
+You can look at them directly, because they are ordinary collections:
+
+```js
+// The metadata document
+db.fs.files.findOne()
+/*
+{
+  _id: ObjectId("66d3f1a2c8e4b90f12345678"),
+  length: 52428800,
+  chunkSize: 261120,
+  uploadDate: ISODate("2026-09-02T09:14:22.417Z"),
+  filename: "quarterly-report.pdf",
+  metadata: { contentType: "application/pdf", ownerId: 4471, tags: ["finance", "q2"] }
+}
+*/
+
+// One chunk
+db.fs.chunks.findOne({}, { data: 0 })
+/*
+{
+  _id: ObjectId("66d3f1a2c8e4b90f1234567a"),
+  files_id: ObjectId("66d3f1a2c8e4b90f12345678"),
+  n: 0
+}
+*/
+```
+
+The default chunk size is 255 KB, chosen so a chunk document with its BSON overhead sits comfortably under the 16 MB document limit and packs well into MongoDB's storage. A 50 MB file becomes 1 metadata document and 206 chunk documents.
+
+Two indexes make it work, and the drivers create them on first upload:
+
+```js
+db.fs.chunks.createIndex({ files_id: 1, n: 1 }, { unique: true })
+db.fs.files.createIndex({ filename: 1, uploadDate: 1 })
+```
+
+If you ever restore a database without indexes, recreate these first. Reading a file without the `{files_id: 1, n: 1}` index means a collection scan per chunk, which turns a fast download into a multi-minute one.
+
+## Uploading and downloading
+
+Every official driver exposes a streaming API. The Node.js version:
+
+```js
+import { MongoClient, GridFSBucket, ObjectId } from "mongodb";
+import fs from "node:fs";
+import { pipeline } from "node:stream/promises";
+
+const client = await MongoClient.connect(process.env.MONGO_URL);
+const db = client.db("app");
+const bucket = new GridFSBucket(db, { bucketName: "fs", chunkSizeBytes: 261120 });
+
+// Upload
+const uploadStream = bucket.openUploadStream("quarterly-report.pdf", {
+  metadata: { contentType: "application/pdf", ownerId: 4471, tags: ["finance", "q2"] },
+});
+await pipeline(fs.createReadStream("./quarterly-report.pdf"), uploadStream);
+console.log("stored as", uploadStream.id);
+
+// Download by id
+await pipeline(
+  bucket.openDownloadStream(new ObjectId("66d3f1a2c8e4b90f12345678")),
+  fs.createWriteStream("./out.pdf")
+);
+
+// Download the newest revision by filename
+await pipeline(
+  bucket.openDownloadStreamByName("quarterly-report.pdf", { revision: -1 }),
+  fs.createWriteStream("./latest.pdf")
+);
+```
+
+Python with PyMongo:
+
+```python
+from pymongo import MongoClient
+import gridfs
+
+client = MongoClient("mongodb://localhost:27017")
+db = client.app
+bucket = gridfs.GridFSBucket(db, bucket_name="fs", chunk_size_bytes=261120)
+
+with open("quarterly-report.pdf", "rb") as f:
+    file_id = bucket.upload_from_stream(
+        "quarterly-report.pdf",
+        f,
+        metadata={"contentType": "application/pdf", "ownerId": 4471},
+    )
+
+with open("out.pdf", "wb") as f:
+    bucket.download_to_stream(file_id, f)
+```
+
+The command line tool is useful for one-off work:
+
+```bash
+mongofiles --uri="mongodb://localhost:27017/app" put quarterly-report.pdf
+mongofiles --uri="mongodb://localhost:27017/app" list
+mongofiles --uri="mongodb://localhost:27017/app" get quarterly-report.pdf
+mongofiles --uri="mongodb://localhost:27017/app" delete quarterly-report.pdf
+```
+
+## Range requests and partial reads
+
+The feature that justifies GridFS over "store the bytes in a document" is seeking. Because chunks are numbered, a driver can compute exactly which chunks cover a byte range and fetch only those. That makes HTTP range requests — video scrubbing, resumable downloads — genuinely efficient.
+
+```js
+// Serve an HTTP range request without reading the whole file
+app.get("/files/:id", async (req, res) => {
+  const id = new ObjectId(req.params.id);
+  const file = await db.collection("fs.files").findOne({ _id: id });
+  if (!file) return res.sendStatus(404);
+
+  const range = req.headers.range;
+  if (!range) {
+    res.set({
+      "Content-Length": file.length,
+      "Content-Type": file.metadata?.contentType ?? "application/octet-stream",
+      "Accept-Ranges": "bytes",
+    });
+    return bucket.openDownloadStream(id).pipe(res);
+  }
+
+  const [startStr, endStr] = range.replace(/bytes=/, "").split("-");
+  const start = parseInt(startStr, 10);
+  const end = endStr ? parseInt(endStr, 10) : file.length - 1;
+
+  res.status(206).set({
+    "Content-Range": `bytes ${start}-${end}/${file.length}`,
+    "Accept-Ranges": "bytes",
+    "Content-Length": end - start + 1,
+    "Content-Type": file.metadata?.contentType ?? "application/octet-stream",
+  });
+
+  // start/end are byte offsets; the driver maps them to chunk numbers
+  bucket.openDownloadStream(id, { start, end: end + 1 }).pipe(res);
+});
+```
+
+Note the `end + 1`: the driver's range is half-open while HTTP's is inclusive. Getting this wrong truncates the last byte of every range, which shows up as a video that stalls one frame from the end of each buffer.
+
+## Querying files by metadata
+
+`fs.files` is a normal collection, so metadata queries are normal queries. Index the fields you filter on:
+
+```js
+db.fs.files.createIndex({ "metadata.ownerId": 1, uploadDate: -1 })
+db.fs.files.createIndex({ "metadata.tags": 1 })
+
+// Every PDF for one owner, newest first
+db.fs.files.find(
+  { "metadata.ownerId": 4471, "metadata.contentType": "application/pdf" }
+).sort({ uploadDate: -1 }).limit(20)
+
+// Total storage consumed per owner
+db.fs.files.aggregate([
+  { $group: { _id: "$metadata.ownerId", files: { $sum: 1 }, bytes: { $sum: "$length" } } },
+  { $sort: { bytes: -1 } },
+  { $limit: 10 }
+])
+```
+
+Deleting must go through the bucket API — deleting the `fs.files` document alone orphans every chunk:
+
+```js
+await bucket.delete(new ObjectId("66d3f1a2c8e4b90f12345678"));
+```
+
+If you suspect orphans from a previous mistake, find them:
+
+```js
+db.fs.chunks.aggregate([
+  { $group: { _id: "$files_id" } },
+  { $lookup: { from: "fs.files", localField: "_id", foreignField: "_id", as: "file" } },
+  { $match: { file: { $size: 0 } } },
+  { $count: "orphaned_files" }
+])
+```
+
+Exploring collections like this is easier in a client with a proper document viewer and a results grid. [Chat2DB](https://chat2db.ai/download) connects to MongoDB alongside PostgreSQL, MySQL and 20+ other engines, so you can inspect `fs.files` next to the relational tables that reference those file ids; there is a browser version at [app.chat2db.ai](https://app.chat2db.ai) as well.
+
+## Performance characteristics
+
+Three things determine whether GridFS performs acceptably.
+
+**Chunk size.** The 255 KB default is a reasonable compromise. Raising it to 1 MB reduces the document count and the per-chunk overhead for large files, which helps sequential throughput. Lowering it helps only if you do many small random reads. Set it per bucket, not per file, and measure before changing it:
+
+```js
+const bucket = new GridFSBucket(db, { chunkSizeBytes: 1024 * 1024 });
+```
+
+**Working set pressure.** Every chunk read pulls data through the WiredTiger cache, competing with your actual documents for memory. A busy GridFS bucket can evict the indexes your application queries depend on. This is the most common way GridFS damages a cluster: not by being slow itself, but by making everything else slow.
+
+**Replication traffic.** Chunks replicate like any other write, so a 500 MB upload puts 500 MB through the oplog and across the network to every secondary. Uploading large files at a steady rate can push the oplog window down enough that a lagging secondary needs a full resync.
+
+You can watch the effect:
+
+```js
+db.serverStatus().wiredTiger.cache["bytes currently in the cache"]
+db.getReplicationInfo()
+rs.printSecondaryReplicationInfo()
+```
+
+## Sharding a GridFS bucket
+
+On a sharded cluster the two collections need different treatment, and getting the shard key wrong is difficult to undo.
+
+`fs.chunks` should be sharded on `{files_id: 1, n: 1}`. That keeps the chunks of a single file together in the same range, so a sequential read hits one shard rather than fanning out across all of them. Sharding on `_id` alone scatters a file's chunks across the cluster and turns every download into a broadcast query.
+
+```js
+sh.enableSharding("app")
+sh.shardCollection("app.fs.chunks", { files_id: 1, n: 1 })
+sh.shardCollection("app.fs.files", { _id: "hashed" })
+```
+
+`fs.files` is small and read by primary key, so hashed `_id` distributes it evenly without hot spots.
+
+One caveat: `files_id` values are ObjectIds, which are monotonically increasing, so a range-sharded `fs.chunks` sends all new uploads to the highest chunk range and therefore to one shard. If your write rate is high enough for that to matter, the balancer will keep splitting and migrating that range, which costs I/O. Pre-splitting the chunk ranges before a bulk load avoids most of the churn:
+
+```js
+// Inspect how chunks are distributed before and after a load
+db.fs.chunks.getShardDistribution()
+```
+
+## Backup considerations
+
+Because GridFS is just collections, it is included in every MongoDB backup mechanism automatically — that is much of its appeal. It also means those backups get large fast. A `mongodump` of a database with 200 GB of GridFS content produces roughly 200 GB of BSON, and a restore replays it through the normal write path, so restore time scales with file volume rather than with document count.
+
+If your recovery time objective matters, measure a restore before you rely on it. Filesystem or volume snapshots of the data directory restore far faster than a logical dump for GridFS-heavy databases, and for replica sets they are the standard approach:
+
+```bash
+# Logical dump of just the bucket, for moving files between environments
+mongodump --uri="mongodb://localhost:27017/app" \
+  --collection=fs.files --out=/backup
+mongodump --uri="mongodb://localhost:27017/app" \
+  --collection=fs.chunks --out=/backup
+```
+
+Dump both collections or neither — a restore with one and not the other produces a bucket full of unreadable metadata.
+
+## When to use GridFS, and when not to
+
+GridFS makes sense when:
+
+- Files must live in the same replica set as the data that references them, so backups and point-in-time restores are atomic across both.
+- You need transactional consistency between a file and the document pointing at it.
+- You are deploying somewhere with no object storage — an air-gapped environment, an on-premises appliance, an edge device.
+- Files are moderate in size and count, and reads are heavily cached upstream.
+- You need range reads over files that are not on a CDN.
+
+Object storage (S3, GCS, Azure Blob, MinIO) is the better answer when:
+
+- Files are served to end users at any volume. A CDN in front of object storage costs a fraction of the compute you would spend streaming bytes through MongoDB.
+- Total volume runs to hundreds of gigabytes or more. Object storage is roughly an order of magnitude cheaper per gigabyte than replicated database storage on fast disks.
+- You want lifecycle policies, storage classes or server-side encryption with a KMS key.
+- You want to keep your MongoDB working set small and predictable.
+
+The hybrid pattern most teams settle on: store the bytes in object storage, store metadata and access control in MongoDB, and hand out presigned URLs so the file never transits your application servers.
+
+```js
+// Metadata in MongoDB, bytes in S3
+await db.collection("documents").insertOne({
+  _id: new ObjectId(),
+  filename: "quarterly-report.pdf",
+  contentType: "application/pdf",
+  bytes: 52428800,
+  storage: { provider: "s3", bucket: "app-documents", key: "2026/09/quarterly-report.pdf" },
+  ownerId: 4471,
+  uploadedAt: new Date(),
+});
+```
+
+## Summary
+
+GridFS is two collections and a chunking convention: `fs.files` for metadata, `fs.chunks` for 255 KB pieces of binary, tied together by a unique index on `{files_id, n}`. It gives you streaming uploads, seekable range reads and metadata queries inside the same replica set as your data, which is exactly right when consistency and a single backup story matter more than cost. It is the wrong tool for serving user-facing media at scale, where object storage plus a CDN is cheaper and keeps your MongoDB working set intact. Always delete through the bucket API, always keep the chunk index in place, and watch oplog and cache pressure when uploads get large.
