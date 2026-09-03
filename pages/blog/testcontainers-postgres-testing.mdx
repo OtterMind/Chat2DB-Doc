@@ -1,0 +1,367 @@
+---
+title: "Testcontainers with PostgreSQL: Real Database Tests"
+description: "Run integration tests against a real PostgreSQL with Testcontainers in Java, Python, Node and Go — reusable containers, migrations and fast test isolation."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: September 3, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# Testcontainers with PostgreSQL: Real Database Tests
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="September 3, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+The traditional way to test database code is to swap PostgreSQL for H2 or SQLite in the test profile and hope the SQL is portable. It is not. `ON CONFLICT DO UPDATE`, `jsonb` operators, window frames, `generated always as identity`, array types, `DISTINCT ON`, partial indexes, `RETURNING` — none of it survives the substitution intact. You end up writing lowest-common-denominator SQL to satisfy a database you do not ship, and the bugs move to production where the real engine behaves differently.
+
+Testcontainers solves this by starting a real PostgreSQL in Docker for the duration of your test run, on an ephemeral port, and throwing it away afterwards.
+
+## The basic idea
+
+```
+test starts
+  └─ Testcontainers pulls postgres:17 (cached after first run)
+  └─ starts a container on a random host port
+  └─ waits until it accepts connections
+  └─ hands you a JDBC URL / DSN
+test runs against real PostgreSQL
+test ends
+  └─ container is removed by the Ryuk reaper sidecar
+```
+
+The only prerequisite is a working Docker (or Podman, or Colima) socket on the machine running the tests — including CI.
+
+## Java and JUnit 5
+
+```xml
+<dependency>
+    <groupId>org.testcontainers</groupId>
+    <artifactId>postgresql</artifactId>
+    <version>1.20.4</version>
+    <scope>test</scope>
+</dependency>
+<dependency>
+    <groupId>org.testcontainers</groupId>
+    <artifactId>junit-jupiter</artifactId>
+    <version>1.20.4</version>
+    <scope>test</scope>
+</dependency>
+```
+
+```java
+@Testcontainers
+class OrderRepositoryTest {
+
+    @Container
+    static PostgreSQLContainer<?> postgres =
+        new PostgreSQLContainer<>("postgres:17-alpine")
+            .withDatabaseName("appdb")
+            .withUsername("app")
+            .withPassword("secret");
+
+    static DataSource dataSource;
+
+    @BeforeAll
+    static void setUp() {
+        HikariConfig cfg = new HikariConfig();
+        cfg.setJdbcUrl(postgres.getJdbcUrl());
+        cfg.setUsername(postgres.getUsername());
+        cfg.setPassword(postgres.getPassword());
+        dataSource = new HikariDataSource(cfg);
+
+        Flyway.configure()
+              .dataSource(dataSource)
+              .locations("filesystem:db/migrations")
+              .load()
+              .migrate();
+    }
+
+    @Test
+    void findsOrdersByCustomer() throws Exception {
+        try (Connection c = dataSource.getConnection()) {
+            c.createStatement().execute("""
+                INSERT INTO customers (id, email, full_name)
+                VALUES (1, 'ana@example.com', 'Ana Ruiz');
+                INSERT INTO orders (customer_id, total, status)
+                VALUES (1, 41.20, 'shipped'), (1, 12.50, 'pending');
+            """);
+
+            var repo = new OrderRepository(dataSource);
+            var orders = repo.findByCustomer(1L);
+
+            assertThat(orders).hasSize(2);
+            assertThat(orders.get(0).total()).isEqualByComparingTo("41.20");
+        }
+    }
+}
+```
+
+`static` on the `@Container` field is important: it starts one container for the whole test class rather than one per test method, which is the difference between a suite that takes seconds and one that takes minutes.
+
+For Spring Boot, `@ServiceConnection` removes the property wiring entirely:
+
+```java
+@SpringBootTest
+@Testcontainers
+class OrderServiceTest {
+
+    @Container
+    @ServiceConnection
+    static PostgreSQLContainer<?> postgres =
+        new PostgreSQLContainer<>("postgres:17-alpine");
+
+    @Autowired OrderService orders;
+
+    @Test
+    void createsAnOrder() {
+        var id = orders.create(1L, new BigDecimal("25.00"));
+        assertThat(orders.findById(id)).isPresent();
+    }
+}
+```
+
+Spring reads the container's connection details and configures the `DataSource` itself — no `@DynamicPropertySource` block needed.
+
+## Python and pytest
+
+```bash
+pip install testcontainers[postgres] psycopg[binary] pytest
+```
+
+```python
+import psycopg
+import pytest
+from testcontainers.postgres import PostgresContainer
+
+@pytest.fixture(scope="session")
+def pg():
+    with PostgresContainer("postgres:17-alpine") as container:
+        yield container
+
+@pytest.fixture(scope="session")
+def migrated_dsn(pg):
+    dsn = pg.get_connection_url().replace("postgresql+psycopg2", "postgresql")
+    with psycopg.connect(dsn, autocommit=True) as conn:
+        for path in sorted(Path("db/migrations").glob("*.sql")):
+            conn.execute(path.read_text())
+    return dsn
+
+@pytest.fixture
+def conn(migrated_dsn):
+    """A connection whose transaction is rolled back after every test."""
+    with psycopg.connect(migrated_dsn) as c:
+        yield c
+        c.rollback()
+
+def test_order_totals(conn):
+    conn.execute(
+        "INSERT INTO customers (id, email, full_name) VALUES (1, %s, %s)",
+        ("ana@example.com", "Ana Ruiz"),
+    )
+    conn.execute(
+        "INSERT INTO orders (customer_id, total, status) VALUES (1, %s, 'shipped')",
+        (41.20,),
+    )
+    row = conn.execute(
+        "SELECT sum(total) FROM orders WHERE customer_id = 1"
+    ).fetchone()
+    assert row[0] == 41.20
+```
+
+The `conn` fixture is the important pattern: `scope="session"` for the container and the migrations, function scope for a transaction that rolls back. Each test gets a clean database without paying to recreate it.
+
+## Node and Vitest
+
+```bash
+npm i -D @testcontainers/postgresql vitest pg
+```
+
+```ts
+import { PostgreSqlContainer, StartedPostgreSqlContainer } from '@testcontainers/postgresql'
+import { Client } from 'pg'
+import { beforeAll, afterAll, beforeEach, afterEach, expect, test } from 'vitest'
+import { readFileSync, readdirSync } from 'node:fs'
+
+let container: StartedPostgreSqlContainer
+let client: Client
+
+beforeAll(async () => {
+  container = await new PostgreSqlContainer('postgres:17-alpine').start()
+
+  const admin = new Client({ connectionString: container.getConnectionUri() })
+  await admin.connect()
+  for (const f of readdirSync('db/migrations').sort()) {
+    await admin.query(readFileSync(`db/migrations/${f}`, 'utf8'))
+  }
+  await admin.end()
+}, 120_000)
+
+afterAll(async () => { await container.stop() })
+
+beforeEach(async () => {
+  client = new Client({ connectionString: container.getConnectionUri() })
+  await client.connect()
+  await client.query('BEGIN')
+})
+
+afterEach(async () => {
+  await client.query('ROLLBACK')
+  await client.end()
+})
+
+test('orders are scoped to a customer', async () => {
+  await client.query(
+    `INSERT INTO customers (id, email, full_name)
+     VALUES (1, 'ana@example.com', 'Ana Ruiz')`
+  )
+  await client.query(
+    `INSERT INTO orders (customer_id, total, status)
+     VALUES (1, 41.20, 'shipped')`
+  )
+  const { rows } = await client.query(
+    'SELECT count(*)::int AS n FROM orders WHERE customer_id = $1', [1]
+  )
+  expect(rows[0].n).toBe(1)
+})
+```
+
+The 120-second timeout on `beforeAll` matters on a cold CI runner that has to pull the image.
+
+## Go
+
+```go
+func TestOrders(t *testing.T) {
+    ctx := context.Background()
+
+    pg, err := postgres.Run(ctx, "postgres:17-alpine",
+        postgres.WithDatabase("appdb"),
+        postgres.WithUsername("app"),
+        postgres.WithPassword("secret"),
+        postgres.WithInitScripts(filepath.Join("..", "db", "schema.sql")),
+        testcontainers.WithWaitStrategy(
+            wait.ForLog("database system is ready to accept connections").
+                WithOccurrence(2).
+                WithStartupTimeout(60*time.Second)),
+    )
+    if err != nil {
+        t.Fatal(err)
+    }
+    defer func() { _ = pg.Terminate(ctx) }()
+
+    dsn, err := pg.ConnectionString(ctx, "sslmode=disable")
+    if err != nil {
+        t.Fatal(err)
+    }
+
+    db, err := sql.Open("pgx", dsn)
+    if err != nil {
+        t.Fatal(err)
+    }
+    defer db.Close()
+
+    // ... assertions
+}
+```
+
+`WithOccurrence(2)` is not a typo. The PostgreSQL entrypoint script starts the server once to run initialisation, shuts it down, then starts it for real — so the "ready to accept connections" line appears twice. Waiting for the first one gives you a connection that is about to be closed, which produces a flaky test that fails maybe one run in twenty.
+
+`WithInitScripts` runs SQL files at container start, which is the simplest way to load a schema when you do not have a migration tool.
+
+## Making the suite fast
+
+A container start costs roughly 1–3 seconds once the image is cached. Three techniques keep that from multiplying:
+
+**1. One container per suite, transaction per test.** Already shown above. This is the single biggest win — never restart the container between tests.
+
+**2. Reusable containers.** For local development, keep the container alive across runs:
+
+```java
+static PostgreSQLContainer<?> postgres =
+    new PostgreSQLContainer<>("postgres:17-alpine")
+        .withReuse(true);
+```
+
+Enable it in `~/.testcontainers.properties`:
+
+```properties
+testcontainers.reuse.enable=true
+```
+
+The container survives the JVM exiting, so the second run connects instantly. Do **not** enable reuse in CI — you want a clean database every build, and the reaper will not clean it up.
+
+**3. Snapshot and restore instead of re-migrating.** Testcontainers 1.20+ can snapshot the database after migrations and restore it between test classes, which is far cheaper than replaying every migration:
+
+```java
+@BeforeAll
+static void setUp() {
+    runMigrations();
+    postgres.snapshot();
+}
+
+@AfterEach
+void restore() {
+    postgres.restoreSnapshot();
+}
+```
+
+**4. Make PostgreSQL unsafe, because it is disposable.** Durability is pointless for a container you are about to delete:
+
+```java
+new PostgreSQLContainer<>("postgres:17-alpine")
+    .withCommand("postgres",
+        "-c", "fsync=off",
+        "-c", "full_page_writes=off",
+        "-c", "synchronous_commit=off",
+        "-c", "shared_buffers=256MB")
+    .withTmpFs(Map.of("/var/lib/postgresql/data", "rw,size=1g"));
+```
+
+`fsync=off` alone often halves the runtime of a write-heavy suite. Putting the data directory on a tmpfs removes disk I/O altogether. Neither is remotely safe in production, and neither matters here.
+
+## Running in CI
+
+GitHub Actions runners have Docker available, so this usually needs no configuration at all:
+
+```yaml
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with: { distribution: temurin, java-version: '21', cache: maven }
+      - run: mvn -B verify
+```
+
+Two things to watch:
+
+- **Image pulls dominate the first run.** Pin an exact tag (`postgres:17.2-alpine`, not `postgres:latest`) so the layer cache is reliable and a new upstream release cannot change behaviour mid-sprint.
+- **Docker-in-Docker setups** (some GitLab and Jenkins configurations) need `TESTCONTAINERS_HOST_OVERRIDE` or a mounted socket. If containers start but connections time out, this is almost always the cause.
+
+## Testcontainers vs a service container
+
+GitHub Actions can also start PostgreSQL as a `services:` block. When should you use which?
+
+| | Testcontainers | CI service container |
+| --- | --- | --- |
+| Works locally | Yes, identically | No — needs separate setup |
+| Configured in | Test code | CI YAML |
+| Per-test isolation | Snapshots, multiple containers | One shared instance |
+| Extra images (Redis, Kafka) | Same mechanism | More YAML |
+| Startup cost | Per run | Per job |
+
+The deciding factor is usually that Testcontainers gives you *the same setup on a laptop and in CI*, defined in one place. A service container only exists in CI, so "works on my machine" comes back.
+
+## What this does not replace
+
+Testcontainers gives you the real engine, but it is empty. It will not tell you that a query which is fast on 100 rows becomes a sequential scan on 100 million, and it will not catch a migration that locks a large table. Those need a production-sized restore — see our guide to [database CI/CD with GitHub Actions](/blog/database-ci-cd-github-actions) for that stage of the pipeline.
+
+It also pairs naturally with [pgTAP](/blog/pgtap-postgres-unit-testing): Testcontainers supplies the disposable PostgreSQL, pgTAP asserts the schema and constraints inside it.
+
+For inspecting the container while a test is paused at a breakpoint, connect to the mapped port with a normal client — `postgres.getJdbcUrl()` prints it. [Chat2DB](https://chat2db.ai/download) works well for this, connecting to PostgreSQL and 20+ other engines with AI-assisted querying, and there is a browser version at [app.chat2db.ai](https://app.chat2db.ai).
+
+## Summary
+
+Testcontainers removes the reason people test against a fake database. Start one container per suite, run migrations once, wrap each test in a transaction that rolls back, and turn off `fsync` because the data is disposable. Use `withReuse(true)` locally and never in CI, pin exact image tags, and wait for the *second* "ready to accept connections" line if you are writing the wait strategy yourself.

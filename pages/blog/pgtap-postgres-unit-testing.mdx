@@ -1,0 +1,382 @@
+---
+title: "pgTAP Tutorial: Unit Testing PostgreSQL Databases"
+description: "Test PostgreSQL with pgTAP: schema assertions, function and trigger tests, row-level security checks, fixtures with transactions, and running pg_prove in CI."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: September 3, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# pgTAP Tutorial: Unit Testing PostgreSQL Databases
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="September 3, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+Most teams test the code that talks to the database and never test the database itself. That is a strange place to draw the line, because a growing share of application logic lives in the schema — check constraints, triggers, row-level security policies, generated columns, PL/pgSQL functions. None of it is covered by an application test suite that mocks the database away.
+
+pgTAP is a testing framework that runs *inside* PostgreSQL. Tests are SQL, assertions are functions, and output is TAP (Test Anything Protocol), so any TAP consumer can read it.
+
+## Installing
+
+```bash
+# Debian/Ubuntu with PGDG
+sudo apt-get install postgresql-17-pgtap
+
+# macOS
+brew install pgtap
+```
+
+```sql
+CREATE EXTENSION IF NOT EXISTS pgtap;
+```
+
+`pg_prove`, the test runner, comes from CPAN:
+
+```bash
+cpan TAP::Parser::SourceHandler::pgTAP
+```
+
+## Your first test
+
+A pgTAP test is a transaction: declare how many assertions you plan to run, run them, finish, and roll back.
+
+**`t/schema.sql`**
+
+```sql
+BEGIN;
+SELECT plan(6);
+
+-- the table exists
+SELECT has_table('public', 'customers', 'customers table should exist');
+
+-- columns exist with the right types
+SELECT has_column('customers', 'email', 'customers.email should exist');
+SELECT col_type_is('customers', 'email', 'text', 'email should be text');
+SELECT col_not_null('customers', 'email', 'email should be NOT NULL');
+
+-- constraints
+SELECT col_is_pk('customers', 'id', 'id should be the primary key');
+SELECT has_index('customers', 'customers_email_key', 'email should be unique');
+
+SELECT * FROM finish();
+ROLLBACK;
+```
+
+Run it:
+
+```bash
+pg_prove -d appdb t/schema.sql
+```
+
+```
+t/schema.sql .. ok
+All tests successful.
+Files=1, Tests=6,  0 wallclock secs
+```
+
+The `ROLLBACK` at the end is what makes this usable: every test undoes itself, so tests can insert whatever fixtures they need and leave the database untouched.
+
+`plan(6)` declares the expected assertion count. If a test errors halfway through, the count will not match and the run fails — which is how TAP distinguishes "assertions passed" from "the file crashed after two assertions". Use `SELECT * FROM no_plan();` while drafting, then pin the number.
+
+## Testing data and queries
+
+```sql
+BEGIN;
+SELECT plan(4);
+
+-- fixtures live inside the transaction
+INSERT INTO customers (id, email, full_name)
+VALUES (1, 'ana@example.com', 'Ana Ruiz'),
+       (2, 'bo@example.com',  'Bo Chen');
+
+INSERT INTO orders (id, customer_id, total, status)
+VALUES (10, 1, 41.20, 'shipped'),
+       (11, 1, 12.50, 'pending'),
+       (12, 2, 99.00, 'shipped');
+
+-- scalar comparison
+SELECT is(
+    (SELECT count(*) FROM orders WHERE customer_id = 1),
+    2::bigint,
+    'Ana should have two orders'
+);
+
+-- compare a whole result set against expected rows
+SELECT results_eq(
+    $$ SELECT c.email, sum(o.total)::numeric(10,2)
+         FROM customers c JOIN orders o ON o.customer_id = c.id
+        WHERE o.status = 'shipped'
+        GROUP BY c.email ORDER BY c.email $$,
+    $$ VALUES ('ana@example.com', 41.20::numeric(10,2)),
+              ('bo@example.com',  99.00::numeric(10,2)) $$,
+    'shipped totals per customer'
+);
+
+-- set comparison, ignoring order
+SELECT set_eq(
+    $$ SELECT status FROM orders WHERE customer_id = 1 $$,
+    ARRAY['shipped', 'pending'],
+    'Ana has one shipped and one pending order'
+);
+
+-- a row that must not exist
+SELECT is_empty(
+    $$ SELECT 1 FROM orders WHERE total < 0 $$,
+    'no order should have a negative total'
+);
+
+SELECT * FROM finish();
+ROLLBACK;
+```
+
+`results_eq` compares rows *in order*; `set_eq` ignores order; `bag_eq` ignores order but counts duplicates. Choosing the wrong one produces tests that fail intermittently when the planner changes its mind about output order.
+
+## Testing that constraints actually reject bad data
+
+This is where pgTAP earns its place. You can assert that an invalid write *fails*, which is impossible to express in most application test frameworks:
+
+```sql
+BEGIN;
+SELECT plan(3);
+
+-- a NOT NULL violation
+SELECT throws_ok(
+    $$ INSERT INTO customers (email, full_name) VALUES (NULL, 'X') $$,
+    '23502',                                  -- not_null_violation
+    NULL,
+    'email must be NOT NULL'
+);
+
+-- a unique violation
+INSERT INTO customers (email, full_name) VALUES ('dup@example.com', 'A');
+SELECT throws_ok(
+    $$ INSERT INTO customers (email, full_name) VALUES ('dup@example.com', 'B') $$,
+    '23505',                                  -- unique_violation
+    NULL,
+    'email must be unique'
+);
+
+-- a check constraint
+SELECT throws_ok(
+    $$ INSERT INTO orders (customer_id, total, status)
+       VALUES (1, -5.00, 'pending') $$,
+    '23514',                                  -- check_violation
+    NULL,
+    'order total must be non-negative'
+);
+
+SELECT * FROM finish();
+ROLLBACK;
+```
+
+Assert on the SQLSTATE code rather than the message text — messages are localised and change between major versions, codes do not.
+
+The complement is `lives_ok`, for asserting that a valid write succeeds:
+
+```sql
+SELECT lives_ok(
+    $$ INSERT INTO orders (customer_id, total, status)
+       VALUES (1, 0.00, 'pending') $$,
+    'a zero-total order should be allowed'
+);
+```
+
+## Testing functions and triggers
+
+Suppose a trigger maintains a denormalised counter:
+
+```sql
+CREATE OR REPLACE FUNCTION bump_order_count() RETURNS trigger AS $$
+BEGIN
+    UPDATE customers
+       SET order_count = order_count + 1
+     WHERE id = NEW.customer_id;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER orders_bump_count
+AFTER INSERT ON orders
+FOR EACH ROW EXECUTE FUNCTION bump_order_count();
+```
+
+The test:
+
+```sql
+BEGIN;
+SELECT plan(5);
+
+-- the objects exist and are wired up correctly
+SELECT has_function('public', 'bump_order_count', 'trigger function exists');
+SELECT has_trigger('orders', 'orders_bump_count', 'trigger is attached');
+SELECT trigger_is('public', 'orders', 'orders_bump_count',
+                  'public', 'bump_order_count',
+                  'trigger calls bump_order_count');
+
+-- and it actually works
+INSERT INTO customers (id, email, full_name, order_count)
+VALUES (1, 'ana@example.com', 'Ana', 0);
+
+INSERT INTO orders (customer_id, total, status) VALUES (1, 10.00, 'pending');
+SELECT is(
+    (SELECT order_count FROM customers WHERE id = 1), 1,
+    'inserting one order bumps the count to 1'
+);
+
+INSERT INTO orders (customer_id, total, status) VALUES (1, 20.00, 'pending');
+SELECT is(
+    (SELECT order_count FROM customers WHERE id = 1), 2,
+    'inserting a second order bumps the count to 2'
+);
+
+SELECT * FROM finish();
+ROLLBACK;
+```
+
+Testing the wiring (`trigger_is`) *and* the behaviour matters: a trigger that exists but was created `BEFORE UPDATE` instead of `AFTER INSERT` passes a naive existence check and does nothing useful.
+
+## Testing row-level security
+
+RLS policies are security controls, and untested security controls are decorative. pgTAP can switch roles inside the test:
+
+```sql
+BEGIN;
+SELECT plan(3);
+
+INSERT INTO customers (id, email, full_name, tenant_id)
+VALUES (1, 'ana@example.com', 'Ana', 'tenant_a'),
+       (2, 'bo@example.com',  'Bo',  'tenant_b');
+
+SELECT has_table('public', 'customers', 'customers exists');
+
+-- policy is enabled
+SELECT is(
+    (SELECT relrowsecurity FROM pg_class WHERE relname = 'customers'),
+    true,
+    'RLS is enabled on customers'
+);
+
+-- a tenant sees only its own rows
+SET LOCAL ROLE app_user;
+SET LOCAL app.tenant_id = 'tenant_a';
+
+SELECT results_eq(
+    $$ SELECT email FROM customers ORDER BY email $$,
+    $$ VALUES ('ana@example.com') $$,
+    'tenant_a sees only its own customer'
+);
+
+RESET ROLE;
+SELECT * FROM finish();
+ROLLBACK;
+```
+
+`SET LOCAL` scopes the change to the transaction, so the rollback cleans it up.
+
+## Organising a suite
+
+```
+t/
+  00-schema.sql          # tables, columns, types, constraints
+  01-indexes.sql         # indexes that queries depend on
+  10-constraints.sql     # constraints reject bad data
+  20-functions.sql       # function behaviour
+  30-triggers.sql        # trigger behaviour
+  40-rls.sql             # security policies
+  90-migrations.sql      # migration invariants
+```
+
+Run everything:
+
+```bash
+pg_prove -d appdb --recurse t/
+pg_prove -d appdb -v t/30-triggers.sql   # verbose, one file
+```
+
+You can also run the suite from inside SQL, which is handy when the test database is only reachable through a connection you already have:
+
+```sql
+SELECT * FROM runtests('test'::name);
+```
+
+That requires your test functions to live in a schema and be named with a `test_` prefix — an alternative layout to the file-based one, useful when you want the tests to ship inside the database itself.
+
+## In CI
+
+```yaml
+name: db-tests
+on: [pull_request]
+
+jobs:
+  pgtap:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17
+        env: { POSTGRES_PASSWORD: ci, POSTGRES_DB: appdb }
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install pgTAP client tooling
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y postgresql-client libtap-parser-sourcehandler-pgtap-perl
+
+      - name: Apply migrations
+        env: { PGPASSWORD: ci }
+        run: |
+          for f in db/migrations/*.sql; do
+            psql -h localhost -U postgres -d appdb -v ON_ERROR_STOP=1 -f "$f"
+          done
+
+      - name: Install pgTAP into the test database
+        env: { PGPASSWORD: ci }
+        run: |
+          psql -h localhost -U postgres -d appdb \
+            -c "CREATE EXTENSION IF NOT EXISTS pgtap;"
+
+      - name: Run tests
+        env: { PGPASSWORD: ci }
+        run: pg_prove -h localhost -U postgres -d appdb --recurse t/
+```
+
+Note the ordering: migrations first, then pgTAP, then the tests. The schema tests are effectively an assertion that your migrations produced the schema you expected — which makes them a second, independent check on the migration pipeline.
+
+The pgTAP extension must exist in the test database, but you do not want it in production. Since it is only ever created in CI here, that separation happens naturally.
+
+## Useful assertions to know
+
+| Assertion | Checks |
+| --- | --- |
+| `has_table`, `has_column`, `has_view` | Object existence |
+| `col_type_is`, `col_default_is`, `col_not_null` | Column definition |
+| `col_is_pk`, `col_is_fk`, `fk_ok` | Key relationships |
+| `has_index`, `index_is_unique`, `is_indexed` | Indexes |
+| `is`, `isnt`, `matches`, `cmp_ok` | Scalar comparison |
+| `results_eq`, `set_eq`, `bag_eq`, `is_empty` | Result sets |
+| `throws_ok`, `lives_ok`, `performs_ok` | Behaviour |
+| `has_function`, `function_returns`, `is_definer` | Functions |
+| `has_trigger`, `trigger_is` | Triggers |
+| `table_privs_are`, `has_role`, `is_member_of` | Permissions |
+
+`table_privs_are` is underused and worth adding — grants drift over years, and a test that asserts the reporting role has `SELECT` and nothing else catches a lot.
+
+## Practical advice
+
+- **Always `BEGIN` … `ROLLBACK`.** Tests that commit will eventually corrupt each other.
+- **Do not depend on data that already exists.** Insert your own fixtures; a test that assumes customer 42 exists breaks the moment somebody cleans up staging.
+- **Use `set_eq` unless order is part of the contract.** Otherwise a plan change turns into a flaky test.
+- **Assert SQLSTATE, not messages.**
+- **Test the constraints you rely on, not every constraint.** Coverage for its own sake produces a suite nobody maintains.
+
+Writing these tests means reading the current schema closely — constraint names, index names, exact types. [Chat2DB](https://chat2db.ai/download) is an AI SQL client that browses schemas and runs queries across PostgreSQL and 20+ other engines, which shortens that loop considerably; it also runs in a browser at [app.chat2db.ai](https://app.chat2db.ai).
+
+## Summary
+
+pgTAP tests the part of your system that application tests skip: constraints, triggers, functions and security policies. Tests are plain SQL wrapped in a transaction that rolls back, assertions are functions with clear names, and `pg_prove` runs the suite anywhere TAP is understood. Start with schema assertions to lock in what your migrations produce, add `throws_ok` tests for the constraints that protect your data, and put it in CI right after the migrations run.

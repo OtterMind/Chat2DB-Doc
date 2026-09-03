@@ -1,0 +1,325 @@
+---
+title: "pg_partman Guide: Automate Postgres Partition Maintenance"
+description: "Use pg_partman to automate PostgreSQL partition creation, retention and archiving: setup, time and serial partitioning, and migrating an existing table."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: September 3, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# pg_partman Guide: Automate Postgres Partition Maintenance
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="September 3, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+PostgreSQL's declarative partitioning gives you the mechanism but none of the operations. You can write `CREATE TABLE events_2026_09 PARTITION OF events FOR VALUES FROM ... TO ...`, but somebody has to write next month's partition before next month arrives, and somebody has to drop the ones older than your retention window. When that somebody is a cron job someone wrote two years ago, the failure is always the same: nobody notices until inserts start failing because no partition covers today's date.
+
+`pg_partman` is the extension that owns that lifecycle — creating partitions ahead of time, dropping or detaching old ones, and keeping indexes and constraints consistent.
+
+## Installing
+
+```bash
+# Debian/Ubuntu with the PGDG repository
+sudo apt-get install postgresql-17-partman
+```
+
+pg_partman needs a background worker for its scheduled maintenance, so add it to `shared_preload_libraries` and restart:
+
+```sql
+ALTER SYSTEM SET shared_preload_libraries = 'pg_partman_bgw';
+ALTER SYSTEM SET pg_partman_bgw.interval = 3600;      -- run hourly
+ALTER SYSTEM SET pg_partman_bgw.role = 'partman_user';
+ALTER SYSTEM SET pg_partman_bgw.dbname = 'appdb';
+```
+
+```bash
+sudo systemctl restart postgresql
+```
+
+Then create the schema and extension:
+
+```sql
+CREATE SCHEMA partman;
+CREATE EXTENSION pg_partman WITH SCHEMA partman;
+
+CREATE ROLE partman_user WITH LOGIN;
+GRANT ALL ON SCHEMA partman TO partman_user;
+GRANT ALL ON ALL TABLES IN SCHEMA partman TO partman_user;
+GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA partman TO partman_user;
+GRANT CREATE ON SCHEMA public TO partman_user;
+```
+
+If you cannot restart the server, you can skip the background worker and call the maintenance function from `pg_cron` or an external scheduler instead — covered below.
+
+## Time-based partitioning
+
+Start with a partitioned parent table. Note that the partition key must be part of the primary key:
+
+```sql
+CREATE TABLE events (
+    id          bigint GENERATED ALWAYS AS IDENTITY,
+    user_id     bigint NOT NULL,
+    event_type  text NOT NULL,
+    payload     jsonb,
+    created_at  timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (id, created_at)
+) PARTITION BY RANGE (created_at);
+
+CREATE INDEX ON events (user_id, created_at DESC);
+CREATE INDEX ON events (event_type);
+```
+
+Hand it to pg_partman:
+
+```sql
+SELECT partman.create_parent(
+    p_parent_table    => 'public.events',
+    p_control         => 'created_at',
+    p_interval        => '1 month',
+    p_type            => 'range',
+    p_premake         => 4,
+    p_start_partition => '2026-09-01'
+);
+```
+
+The parameters that decide how this behaves:
+
+- **`p_control`** — the partition key column.
+- **`p_interval`** — partition width. Accepts any interval: `'1 day'`, `'1 week'`, `'1 month'`, `'1 hour'`, `'15 minutes'`.
+- **`p_premake`** — how many future partitions to keep ready. This is your safety margin: with `p_premake => 4` and monthly partitions, maintenance can fail silently for four months before inserts break. Set it generously; empty partitions cost almost nothing.
+- **`p_start_partition`** — where the first partition begins.
+
+In pg_partman 5.x, `p_type` is `'range'` or `'list'`. Older 4.x releases used `'native'` and a `p_time_encoder`; if you are following an older tutorial and getting errors, that is why.
+
+Verify what it created:
+
+```sql
+SELECT relname
+FROM pg_class c
+JOIN pg_inherits i ON i.inhrelid = c.oid
+JOIN pg_class p ON p.oid = i.inhparent
+WHERE p.relname = 'events'
+ORDER BY relname;
+```
+
+```
+ events_p2026_09
+ events_p2026_10
+ events_p2026_11
+ events_p2026_12
+ events_p2027_01
+ events_default
+```
+
+New partitions inherit the parent's indexes automatically — that is a declarative partitioning feature, not a pg_partman one, but it is why you should create the indexes on the parent before calling `create_parent`.
+
+## Retention: dropping old data
+
+Retention is configured in `partman.part_config`, and it is off by default:
+
+```sql
+UPDATE partman.part_config
+SET retention             = '12 months',
+    retention_keep_table  = false,
+    retention_keep_index  = false,
+    infinite_time_partitions = true
+WHERE parent_table = 'public.events';
+```
+
+- **`retention = '12 months'`** — anything whose range ends more than 12 months ago is eligible.
+- **`retention_keep_table = false`** — actually `DROP` the partition. Set it to `true` to `DETACH` instead, which leaves the table in place as a standalone relation you can dump and remove later. **Start with `true`.** A dropped partition is gone.
+- **`infinite_time_partitions = true`** — keep making future partitions even if no rows have arrived. Without this, a quiet table can stop getting new partitions.
+
+Dropping a monthly partition is a metadata operation that completes instantly and reclaims the whole file. That is the real argument for partitioning a large time-series table: `DELETE FROM events WHERE created_at < now() - interval '12 months'` on a 500 GB table takes hours, generates enormous WAL, and leaves bloat that `VACUUM` has to chase for days. `DROP TABLE events_p2025_08` takes milliseconds.
+
+## Archiving before dropping
+
+To keep the data somewhere cheaper, detach rather than drop, then handle the detached table yourself:
+
+```sql
+UPDATE partman.part_config
+SET retention = '12 months',
+    retention_keep_table = true
+WHERE parent_table = 'public.events';
+```
+
+Detached partitions keep the naming convention, so they are easy to find:
+
+```sql
+-- detached partitions no longer inherit from the parent
+SELECT c.relname,
+       pg_size_pretty(pg_total_relation_size(c.oid)) AS size
+FROM pg_class c
+JOIN pg_namespace n ON n.oid = c.relnamespace
+WHERE n.nspname = 'public'
+  AND c.relname LIKE 'events_p%'
+  AND NOT EXISTS (
+      SELECT 1 FROM pg_inherits i WHERE i.inhrelid = c.oid
+  )
+ORDER BY c.relname;
+```
+
+Then archive and drop from a scheduled script:
+
+```bash
+for t in $(psql -At -d appdb -f /opt/scripts/list-detached.sql); do
+  pg_dump -d appdb -t "public.$t" -Fc -f "/archive/${t}.dump"
+  aws s3 cp "/archive/${t}.dump" "s3://cold-storage/events/${t}.dump"
+  psql -d appdb -c "DROP TABLE public.$t;"
+done
+```
+
+## Running maintenance
+
+The background worker calls this for you. To run it manually or from another scheduler:
+
+```sql
+-- all configured tables
+CALL partman.run_maintenance_proc();
+
+-- one table, with analyze
+SELECT partman.run_maintenance(
+    p_parent_table => 'public.events',
+    p_analyze      => true
+);
+```
+
+With `pg_cron` instead of the background worker:
+
+```sql
+CREATE EXTENSION pg_cron;
+SELECT cron.schedule('partman-maintenance', '@hourly',
+                     $$CALL partman.run_maintenance_proc()$$);
+```
+
+**Monitor it.** A maintenance job that stops running is invisible until inserts fail. This query alerts you before that happens:
+
+```sql
+SELECT p.parent_table,
+       max(
+         substring(c.relname from '\d{4}_\d{2}$')
+       ) AS newest_partition
+FROM partman.part_config p
+JOIN pg_inherits i ON i.inhparent = p.parent_table::regclass
+JOIN pg_class c ON c.oid = i.inhrelid
+GROUP BY p.parent_table;
+```
+
+Better still, alert on rows landing in the default partition, which means no matching partition existed:
+
+```sql
+SELECT count(*) AS rows_in_default FROM events_default;
+```
+
+That count should always be zero. If it is not, `create_parent` premake fell behind, and you will need `partman.partition_data_proc` to move those rows into real partitions before you can create the partitions that cover them.
+
+## Serial and ID-based partitioning
+
+pg_partman also partitions on an integer column:
+
+```sql
+CREATE TABLE audit_log (
+    id      bigint GENERATED ALWAYS AS IDENTITY,
+    actor   text NOT NULL,
+    action  text NOT NULL,
+    PRIMARY KEY (id)
+) PARTITION BY RANGE (id);
+
+SELECT partman.create_parent(
+    p_parent_table => 'public.audit_log',
+    p_control      => 'id',
+    p_interval     => '10000000',   -- 10M ids per partition
+    p_type         => 'range',
+    p_premake      => 4
+);
+```
+
+Retention works the same way, counted in partitions rather than time:
+
+```sql
+UPDATE partman.part_config
+SET retention = '50000000',        -- keep the most recent 50M ids
+    retention_keep_table = true
+WHERE parent_table = 'public.audit_log';
+```
+
+## Migrating an existing table
+
+You cannot convert a plain table into a partitioned one in place. The pattern is to create a new partitioned parent, move the data in batches, then swap names:
+
+```sql
+-- 1. new partitioned parent, same columns
+CREATE TABLE events_new (LIKE events INCLUDING ALL)
+PARTITION BY RANGE (created_at);
+
+-- the primary key must include the partition key
+ALTER TABLE events_new DROP CONSTRAINT events_new_pkey;
+ALTER TABLE events_new ADD PRIMARY KEY (id, created_at);
+
+-- 2. register it
+SELECT partman.create_parent(
+    p_parent_table    => 'public.events_new',
+    p_control         => 'created_at',
+    p_interval        => '1 month',
+    p_type            => 'range',
+    p_start_partition => '2024-01-01'
+);
+```
+
+Copy in batches so nothing holds a long transaction:
+
+```sql
+DO $$
+DECLARE
+    lo timestamptz := '2024-01-01';
+    hi timestamptz := date_trunc('month', now()) + interval '1 month';
+    cur timestamptz;
+BEGIN
+    cur := lo;
+    WHILE cur < hi LOOP
+        INSERT INTO events_new
+        SELECT * FROM events
+        WHERE created_at >= cur AND created_at < cur + interval '1 month';
+        RAISE NOTICE 'copied %', cur;
+        COMMIT;
+        cur := cur + interval '1 month';
+    END LOOP;
+END $$;
+```
+
+Then swap, in a transaction, after a final catch-up copy:
+
+```sql
+BEGIN;
+LOCK TABLE events IN ACCESS EXCLUSIVE MODE;
+
+INSERT INTO events_new
+SELECT * FROM events
+WHERE created_at >= (SELECT max(created_at) FROM events_new);
+
+ALTER TABLE events RENAME TO events_old;
+ALTER TABLE events_new RENAME TO events;
+COMMIT;
+```
+
+Keep `events_old` for a few days before dropping it.
+
+pg_partman also offers `partman.partition_data_time` and `partition_data_proc` to move rows out of a default partition or an existing parent in controlled batches, which is gentler than the manual loop when the table is very large.
+
+## Things that go wrong
+
+**Rows in the default partition.** Means premake fell behind or data arrived outside the expected range. Attaching a partition that overlaps rows in the default requires scanning the default partition, which takes an `ACCESS EXCLUSIVE` lock — handle it before it grows.
+
+**Too many partitions.** Query planning cost grows with partition count. Daily partitions over five years is 1,825 partitions, and planning gets noticeably slower. Prefer monthly unless the data volume genuinely requires finer granularity, and make sure `enable_partition_pruning` is on (it is by default).
+
+**Unique constraints across partitions.** PostgreSQL cannot enforce a unique constraint that does not include the partition key. If you need globally unique `id`, that is a design constraint to accept, not one to work around.
+
+**Forgetting `ANALYZE`.** New partitions have no statistics. Pass `p_analyze => true` to maintenance, or the planner will make poor choices on freshly created partitions.
+
+Inspecting partition sizes, row counts and which partitions a query actually pruned is constant work on a partitioned schema. [Chat2DB](https://chat2db.ai/download) browses partitioned tables and shows execution plans for PostgreSQL and 20+ other engines with AI assistance, and works in a browser at [app.chat2db.ai](https://app.chat2db.ai). For sizing the partitions before you create them, our [Postgres Table Size Estimator](https://chat2db.ai/tools/postgres-table-size-estimator) is a quick sanity check.
+
+## Summary
+
+pg_partman turns partitioning from a recurring chore into configuration. Create the parent with the indexes you want, call `create_parent` with a generous `p_premake`, set retention with `retention_keep_table = true` until you trust it, run maintenance from the background worker or `pg_cron`, and alert on rows landing in the default partition. The payoff is that dropping a month of data becomes a metadata operation instead of a multi-hour `DELETE` that bloats the table.

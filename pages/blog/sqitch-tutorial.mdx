@@ -1,0 +1,306 @@
+---
+title: "Sqitch Tutorial: Database Migrations Without Numbers"
+description: "Learn Sqitch for PostgreSQL: deploy, revert and verify scripts, dependency-based ordering instead of version numbers, tagging, rework and a CI setup."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: September 3, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# Sqitch Tutorial: Database Migrations Without Numbers
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="September 3, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+Every numbered migration tool has the same failure mode. Two developers branch from the same commit, both add `V014__...sql`, and merging produces either a collision or a silent reordering. Teams work around it by embedding timestamps in filenames, which converts the collision into a different problem: the order migrations run in depends on when someone's laptop clock said they wrote the file, not on what actually depends on what.
+
+Sqitch takes a different position: migrations are a **dependency graph**, not a sequence. Each change declares what it requires, and Sqitch works out a valid order. There are no version numbers at all.
+
+It is also plain SQL — no XML, no YAML, no ORM, no DSL. Your deploy script is a `.sql` file you could paste into psql.
+
+## Installing
+
+```bash
+# macOS
+brew install sqitch
+
+# Debian/Ubuntu
+sudo apt-get install sqitch libdbd-pg-perl
+
+# Docker
+docker run --rm -v "$PWD:/repo" sqitch/sqitch:latest help
+```
+
+Verify and initialise a project:
+
+```bash
+sqitch --version
+cd myapp
+sqitch init myapp --engine pg --top-dir db
+```
+
+That creates:
+
+```
+db/
+  sqitch.plan     # the ordered list of changes and their dependencies
+  deploy/         # scripts that make a change
+  revert/         # scripts that undo it
+  verify/         # scripts that assert it worked
+sqitch.conf
+```
+
+Three directories, and the third is what makes Sqitch different from most tools.
+
+## Configure the target
+
+```bash
+sqitch config --user user.name "Ana Ruiz"
+sqitch config --user user.email "ana@example.com"
+
+# named targets so nobody types connection strings
+sqitch target add dev  db:pg://app@localhost:5432/appdb_dev
+sqitch target add prod db:pg://deployer@db.internal:5432/appdb
+sqitch engine add pg dev
+```
+
+## Your first change
+
+```bash
+sqitch add customers -n 'Create the customers table.'
+```
+
+This writes three stub files and appends a line to `sqitch.plan`. Fill them in.
+
+**`db/deploy/customers.sql`**
+
+```sql
+-- Deploy myapp:customers to pg
+
+BEGIN;
+
+CREATE TABLE customers (
+    id          bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    email       text NOT NULL UNIQUE,
+    full_name   text NOT NULL,
+    created_at  timestamptz NOT NULL DEFAULT now()
+);
+
+COMMIT;
+```
+
+**`db/revert/customers.sql`**
+
+```sql
+-- Revert myapp:customers from pg
+
+BEGIN;
+
+DROP TABLE customers;
+
+COMMIT;
+```
+
+**`db/verify/customers.sql`**
+
+```sql
+-- Verify myapp:customers on pg
+
+SELECT id, email, full_name, created_at
+  FROM customers
+ WHERE FALSE;
+```
+
+The verify script is the interesting one. It runs after every deploy, and Sqitch treats a SQL error as a failed verification. `WHERE FALSE` returns no rows but still forces PostgreSQL to resolve every column name — so if a column is missing or misspelled, the deploy fails immediately instead of three weeks later.
+
+Deploy it:
+
+```bash
+sqitch deploy dev
+```
+
+```
+Adding registry tables to dev
+Deploying changes to dev
+  + customers .. ok
+```
+
+Sqitch created a `sqitch` schema in your database holding the registry of what has been deployed, by whom and when.
+
+## Dependencies instead of ordering
+
+Now add a table that needs the first one. Declare the dependency with `--requires`:
+
+```bash
+sqitch add orders --requires customers -n 'Create the orders table.'
+```
+
+**`db/deploy/orders.sql`**
+
+```sql
+-- Deploy myapp:orders to pg
+-- requires: customers
+
+BEGIN;
+
+CREATE TABLE orders (
+    id           bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    customer_id  bigint NOT NULL REFERENCES customers(id),
+    status       text NOT NULL DEFAULT 'pending',
+    total        numeric(10,2) NOT NULL,
+    created_at   timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE INDEX orders_customer_id_idx ON orders (customer_id);
+
+COMMIT;
+```
+
+**`db/verify/orders.sql`**
+
+```sql
+-- Verify myapp:orders on pg
+
+SELECT id, customer_id, status, total, created_at
+  FROM orders
+ WHERE FALSE;
+
+-- assert the foreign key really exists
+SELECT 1/COUNT(*)
+  FROM pg_constraint
+ WHERE conname = 'orders_customer_id_fkey';
+```
+
+`1/COUNT(*)` is the standard Sqitch idiom for an assertion: if the count is zero it divides by zero, the script errors, and the verification fails. It reads oddly the first time and then becomes second nature.
+
+The `sqitch.plan` now looks like this:
+
+```
+%syntax-version=1.0.0
+%project=myapp
+
+customers 2026-09-03T09:12:04Z Ana Ruiz <ana@example.com> # Create the customers table.
+orders [customers] 2026-09-03T09:18:41Z Ana Ruiz <ana@example.com> # Create the orders table.
+```
+
+The `[customers]` is the dependency. If a colleague on another branch adds `products`, the merge is a two-line plan conflict with an obvious resolution — and because neither change requires the other, their relative order genuinely does not matter.
+
+## Reverting and verifying
+
+```bash
+sqitch revert dev --to @HEAD^   # undo the most recent change
+sqitch verify dev               # run every verify script in order
+sqitch status dev               # what is deployed here?
+```
+
+`sqitch verify` against production is a useful thing to have. It is a fast, read-only assertion that the database matches what the plan says it should be — cheap drift detection you can run on a schedule.
+
+## Tags and releases
+
+Tag the plan when you cut a release, then deploy or revert to that point by name:
+
+```bash
+sqitch tag v1.0 -n 'Tag v1.0 for release.'
+sqitch deploy prod --to v1.0
+sqitch revert prod --to v1.0
+```
+
+## Reworking a change
+
+This is Sqitch's best feature and the one with no real equivalent elsewhere. Suppose you have a view and you need to change it. With a numbered tool you write a new migration that drops and recreates it, and the original definition is now scattered across two files. With Sqitch you *rework* the change, and the current definition stays in one file:
+
+```bash
+sqitch add customer_summary --requires customers -n 'Summary view.'
+# ... later, after tagging v1.0 ...
+sqitch rework customer_summary -n 'Add lifetime value to the summary.'
+```
+
+Sqitch copies the old scripts to `customer_summary@v1.0.sql` and lets you edit the originals in place:
+
+```sql
+-- Deploy myapp:customer_summary to pg
+-- requires: customers
+
+BEGIN;
+
+CREATE OR REPLACE VIEW customer_summary AS
+SELECT c.id,
+       c.email,
+       COUNT(o.id)                    AS order_count,
+       COALESCE(SUM(o.total), 0)      AS lifetime_value
+  FROM customers c
+  LEFT JOIN orders o ON o.customer_id = c.id
+ GROUP BY c.id, c.email;
+
+COMMIT;
+```
+
+`git log` on that one file now shows the entire history of the view — which is how you would want to read it, and exactly what numbered migrations make impossible.
+
+Rework requires a tag between the original and the rework, because the tag is what gives the archived copy a name.
+
+## Sqitch in CI
+
+```yaml
+name: sqitch
+on:
+  pull_request:
+    paths: ['db/**']
+
+jobs:
+  deploy-revert-redeploy:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17
+        env: { POSTGRES_PASSWORD: ci, POSTGRES_DB: appdb }
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s --health-retries 10
+    container: sqitch/sqitch:latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Deploy, verify, revert, redeploy
+        env:
+          SQITCH_TARGET: db:pg://postgres:ci@postgres:5432/appdb
+        run: |
+          sqitch deploy --verify
+          sqitch verify
+          sqitch revert -y --to @ROOT
+          sqitch deploy --verify
+```
+
+The round trip is the whole point: `deploy → revert → deploy` proves that every revert script actually works. Most migration bugs are in the down script, because in a numbered tool nothing ever runs it until the night you need it.
+
+`--verify` runs each verify script as part of the deploy, so a broken change fails at the change that broke rather than at the end.
+
+## Sqitch compared to Flyway and Liquibase
+
+| | Sqitch | Flyway | Liquibase |
+| --- | --- | --- | --- |
+| Ordering | Dependency graph | Version numbers | Changelog order |
+| Format | Plain SQL | Plain SQL | XML/YAML/JSON/SQL |
+| Revert | First class, in repo | Paid `undo` | `rollback` blocks |
+| Verify step | Built in | No | Preconditions |
+| Rework in place | Yes | No | No |
+| Merge conflicts | Plan file, explicit | Filename collisions | Changelog collisions |
+| Learning curve | Steeper | Gentle | Moderate |
+
+Sqitch is the right choice when your schema has real structure — views, functions, triggers that get edited repeatedly — and when parallel branches are routine. Flyway is the right choice when you want something a new team member understands in ten minutes.
+
+## Practical notes
+
+- **Always write the verify script.** A migration tool that only tracks what it ran cannot tell you whether it worked; the verify script is what closes that gap.
+- **Keep changes small and single-purpose.** A change that creates three tables cannot be reverted partially.
+- **Do not edit a deployed change.** Rework it; that is what the mechanism exists for.
+- **Wrap in explicit transactions.** Sqitch does not add `BEGIN`/`COMMIT` for you, and PostgreSQL supports transactional DDL, so use it.
+- **`sqitch revert` on production still drops things.** Reverting a table drops it and its data. Rehearse against a restore first.
+
+While writing the deploy and verify scripts you will be inspecting the live schema constantly — checking constraint names for a `pg_constraint` assertion, confirming an index exists. [Chat2DB](https://chat2db.ai/download) is an AI SQL client for PostgreSQL, MySQL, Oracle and 20+ other databases that makes that loop quick, with schema browsing and query execution side by side; it also runs at [app.chat2db.ai](https://app.chat2db.ai).
+
+## Summary
+
+Sqitch replaces version numbers with declared dependencies, which removes the merge conflicts numbered migrations cause. It ships revert and verify scripts as first-class artifacts, so rollbacks are tested and deploys are asserted rather than assumed. And `sqitch rework` keeps the current definition of a view or function in one file with a readable git history. The cost is a steeper introduction and a plan file the team has to understand — worth it on a schema that changes constantly across parallel branches.

@@ -1,0 +1,166 @@
+---
+title: "What Is a Columnar Database? Examples and Trade-offs"
+description: "Columnar databases explained: how column storage differs from row storage, why compression and vectorization make analytics fast, and when not to use one."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: September 3, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# What Is a Columnar Database? Examples and Trade-offs
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="September 3, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+A columnar database stores the values of each column together on disk, instead of storing each row together. That single change to physical layout is the reason an analytical query over a billion rows can finish in under a second on hardware that would take minutes with a traditional row store.
+
+Everything else — the compression ratios, the vectorized execution, the "wide tables are fine" advice — follows from that layout choice.
+
+## Row storage vs column storage
+
+Consider a table of events:
+
+```sql
+CREATE TABLE events (
+    event_id    bigint,
+    user_id     bigint,
+    country     text,
+    device      text,
+    revenue     numeric(10,2),
+    created_at  timestamptz
+);
+```
+
+A **row store** — PostgreSQL, MySQL, Oracle, SQL Server — writes each row as a contiguous unit inside a page:
+
+```
+page 1: [1|4471|US|ios|12.50|2026-09-01] [2|8823|DE|web|0.00|2026-09-01] ...
+page 2: [3|1190|FR|android|41.20|2026-09-01] ...
+```
+
+A **column store** — ClickHouse, DuckDB, Snowflake, BigQuery, Redshift — writes each column as its own contiguous run:
+
+```
+event_id:   [1, 2, 3, 4, 5, ...]
+user_id:    [4471, 8823, 1190, ...]
+country:    [US, DE, FR, ...]
+device:     [ios, web, android, ...]
+revenue:    [12.50, 0.00, 41.20, ...]
+created_at: [2026-09-01, 2026-09-01, ...]
+```
+
+Now run a typical analytical query:
+
+```sql
+SELECT country, SUM(revenue) AS total
+FROM events
+WHERE created_at >= '2026-09-01'
+GROUP BY country;
+```
+
+This query touches three of the six columns. The row store has to read every page that contains matching rows, which means pulling `device`, `event_id` and `user_id` off disk too — they are physically interleaved with the columns you asked for. The column store reads exactly three column files and skips the rest. On a table with 60 columns instead of 6, that ratio is what turns a table scan from painful into routine.
+
+## Why compression works so much better
+
+Values within a single column are the same type and usually drawn from a small domain. That is ideal for compression:
+
+- **`country`** has maybe 200 distinct values across a billion rows. Dictionary encoding replaces each with a 1-byte code.
+- **`created_at`** in an append-mostly table is nearly sorted. Delta encoding stores the differences, which are tiny.
+- **`revenue`** with two decimal places compresses well with a bit-packed integer representation after scaling.
+- Long runs of a repeated value — `device = 'web'` for a thousand consecutive rows — collapse under run-length encoding to a value and a count.
+
+Ten-to-one compression is ordinary in a column store; row stores typically manage two or three to one, because a page holds mixed types that share no structure. Since analytical queries are almost always I/O-bound, compressing the data ten times smaller makes them roughly ten times faster before any other optimisation.
+
+Better still, modern engines operate on the compressed representation. Grouping by a dictionary-encoded `country` means grouping 1-byte integers, not comparing strings.
+
+## Vectorized execution
+
+Row stores traditionally process one tuple at a time through the operator tree. Column stores process a batch — typically 1,024 or 65,536 values — through each operator at once. The inner loop becomes a tight pass over a primitive array:
+
+```
+for (i = 0; i < 65536; i++)
+    sum += revenue[i];
+```
+
+That loop vectorises to SIMD instructions, keeps the CPU pipeline full and stays inside L1 cache. Per-tuple interpretation overhead — which dominates row-store scans — is amortised across the whole batch.
+
+## Column pruning and predicate pushdown
+
+Column stores keep per-block metadata: min, max, and often a null count for every chunk of a column. When a query filters on `created_at >= '2026-09-01'`, the engine reads the metadata for each block, compares against the predicate, and skips every block whose maximum is below the threshold — without decompressing anything.
+
+This is why sort order matters so much in a column store. In ClickHouse the `ORDER BY` of the table defines the physical layout:
+
+```sql
+CREATE TABLE events
+(
+    event_id   UInt64,
+    user_id    UInt64,
+    country    LowCardinality(String),
+    device     LowCardinality(String),
+    revenue    Decimal(10, 2),
+    created_at DateTime
+)
+ENGINE = MergeTree
+PARTITION BY toYYYYMM(created_at)
+ORDER BY (created_at, country);
+```
+
+With this layout, a query filtered on a date range reads a handful of blocks out of thousands. The same query on a table sorted by `event_id` would have matching rows scattered everywhere, and every block would have to be read. Choosing the sort key is the single highest-leverage decision in a columnar schema.
+
+`LowCardinality(String)` is ClickHouse's explicit dictionary encoding — worth using for any column with fewer than roughly 10,000 distinct values.
+
+## What columnar databases are bad at
+
+The layout that makes analytics fast makes transactional work slow:
+
+**Single-row lookups.** `SELECT * FROM events WHERE event_id = 8842713` has to touch every column file and decompress a block from each. A row store fetches one page.
+
+**Single-row updates.** To update one field you must rewrite the compressed block containing it. Most column stores therefore do not offer true in-place updates. ClickHouse implements `ALTER TABLE ... UPDATE` as an asynchronous *mutation* that rewrites data parts in the background — it is a bulk operation, not an OLTP one.
+
+**Row-at-a-time inserts.** Inserting a single row means writing a fragment to every column. ClickHouse explicitly documents that you should insert in batches of at least 1,000 rows; a thousand single-row inserts per second will create so many small parts that background merging cannot keep up.
+
+**Constraints and transactions.** Foreign keys, unique constraints and full multi-statement ACID transactions are usually absent or limited. Deduplication tends to be eventual rather than enforced.
+
+## Real examples
+
+| Database | Deployment | Notes |
+| --- | --- | --- |
+| **ClickHouse** | Self-hosted / cloud | Fastest open-source OLAP engine; `MergeTree` family; enormous ingest throughput |
+| **DuckDB** | Embedded | In-process, no server; reads Parquet and CSV directly; ideal for local analytics |
+| **Snowflake** | Cloud only | Micro-partitions, separated storage and compute, automatic clustering |
+| **BigQuery** | Cloud only | Capacitor format on Colossus; serverless; charged per byte scanned |
+| **Redshift** | AWS | Column store with zone maps; sort and dist keys are manual |
+| **Apache Druid** | Self-hosted | Real-time ingestion plus columnar segments; time-series oriented |
+| **Postgres + citus columnar** | Extension | Columnar tables inside PostgreSQL for append-only history |
+
+The file formats matter too: **Parquet** and **ORC** are columnar formats rather than databases, and they are the storage layer under most lakehouse setups. Their column chunks, min/max statistics and encodings mirror what an engine does internally, which is why DuckDB or ClickHouse can query a Parquet file almost as fast as their own native storage:
+
+```sql
+-- DuckDB reading Parquet directly, no load step
+SELECT country, SUM(revenue)
+FROM 's3://analytics/events/*.parquet'
+WHERE created_at >= '2026-09-01'
+GROUP BY country;
+```
+
+## Hybrid approaches
+
+The row/column split is no longer absolute:
+
+- **PostgreSQL with `citus` columnar** gives you columnar storage for cold partitions while recent partitions stay row-based — a common pattern for time-series where writes go to today's partition and analytics scan history.
+- **Oracle In-Memory** and **SQL Server columnstore indexes** maintain a column-oriented copy of the data alongside the row store, so OLTP and analytics run on the same instance.
+- **DuckDB alongside Postgres** is the modern lightweight pattern: keep the transactional truth in Postgres, export to Parquet, analyse in DuckDB.
+
+## Choosing between them
+
+Use a **row store** when queries fetch whole rows by key, when you write and update rows individually, and when you need real transactions and constraints. That is nearly every application backend.
+
+Use a **column store** when queries scan many rows and few columns, when data arrives in batches and is rarely updated, and when your tables are wide. That is nearly every reporting and analytics workload.
+
+Most organisations end up with both — PostgreSQL for the application, ClickHouse or a warehouse for analysis, with a pipeline in between. Working across both means switching clients constantly, which is why a single tool that speaks both matters: [Chat2DB](https://chat2db.ai/download) connects to PostgreSQL, MySQL, ClickHouse, Snowflake and 20+ other engines in one workspace, with AI assistance for writing the queries and reading the plans. You can also use it in the browser at [app.chat2db.ai](https://app.chat2db.ai).
+
+## Summary
+
+A columnar database stores each column contiguously. That gives you column pruning, ten-to-one compression, vectorized execution over primitive arrays, and block-level skipping via min/max metadata — the four things that make aggregate queries over huge tables fast. It costs you cheap single-row reads, in-place updates, small inserts and strong constraints. Match the layout to the access pattern and the choice is straightforward.

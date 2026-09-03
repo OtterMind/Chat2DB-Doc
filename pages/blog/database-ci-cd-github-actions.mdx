@@ -1,0 +1,268 @@
+---
+title: "Database CI/CD with GitHub Actions: A Practical Guide"
+description: "Build a database CI/CD pipeline with GitHub Actions: migration linting, a throwaway Postgres, rollback tests, drift detection and safe production deploys."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: September 3, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# Database CI/CD with GitHub Actions: A Practical Guide
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="September 3, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+Application code has had continuous delivery for a decade. Database changes, in a lot of organisations, are still a person with psql open and a Slack thread for approval. The gap is not tooling — the tooling is excellent — it is that people are reasonably afraid of automating something that can drop a table.
+
+This guide builds a database CI/CD pipeline in GitHub Actions that is safe specifically *because* it is automated: every migration runs against a throwaway database before it ever runs against production, rollbacks are tested rather than assumed, and drift is detected instead of discovered.
+
+## The pipeline
+
+Five stages, each a gate:
+
+1. **Lint** — is the migration well-formed and free of dangerous patterns?
+2. **Apply to an ephemeral database** — does it run at all, from an empty schema?
+3. **Apply to a production-shaped copy** — does it run against real data volume?
+4. **Test the rollback** — can we get back?
+5. **Deploy** — apply to production, with drift detection first.
+
+## Choosing a migration tool
+
+The pipeline assumes versioned migration files under source control. The main options:
+
+| Tool | Style | Rollback | Notes |
+| --- | --- | --- | --- |
+| **Flyway** | SQL files, versioned | Paid tier (`undo`) | Simplest model; huge install base |
+| **Liquibase** | XML/YAML/SQL changesets | Yes, built in | Verbose but database-agnostic |
+| **Sqitch** | SQL with explicit dependencies | Yes, `revert` | No version numbers; plan-based |
+| **Atlas** | Declarative + versioned | Yes | Diffs desired schema against current |
+| **Alembic / Rails / Django** | Framework-native | Yes | Fine if you are already in that stack |
+
+The pipeline below uses Flyway because its file convention is the easiest to read, but the structure applies to all of them.
+
+```
+db/
+  migrations/
+    V001__create_customers.sql
+    V002__create_orders.sql
+    V003__add_orders_status_index.sql
+  undo/
+    U003__drop_orders_status_index.sql
+```
+
+## Stage 1: lint the migration
+
+Two separate checks. First, SQL style and correctness with SQLFluff:
+
+```yaml
+name: db-ci
+on:
+  pull_request:
+    paths: ['db/migrations/**']
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.12' }
+      - run: pip install sqlfluff==3.2.5
+      - run: sqlfluff lint db/migrations --dialect postgres
+```
+
+Second, and more important: block the patterns that cause outages. These are not style issues — they are locks.
+
+```yaml
+      - name: Block unsafe migration patterns
+        run: |
+          set -e
+          FILES=$(git diff --name-only origin/${{ github.base_ref }}... -- 'db/migrations/*.sql')
+          [ -z "$FILES" ] && exit 0
+          FAIL=0
+          for f in $FILES; do
+            # CREATE INDEX without CONCURRENTLY locks writes for the whole build
+            if grep -Eiq 'CREATE +(UNIQUE +)?INDEX' "$f" && ! grep -Eiq 'CONCURRENTLY' "$f"; then
+              echo "::error file=$f::CREATE INDEX must use CONCURRENTLY"; FAIL=1
+            fi
+            # A NOT NULL column with a volatile default rewrites the table on old versions
+            if grep -Eiq 'ADD +COLUMN.*NOT +NULL' "$f" && ! grep -Eiq 'DEFAULT' "$f"; then
+              echo "::error file=$f::ADD COLUMN NOT NULL needs a DEFAULT or a backfill plan"; FAIL=1
+            fi
+            # Destructive statements need an explicit opt-in comment
+            if grep -Eiq '^\s*(DROP +(TABLE|COLUMN)|TRUNCATE)' "$f" && ! grep -q 'destructive-ok' "$f"; then
+              echo "::error file=$f::destructive statement requires a '-- destructive-ok' comment"; FAIL=1
+            fi
+          done
+          exit $FAIL
+```
+
+The `-- destructive-ok` marker is deliberate friction. It does not prevent a drop; it makes the author write the comment and the reviewer see it in the diff.
+
+## Stage 2: apply to an ephemeral database
+
+GitHub Actions service containers give you a real PostgreSQL for the duration of the job:
+
+```yaml
+  migrate-fresh:
+    runs-on: ubuntu-latest
+    needs: lint
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_PASSWORD: ci
+          POSTGRES_DB: appdb
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s --health-timeout 5s --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Apply all migrations from empty
+        run: |
+          docker run --rm --network host \
+            -v ${{ github.workspace }}/db/migrations:/flyway/sql \
+            flyway/flyway:10 \
+            -url=jdbc:postgresql://localhost:5432/appdb \
+            -user=postgres -password=ci \
+            -connectRetries=10 \
+            migrate
+
+      - name: Verify the schema matches the checked-in snapshot
+        run: |
+          PGPASSWORD=ci pg_dump -h localhost -U postgres -d appdb \
+            --schema-only --no-owner --no-privileges > /tmp/schema.sql
+          diff -u db/schema.sql /tmp/schema.sql
+```
+
+That last step is the one people skip and then regret. Committing a `schema.sql` snapshot and diffing it in CI means a migration cannot change the schema in a way nobody reviewed — the diff shows up in the pull request as a file change.
+
+## Stage 3: apply against production-shaped data
+
+A migration that takes 30 ms on an empty table can take 40 minutes on 200 million rows and hold an `ACCESS EXCLUSIVE` lock the whole time. Restore an anonymised dump and time it:
+
+```yaml
+  migrate-against-restore:
+    runs-on: ubuntu-latest
+    needs: lint
+    services:
+      postgres:
+        image: postgres:17
+        env: { POSTGRES_PASSWORD: ci, POSTGRES_DB: appdb }
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Restore anonymised snapshot
+        env:
+          PGPASSWORD: ci
+        run: |
+          aws s3 cp s3://db-snapshots/anon-latest.dump /tmp/anon.dump
+          pg_restore -h localhost -U postgres -d appdb --no-owner -j 4 /tmp/anon.dump
+
+      - name: Time the migration and fail if it locks too long
+        env:
+          PGPASSWORD: ci
+        run: |
+          START=$(date +%s)
+          psql -h localhost -U postgres -d appdb \
+            -v ON_ERROR_STOP=1 \
+            -c "SET lock_timeout = '5s'; SET statement_timeout = '10min';" \
+            -f db/migrations/$(ls db/migrations | tail -1)
+          echo "took $(( $(date +%s) - START ))s"
+```
+
+`SET lock_timeout = '5s'` is the critical line. If the migration cannot acquire its lock within five seconds it fails in CI rather than queueing behind a long-running query in production and blocking every other session behind it.
+
+## Stage 4: test the rollback
+
+An untested rollback is a hope. Apply forward, revert, apply forward again:
+
+```yaml
+      - name: Round-trip the migration
+        run: |
+          flyway migrate                       # to head
+          flyway undo                          # back one version
+          flyway migrate                       # forward again
+          PGPASSWORD=ci pg_dump -h localhost -U postgres -d appdb \
+            --schema-only --no-owner > /tmp/after.sql
+          diff -u db/schema.sql /tmp/after.sql
+```
+
+If the schema after `migrate → undo → migrate` does not match the snapshot, the down migration is wrong. This catches the extremely common case where the up migration adds a column and an index but the down migration only drops the column.
+
+## Stage 5: deploy, with drift detection first
+
+Never migrate a production database whose current state you have not verified. Compare it against what the migration history claims before applying anything:
+
+```yaml
+  deploy:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    needs: [migrate-fresh, migrate-against-restore]
+    environment: production        # requires a manual approval
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Detect drift
+        env:
+          PGPASSWORD: ${{ secrets.PROD_DB_PASSWORD }}
+        run: |
+          pg_dump -h ${{ secrets.PROD_DB_HOST }} -U deployer -d appdb \
+            --schema-only --no-owner --no-privileges > /tmp/prod-schema.sql
+          if ! diff -u db/schema.sql /tmp/prod-schema.sql; then
+            echo "::error::production schema has drifted from source control"
+            exit 1
+          fi
+
+      - name: Show the plan
+        run: flyway info
+
+      - name: Migrate
+        run: flyway -outOfOrder=false migrate
+```
+
+Two things make this safe. `environment: production` triggers GitHub's manual approval gate, so a human still says yes — they just say yes to a plan that has already been tested three times. And the drift check fails the deploy if someone made a manual change, which is precisely the situation where an automated migration would do something unexpected.
+
+## Expand and contract
+
+The pipeline above is only safe if the migrations themselves are backward compatible, because during a deploy the old and new application versions run simultaneously. The rule: **never change a column in one step.**
+
+Renaming `email` to `email_address`, done properly:
+
+```sql
+-- V010: expand — add the new column, keep the old one
+ALTER TABLE customers ADD COLUMN email_address text;
+
+-- V011: backfill in batches so nothing locks for long
+UPDATE customers SET email_address = email
+WHERE email_address IS NULL AND id BETWEEN 1 AND 100000;
+
+-- V012: enforce, once the application writes both
+ALTER TABLE customers
+  ADD CONSTRAINT customers_email_address_not_null
+  CHECK (email_address IS NOT NULL) NOT VALID;
+ALTER TABLE customers VALIDATE CONSTRAINT customers_email_address_not_null;
+
+-- V013: contract — only after every deployed version has stopped reading `email`
+-- destructive-ok
+ALTER TABLE customers DROP COLUMN email;
+```
+
+`NOT VALID` followed by `VALIDATE CONSTRAINT` is the trick worth remembering: adding the constraint takes a brief lock and does not scan the table, and the validation pass takes only a `SHARE UPDATE EXCLUSIVE` lock, which does not block reads or writes.
+
+The contract step usually lands weeks after the expand step. That is not a failure of the process — that is the process.
+
+## Verifying by hand before you commit
+
+Everything above assumes the migration is already written. Getting there still means exploring the current schema, checking what indexes exist and running `EXPLAIN` on the queries the change affects. [Chat2DB](https://chat2db.ai/download) is an AI SQL client that connects to PostgreSQL, MySQL, Oracle and 20+ other engines, generates DDL from a description and shows execution plans next to the query — useful for the drafting stage that precedes the pipeline. It also runs in a browser at [app.chat2db.ai](https://app.chat2db.ai).
+
+## Summary
+
+Database CI/CD is not risky automation — it is the replacement for risky manual work. Lint for the specific patterns that lock tables, run every migration against an empty database and against a production-sized restore with a `lock_timeout`, round-trip the rollback, check for drift before deploying, and require a human approval on a plan that has already been proven three times. Combine that with expand-and-contract migrations and schema changes stop being an event.

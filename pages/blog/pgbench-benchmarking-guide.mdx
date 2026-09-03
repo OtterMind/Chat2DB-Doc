@@ -1,0 +1,276 @@
+---
+title: "pgbench Tutorial: Benchmark PostgreSQL Properly"
+description: "How to use pgbench for PostgreSQL benchmarking: scale factors, client and thread counts, custom scripts, latency percentiles and the mistakes to avoid."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: September 3, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# pgbench Tutorial: Benchmark PostgreSQL Properly
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="September 3, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+`pgbench` ships with PostgreSQL and will happily print a transactions-per-second number thirty seconds after you install it. That number is almost always wrong — not because the tool is bad, but because the default run measures a dataset that fits entirely in cache, over a duration too short to include a checkpoint, using a workload that resembles nothing you run in production.
+
+Used carefully, pgbench is genuinely useful: for comparing configuration changes, sizing hardware, and testing your own queries under concurrency. Here is how to get numbers that mean something.
+
+## Initialising
+
+pgbench's built-in workload is a TPC-B-like banking test with four tables. Initialise with `-i` and a scale factor `-s`:
+
+```bash
+createdb bench
+pgbench -i -s 100 bench
+```
+
+The scale factor sets the data volume. `-s 1` creates 100,000 rows in `pgbench_accounts`; `-s 100` creates 10 million, roughly 1.5 GB.
+
+```
+scale  pgbench_accounts rows   approximate size
+1      100,000                 15 MB
+100    10,000,000              1.5 GB
+1000   100,000,000             15 GB
+```
+
+**The single most important rule in this article: the scale factor must make the dataset larger than `shared_buffers`, and ideally larger than RAM, unless you are deliberately benchmarking a fully cached workload.** Benchmarking `-s 10` on a machine with 64 GB of RAM measures how fast PostgreSQL reads its own memory. That is a real number and it is useless for capacity planning.
+
+Check what you are actually testing:
+
+```sql
+SELECT pg_size_pretty(pg_database_size('bench'));
+SHOW shared_buffers;
+```
+
+Speed up initialisation on a large scale factor by deferring index creation and disabling logging during the load:
+
+```bash
+pgbench -i -s 1000 --unlogged-tables --index-tablespace=pg_default bench
+```
+
+## A first real run
+
+```bash
+pgbench -c 16 -j 4 -T 600 -P 10 -M prepared bench
+```
+
+The flags that matter:
+
+| Flag | Meaning |
+| --- | --- |
+| `-c 16` | 16 concurrent client connections |
+| `-j 4` | 4 worker threads on the pgbench side |
+| `-T 600` | run for 600 seconds (use this, not `-t`) |
+| `-P 10` | print progress every 10 seconds |
+| `-M prepared` | use prepared statements |
+| `-r` | report per-statement latency |
+| `-S` | read-only variant (`SELECT` only) |
+| `-N` | skip updates to `pgbench_tellers`/`branches` |
+
+Use `-T` (duration) rather than `-t` (transaction count) so every run covers the same wall-clock time regardless of throughput.
+
+`-j` controls pgbench's own threads. If pgbench saturates a single CPU core it becomes the bottleneck and you are benchmarking the benchmark. A reasonable rule is `-j` equal to the number of cores on the client machine, capped at `-c`.
+
+`-M prepared` avoids re-parsing and re-planning every statement. Use it when comparing server configurations, since it removes client-side noise; leave it off if your application really does send raw SQL each time.
+
+## Reading the output
+
+```
+transaction type: <builtin: TPC-B (sort of)>
+scaling factor: 100
+query mode: prepared
+number of clients: 16
+number of threads: 4
+duration: 600 s
+number of transactions actually processed: 1893441
+latency average = 5.069 ms
+latency stddev = 3.412 ms
+initial connection time = 42.118 ms
+tps = 3155.735028 (without initial connection time)
+```
+
+Average latency is the least useful line. What matters is the tail — the slow requests are what users notice. Get percentiles by logging every transaction:
+
+```bash
+pgbench -c 16 -j 4 -T 600 -M prepared --log --log-prefix=/tmp/bench bench
+
+# p50, p95, p99 from the latency column (field 3, microseconds)
+sort -n -k3 -t' ' /tmp/bench.* | awk '{print $3}' > /tmp/lat.txt
+wc -l < /tmp/lat.txt
+awk 'NR==int(0.50*n)||NR==int(0.95*n)||NR==int(0.99*n) {print NR": "$1/1000" ms"}' \
+    n=$(wc -l < /tmp/lat.txt) /tmp/lat.txt
+```
+
+Or let pgbench aggregate for you:
+
+```bash
+pgbench -c 16 -T 600 --log --aggregate-interval=10 bench
+```
+
+## Latency under a fixed rate
+
+Throughput benchmarks answer "how many can it do". That is the wrong question for a system that must respond quickly. The right question is "at 2,000 TPS, what is the p99 latency" — and for that you need `--rate`:
+
+```bash
+pgbench -c 32 -j 8 -T 600 -M prepared --rate=2000 --latency-limit=200 -P 10 bench
+```
+
+`--rate` sends transactions at a fixed rate rather than as fast as possible, which means the reported latency includes **queueing delay** — the time a transaction waited before pgbench even sent it. This is the number that corresponds to what a user experiences, and it is dramatically different from the unthrottled figure once the server approaches saturation.
+
+`--latency-limit=200` counts transactions that took longer than 200 ms as skipped and reports them separately, which gives you a direct read on how often you miss an SLO.
+
+## Custom scripts: benchmarking your own queries
+
+The built-in workload does not resemble your application. Write your own script with `-f`:
+
+**`/tmp/orders.sql`**
+
+```sql
+\set customer_id random(1, 100000)
+\set days_back random(1, 90)
+
+BEGIN;
+
+SELECT o.id, o.total, o.status
+  FROM orders o
+ WHERE o.customer_id = :customer_id
+   AND o.created_at >= now() - make_interval(days => :days_back)
+ ORDER BY o.created_at DESC
+ LIMIT 20;
+
+INSERT INTO order_events (order_id, event_type, created_at)
+SELECT id, 'viewed', now()
+  FROM orders
+ WHERE customer_id = :customer_id
+ LIMIT 1;
+
+END;
+```
+
+Run it:
+
+```bash
+pgbench -c 16 -j 4 -T 300 -M prepared -f /tmp/orders.sql -r bench
+```
+
+`-r` gives per-statement latency, which tells you which statement in the script is the expensive one:
+
+```
+statement latencies in milliseconds:
+    0.001  \set customer_id random(1, 100000)
+    0.001  \set days_back random(1, 90)
+    0.089  BEGIN;
+    4.312  SELECT o.id, o.total, o.status ...
+    0.771  INSERT INTO order_events ...
+    0.412  END;
+```
+
+Mix several scripts with weights, using `@` to express the ratio:
+
+```bash
+pgbench -c 32 -j 8 -T 600 \
+  -f /tmp/read_orders.sql@8 \
+  -f /tmp/write_order.sql@2 \
+  bench
+```
+
+That runs the read script 80% of the time and the write script 20%.
+
+Useful `\set` functions inside scripts:
+
+```sql
+\set id random(1, 100000)                  -- uniform
+\set id random_exponential(1, 100000, 6.0) -- skewed toward low values
+\set id random_gaussian(1, 100000, 4.0)    -- normal around the midpoint
+\set delta random(-5000, 5000)
+```
+
+`random_exponential` is worth knowing. Real workloads are skewed — a small set of rows gets most of the traffic — and a uniform distribution over ten million rows produces a cache hit rate no production system ever sees. Uniform random access is usually the reason a benchmark looks worse than production.
+
+## The mistakes that ruin benchmarks
+
+**Running for 60 seconds.** PostgreSQL checkpoints periodically; by default `checkpoint_timeout` is 5 minutes. A one-minute run may contain no checkpoint at all and reports a throughput you cannot sustain. Run at least 10 minutes, and confirm you captured checkpoint activity:
+
+```sql
+SELECT num_timed, num_requested, write_time, sync_time
+FROM pg_stat_checkpointer;   -- pg_stat_bgwriter on PostgreSQL 16 and older
+```
+
+**Not resetting between runs.** Statistics accumulate. Reset before each run so the numbers describe that run:
+
+```sql
+SELECT pg_stat_reset();
+SELECT pg_stat_statements_reset();
+```
+
+**Ignoring the cache warm-up.** The first minutes of a run populate `shared_buffers`. Either discard them or warm up explicitly:
+
+```sql
+CREATE EXTENSION IF NOT EXISTS pg_prewarm;
+SELECT pg_prewarm('pgbench_accounts');
+```
+
+**Running pgbench on the database server.** It competes for the same CPU. Run it on a separate machine on the same network — and then be aware you are also measuring the network.
+
+**Changing two things at once.** Change one setting, re-run, record. A benchmark that varies `shared_buffers` and `max_wal_size` together tells you nothing about either.
+
+**Comparing against a different dataset.** Re-initialise between configuration comparisons, or the second run benefits from a warmed cache and pages the first run dirtied.
+
+## A repeatable comparison harness
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+SCALE=${SCALE:-500}
+DURATION=${DURATION:-600}
+
+for setting in "shared_buffers=4GB" "shared_buffers=16GB"; do
+  psql -d bench -c "ALTER SYSTEM SET ${setting};"
+  psql -d bench -c "SELECT pg_reload_conf();"
+  sudo systemctl restart postgresql   # shared_buffers needs a restart
+  sleep 10
+
+  pgbench -i -s "$SCALE" -q bench
+  psql -d bench -c "SELECT pg_stat_reset();"
+
+  echo "=== ${setting} ==="
+  pgbench -c 32 -j 8 -T "$DURATION" -M prepared -P 60 \
+          --rate=3000 --latency-limit=200 bench \
+    | tee "results-${setting//[^a-zA-Z0-9]/_}.txt"
+done
+```
+
+Run each configuration three times and take the median. A single run of anything is an anecdote.
+
+## What to watch while it runs
+
+```sql
+-- concurrency and what sessions are waiting on
+SELECT state, wait_event_type, wait_event, count(*)
+FROM pg_stat_activity
+WHERE backend_type = 'client backend'
+GROUP BY 1, 2, 3
+ORDER BY 4 DESC;
+
+-- cache hit ratio for the database under test
+SELECT sum(blks_hit) * 100.0 / nullif(sum(blks_hit + blks_read), 0) AS hit_pct
+FROM pg_stat_database WHERE datname = 'bench';
+
+-- the statements actually consuming time
+SELECT calls, round(mean_exec_time::numeric, 2) AS mean_ms,
+       round(total_exec_time::numeric) AS total_ms, query
+FROM pg_stat_statements
+ORDER BY total_exec_time DESC
+LIMIT 10;
+```
+
+The `wait_event` breakdown is where the diagnosis lives. `LWLock` contention, `IO:DataFileRead` and `Lock:transactionid` point at completely different problems, and the TPS number alone will never tell you which one you have.
+
+Keeping those monitoring queries next to the benchmark output is easier in a client that can hold several result tabs at once — [Chat2DB](https://chat2db.ai/download) connects to PostgreSQL and 20+ other engines with AI assistance for interpreting plans and stats, and also runs in a browser at [app.chat2db.ai](https://app.chat2db.ai).
+
+## Summary
+
+pgbench produces meaningful numbers when the dataset exceeds `shared_buffers`, the run lasts long enough to include checkpoints, the access distribution is skewed rather than uniform, and you measure p99 latency at a fixed rate instead of maximum throughput. Write custom scripts with `-f` so you benchmark your queries rather than TPC-B, change one variable per run, take the median of three, and watch `pg_stat_activity` while it runs — the wait events explain the number that the TPS figure only reports.
