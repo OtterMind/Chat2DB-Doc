@@ -1,0 +1,227 @@
+---
+title: "HikariCP Pool Size: How to Set maximumPoolSize Correctly"
+description: "How to choose HikariCP maximumPoolSize: the core-count formula, Little's Law, per-pod division, maxLifetime and friends, and how to spot a mis-sized pool."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: September 4, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# HikariCP Pool Size: How to Set maximumPoolSize Correctly
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="September 4, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+HikariCP defaults `maximumPoolSize` to 10. The first time a service logs `Connection is not available, request timed out after 30000ms`, someone raises it to 50 or 100, the error goes away for a week, and then the database starts running hot while throughput drops. The instinct — more connections, more capacity — is wrong for the same reason adding lanes to a road does not help when the bottleneck is the toll booth. This article works through how to size the pool from the database's capacity rather than the application's appetite, what the surrounding settings should be, and how to read the symptoms on both sides when the number is off.
+
+## Why a bigger pool is usually slower
+
+A database server with 8 cores can execute 8 queries at the same instant. A ninth active connection does not add capacity; it adds a context switch. With 100 active connections on 8 cores, the CPU spends a growing share of its time switching between backends, every backend holds its locks and buffer pins longer because it is descheduled mid-query, and lock contention rises on top of the CPU contention. Throughput falls and latency rises for every query, not just the extra ones.
+
+The HikariCP wiki's "About Pool Sizing" page makes this point with an Oracle benchmark in which cutting the pool from 2048 to 96 connections dropped response times from around 100 ms to around 2 ms with no other change. The mechanism generalises to PostgreSQL, where each connection is also a separate process with its own memory (and where every sort or hash node in a plan can allocate up to `work_mem`), so 100 idle-ish connections are not free even when they are not running anything.
+
+The only reason to have more connections than cores is I/O. When a backend blocks waiting for a disk read, its core is free, and another connection can use it. That is where the formula comes from.
+
+## The formula
+
+```
+connections = (core_count * 2) + effective_spindle_count
+```
+
+`core_count` is the **database server's** physical cores, not the application's. `effective_spindle_count` is the number of disks that can be servicing a read at the same time — on rotating disks, one seek per spindle. A single HDD gives 1; a RAID-10 of 8 disks gives roughly 8.
+
+On SSD and NVMe the term stops meaning anything literal: one NVMe device serves dozens of concurrent reads. Treat it as "how many of my queries are waiting on I/O at once". If the working set fits in `shared_buffers` and the OS cache, that is close to 0 and the pool should be about `core_count * 2`. If the working set is much larger than RAM and queries are I/O-bound, allow a few more and measure. For a common 8-core, NVMe-backed PostgreSQL with a mostly cached working set:
+
+```
+(8 * 2) + 1 = 17   ->  round to 16 or 20 and benchmark both
+```
+
+That is the optimum for the *whole database*, shared among everything that connects to it. Two numbers that will look surprisingly small are correct: a 4-core database is well served by 8 to 10 connections total, and a 16-core one by 32 to 40.
+
+## Little's Law: sizing from throughput and latency
+
+The formula gives the database's capacity. Little's Law tells you what the application will *ask for*, and the two need to be compared.
+
+```
+connections_in_use = throughput * mean_time_holding_a_connection
+```
+
+Take a service doing 500 queries per second where each query holds a connection for 20 ms on average (query time plus the time the code holds it open around the call):
+
+```
+500 /s * 0.020 s = 10 connections in use on average
+```
+
+Size for the peak, not the average. If peak traffic is 1,500 queries per second at the same latency:
+
+```
+1500 /s * 0.020 s = 30 connections
+```
+
+Now compare with the formula. If the database optimum is 17 and Little's Law says 30, the database cannot serve peak demand with 30 concurrent queries anyway — it would serve them slower, which raises the 20 ms, which raises the connection count, which is the spiral that produces the "bigger pool, worse latency" outcome. The right response is to keep the pool near 17 (queue in the pool, where waiting is cheap) and reduce the 20 ms: add an index, shorten the transaction, stop holding the connection while calling another service. Measure the latency input for Little's Law under healthy load; measured under overload it already includes queueing and overstates what you need.
+
+## Per-database optimum vs per-instance pool
+
+`maximumPoolSize` is per JVM, and the formula is per database. With 12 pods of the same service, `maximumPoolSize: 10` means up to 120 connections to a database whose optimum is 17:
+
+```
+per_pod_max = database_optimum / number_of_instances
+            = 17 / 12  ~ 1 to 2 connections each
+```
+
+That is unworkable for a pod that also needs a couple of connections for health checks and background jobs, which is precisely the situation that calls for a server-side pooler, covered below. Until then, be honest about the total: count every service, every pod, migration jobs, reporting tools and the monitoring agent, and keep the sum inside the database optimum and well inside `max_connections`. The [PostgreSQL max_connections guide](/blog/postgres-max-connections-guide) explains why raising that limit does not raise capacity.
+
+Chat2DB has a [connection pool size calculator](https://chat2db.ai/tools/connection-pool-size-calculator) that applies these formulas and does the per-instance division for you.
+
+## The other settings
+
+| Setting | Default | Recommendation |
+| --- | --- | --- |
+| `minimumIdle` | same as `maximumPoolSize` | Leave it equal: a fixed-size pool. A pool that grows under load pays connection setup cost exactly when it is busiest. |
+| `connectionTimeout` | 30000 ms | Lower it (3000 to 5000 ms). A request that waited 30 s for a connection is already failed from the user's point of view. |
+| `idleTimeout` | 600000 ms | Only applies when `minimumIdle` is smaller than `maximumPoolSize`. Irrelevant for a fixed pool. |
+| `maxLifetime` | 1800000 ms (30 min) | Must be shorter than every timeout between the app and the database: PgBouncer `server_lifetime` (default 3600 s), cloud load balancer idle timeouts, PostgreSQL `idle_session_timeout` if set. Hikari retires connections a little early with random variance, so mass reconnects do not line up. |
+| `keepaliveTime` | 0 (disabled) | Set 30000 to 60000 ms when an LB, NAT or firewall sits in the path; it pings idle connections so they are not dropped silently. Must be less than `maxLifetime`. |
+| `leakDetectionThreshold` | 0 (disabled) | 60000 ms in development and staging. Logs the stack trace of any borrower that has held a connection longer than that. |
+| `validationTimeout` | 5000 ms | Fine as is. `connectionTestQuery` is unnecessary with a JDBC4 driver; Hikari uses `isValid()`. |
+
+The `maxLifetime` rule is the one that produces mysterious `Connection reset` or `An I/O error occurred while sending to the backend` errors when violated: an intermediary closes the idle TCP connection after, say, 350 seconds, Hikari still considers the connection healthy for 30 minutes, and the next borrower finds it dead. Set `maxLifetime` below the shortest such timeout, or enable `keepaliveTime` so the connection never looks idle.
+
+### Spring Boot `application.yml`
+
+```yaml
+spring:
+  datasource:
+    url: jdbc:postgresql://db.internal:5432/orders?ApplicationName=orders-api
+    username: app
+    password: ${DB_PASSWORD}
+    hikari:
+      pool-name: orders-api
+      maximum-pool-size: 16
+      minimum-idle: 16
+      connection-timeout: 5000
+      max-lifetime: 300000
+      keepalive-time: 60000
+      leak-detection-threshold: 60000
+      validation-timeout: 3000
+```
+
+`ApplicationName` in the JDBC URL is not decorative: it is what shows up in `pg_stat_activity.application_name`, and the diagnostics below depend on it.
+
+### Plain Java `HikariConfig`
+
+```java
+HikariConfig config = new HikariConfig();
+config.setJdbcUrl("jdbc:postgresql://db.internal:5432/orders?ApplicationName=orders-api");
+config.setUsername("app");
+config.setPassword(System.getenv("DB_PASSWORD"));
+config.setPoolName("orders-api");
+config.setMaximumPoolSize(16);
+config.setMinimumIdle(16);
+config.setConnectionTimeout(5_000);
+config.setMaxLifetime(300_000);
+config.setKeepaliveTime(60_000);
+config.setLeakDetectionThreshold(60_000);
+config.setMetricRegistry(meterRegistry);   // Micrometer; exposes hikaricp.* metrics
+
+HikariDataSource ds = new HikariDataSource(config);
+```
+
+## How to tell the pool is too small
+
+The application-side symptom is threads blocked in `HikariPool.getConnection`, and eventually this:
+
+```
+java.sql.SQLTransientConnectionException: orders-api - Connection is not available, request timed out after 5000ms (total=16, active=16, idle=0, waiting=41)
+```
+
+The numbers in parentheses matter more than the message. `active=16` of `total=16` with `waiting=41` says every connection is busy and 41 threads are queued. With Micrometer, the same signal is `hikaricp.connections.pending` (threads waiting), `hikaricp.connections.active` and the `hikaricp.connections.acquire` timer.
+
+A non-zero `pending` gauge is not by itself a reason to raise the pool. First look at the database: if its CPU is at 100%, more connections will make it slower, and the fix is on the query side. If the database is mostly idle while `active` is pinned at the maximum, the connections are being held without doing database work — a transaction left open while the code calls an HTTP API, a result set not closed, or a genuine leak. `leakDetectionThreshold` finds the last one:
+
+```
+WARN  com.zaxxer.hikari.pool.ProxyLeakTask - Connection leak detection triggered for org.postgresql.jdbc.PgConnection@6d1b0b3a on thread http-nio-8080-exec-7, stack trace follows
+java.lang.Exception: Apparent connection leak detected
+	at com.zaxxer.hikari.HikariDataSource.getConnection(HikariDataSource.java:128)
+	at com.example.orders.ReportService.export(ReportService.java:54)
+```
+
+Only when the database has headroom and the connections are genuinely doing work is raising `maximumPoolSize` the right move — and then in steps, re-measuring p99 latency each time.
+
+## How to tell the pool is too large
+
+On the PostgreSQL side, the hard failure is SQLSTATE `53300`:
+
+```
+org.postgresql.util.PSQLException: FATAL: sorry, too many clients already
+```
+
+That means the sum of all pools plus admin sessions hit `max_connections`. The soft failure is more common and harder to spot: the database host at high CPU with a load average well above its core count, p99 query latency climbing, and total throughput flat or falling as the pool was raised. Check who is connected and what they are doing:
+
+```sql
+SELECT application_name, state, count(*)
+FROM pg_stat_activity
+WHERE backend_type = 'client backend'
+GROUP BY 1, 2
+ORDER BY 3 DESC;
+```
+
+```
+ application_name |        state        | count
+------------------+---------------------+-------
+ orders-api       | idle                |   152
+ orders-api       | active              |    14
+ orders-api       | idle in transaction |     9
+ reporting        | active              |     6
+```
+
+152 idle connections from one service is 12 pods each holding a fixed pool of 16 that they mostly do not use; 9 `idle in transaction` is the held-open-transaction problem from the previous section. Fourteen active on an 8-core box is near the sweet spot, which means the other 166 are contributing nothing but memory and `max_connections` headroom.
+
+Do the arithmetic before the database does it for you:
+
+```
+pods * maximumPoolSize + other services + admin/migration sessions + superuser_reserved_connections
+  = 12 * 16 + 6 + 10 + 3
+  = 211                                   ->  needs max_connections >= 220 with margin
+```
+
+Scale to 20 pods with the same pool and you are at 339, which is why autoscaling events so often coincide with `too many clients already`.
+
+## When to add PgBouncer
+
+Once `pods * sensible_per_pod_size` exceeds the database optimum by more than a small factor — and the table above shows a total of 175 connections for 14 active queries — a server-side pooler is the fix. PgBouncer in `transaction` pooling mode holds a small number of real server connections (sized by the formula) and hands one to each client connection only for the duration of a transaction. The application keeps its own Hikari pool sized to its threads; PgBouncer keeps the database at its optimum. The [PgBouncer configuration guide](/blog/pgbouncer-configuration-guide) covers the server side; the [PgBouncer vs Pgpool comparison](/blog/pgbouncer-vs-pgpool-connection-pooling) covers when the alternative makes sense.
+
+```ini
+[databases]
+orders = host=127.0.0.1 port=5432 dbname=orders
+
+[pgbouncer]
+listen_port = 6432
+pool_mode = transaction
+default_pool_size = 16
+max_client_conn = 1000
+server_lifetime = 3600
+server_idle_timeout = 600
+```
+
+Hikari settings change in two ways with a transaction-mode pooler. First, `maxLifetime` must stay below `server_lifetime`, and `connectionTimeout` can be lower still because a PgBouncer client connection is cheap. Second, and easy to miss, server-side prepared statements break: the JDBC driver prepares a statement on one server connection after `prepareThreshold` executions (default 5), and the next transaction may be routed to a different server connection where that statement does not exist:
+
+```
+org.postgresql.util.PSQLException: ERROR: prepared statement "S_1" does not exist
+```
+
+Disable server-side preparation in the JDBC URL:
+
+```
+jdbc:postgresql://pgbouncer.internal:6432/orders?ApplicationName=orders-api&prepareThreshold=0
+```
+
+Recent PgBouncer releases can track protocol-level prepared statements across server connections (`max_prepared_statements`), which makes this unnecessary on those versions, but `prepareThreshold=0` is the setting that works everywhere. Transaction mode also rules out session state — `SET` without `LOCAL`, `LISTEN`, session-level advisory locks, temporary tables across transactions — so audit the code for those before switching.
+
+To watch the effect from the database side while you tune, keep the `pg_stat_activity` query above open next to `SHOW POOLS` on PgBouncer's admin console; [Chat2DB](https://app.chat2db.ai) can hold both connections in separate tabs, and its browser version needs no install on a bastion host. For the broader background on why pooling exists at all, see [database connection pooling explained](/blog/database-connection-pooling).
+
+## Summary
+
+Size `maximumPoolSize` from the database, not the application: start at `(cores * 2) + effective spindles` for the database as a whole, treat effective spindles as near zero on SSD with a cached working set, and divide that total across every instance that connects. Use Little's Law (throughput times connection hold time) to see what the application would ask for at peak, and when it exceeds the database optimum, fix the hold time rather than the pool. Keep `minimumIdle` equal to the maximum, `connectionTimeout` short, `maxLifetime` below every intermediary's timeout, and `leakDetectionThreshold` on outside production. Read `pending` and `active` on the Hikari side and `pg_stat_activity` on the PostgreSQL side before changing the number, and when the pod count makes the per-pod share impractically small, put PgBouncer in transaction mode in front of the database with `prepareThreshold=0` in the JDBC URL.

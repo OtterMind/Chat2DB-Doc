@@ -1,0 +1,332 @@
+---
+title: "Fix duplicate key value violates unique constraint (23505)"
+description: "The six real causes of duplicate key value violates unique constraint in PostgreSQL, with reproduction SQL and a fix for each: sequences, races and upserts."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: September 4, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# Fix duplicate key value violates unique constraint (23505)
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="September 4, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+The full error looks like this:
+
+```
+ERROR:  duplicate key value violates unique constraint "users_email_key"
+DETAIL:  Key (email)=(a@b.com) already exists.
+```
+
+Its SQLSTATE is `23505`, condition name `unique_violation`. PostgreSQL raises it whenever an `INSERT` or `UPDATE` would produce a second row with the same value under a unique constraint, a primary key, or a unique index. The message tells you the constraint name; the `DETAIL` line tells you the column and the exact value that collided. Read both before doing anything else, because the constraint name is what distinguishes the six quite different situations that produce this identical error.
+
+## Reading the error
+
+`users_email_key` follows PostgreSQL's default naming: `table_column_key` for a `UNIQUE` constraint, `table_pkey` for a primary key, `table_column_idx` for an index created without an explicit name. If the name does not match what you expected, or you do not recognise it at all, look it up:
+
+```sql
+SELECT conname, contype, pg_get_constraintdef(oid)
+FROM pg_constraint
+WHERE conrelid = 'users'::regclass AND contype IN ('p', 'u');
+
+SELECT indexname, indexdef
+FROM pg_indexes
+WHERE tablename = 'users' AND indexdef LIKE 'CREATE UNIQUE%';
+```
+
+The second query matters because a unique **index** created with `CREATE UNIQUE INDEX` does not appear in `pg_constraint` at all, yet raises exactly the same error. The difference is explained in [unique constraint vs unique index](/blog/postgres-unique-constraint-vs-unique-index).
+
+Now the causes, from most to least common.
+
+## Cause 1: the data really is duplicated
+
+Something tried to insert a value that already exists and should not have. Confirm it:
+
+```sql
+SELECT * FROM users WHERE email = 'a@b.com';
+```
+
+If the row is there and the application meant to create a new one, the bug is in the application: a form submitted twice, a retry that re-ran a non-idempotent insert, a message consumed twice from a queue. The fix is to make the insert tolerant, which is covered under cause 3, or to look up the existing row first when the semantics are "create if missing":
+
+```sql
+INSERT INTO users (email, name)
+SELECT 'a@b.com', 'Ann'
+WHERE NOT EXISTS (SELECT 1 FROM users WHERE email = 'a@b.com');
+```
+
+That pattern is still racy under concurrency, which is why `ON CONFLICT` exists; but for a single-user script it is fine.
+
+## Cause 2: the sequence is behind the data
+
+This is the one that confuses people the most, because the error names the **primary key** even though you never supplied an id:
+
+```sql
+CREATE TABLE customers (id serial PRIMARY KEY, email text UNIQUE);
+
+-- someone inserted with explicit ids: a migration, a COPY, a restore
+INSERT INTO customers (id, email)
+VALUES (1, 'a@example.com'), (2, 'b@example.com'), (3, 'c@example.com');
+
+-- now the application inserts normally
+INSERT INTO customers (email) VALUES ('d@example.com');
+```
+
+```
+ERROR:  duplicate key value violates unique constraint "customers_pkey"
+DETAIL:  Key (id)=(1) already exists.
+```
+
+Inserting an explicit id does not advance the sequence. The sequence still thinks the next value is 1, hands it out, and collides with the row that was loaded by hand. Confirm the gap:
+
+```sql
+SELECT last_value, is_called FROM customers_id_seq;
+SELECT max(id) FROM customers;
+```
+
+Fix it by moving the sequence past the highest existing id. `pg_get_serial_sequence` finds the sequence for you, and works for both `serial` and identity columns:
+
+```sql
+SELECT setval(
+  pg_get_serial_sequence('customers', 'id'),
+  COALESCE((SELECT max(id) FROM customers), 0) + 1,
+  false
+);
+```
+
+The three-argument form with `false` means "the next `nextval` returns exactly this value". The shorter `setval(seq, max(id))` also works because the default `is_called = true` makes the next call return `max + 1`; the `COALESCE` guards against an empty table, where `max(id)` is `NULL` and `setval(NULL)` silently does nothing.
+
+For an identity column there is also a DDL form:
+
+```sql
+ALTER TABLE customers ALTER COLUMN id RESTART WITH 1001;
+```
+
+Identity columns declared `GENERATED ALWAYS` refuse explicit ids unless you write `OVERRIDING SYSTEM VALUE`, which is precisely the guard rail that prevents this cause. The trade-offs are in [serial vs identity column](/blog/postgres-serial-vs-identity-column), and the general sequence-repair recipes, including a query to fix every sequence in a schema at once, are in [how to reset a sequence](/blog/postgres-reset-sequence).
+
+## Cause 3: two sessions raced
+
+Two requests arrive at the same time, both check that the email is free, both see that it is, both insert. One wins, the other gets `23505`. You cannot fix this with a `SELECT` first; the check and the insert are not atomic across connections. The fix is to let the database decide:
+
+```sql
+-- insert if new, otherwise do nothing
+INSERT INTO users (email, name)
+VALUES ('a@b.com', 'Ann')
+ON CONFLICT (email) DO NOTHING;
+
+-- insert if new, otherwise update the existing row (upsert)
+INSERT INTO users (email, name, updated_at)
+VALUES ('a@b.com', 'Ann', now())
+ON CONFLICT (email) DO UPDATE
+  SET name = EXCLUDED.name,
+      updated_at = EXCLUDED.updated_at
+RETURNING id, (xmax = 0) AS inserted;
+```
+
+`EXCLUDED` refers to the row that was proposed for insertion. The `RETURNING` trick with `xmax = 0` tells you whether the statement inserted (true) or updated (false), which is often useful for the caller.
+
+Two rules about `ON CONFLICT`:
+
+- The conflict target must correspond to an existing unique index or constraint. `ON CONFLICT (email)` only works if there is a unique index on exactly `(email)`. If there is none you get `there is no unique or exclusion constraint matching the ON CONFLICT specification`.
+- For an expression index or a partial index, the conflict target must repeat the expression or the `WHERE` clause: `ON CONFLICT (lower(email))` or `ON CONFLICT (room_id, day) WHERE cancelled = false`. Alternatively name the constraint: `ON CONFLICT ON CONSTRAINT users_email_key`.
+
+`MERGE` (PostgreSQL 15 and later) is not a substitute here. `MERGE` does not take the special speculative-insertion path that `ON CONFLICT` uses, so two concurrent `MERGE` statements can still both attempt the insert and one will get `23505`.
+
+## Cause 4: the values are not identical, but the index thinks they are
+
+A unique index on an expression compares the expression result, not the raw column:
+
+```sql
+CREATE UNIQUE INDEX users_email_lower_idx ON users (lower(email));
+INSERT INTO users (email) VALUES ('a@b.com');
+INSERT INTO users (email) VALUES ('A@B.COM');
+```
+
+```
+ERROR:  duplicate key value violates unique constraint "users_email_lower_idx"
+DETAIL:  Key (lower(email))=(a@b.com) already exists.
+```
+
+The `DETAIL` shows the expression, which is your clue. To find the row that is blocking you, query with the same expression:
+
+```sql
+SELECT id, email FROM users WHERE lower(email) = lower('A@B.COM');
+```
+
+The same applies to `btrim(email)`, `citext` columns, and, on PostgreSQL 12 and later, non-deterministic collations. The real fix is to normalise on write so the stored value and the compared value are the same thing:
+
+```sql
+UPDATE users SET email = lower(btrim(email));
+-- and in the application, or with a BEFORE INSERT trigger, keep it that way
+```
+
+## Cause 5: the constraint is composite or partial
+
+The developer expects `email` to be the unique column, but the constraint that fired is on something else entirely:
+
+```sql
+CREATE TABLE bookings (
+  id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  room_id int NOT NULL,
+  day date NOT NULL,
+  cancelled boolean NOT NULL DEFAULT false
+);
+CREATE UNIQUE INDEX bookings_room_day_active
+  ON bookings (room_id, day) WHERE cancelled = false;
+
+INSERT INTO bookings (room_id, day) VALUES (7, '2026-09-04');
+INSERT INTO bookings (room_id, day) VALUES (7, '2026-09-04');
+```
+
+```
+ERROR:  duplicate key value violates unique constraint "bookings_room_day_active"
+DETAIL:  Key (room_id, day)=(7, 2026-09-04) already exists.
+```
+
+Composite keys show every column in the `DETAIL`. Partial indexes do not mention their `WHERE` clause in the error at all, so the only way to know one is involved is to look at the definition. In psql:
+
+```
+\d bookings
+```
+
+```
+Indexes:
+    "bookings_pkey" PRIMARY KEY, btree (id)
+    "bookings_room_day_active" UNIQUE, btree (room_id, day) WHERE cancelled = false
+```
+
+Or from any client:
+
+```sql
+SELECT indexdef FROM pg_indexes WHERE indexname = 'bookings_room_day_active';
+```
+
+Once you can see the definition, the fix is a business decision: cancel the existing booking first, or use `ON CONFLICT (room_id, day) WHERE cancelled = false DO UPDATE` to take it over.
+
+## Cause 6: restore, migration, or seed data ran twice
+
+`pg_restore` into a database that already has rows, a data migration that was re-run after a partial failure, or a seed script executed on every deploy will all produce a wall of `23505` errors. There is nothing wrong with the database; the load simply is not idempotent.
+
+For seed scripts, make every insert tolerant:
+
+```sql
+INSERT INTO roles (id, name) VALUES (1, 'admin'), (2, 'editor')
+ON CONFLICT (id) DO NOTHING;
+```
+
+For restores, either restore into an empty database, or use `pg_restore --clean --if-exists` so objects are dropped and recreated first. A plain `pg_dump` already emits `setval` calls for every sequence, so a complete restore leaves sequences correct; a hand-rolled `COPY` of a single table does not, and you are back in cause 2.
+
+## Finding duplicates before adding a constraint
+
+The mirror image of this error is trying to add a unique constraint to a table that already contains duplicates:
+
+```sql
+ALTER TABLE users ADD CONSTRAINT users_email_key UNIQUE (email);
+```
+
+```
+ERROR:  could not create unique index "users_email_key"
+DETAIL:  Key (email)=(a@b.com) is duplicated.
+```
+
+Find all of them, not just the first one PostgreSQL happened to report:
+
+```sql
+SELECT email, count(*), array_agg(id ORDER BY id) AS ids
+FROM users
+GROUP BY email
+HAVING count(*) > 1
+ORDER BY count(*) DESC;
+```
+
+Then delete the extras. With a primary key, keep the lowest id:
+
+```sql
+DELETE FROM users a
+USING users b
+WHERE a.email = b.email
+  AND a.id > b.id;
+```
+
+Without any key to distinguish rows, use the physical row identifier `ctid`, which is unique within a table for the duration of a transaction:
+
+```sql
+DELETE FROM users a
+USING users b
+WHERE a.email = b.email
+  AND a.ctid > b.ctid;
+```
+
+If you would rather choose which row survives by a rule such as "most recently updated", use a window function:
+
+```sql
+DELETE FROM users
+WHERE id IN (
+  SELECT id FROM (
+    SELECT id, row_number() OVER (PARTITION BY email ORDER BY updated_at DESC) AS rn
+    FROM users
+  ) ranked
+  WHERE rn > 1
+);
+```
+
+Run the `GROUP BY` query again afterwards, and only then add the constraint. On a large, busy table, build the index concurrently first and attach it, so the table is not locked for the duration:
+
+```sql
+CREATE UNIQUE INDEX CONCURRENTLY users_email_key ON users (email);
+ALTER TABLE users ADD CONSTRAINT users_email_key UNIQUE USING INDEX users_email_key;
+```
+
+If duplicates appear while the concurrent build is running, the build fails and leaves an invalid index behind that you must drop before retrying.
+
+Running the duplicate-finder and the delete side by side, with the result grid open to sanity-check which rows are about to go, is the kind of task a GUI client is good for. [Chat2DB](https://chat2db.ai/download) does this for PostgreSQL and other engines, and also runs in the browser at [app.chat2db.ai](https://app.chat2db.ai).
+
+## Catching it in PL/pgSQL
+
+When a function should treat "already exists" as success, catch the condition by name or by code:
+
+```sql
+CREATE OR REPLACE FUNCTION ensure_user(p_email text)
+RETURNS bigint LANGUAGE plpgsql AS $$
+DECLARE
+  v_id bigint;
+BEGIN
+  INSERT INTO users (email) VALUES (p_email) RETURNING id INTO v_id;
+  RETURN v_id;
+EXCEPTION
+  WHEN unique_violation THEN          -- or: WHEN SQLSTATE '23505' THEN
+    SELECT id INTO v_id FROM users WHERE email = p_email;
+    RETURN v_id;
+END $$;
+```
+
+An `EXCEPTION` block costs a subtransaction per call. For a hot path, `INSERT ... ON CONFLICT DO NOTHING RETURNING id` followed by a `SELECT` when nothing came back is cheaper and does the same job. The wider picture of matching on SQLSTATE codes rather than message text is in the [PostgreSQL error codes guide](/blog/postgres-error-codes-sqlstate-guide).
+
+## What your ORM shows you
+
+The error reaches application code wrapped in the driver's exception type; the SQLSTATE is always still available underneath.
+
+**Django** raises `django.db.IntegrityError`. The original driver exception is `e.__cause__`, with `.sqlstate` (psycopg 3) or `.pgcode` (psycopg2). `get_or_create()` and `update_or_create()` already catch the integrity error and re-fetch, so they are safe under concurrency as long as the lookup fields match the unique constraint. For bulk loads use `bulk_create(objs, ignore_conflicts=True)` or `update_conflicts=True` with `unique_fields`, which compile to `ON CONFLICT`.
+
+**Prisma** raises `PrismaClientKnownRequestError` with `code: 'P2002'`; `meta.target` lists the columns of the violated constraint. `prisma.user.upsert()` compiles to `ON CONFLICT DO UPDATE` and is the correct way to handle the race.
+
+**SQLAlchemy** raises `sqlalchemy.exc.IntegrityError`; `e.orig` is the driver exception with the code. For upserts use the PostgreSQL-specific insert construct:
+
+```python
+from sqlalchemy.dialects.postgresql import insert
+
+stmt = insert(User).values(email="a@b.com", name="Ann")
+stmt = stmt.on_conflict_do_update(
+    index_elements=["email"],
+    set_={"name": stmt.excluded.name},
+)
+session.execute(stmt)
+```
+
+In all three, do not match on the message string. Match on `23505`, or on the typed exception the driver derives from it.
+
+## Summary
+
+`duplicate key value violates unique constraint` always means the same mechanical thing: a unique index refused a second copy of a key. The constraint name and the `DETAIL` line tell you which index and which value. From there the cause is one of six: genuinely duplicated data, a sequence left behind by an explicit-id insert or restore (fix with `setval` or `ALTER COLUMN ... RESTART`), a race between concurrent inserts (fix with `ON CONFLICT`), an expression index that normalises values you thought were distinct, a composite or partial index you had forgotten about, or a non-idempotent seed or restore. Before adding a new unique constraint, find duplicates with `GROUP BY ... HAVING count(*) > 1` and remove them with `DELETE ... USING`. And in application code, handle the error by its SQLSTATE, not its text.

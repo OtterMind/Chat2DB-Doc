@@ -1,0 +1,295 @@
+---
+title: "Fix \"connection refused\" When Connecting to PostgreSQL"
+description: "psql connection refused on port 5432? Step-by-step diagnosis: server not running, listen_addresses, IPv6 localhost, wrong port, Docker, firewalls and sockets."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: September 4, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# Fix "connection refused" When Connecting to PostgreSQL
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="September 4, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+This is the error, in the form psql has printed it since PostgreSQL 14:
+
+```
+psql: error: connection to server at "localhost" (127.0.0.1), port 5432 failed: Connection refused
+	Is the server running on that host and accepting TCP/IP connections?
+```
+
+and its Unix-socket sibling, which you get when you run `psql` with no `-h` at all:
+
+```
+psql: error: connection to server on socket "/var/run/postgresql/.s.PGSQL.5432" failed: No such file or directory
+	Is the server running locally and accepting connections on that socket?
+```
+
+Both mean the same thing: the client never reached a PostgreSQL process. The hint in the second line is accurate but not specific. The rest of this article is the specific version — an ordered diagnosis that goes from "is it running" to "is it reachable" to "is it listening where I think it is", with the commands to check each step.
+
+## What "connection refused" actually means
+
+"Connection refused" is a TCP-level answer, not a PostgreSQL answer. The client sent a SYN packet to an IP and port, the host at that IP was alive, and its kernel replied with RST because **no process was listening on that port** (or a firewall was configured to actively reject rather than silently drop). PostgreSQL was never involved.
+
+That makes it worth distinguishing from the two errors it is most often confused with:
+
+| Error text | What it tells you |
+| --- | --- |
+| `Connection refused` | Host reachable, nothing listening on that IP:port |
+| `Connection timed out` / `timeout expired` | Packets dropped — firewall, security group, wrong IP, unroutable network |
+| `FATAL: no pg_hba.conf entry for host ...` | You reached PostgreSQL; the network is fine, authentication rules are not |
+| `No such file or directory` (socket) | Client used a Unix socket and the socket file is not there |
+
+If you have a timeout, skip to the firewall section. If you have a `pg_hba.conf` error, the network part is already solved. "Refused" means one of: the server is down, it is listening on a different address, a different port, or in a different network namespace (Docker) than the one you are connecting to.
+
+## Step 1: Is the server actually running?
+
+Check with whatever manages it:
+
+```bash
+# systemd (Debian, Ubuntu, RHEL, Fedora)
+systemctl status postgresql
+systemctl status postgresql@16-main     # Debian/Ubuntu per-cluster unit
+
+# any platform, if you know the data directory
+pg_ctl status -D /var/lib/postgresql/16/main
+
+# Homebrew on macOS
+brew services list
+
+# Docker
+docker ps --filter "ancestor=postgres"
+```
+
+If it is not running, do not just restart it — read why it stopped. The last few lines of the log usually name the cause:
+
+```bash
+# Debian/Ubuntu
+tail -n 50 /var/log/postgresql/postgresql-16-main.log
+# systemd journal
+journalctl -u postgresql@16-main -n 50 --no-pager
+# Homebrew
+tail -n 50 /opt/homebrew/var/log/postgresql@16.log
+# Docker
+docker logs --tail 50 db
+```
+
+Three startup failures account for most cases. The port is already taken by another postmaster (or something else):
+
+```
+LOG:  could not bind IPv4 address "127.0.0.1": Address already in use
+HINT:  Is another postmaster already running on port 5432? If not, wait a few seconds and retry.
+WARNING:  could not create listen socket for "localhost"
+FATAL:  could not create any TCP/IP sockets
+```
+
+A stale lock file after an unclean shutdown or a restored data directory:
+
+```
+FATAL:  lock file "postmaster.pid" already exists
+HINT:  Is another postmaster (PID 4127) running in data directory "/var/lib/postgresql/16/main"?
+```
+
+Verify that PID is not actually a running postmaster (`ps -p 4127`) before removing `postmaster.pid`; deleting it under a live server corrupts data. And the permissions check, which bites after a `cp -r` or a volume mount:
+
+```
+FATAL:  data directory "/var/lib/postgresql/16/main" has invalid permissions
+DETAIL:  Permissions should be u=rwx (0700) or u=rwx,g=rx (0750).
+```
+
+Fix with `chown -R postgres:postgres` and `chmod 700` on the data directory, then start again.
+
+## Step 2: Is it listening on the address you are connecting to?
+
+A running server that only listens on the loopback interface still refuses connections to its public IP. The default for `listen_addresses` is `localhost`, which is deliberate: a fresh install is not reachable from the network. Check what the kernel actually has bound:
+
+```bash
+ss -ltnp | grep 5432
+```
+
+```
+LISTEN 0  200  127.0.0.1:5432  0.0.0.0:*  users:(("postgres",pid=4127,fd=6))
+LISTEN 0  200      [::1]:5432     [::]:*  users:(("postgres",pid=4127,fd=7))
+```
+
+That server accepts `127.0.0.1` and `::1` and nothing else. Confirm from inside if you can get a local connection:
+
+```sql
+SHOW listen_addresses;
+SHOW port;
+SHOW unix_socket_directories;
+```
+
+To accept connections on all interfaces, set it in `postgresql.conf` or with `ALTER SYSTEM`:
+
+```sql
+ALTER SYSTEM SET listen_addresses = '*';
+```
+
+```bash
+sudo systemctl restart postgresql@16-main
+```
+
+`listen_addresses` has context `postmaster`, which means **a reload is not enough; the server must be restarted**. `SELECT pg_reload_conf()` will silently do nothing for it. After the restart, `ss` should show `0.0.0.0:5432` and `[::]:5432`. Prefer listing specific interface addresses over `'*'` on hosts with a public interface, and pair the change with the `pg_hba.conf` rule in Step 8, because the next error you see will be about that.
+
+## Step 3: The `localhost` IPv6 trap
+
+`localhost` resolves to both `::1` and `127.0.0.1` on most modern systems. libpq tries every address it gets back, and reports each failure, so you may see two blocks:
+
+```
+psql: error: connection to server at "localhost" (::1), port 5432 failed: Connection refused
+	Is the server running on that host and accepting TCP/IP connections?
+connection to server at "localhost" (127.0.0.1), port 5432 failed: Connection refused
+	Is the server running on that host and accepting TCP/IP connections?
+```
+
+That is fine — both were refused, so the server is not on 5432 at all. The confusing case is a server bound only to `127.0.0.1` (`listen_addresses = '127.0.0.1'`) with a client whose resolver returns only `::1` for `localhost`, or a Docker port mapping that only published the IPv4 side. The fix is to stop relying on name resolution and be explicit:
+
+```bash
+psql -h 127.0.0.1 -p 5432 -U postgres
+```
+
+If that works and `-h localhost` does not, the mismatch is between address families, not the server. Setting `listen_addresses = 'localhost'` (rather than `127.0.0.1`) makes PostgreSQL bind both.
+
+## Step 4: Wrong port
+
+Package upgrades and side-by-side installs are the usual cause. On Debian and Ubuntu, installing `postgresql-16` next to an existing `postgresql-15` creates a second cluster on the **next free port, 5433**, because 5432 is taken:
+
+```bash
+pg_lsclusters
+```
+
+```
+Ver Cluster Port Status Owner    Data directory              Log file
+15  main    5432 online postgres /var/lib/postgresql/15/main /var/log/postgresql/postgresql-15-main.log
+16  main    5433 online postgres /var/lib/postgresql/16/main /var/log/postgresql/postgresql-16-main.log
+```
+
+Connecting to 5432 gets you the old cluster (working, but not the database you just created in 16), and after you drop the old cluster, 5432 has nothing on it — connection refused. Either pass `-p 5433`, set `PGPORT=5433`, or edit `port` in the 16 cluster's `postgresql.conf` and restart. The same pattern applies to Homebrew's `postgresql@14` and `postgresql@16` formulas running at once, and to Docker mappings like `-p 5433:5432` chosen because the host already had a PostgreSQL on 5432.
+
+## Step 5: Docker
+
+Three separate Docker mistakes all present as "connection refused".
+
+**The port is not published.** A container started without `-p` is reachable only from the Docker network, not from the host:
+
+```bash
+docker run -d --name db -e POSTGRES_PASSWORD=secret postgres:16
+docker port db          # prints nothing
+```
+
+Publish it:
+
+```bash
+docker run -d --name db -p 5432:5432 -e POSTGRES_PASSWORD=secret postgres:16
+docker port db          # 5432/tcp -> 0.0.0.0:5432
+```
+
+**Another container is using `localhost`.** Inside a container, `localhost` is that container's own loopback, where nothing is listening on 5432. Containers on the same Compose network reach each other by service name, on the container's internal port regardless of what is published:
+
+```yaml
+services:
+  db:
+    image: postgres:16
+    environment:
+      POSTGRES_PASSWORD: secret
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+  api:
+    build: .
+    environment:
+      DATABASE_URL: postgresql://postgres:secret@db:5432/postgres
+    depends_on:
+      db:
+        condition: service_healthy
+```
+
+**The container is still initialising.** The official image runs a temporary server bound only to a Unix socket while it executes `/docker-entrypoint-initdb.d/` scripts, then restarts it for real. `docker logs db` shows `database system is ready to accept connections` twice; only the second one accepts TCP. An `api` service with a bare `depends_on: [db]` starts as soon as the container exists and gets refused. The `condition: service_healthy` form above waits for `pg_isready` to succeed.
+
+## Step 6: Cloud databases and firewalls
+
+Here the distinction from the first section matters most. A firewall configured to **drop** gives a timeout; one configured to **reject** gives a refusal. Test the raw TCP path without involving psql:
+
+```bash
+nc -vz db.internal.example.com 5432
+# or
+timeout 5 bash -c 'cat < /dev/null > /dev/tcp/10.0.1.5/5432' && echo open
+```
+
+On the host, `ufw` and `firewalld` default to dropping, so a refusal from a host-level firewall is rare, but check:
+
+```bash
+sudo ufw status verbose
+sudo ufw allow from 10.0.1.0/24 to any port 5432 proto tcp
+```
+
+On AWS, a security group with no inbound rule for 5432 produces a timeout, not a refusal. An RDS instance with **Publicly accessible** set to No resolves to a private IP; from outside the VPC that is a timeout too. A refusal on a cloud database almost always means you connected to the right host on the wrong port, or to a proxy that is not running. Cloud SQL is the common example: the Auth Proxy listens on `127.0.0.1:5432` on the client machine, and if it has exited, every connection to `localhost` is refused even though the database is healthy. Check the proxy process before the database.
+
+Once TCP works, the next surprise is often TLS: managed databases may require `sslmode=require` or reject the default; [PostgreSQL sslmode explained](/blog/postgres-sslmode-explained) covers the values.
+
+## Step 7: Socket directory mismatch
+
+The "No such file or directory" variant means the client looked for a socket file that does not exist. That happens when the server is down (Step 1), or when the client and server disagree on where the socket lives. Debian-family packages put it in `/var/run/postgresql`; Homebrew and source builds default to `/tmp`; a client library compiled with one default cannot find a server using the other.
+
+```bash
+ls -la /var/run/postgresql/ /tmp/.s.PGSQL.*
+```
+
+Point the client at the right directory — `-h` accepts a directory path, and so does `PGHOST`:
+
+```bash
+psql -h /tmp -U postgres
+export PGHOST=/var/run/postgresql
+```
+
+Or switch to TCP with `-h 127.0.0.1`. A server in Docker never has a socket on the host, so `psql` with no `-h` on the host always fails this way; use `-h localhost` there. If you installed with Homebrew, the [Homebrew PostgreSQL install guide](/blog/install-postgresql-mac-homebrew) shows the paths that formula uses.
+
+## Step 8: After fixing listen_addresses, the pg_hba.conf error
+
+Opening `listen_addresses` reliably produces the next error, which is actually progress:
+
+```
+psql: error: connection to server at "10.0.1.5", port 5432 failed: FATAL:  no pg_hba.conf entry for host "10.0.1.22", user "app", database "orders", no encryption
+```
+
+You reached PostgreSQL. It rejected the connection because no line in `pg_hba.conf` matches that client address, user and database. Add one, matching your subnet, and reload — `pg_hba.conf` does not need a restart:
+
+```
+# TYPE  DATABASE  USER  ADDRESS        METHOD
+host    orders    app   10.0.1.0/24    scram-sha-256
+```
+
+```sql
+SELECT pg_reload_conf();
+```
+
+The `no encryption` at the end of the message means the client did not negotiate TLS; if your rules use `hostssl`, that client will not match. The [pg_hba.conf guide](/blog/pg-hba-conf-explained) goes through the matching order, which trips people up when a broad `reject` line sits above a specific `host` line.
+
+Every GUI client hits the same wall as psql, because they all use the same host, port and address resolution. If [Chat2DB](https://chat2db.ai/download) or its browser version at [app.chat2db.ai](https://app.chat2db.ai) reports connection refused while `psql -h 127.0.0.1` succeeds, the difference is almost always `localhost` versus `127.0.0.1` or the port field — check those two before anything else. Chat2DB's error dialog shows the driver message verbatim, so the same table from the first section applies.
+
+## Quick checklist
+
+Work down this list in order; stop at the first one that fails.
+
+```
+[ ] systemctl status postgresql / docker ps / brew services list  -> running?
+[ ] tail the log                                                   -> startup error (port in use, postmaster.pid, permissions)?
+[ ] ss -ltnp | grep 5432                                           -> bound to 127.0.0.1 only, or 0.0.0.0?
+[ ] SHOW listen_addresses; SHOW port;                              -> restart after changing listen_addresses
+[ ] psql -h 127.0.0.1 instead of -h localhost                      -> IPv6 / IPv4 mismatch?
+[ ] pg_lsclusters / PGPORT                                         -> 5433 after an upgrade?
+[ ] docker port <container>                                        -> published? other containers use the service name
+[ ] nc -vz host 5432                                               -> refused (wrong port/proxy) vs timeout (firewall)
+[ ] ls /var/run/postgresql /tmp                                    -> socket dir mismatch; use -h /path or PGHOST
+[ ] no pg_hba.conf entry                                           -> add host line, SELECT pg_reload_conf()
+```
+
+## Summary
+
+"Connection refused" is the kernel telling you nothing was listening at the address and port you asked for. Confirm the server is up and read its log; confirm with `ss` which addresses it bound and restart after changing `listen_addresses`; connect with `-h 127.0.0.1` to rule out IPv6 resolution; check the port with `pg_lsclusters` after upgrades; in Docker, publish the port and use the service name between containers; in the cloud, use `nc` to separate refusals from firewall timeouts; and match the socket directory when connecting locally without `-h`. When the error changes to `no pg_hba.conf entry`, the network is done — add the rule and reload.
