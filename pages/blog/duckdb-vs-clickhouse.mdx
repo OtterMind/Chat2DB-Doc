@@ -1,0 +1,263 @@
+---
+title: "DuckDB vs ClickHouse: Choosing an Analytics Engine"
+description: "DuckDB vs ClickHouse compared: embedded versus server, storage formats, concurrency, ingest, SQL dialect, joins and cost, with clear guidance on which to pick."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: September 5, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# DuckDB vs ClickHouse: Choosing an Analytics Engine
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="September 5, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+DuckDB and ClickHouse are both column-oriented, both vectorised, and both extremely fast at analytical SQL. They are also almost completely different products, and the choice between them is rarely close once you know which question you are answering. This is a comparison of what they actually are, not a benchmark.
+
+## The fundamental difference
+
+**DuckDB is a library.** It has no server, no daemon, no network protocol. You `pip install duckdb` or link the C++ amalgamation, and it runs inside your process, using your process's memory and CPU. It is to analytics what SQLite is to transactional workloads — and the comparison is deliberate, since DuckDB was explicitly designed as "SQLite for OLAP".
+
+```python
+import duckdb
+
+# No server, no connection string, no setup
+duckdb.sql("SELECT count(*), avg(amount) FROM 'orders/*.parquet'").show()
+```
+
+**ClickHouse is a distributed database server.** You run it as a process, connect over HTTP or its native TCP protocol, and it manages storage, replication, sharding and concurrent clients.
+
+```bash
+clickhouse-client --query "SELECT count(), avg(amount) FROM orders"
+```
+
+Everything below follows from this.
+
+## Storage
+
+**DuckDB** has a single-file format (`.duckdb`) but is most often used without persisting anything at all — reading Parquet, CSV, JSON or Arrow directly from disk, S3 or HTTP:
+
+```sql
+-- Query Parquet in place, no import step
+SELECT country, count(*) AS n, sum(amount) AS total
+FROM   read_parquet('s3://analytics/orders/year=2026/*/*.parquet')
+WHERE  status = 'paid'
+GROUP  BY country
+ORDER  BY total DESC;
+
+-- Join across formats in a single query
+SELECT u.name, o.total
+FROM   read_csv('users.csv') u
+JOIN   (SELECT user_id, sum(amount) AS total
+        FROM   read_parquet('orders.parquet')
+        GROUP  BY user_id) o
+  ON   o.user_id = u.id;
+```
+
+Predicate and projection pushdown into Parquet means it only reads the row groups and columns it needs. For querying files, this is the most convenient tool that exists.
+
+**ClickHouse** wants data in its own MergeTree format. You choose an engine, a sorting key and a partitioning scheme, and those choices dominate query performance:
+
+```sql
+CREATE TABLE orders (
+  id          UUID,
+  customer_id UInt64,
+  status      LowCardinality(String),
+  country     LowCardinality(String),
+  amount      Decimal(12, 2),
+  created_at  DateTime
+)
+ENGINE = MergeTree
+PARTITION BY toYYYYMM(created_at)
+ORDER BY (country, created_at, customer_id);
+```
+
+The `ORDER BY` clause is the sparse primary index. Queries filtering on a prefix of it skip whole granules; queries filtering on something else scan everything. `LowCardinality(String)` dictionary-encodes columns with few distinct values, often cutting their size by an order of magnitude. Getting these right is the main ClickHouse skill.
+
+ClickHouse can also read external files, and DuckDB can persist to its own format — but each is working against its grain when it does.
+
+## Concurrency
+
+**DuckDB** is single-process by design. One writer, and readers only from the same process unless you open the file read-only from several. It parallelises a single query across cores extremely well, but it is not a shared service. Two people cannot point BI tools at the same DuckDB file and expect it to behave like a database server.
+
+**ClickHouse** handles thousands of concurrent connections, with per-query and per-user resource limits, quotas and priorities:
+
+```sql
+CREATE SETTINGS PROFILE analyst SETTINGS
+  max_memory_usage = 10000000000,
+  max_execution_time = 60,
+  max_threads = 8;
+
+CREATE QUOTA analyst_quota FOR INTERVAL 1 hour
+  MAX queries = 1000, result_rows = 1000000000
+  TO analyst_role;
+```
+
+If more than one person or service needs to query the data at the same time, this alone decides it.
+
+## Ingest
+
+**DuckDB** ingests as fast as it can read a file, which is very fast, but there is no streaming concept. You load a batch, you query it. Continuous ingest means an external process writing files that DuckDB then reads.
+
+**ClickHouse** is built for continuous high-volume ingest. It has native Kafka and RabbitMQ table engines, buffer tables, and asynchronous inserts:
+
+```sql
+CREATE TABLE events_queue (
+  raw String
+) ENGINE = Kafka
+SETTINGS kafka_broker_list = 'kafka:9092',
+         kafka_topic_list = 'events',
+         kafka_group_name = 'clickhouse',
+         kafka_format = 'JSONAsString';
+
+CREATE MATERIALIZED VIEW events_mv TO events AS
+SELECT JSONExtractString(raw, 'user_id')          AS user_id,
+       JSONExtractString(raw, 'event_type')       AS event_type,
+       parseDateTimeBestEffort(
+         JSONExtractString(raw, 'ts'))            AS ts
+FROM   events_queue;
+```
+
+The important constraint on the other side: ClickHouse hates small frequent inserts. Each `INSERT` creates a data part that background merges must later combine, and inserting one row at a time produces the infamous `Too many parts` error. Batch to tens of thousands of rows, or use `async_insert = 1` and let ClickHouse batch for you.
+
+## Materialized views
+
+This is a bigger difference than it first appears.
+
+**ClickHouse materialized views are insert triggers.** They run on inserted data and write to a target table, giving you real-time incremental aggregation:
+
+```sql
+CREATE TABLE daily_country_totals (
+  day      Date,
+  country  LowCardinality(String),
+  orders   AggregateFunction(count, UInt64),
+  revenue  AggregateFunction(sum, Decimal(12,2))
+) ENGINE = AggregatingMergeTree
+ORDER BY (day, country);
+
+CREATE MATERIALIZED VIEW daily_country_mv TO daily_country_totals AS
+SELECT toDate(created_at) AS day,
+       country,
+       countState()       AS orders,
+       sumState(amount)   AS revenue
+FROM   orders
+GROUP  BY day, country;
+
+-- Query the pre-aggregated data
+SELECT day, country,
+       countMerge(orders)  AS orders,
+       sumMerge(revenue)   AS revenue
+FROM   daily_country_totals
+WHERE  day >= today() - 30
+GROUP  BY day, country
+ORDER  BY day;
+```
+
+Aggregation happens at write time, so a dashboard querying 30 days of pre-aggregated rows is instant regardless of how many billions of raw events sit behind it. Nothing in DuckDB is equivalent — DuckDB views are logical, re-evaluated on every query.
+
+## SQL dialect
+
+**DuckDB is deliberately PostgreSQL-compatible** and then adds ergonomic extensions that are genuinely pleasant:
+
+```sql
+-- Exclude and replace columns instead of listing them all
+SELECT * EXCLUDE (internal_id, debug_blob) FROM wide_table;
+SELECT * REPLACE (upper(country) AS country) FROM orders;
+
+-- Group by every non-aggregate column
+SELECT country, status, count(*) FROM orders GROUP BY ALL;
+
+-- Reuse a select alias later in the same query
+SELECT amount * 1.2 AS with_tax, with_tax - amount AS tax FROM orders;
+
+-- Query a DataFrame directly by variable name
+-- (in Python: df is a pandas or Polars DataFrame in scope)
+SELECT country, count(*) FROM df GROUP BY country;
+```
+
+**ClickHouse has its own dialect** that is SQL-like but diverges in ways that break portability: `Nullable` is opt-in and discouraged, `JOIN` semantics differ, `GROUP BY` has extensions like `WITH TOTALS`, and there is a large library of ClickHouse-specific functions (`uniqExact`, `quantileTDigest`, `arrayJoin`, the `-If`, `-State` and `-Merge` combinators). Powerful, and not portable.
+
+```sql
+-- Approximate distinct counts and quantiles, cheaply
+SELECT country,
+       uniq(customer_id)                       AS approx_customers,
+       uniqExact(customer_id)                  AS exact_customers,
+       quantileTDigest(0.95)(amount)           AS p95_amount,
+       countIf(status = 'cancelled')           AS cancellations
+FROM   orders
+GROUP  BY country;
+```
+
+## Joins
+
+**DuckDB has a proper cost-based optimiser** and handles complex multi-table joins and correlated subqueries well. Star-schema queries with several dimension tables work the way you would expect from PostgreSQL.
+
+**ClickHouse joins are its weakest area.** The default `hash` join builds the right-hand table in memory, and there is no automatic reordering of a multi-way join by cardinality — you are expected to put the smaller table on the right yourself. Large joins spill or fail:
+
+```sql
+-- Prefer dictionaries over joins for dimension lookups
+CREATE DICTIONARY customers_dict (
+  id   UInt64,
+  name String,
+  tier String
+)
+PRIMARY KEY id
+SOURCE(CLICKHOUSE(TABLE 'customers'))
+LAYOUT(HASHED())
+LIFETIME(MIN 300 MAX 600);
+
+SELECT dictGet('customers_dict', 'name', customer_id) AS customer_name,
+       sum(amount)
+FROM   orders
+GROUP  BY customer_name;
+```
+
+ClickHouse schemas are therefore usually denormalised — wide flat tables rather than star schemas. If your analytics genuinely require normalised joins, that is a point for DuckDB.
+
+## Scale and deployment
+
+| | DuckDB | ClickHouse |
+| --- | --- | --- |
+| Deployment | Library in your process | Server, optionally clustered |
+| Data size | Comfortable to a few hundred GB on one machine | Petabytes across a cluster |
+| Concurrency | Effectively single-user | Thousands of connections |
+| Replication | None | Built in via ReplicatedMergeTree + Keeper |
+| Sharding | None | Distributed tables |
+| Continuous ingest | No | Kafka engine, async inserts, buffer tables |
+| Materialized views | Logical only | Incremental, at insert time |
+| Managed offering | MotherDuck | ClickHouse Cloud, and others |
+| Setup effort | Zero | Real: schema design, merges, Keeper, monitoring |
+
+DuckDB scales beyond memory — it spills to disk and handles datasets several times larger than RAM — but it scales *up*, not *out*. There is no cluster.
+
+## Choosing
+
+**Use DuckDB when:**
+- The work is analysis, not serving: notebooks, data science, ad-hoc exploration
+- You are querying Parquet or CSV files, in a data lake or on a laptop
+- It runs inside an application, a CLI, or a data pipeline transform step
+- Testing and local development against production-shaped data
+- One person or one process at a time
+- You want zero operational overhead
+
+**Use ClickHouse when:**
+- Many users or services query concurrently — a BI tool, a customer-facing dashboard
+- Data arrives continuously at high volume: logs, metrics, clickstream, telemetry
+- The dataset outgrows a single machine
+- Sub-second responses over billions of rows are a product requirement
+- You need replication and high availability
+- Real-time incremental aggregation via materialized views is worth the schema work
+
+**Use both** — this is common and sensible. ClickHouse serves the production analytics workload; analysts use DuckDB against Parquet exports for exploration without touching the production cluster. DuckDB can also read directly from ClickHouse over its HTTP interface, and both are reachable from any SQL client — [Chat2DB](https://chat2db.ai/download) connects to ClickHouse alongside PostgreSQL and MySQL, so you can keep transactional and analytical queries in one window, or use the [web version](https://app.chat2db.ai) for a quick look.
+
+## A quick decision rule
+
+Ask who runs the query. If the answer is "one analyst, one script, one process", DuckDB — and you will be productive within a minute. If the answer is "an application, on behalf of many users, continuously", ClickHouse — and budget real time for schema design, because the `ORDER BY` key and partitioning scheme determine whether it is fast or unusable.
+
+The mistake in one direction is standing up a three-node ClickHouse cluster to analyse 40 GB of Parquet that DuckDB would chew through on a laptop. The mistake in the other direction is building a customer-facing dashboard on DuckDB and discovering that concurrent users were never part of its design.
+
+## Summary
+
+DuckDB is an embedded analytical engine: no server, PostgreSQL-compatible SQL with genuinely nice extensions, excellent joins, and direct querying of Parquet and CSV. ClickHouse is a distributed analytical database: MergeTree storage tuned by your `ORDER BY` key, incremental materialized views, native streaming ingest, replication, sharding and high concurrency — with weaker joins and its own SQL dialect. Pick DuckDB for analysis and embedding, ClickHouse for serving analytics to many users at scale, and do not be surprised if the right answer is both.

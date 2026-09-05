@@ -1,0 +1,294 @@
+---
+title: "Fix Postgres \"collation version mismatch\" Warnings"
+description: "Why PostgreSQL warns about a collation version mismatch after a glibc or ICU upgrade, how to check which indexes are affected, and the safe way to rebuild them."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: September 5, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# Fix Postgres "collation version mismatch" Warnings
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="September 5, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+You upgrade the operating system under a PostgreSQL server, or move a data directory to a newer base image, and every connection starts printing this:
+
+```
+WARNING:  database "app" has a collation version mismatch
+DETAIL:  The database was created using collation version 2.31,
+         but the operating system provides version 2.36.
+HINT:  Rebuild all objects in this database that use the default collation
+       and run ALTER DATABASE app REFRESH COLLATION VERSION,
+       or build PostgreSQL with the right library version.
+```
+
+This is not a cosmetic warning, and the `REFRESH COLLATION VERSION` in the hint is not the fix — running it on its own just silences the alarm while leaving the actual problem in place. Here is what happened, how to find out whether you are affected, and the correct order of operations.
+
+## What a collation version actually is
+
+A collation defines the sort order for text. `'a' < 'B'` is true under `en_US.UTF-8` and false under the `C` locale, because one compares linguistically and the other compares byte values. PostgreSQL does not implement these rules itself — it delegates to an external library: the operating system's glibc on most Linux systems, or ICU if the collation was created as an ICU collation.
+
+The critical consequence is that **B-tree indexes on text columns store rows in the order that library produced at index build time**. An index is a sorted structure; if the sort rules change underneath it, the structure is no longer sorted according to the current rules, and binary search through it can miss rows that are physically present.
+
+glibc changed a large number of locale definitions in version 2.28 — that release is the notorious one, and it affected essentially every distribution upgrade that crossed it (Debian 9 to 10, RHEL 7 to 8, Ubuntu 18.04 to 20.04). Later versions have made smaller changes. PostgreSQL 10 added collation version tracking so it can at least tell you when the library it is now linked against differs from the one that built your indexes.
+
+## What breaks
+
+Concretely, with a stale index on a text column:
+
+- `SELECT ... WHERE name = 'Müller'` can return zero rows while the row exists, because the index lookup walks to the wrong part of the tree.
+- A `UNIQUE` constraint can be violated — two rows that should collide no longer compare equal in the index, so both are accepted.
+- `ORDER BY name` returns different results depending on whether the planner chose an index scan or a sort.
+- A foreign key can end up referencing a parent row that a fresh comparison no longer considers a match.
+
+Partitioned tables using range partitioning on text are affected the same way, as are exclusion constraints involving text.
+
+Note what is *not* affected: indexes on integers, dates, UUIDs, and text columns declared with the `C` or `POSIX` collation. Those use byte-order comparison, which no library upgrade changes. `citext` and case-insensitive ICU collations *are* affected.
+
+## Checking whether you are affected
+
+First, see what PostgreSQL thinks is stale. `pg_collation.collversion` holds the version recorded when the collation was created; `pg_collation_actual_version()` asks the library what it is now.
+
+```sql
+-- Collations whose recorded version no longer matches the library
+SELECT c.oid,
+       c.collname,
+       c.collprovider,          -- 'c' = libc, 'i' = ICU, 'd' = database default
+       c.collversion            AS recorded_version,
+       pg_collation_actual_version(c.oid) AS current_version
+FROM   pg_collation c
+WHERE  c.collversion IS NOT NULL
+  AND  c.collversion <> pg_collation_actual_version(c.oid);
+```
+
+```sql
+-- The database's own default collation
+SELECT datname,
+       datcollate,
+       datctype,
+       datcollversion                                AS recorded_version,
+       pg_database_collation_actual_version(oid)     AS current_version
+FROM   pg_database
+WHERE  datname = current_database();
+```
+
+Now find the objects that actually depend on those collations. This is the query that tells you how much work you have:
+
+```sql
+-- Indexes whose key columns use a non-C collation
+SELECT DISTINCT
+       n.nspname                       AS schema_name,
+       t.relname                       AS table_name,
+       i.relname                       AS index_name,
+       col.collname,
+       pg_size_pretty(pg_relation_size(i.oid)) AS index_size,
+       idx.indisunique                 AS is_unique,
+       idx.indisprimary                AS is_primary
+FROM   pg_index idx
+JOIN   pg_class i    ON i.oid = idx.indexrelid
+JOIN   pg_class t    ON t.oid = idx.indrelid
+JOIN   pg_namespace n ON n.oid = t.relnamespace
+JOIN   LATERAL unnest(idx.indcollation) AS c(collid) ON true
+JOIN   pg_collation col ON col.oid = c.collid
+WHERE  col.collname NOT IN ('C', 'POSIX')
+  AND  n.nspname NOT IN ('pg_catalog', 'information_schema')
+ORDER  BY pg_relation_size(i.oid) DESC;
+```
+
+Also check constraints and partitions, which people forget:
+
+```sql
+-- Text columns used in partition keys
+SELECT c.oid::regclass AS partitioned_table,
+       pg_get_partkeydef(c.oid) AS partition_key
+FROM   pg_class c
+JOIN   pg_partitioned_table p ON p.partrelid = c.oid
+WHERE  pg_get_partkeydef(c.oid) ~* 'text|varchar|char';
+
+-- Exclusion constraints and unique constraints on text
+SELECT conrelid::regclass AS table_name,
+       conname,
+       contype,
+       pg_get_constraintdef(oid) AS definition
+FROM   pg_constraint
+WHERE  contype IN ('u', 'x')
+  AND  pg_get_constraintdef(oid) ~* 'text|varchar|char|citext';
+```
+
+## Verifying an index is actually corrupt
+
+Before rebuilding hundreds of gigabytes of indexes, it is worth confirming which ones are genuinely wrong. The `amcheck` extension does exactly this:
+
+```sql
+CREATE EXTENSION IF NOT EXISTS amcheck;
+
+-- Check one index thoroughly: verifies ordering and heap consistency
+SELECT bt_index_check(index => 'public.users_email_idx'::regclass,
+                      heapallindexed => true);
+```
+
+If the ordering is wrong you get an error rather than a clean return:
+
+```
+ERROR:  item order invariant violated for index "users_email_idx"
+```
+
+To sweep every B-tree index in a schema:
+
+```sql
+DO $$
+DECLARE
+  r record;
+BEGIN
+  FOR r IN
+    SELECT i.oid::regclass AS idx
+    FROM   pg_index x
+    JOIN   pg_class i ON i.oid = x.indexrelid
+    JOIN   pg_class t ON t.oid = x.indrelid
+    JOIN   pg_namespace n ON n.oid = t.relnamespace
+    JOIN   pg_am am ON am.oid = i.relam
+    WHERE  am.amname = 'btree'
+      AND  n.nspname = 'public'
+      AND  x.indisvalid
+  LOOP
+    BEGIN
+      PERFORM bt_index_check(index => r.idx, heapallindexed => true);
+    EXCEPTION WHEN others THEN
+      RAISE WARNING 'FAILED: % — %', r.idx, SQLERRM;
+    END;
+  END LOOP;
+END;
+$$;
+```
+
+`bt_index_check` takes only an `ACCESS SHARE` lock, so it is safe to run against a live system, though it does read the whole index. On a large database, run it against a restored copy or a replica if you can.
+
+You can also spot duplicate values that a unique index should have prevented — a strong signal the index is stale:
+
+```sql
+SELECT email, count(*)
+FROM   users
+GROUP  BY email
+HAVING count(*) > 1;
+```
+
+If that returns rows on a table with a unique index on `email`, the index has already let bad data in and you will need to deduplicate before you can rebuild it.
+
+## Fixing it: the correct order
+
+**Step 1 — rebuild the indexes.** Do this *before* refreshing the version, so the rebuild happens while PostgreSQL still knows something is wrong.
+
+For a database you can take a maintenance window on, the simplest correct answer is:
+
+```sql
+REINDEX DATABASE app;
+```
+
+That takes locks that block writes to each table as it goes. For a live system, rebuild concurrently instead:
+
+```sql
+-- PostgreSQL 12+
+REINDEX INDEX CONCURRENTLY public.users_email_idx;
+
+-- Or a whole table's indexes
+REINDEX TABLE CONCURRENTLY public.users;
+
+-- Or everything, one index at a time, without blocking writes
+REINDEX DATABASE CONCURRENTLY app;
+```
+
+`CONCURRENTLY` builds a new index alongside the old one and swaps them, so writes keep working. It is slower, uses extra disk equal to the index size, and cannot run inside a transaction block. If it is interrupted you may be left with an invalid index, which you clean up with:
+
+```sql
+-- Find leftovers from a failed concurrent rebuild
+SELECT i.oid::regclass AS invalid_index
+FROM   pg_index x
+JOIN   pg_class i ON i.oid = x.indexrelid
+WHERE  NOT x.indisvalid;
+
+DROP INDEX CONCURRENTLY public.users_email_idx_ccnew;
+```
+
+Generate the statements for a large database rather than typing them:
+
+```sql
+SELECT format('REINDEX INDEX CONCURRENTLY %I.%I;', n.nspname, i.relname) AS stmt
+FROM   pg_index idx
+JOIN   pg_class i    ON i.oid = idx.indexrelid
+JOIN   pg_class t    ON t.oid = idx.indrelid
+JOIN   pg_namespace n ON n.oid = t.relnamespace
+JOIN   LATERAL unnest(idx.indcollation) AS c(collid) ON true
+JOIN   pg_collation col ON col.oid = c.collid
+WHERE  col.collname NOT IN ('C', 'POSIX')
+  AND  n.nspname NOT IN ('pg_catalog', 'information_schema')
+  AND  idx.indisvalid
+ORDER  BY pg_relation_size(i.oid);
+```
+
+Ordering by size ascending gets the quick wins done first; running a client that lets you execute a generated result set as a script — [Chat2DB](https://chat2db.ai/download) among them — saves copying each statement out by hand.
+
+**Step 2 — refresh the recorded versions.** Only now, once the indexes are genuinely rebuilt:
+
+```sql
+ALTER DATABASE app REFRESH COLLATION VERSION;
+
+-- And for any explicitly created collations
+ALTER COLLATION public.en_us_ci REFRESH VERSION;
+```
+
+**Step 3 — verify the warning is gone.** Reconnect and check:
+
+```sql
+SELECT datname, datcollversion,
+       pg_database_collation_actual_version(oid) AS actual
+FROM   pg_database WHERE datname = current_database();
+```
+
+The two columns should now match, and new connections should be quiet.
+
+## Avoiding the problem in future
+
+**Use ICU collations instead of libc.** ICU versions its collation data explicitly and PostgreSQL records the exact ICU version, so upgrades are visible and controllable rather than implicit in the OS. From PostgreSQL 15 you can make ICU the provider for a whole database:
+
+```sql
+CREATE DATABASE app
+  LOCALE_PROVIDER = 'icu'
+  ICU_LOCALE = 'en-US'
+  LOCALE = 'en_US.UTF-8'
+  TEMPLATE = template0;
+```
+
+Per-column is also possible:
+
+```sql
+CREATE COLLATION en_us_icu (provider = icu, locale = 'en-US');
+ALTER TABLE users ALTER COLUMN email TYPE text COLLATE en_us_icu;
+```
+
+**Use the `C` collation where sorting is not linguistic.** Email addresses, usernames, slugs, SKUs, UUID-as-text columns — none of these need locale-aware ordering, and `C` collation is both immune to this problem and measurably faster for comparisons:
+
+```sql
+CREATE TABLE users (
+  id    bigint PRIMARY KEY,
+  email text COLLATE "C" NOT NULL UNIQUE,
+  name  text NOT NULL          -- linguistic sorting genuinely matters here
+);
+```
+
+PostgreSQL 17 added the built-in `C.UTF-8` locale provider, which gives you byte-order sorting with proper UTF-8 character semantics for `upper()`/`lower()`, and is guaranteed stable across upgrades:
+
+```sql
+CREATE DATABASE app
+  LOCALE_PROVIDER = 'builtin'
+  BUILTIN_LOCALE = 'C.UTF-8'
+  TEMPLATE = template0;
+```
+
+**Reindex as part of the OS upgrade runbook.** If you cross a glibc version, plan the reindex into the same maintenance window rather than discovering the warning afterwards. And when migrating via `pg_dump`/`pg_restore` rather than in place, the problem does not arise at all: the restore rebuilds every index against the new library.
+
+## Summary
+
+A collation version mismatch means the sort library changed under your existing text indexes, so those indexes may no longer be correctly ordered — which can produce missing rows, duplicate values in unique columns and inconsistent `ORDER BY` results. Find affected indexes through `pg_index.indcollation`, confirm with `amcheck`'s `bt_index_check`, rebuild with `REINDEX ... CONCURRENTLY`, and only then run `ALTER DATABASE ... REFRESH COLLATION VERSION`. Running the refresh first just hides a real problem. Long term, prefer ICU or the builtin `C.UTF-8` provider, and use `COLLATE "C"` on columns that never needed linguistic ordering.

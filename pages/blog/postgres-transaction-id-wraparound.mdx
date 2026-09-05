@@ -1,0 +1,263 @@
+---
+title: "Postgres Transaction ID Wraparound: Prevent and Fix It"
+description: "What transaction ID wraparound is in PostgreSQL, how to monitor relfrozenxid age, what the warnings mean, and how to recover a shut-down database."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: September 5, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# Postgres Transaction ID Wraparound: Prevent and Fix It
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="September 5, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+Transaction ID wraparound is the one PostgreSQL failure mode that can take a healthy, well-tuned database completely offline for writes, with no warning that most teams are watching for. It is also entirely preventable, and the monitoring query fits on one screen. This guide explains the mechanism, shows you exactly what to watch, and walks through recovery if you are already in the emergency state.
+
+## Why transaction IDs run out
+
+Every transaction in PostgreSQL gets a 32-bit transaction ID (XID). Every row version stores the XID that created it in a hidden `xmin` column and, once deleted or updated, the XID that removed it in `xmax`. Visibility is decided by comparing your snapshot against those numbers: a row is visible to you if `xmin` committed before your snapshot and `xmax` did not.
+
+You can see the hidden columns directly:
+
+```sql
+CREATE TABLE demo (id int, note text);
+INSERT INTO demo VALUES (1, 'first'), (2, 'second');
+
+SELECT xmin, xmax, id, note FROM demo;
+--   xmin   | xmax | id |  note
+-- ---------+------+----+--------
+--  1042371 |    0 |  1 | first
+--  1042371 |    0 |  2 | second
+```
+
+The problem is that 32 bits gives you about 4.2 billion IDs, and PostgreSQL treats the space as circular. Comparison is modulo 2^32: roughly two billion IDs are "in the past" and two billion are "in the future". If the counter were allowed to wrap all the way around, transactions that committed long ago would suddenly appear to be in the future, and their rows would vanish from every query. Committed data would silently disappear.
+
+PostgreSQL prevents this by *freezing*. Freezing marks a row version as unconditionally visible — older than every possible snapshot — so its original `xmin` no longer matters and the ID can be safely reused. In modern PostgreSQL this is recorded in the tuple's hint bits rather than by rewriting `xmin` to a magic value, but the effect is the same.
+
+Freezing is done by `VACUUM`. That is the real reason autovacuum can never be switched off: it is not just a space-reclamation nicety, it is what keeps the XID counter from catching up with your oldest unfrozen row.
+
+## The two numbers that matter
+
+Each table records the oldest XID that is definitely frozen in `pg_class.relfrozenxid`, and each database rolls that up into `pg_database.datfrozenxid`. The *age* of those values — the distance between them and the current XID — is what you monitor.
+
+```sql
+-- Age of every table, worst first
+SELECT c.oid::regclass                       AS table_name,
+       age(c.relfrozenxid)                   AS xid_age,
+       pg_size_pretty(pg_total_relation_size(c.oid)) AS size,
+       c.relkind
+FROM   pg_class c
+WHERE  c.relkind IN ('r', 'm', 't')          -- tables, matviews, TOAST
+ORDER  BY age(c.relfrozenxid) DESC
+LIMIT  20;
+```
+
+```sql
+-- Age per database, and how much headroom is left
+SELECT datname,
+       age(datfrozenxid)                                     AS xid_age,
+       current_setting('autovacuum_freeze_max_age')::bigint  AS freeze_max_age,
+       2147483648 - age(datfrozenxid)                        AS xids_until_shutdown
+FROM   pg_database
+ORDER  BY age(datfrozenxid) DESC;
+```
+
+Four thresholds govern what happens as the age grows. The defaults are:
+
+| Parameter | Default | What happens at that age |
+| --- | --- | --- |
+| `vacuum_freeze_min_age` | 50 million | Rows this old get frozen when vacuum visits their page anyway |
+| `vacuum_freeze_table_age` | 150 million | The next vacuum on the table becomes an aggressive whole-table scan |
+| `autovacuum_freeze_max_age` | 200 million | Autovacuum forces a wraparound vacuum even if autovacuum is disabled |
+| (hard limit) | ~2 billion | The database refuses new write transactions |
+
+A healthy system should never exceed `autovacuum_freeze_max_age` by much, because the forced anti-wraparound vacuum kicks in there. If ages keep climbing past 200 million, something is *stopping* vacuum from finishing — that is the actual bug, not the age itself.
+
+## The warnings you will see
+
+Around 40 million remaining IDs, PostgreSQL starts logging on every transaction:
+
+```
+WARNING:  database "app" must be vacuumed within 39987231 transactions
+HINT:  To avoid a database shutdown, execute a database-wide VACUUM in that database.
+```
+
+At roughly 3 million remaining, it stops accepting writes:
+
+```
+ERROR:  database is not accepting commands to avoid wraparound data loss in database "app"
+HINT:  Stop the postmaster and vacuum that database in single-user mode.
+```
+
+Reads still work. Every `INSERT`, `UPDATE`, `DELETE` and DDL statement fails. This is a safety stop, not corruption — no data has been lost at this point.
+
+## What actually blocks freezing
+
+Anti-wraparound vacuum cannot freeze a row that some transaction might still need to see. Anything that holds back the global xmin horizon therefore holds back freezing. There are five common culprits, and this query finds all of them:
+
+```sql
+-- 1. Long-running or abandoned transactions
+SELECT pid,
+       usename,
+       state,
+       now() - xact_start AS xact_duration,
+       now() - state_change AS in_state_for,
+       left(query, 80)     AS query
+FROM   pg_stat_activity
+WHERE  xact_start IS NOT NULL
+  AND  now() - xact_start > interval '5 minutes'
+ORDER  BY xact_start;
+
+-- 2. Inactive replication slots pinning the xmin horizon
+SELECT slot_name,
+       slot_type,
+       active,
+       xmin,
+       catalog_xmin,
+       age(xmin) AS xmin_age
+FROM   pg_replication_slots
+ORDER  BY age(xmin) DESC NULLS LAST;
+
+-- 3. Orphaned prepared transactions (two-phase commit left dangling)
+SELECT gid, prepared, owner, database, age(transaction) AS xid_age
+FROM   pg_prepared_xacts
+ORDER  BY prepared;
+
+-- 4. Standbys with hot_standby_feedback holding back the primary
+SELECT application_name, state, backend_xmin, age(backend_xmin) AS xmin_age
+FROM   pg_stat_replication;
+
+-- 5. Anti-wraparound vacuums that are running but being cancelled or starved
+SELECT p.pid, p.relid::regclass, p.phase,
+       round(100.0 * p.heap_blks_scanned / NULLIF(p.heap_blks_total, 0), 1) AS pct,
+       now() - a.xact_start AS running_for
+FROM   pg_stat_progress_vacuum p
+JOIN   pg_stat_activity a USING (pid);
+```
+
+An abandoned replication slot is the single most common cause in production. A standby is decommissioned, nobody drops its slot, and from that moment the primary can neither recycle WAL nor advance its xmin horizon. Months later the database stops accepting writes and everyone blames autovacuum.
+
+The fix, once you have confirmed the slot is genuinely dead:
+
+```sql
+SELECT pg_drop_replication_slot('old_standby_slot');
+```
+
+For a stuck prepared transaction:
+
+```sql
+ROLLBACK PREPARED 'the_gid_from_pg_prepared_xacts';
+```
+
+For a session sitting in `idle in transaction`, terminate it and then fix the application that leaked it:
+
+```sql
+SELECT pg_terminate_backend(pid)
+FROM   pg_stat_activity
+WHERE  state = 'idle in transaction'
+  AND  now() - state_change > interval '1 hour';
+
+-- Then stop it happening again:
+ALTER SYSTEM SET idle_in_transaction_session_timeout = '10min';
+SELECT pg_reload_conf();
+```
+
+## Recovering a database that has already shut down
+
+If you are seeing `database is not accepting commands to avoid wraparound data loss`, work through this in order.
+
+**Step 1 — remove whatever is holding the horizon.** Everything above. Skipping this step means the vacuum you are about to run will not be able to freeze anything, and you will be back here in an hour.
+
+**Step 2 — try a normal vacuum first.** In recent PostgreSQL versions you usually do *not* need single-user mode. The server still allows the vacuum itself to run:
+
+```bash
+vacuumdb --all --freeze --jobs=4 --echo --analyze
+```
+
+Or from psql, targeting the worst tables first (get the list from the `relfrozenxid` query above):
+
+```sql
+VACUUM (FREEZE, VERBOSE) public.big_events_table;
+```
+
+`--jobs=4` runs four connections in parallel; set it to something below your core count so the rest of the system stays responsive.
+
+**Step 3 — single-user mode, only if step 2 is refused.** Stop the server, then:
+
+```bash
+postgres --single -D /var/lib/postgresql/data app_database
+```
+
+At the `backend>` prompt:
+
+```
+backend> VACUUM (FREEZE, VERBOSE);
+```
+
+Single-user mode is strictly worse than step 2 — the whole cluster is down and you get no parallelism — so treat it as the fallback it is. When the vacuum finishes, exit with Ctrl-D and start the server normally.
+
+**Step 4 — confirm the age dropped.** Re-run the `pg_database` query. `age(datfrozenxid)` should now be a small number. If it has not moved, something is still pinning the horizon; go back to step 1.
+
+## Preventing it properly
+
+Wraparound is a monitoring failure, not a tuning failure. Three things prevent it permanently.
+
+**Alert on XID age, not on disk space.** Set a warning at 500 million and a page at 1 billion. Both are far below the 2-billion hard limit and give you weeks of runway:
+
+```sql
+-- Return one row per database that needs attention
+SELECT datname,
+       age(datfrozenxid) AS xid_age,
+       CASE
+         WHEN age(datfrozenxid) > 1000000000 THEN 'CRITICAL'
+         WHEN age(datfrozenxid) > 500000000  THEN 'WARNING'
+         ELSE 'ok'
+       END AS status
+FROM   pg_database
+WHERE  datallowconn
+ORDER  BY age(datfrozenxid) DESC;
+```
+
+**Alert on inactive replication slots too**, since they are the usual root cause:
+
+```sql
+SELECT slot_name,
+       active,
+       pg_size_pretty(
+         pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn)
+       ) AS wal_retained
+FROM   pg_replication_slots
+WHERE  NOT active
+   OR  pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn) > 10 * 1024^3;
+```
+
+**Freeze earlier on tables that never change.** For large append-only or historical tables, lowering the freeze ages means vacuum does the work incrementally instead of in one enormous forced pass:
+
+```sql
+ALTER TABLE public.events_archive SET (
+  autovacuum_freeze_min_age   = 10000000,   -- freeze rows sooner
+  autovacuum_freeze_max_age   = 100000000,  -- force the anti-wraparound pass earlier
+  autovacuum_freeze_table_age = 50000000
+);
+```
+
+Since PostgreSQL 13, `autovacuum_vacuum_insert_threshold` also triggers vacuums on insert-only tables, which is what stops an append-only log table from quietly aging past every threshold while never being touched by the dead-tuple trigger.
+
+If you are checking these numbers by hand, it is worth having them somewhere you can see them next to everything else. [Chat2DB](https://chat2db.ai/download) connects to PostgreSQL and lets you run the queries above, chart `age(relfrozenxid)` over time and drill into `pg_stat_activity` in the same window — the [web version](https://app.chat2db.ai) works without installing anything if you just need to check a server quickly.
+
+## Common misconceptions
+
+**"Upgrading to 64-bit XIDs will fix this."** PostgreSQL still uses 32-bit transaction IDs. Work on 64-bit XIDs has been proposed and discussed for years but is not in a released version, so the monitoring above remains necessary.
+
+**"Autovacuum is running, so I am safe."** Autovacuum running is not the same as autovacuum *finishing*. A vacuum that is repeatedly cancelled by conflicting DDL, or throttled so hard it never completes a pass on a large table, makes no progress on freezing. Watch `pg_stat_progress_vacuum` and `last_autovacuum`, not just the process list.
+
+**"I will notice the warnings in the log."** The warning starts at 40 million remaining out of 2 billion — that is 2% of the runway. On a busy system that can be hours. Alert on the age, which gives you months.
+
+**"VACUUM FULL is safer than VACUUM FREEZE."** `VACUUM FULL` rewrites the table and takes an `ACCESS EXCLUSIVE` lock, blocking all reads and writes to it, and it needs enough free disk for a second copy. For wraparound, plain `VACUUM (FREEZE)` is both sufficient and far less disruptive.
+
+## Summary
+
+Transaction ID wraparound happens when vacuum cannot freeze old rows fast enough to keep up with a 32-bit counter. Monitor `age(datfrozenxid)` per database and `age(relfrozenxid)` per table, alert well before the 2-billion limit, and treat any table whose age climbs past `autovacuum_freeze_max_age` as a signal that something is blocking the xmin horizon — usually an abandoned replication slot, a leaked idle-in-transaction session or a dangling prepared transaction. Fix the blocker first, then run `VACUUM (FREEZE)`; single-user mode is a last resort, not the standard procedure.

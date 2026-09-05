@@ -1,0 +1,273 @@
+---
+title: "PostgreSQL Tablespaces: When and How to Use Them"
+description: "A practical guide to PostgreSQL tablespaces: creating them, moving tables and indexes, temp_tablespaces, per-tablespace cost settings, backups and the pitfalls."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: September 5, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# PostgreSQL Tablespaces: When and How to Use Them
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="September 5, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+A tablespace in PostgreSQL is a named directory on disk where table and index files can live, instead of inside the main data directory. That is the whole concept. What makes them worth understanding is that they are simultaneously the right answer to a small number of real problems and a common source of self-inflicted operational pain — including one failure mode that can leave a cluster unable to start.
+
+## What a tablespace actually is
+
+By default every relation lives under `$PGDATA/base/<database-oid>/`. A tablespace lets you point specific relations somewhere else:
+
+```sql
+CREATE TABLESPACE fastdisk LOCATION '/mnt/nvme/pgdata';
+```
+
+PostgreSQL creates a versioned subdirectory inside that location and puts a symlink into `$PGDATA/pg_tblspc/` pointing at it:
+
+```bash
+$ ls -l /var/lib/postgresql/17/main/pg_tblspc/
+lrwxrwxrwx 1 postgres postgres 17 Sep  5 10:22 16451 -> /mnt/nvme/pgdata
+
+$ ls /mnt/nvme/pgdata/
+PG_17_202406121/
+```
+
+The version-stamped subdirectory is what lets two different major versions share a location during `pg_upgrade`.
+
+Two tablespaces always exist and cannot be dropped: `pg_default` (the `base` directory) and `pg_global` (shared catalogs).
+
+```sql
+SELECT spcname,
+       pg_tablespace_location(oid) AS location,
+       pg_size_pretty(pg_tablespace_size(oid)) AS size
+FROM   pg_tablespace
+ORDER  BY spcname;
+```
+
+## Setting one up correctly
+
+The directory must exist, be empty, and be owned by the OS user PostgreSQL runs as:
+
+```bash
+sudo mkdir -p /mnt/nvme/pgdata
+sudo chown postgres:postgres /mnt/nvme/pgdata
+sudo chmod 700 /mnt/nvme/pgdata
+```
+
+Then, as a superuser:
+
+```sql
+CREATE TABLESPACE fastdisk
+  OWNER postgres
+  LOCATION '/mnt/nvme/pgdata';
+
+-- Let an application role create objects there
+GRANT CREATE ON TABLESPACE fastdisk TO app_owner;
+```
+
+The mount point matters more than the SQL. If `/mnt/nvme` is a separate device, it must be in `/etc/fstab` so it mounts before PostgreSQL starts, and the systemd unit should depend on it. If PostgreSQL starts and the mount is not there, it will find a symlink pointing at an empty directory — and behave as though every relation in that tablespace has vanished.
+
+## Putting objects in a tablespace
+
+```sql
+-- At creation time
+CREATE TABLE events (
+  id         bigserial PRIMARY KEY,
+  payload    jsonb NOT NULL,
+  created_at timestamptz NOT NULL DEFAULT now()
+) TABLESPACE fastdisk;
+
+-- An index in a different tablespace from its table
+CREATE INDEX events_created_at_idx
+  ON events (created_at)
+  TABLESPACE fastdisk;
+
+-- Move an existing table (rewrites it; ACCESS EXCLUSIVE lock)
+ALTER TABLE events SET TABLESPACE fastdisk;
+
+-- Move an index (also ACCESS EXCLUSIVE on the table)
+ALTER INDEX events_created_at_idx SET TABLESPACE fastdisk;
+
+-- Move everything a role owns, in one statement
+ALTER TABLE ALL IN TABLESPACE pg_default OWNED BY reporting
+  SET TABLESPACE slowdisk;
+```
+
+`ALTER TABLE ... SET TABLESPACE` physically copies every file and takes an `ACCESS EXCLUSIVE` lock for the whole operation. On a 500 GB table that is a long outage. There is no concurrent variant. The workaround for a live system is to create a new partition or table in the target tablespace and migrate data into it in batches — the same technique you would use for any large table rewrite.
+
+Note also that the move needs free space in *both* tablespaces simultaneously, because the old files are only removed after the new ones are written.
+
+Set a default for a database or a session so you do not have to name it every time:
+
+```sql
+ALTER DATABASE app SET default_tablespace = 'fastdisk';
+
+-- Or per session / per role
+SET default_tablespace = 'fastdisk';
+ALTER ROLE etl SET default_tablespace = 'bulkdisk';
+```
+
+An important subtlety: partitioned tables. Setting a tablespace on the parent affects where *future* partitions go, not existing ones:
+
+```sql
+CREATE TABLE measurements (
+  id bigserial,
+  taken_at timestamptz NOT NULL,
+  value numeric
+) PARTITION BY RANGE (taken_at) TABLESPACE archive_disk;
+
+-- New partitions inherit archive_disk unless overridden
+CREATE TABLE measurements_2026_09
+  PARTITION OF measurements
+  FOR VALUES FROM ('2026-09-01') TO ('2026-10-01')
+  TABLESPACE fastdisk;   -- current month on the fast device
+```
+
+That pattern — hot partitions on NVMe, older partitions rolled onto cheaper storage — is the single most defensible use of tablespaces.
+
+## Temporary files
+
+The most broadly useful tablespace setting has nothing to do with tables. Sorts and hash joins that exceed `work_mem` spill to temporary files, and by default those land in the main data directory, competing with normal I/O.
+
+```sql
+CREATE TABLESPACE tempspace LOCATION '/mnt/scratch/pgtemp';
+
+ALTER SYSTEM SET temp_tablespaces = 'tempspace';
+SELECT pg_reload_conf();
+```
+
+`temp_tablespaces` accepts a list, and PostgreSQL picks randomly among them per temporary object, which spreads the load:
+
+```sql
+ALTER SYSTEM SET temp_tablespaces = 'tempspace1, tempspace2';
+```
+
+This is worth doing when you have a cheap fast local disk. Temporary files are, by definition, disposable — they do not need to survive a crash and do not need to be backed up, so ephemeral instance storage is perfectly appropriate for them, unlike for table data.
+
+Find out whether you are spilling enough for this to matter:
+
+```sql
+SELECT datname,
+       temp_files,
+       pg_size_pretty(temp_bytes) AS temp_written,
+       stats_reset
+FROM   pg_stat_database
+WHERE  temp_files > 0
+ORDER  BY temp_bytes DESC;
+```
+
+```sql
+-- Which queries are spilling? (requires track_io_timing and pg_stat_statements)
+SELECT round(mean_exec_time::numeric, 1) AS mean_ms,
+       calls,
+       temp_blks_written,
+       pg_size_pretty(temp_blks_written * 8192::bigint) AS temp_written,
+       left(query, 100) AS query
+FROM   pg_stat_statements
+WHERE  temp_blks_written > 0
+ORDER  BY temp_blks_written DESC
+LIMIT  10;
+```
+
+Very often the right answer to a high `temp_bytes` is to raise `work_mem` for the offending queries rather than to buy faster scratch disk — but a temp tablespace helps in either case.
+
+## Per-tablespace planner settings
+
+The planner assumes a single storage speed via `random_page_cost` and `seq_page_cost`. If you genuinely have mixed storage, you can override those per tablespace:
+
+```sql
+-- NVMe: random reads are almost as cheap as sequential
+ALTER TABLESPACE fastdisk SET (random_page_cost = 1.1, seq_page_cost = 1.0);
+
+-- Spinning disk or network storage: random access is expensive
+ALTER TABLESPACE slowdisk SET (random_page_cost = 4.0, seq_page_cost = 1.0);
+
+SELECT spcname, spcoptions FROM pg_tablespace WHERE spcoptions IS NOT NULL;
+```
+
+`effective_io_concurrency` can also be set per tablespace. These are among the few settings that make tablespaces useful for performance rather than purely for capacity, and they are frequently forgotten by people who set up mixed storage and then wonder why the planner keeps choosing sequential scans on the fast device.
+
+## Monitoring and space management
+
+```sql
+-- Size per tablespace
+SELECT spcname,
+       pg_tablespace_location(oid) AS location,
+       pg_size_pretty(pg_tablespace_size(oid)) AS size
+FROM   pg_tablespace
+ORDER  BY pg_tablespace_size(oid) DESC;
+```
+
+```sql
+-- What lives in each tablespace, largest first
+SELECT COALESCE(t.spcname, 'pg_default')        AS tablespace,
+       n.nspname                                AS schema,
+       c.relname                                AS object,
+       c.relkind,
+       pg_size_pretty(pg_relation_size(c.oid))  AS size
+FROM   pg_class c
+JOIN   pg_namespace n ON n.oid = c.relnamespace
+LEFT   JOIN pg_tablespace t ON t.oid = c.reltablespace
+WHERE  c.relkind IN ('r', 'i', 'm', 'p')
+  AND  n.nspname NOT IN ('pg_catalog', 'information_schema')
+ORDER  BY pg_relation_size(c.oid) DESC
+LIMIT  25;
+```
+
+Note the `LEFT JOIN` and the `COALESCE`: `pg_class.reltablespace` is `0` for anything in the database's default tablespace, not a real OID. Getting this wrong is the usual reason a "what is in my tablespaces" query returns far fewer rows than expected.
+
+Keeping an eye on per-tablespace growth over time is the point — a tablespace filling up is much less forgiving than the main data directory, because the failure is localised and surprising. A client that can chart repeated query results, such as [Chat2DB](https://app.chat2db.ai), makes trend-watching straightforward without standing up a metrics stack.
+
+Dropping a tablespace requires it to be completely empty, including of temporary files and objects in other databases:
+
+```sql
+-- This will fail if anything remains
+DROP TABLESPACE slowdisk;
+-- ERROR:  tablespace "slowdisk" is not empty
+
+-- Find the stragglers — note you must run this in EACH database
+SELECT c.oid::regclass, c.relkind
+FROM   pg_class c
+JOIN   pg_tablespace t ON t.oid = c.reltablespace
+WHERE  t.spcname = 'slowdisk';
+```
+
+The "in each database" part catches people out regularly, because `pg_class` is per-database while `pg_tablespace` is cluster-wide.
+
+## Backup and replication implications
+
+This is where tablespaces stop being a local decision.
+
+**`pg_basebackup` needs mapping.** Restoring to a machine with a different filesystem layout requires you to remap every tablespace:
+
+```bash
+pg_basebackup -D /var/lib/postgresql/17/main \
+  --tablespace-mapping=/mnt/nvme/pgdata=/data/nvme/pgdata \
+  --tablespace-mapping=/mnt/archive/pgdata=/data/archive/pgdata \
+  -h primary.internal -U replicator -P
+```
+
+Forget one mapping and the restore fails, or worse, tries to write into the source path.
+
+**Streaming replicas need the same paths** unless you remap at base-backup time. A replica that cannot resolve a tablespace symlink will not start.
+
+**File-system snapshots must be atomic across all devices.** If your table data is on one volume and a tablespace is on another, a snapshot that captures them at different instants produces an inconsistent, unrecoverable backup. Either use `pg_basebackup`/pgBackRest, or ensure your snapshot mechanism is consistency-group aware.
+
+**A missing tablespace mount stops recovery.** If the device behind a tablespace is unavailable at startup, PostgreSQL cannot replay WAL touching those relations. The cluster does not start.
+
+## When tablespaces are the wrong tool
+
+Most reasons people reach for tablespaces are better served by something else:
+
+- **"I am running out of disk."** Extend the filesystem — LVM, or growing the cloud volume. Almost always simpler and always safer than introducing a second storage location.
+- **"I want to separate indexes from tables for parallel I/O."** This was sound advice for arrays of spinning disks. On SSD, NVMe or any cloud block store, there is no seek time to optimise away and the underlying device is shared anyway.
+- **"I want to isolate one tenant's data."** Use a separate database or schema. Tablespaces control physical placement, not access; they are not a security boundary.
+- **"I want the WAL on a separate disk."** That is a real and worthwhile optimisation, but it is not a tablespace — it is the `pg_wal` symlink, or `initdb --waldir`.
+
+The genuinely good reasons are narrow: tiered storage for partitioned data, a dedicated scratch device for temporary files, and mixed-speed storage where you also set the per-tablespace cost parameters.
+
+## Summary
+
+A tablespace maps relations onto a different directory, wired up through symlinks in `pg_tblspc`. Create the directory as the postgres user first, use `CREATE TABLESPACE`, and remember that `ALTER TABLE ... SET TABLESPACE` is a full rewrite under an exclusive lock. The strongest uses are tiered storage on partitioned tables and a `temp_tablespaces` scratch device; pair mixed storage with per-tablespace `random_page_cost` so the planner knows. Before adopting them, be sure your backup, restore and replica provisioning all handle tablespace mapping — because a tablespace that fails to mount is a cluster that will not start.

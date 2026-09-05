@@ -1,0 +1,222 @@
+---
+title: "Postgres vs CockroachDB: Which Should You Choose?"
+description: "PostgreSQL vs CockroachDB compared on architecture, SQL compatibility, transactions, scaling, schema changes and cost, with guidance on when each fits."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: September 5, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# Postgres vs CockroachDB: Which Should You Choose?
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="September 5, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+CockroachDB speaks the PostgreSQL wire protocol and accepts most PostgreSQL SQL, which makes it look like a drop-in replacement that happens to scale horizontally. It is not one. The two databases have fundamentally different architectures, and that difference shows up in transaction semantics, latency characteristics, operational work and cost. This comparison covers where they actually differ and how to decide.
+
+## Architecture
+
+**PostgreSQL** is a single-writer database. One primary process handles all writes; replicas receive a stream of WAL records and serve reads. Scaling reads means adding replicas. Scaling writes means a bigger machine, or sharding at the application layer, or an extension like Citus. Replication is asynchronous by default, so a failover can lose recently committed transactions unless you configure synchronous replication and accept the latency cost.
+
+**CockroachDB** is a distributed, shared-nothing database. Data is split into ~512 MiB *ranges*, each replicated (three copies by default) across nodes, with Raft consensus per range electing a leaseholder that serves reads and coordinates writes. There is no primary node — every node accepts SQL for any key, routing internally to the right leaseholder. Storage is Pebble, an LSM-tree engine, rather than PostgreSQL's heap-and-B-tree.
+
+That single architectural fact drives everything else. A write in PostgreSQL is a local operation: append to WAL, fsync, done. A write in CockroachDB requires a Raft quorum, which means at least one network round trip to another node, and if your nodes span regions, a cross-region round trip. In exchange, losing a node loses nothing and requires no failover procedure.
+
+## SQL compatibility
+
+CockroachDB implements a large subset of PostgreSQL SQL and uses its wire protocol, so `psql`, JDBC, `psycopg`, `pgx` and most ORMs connect without modification. Common DDL and DML work as expected:
+
+```sql
+CREATE TABLE orders (
+  id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  customer_id UUID NOT NULL,
+  status      STRING NOT NULL,
+  amount      DECIMAL(12,2) NOT NULL,
+  created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+  INDEX (customer_id, created_at DESC)
+);
+
+WITH recent AS (
+  SELECT customer_id, sum(amount) AS total
+  FROM   orders
+  WHERE  created_at > now() - INTERVAL '30 days'
+  GROUP  BY customer_id
+)
+SELECT c.name, r.total
+FROM   recent r JOIN customers c ON c.id = r.customer_id
+ORDER  BY r.total DESC
+LIMIT  10;
+```
+
+CTEs, window functions, JSONB, arrays, foreign keys, check constraints, `ON CONFLICT` upserts, and most built-in functions all work.
+
+The gaps that matter in practice:
+
+- **No stored procedures or user-defined functions in PL/pgSQL** beyond a limited subset. Application logic living in the database does not port.
+- **Triggers** are limited compared to PostgreSQL's.
+- **No extensions.** PostGIS, pgvector, pg_stat_statements, TimescaleDB, pg_cron — none of these exist. CockroachDB has its own built-in spatial support and its own statement statistics, but they are not the extensions and not compatible with tooling that expects them.
+- **`SELECT ... FOR UPDATE`** exists but interacts differently with the concurrency model.
+- **Sequences are expensive.** `SERIAL` works but a monotonic sequence forces coordination and creates a write hotspot on one range. Use `UUID` or `unique_rowid()` instead.
+- **Full-text search** is much weaker than PostgreSQL's `tsvector` machinery.
+
+## Transactions and isolation
+
+This is the most consequential difference and the one most likely to surprise a PostgreSQL developer.
+
+**PostgreSQL** defaults to `READ COMMITTED`. Each statement sees a fresh snapshot; concurrent updates to the same row block rather than fail. Most application code is written against this behaviour without thinking about it.
+
+**CockroachDB** has historically defaulted to `SERIALIZABLE` — the strictest isolation level, which guarantees the outcome is equivalent to some serial ordering. There is no anomaly to reason about. The cost is that transactions can be *rejected* rather than blocked:
+
+```
+ERROR: restart transaction: TransactionRetryWithProtoRefreshError:
+       WriteTooOldError: write at timestamp 1725523200.000000000,0 too old
+SQLSTATE: 40001
+```
+
+Under serializable isolation, when the database detects that committing would violate serializability, it aborts the transaction and asks the client to retry. **Every transaction needs retry logic.** This is not optional and it is not an edge case under contention.
+
+```python
+import psycopg
+from psycopg.errors import SerializationFailure
+import time
+
+def run_with_retry(conn, work, max_attempts=5):
+    for attempt in range(max_attempts):
+        try:
+            with conn.transaction():
+                return work(conn)
+        except SerializationFailure:
+            if attempt == max_attempts - 1:
+                raise
+            # Exponential backoff with jitter
+            time.sleep((2 ** attempt) * 0.05)
+    raise RuntimeError("retries exhausted")
+```
+
+CockroachDB also supports `READ COMMITTED` in recent versions, which reduces retries and eases migration — but adopting it gives up the serializability guarantee that was the reason to choose the database in the first place, so it is a migration aid more than a destination.
+
+PostgreSQL can also raise `40001` if you explicitly request `SERIALIZABLE`, and the same retry pattern applies. The difference is that in PostgreSQL this is opt-in and rare; in CockroachDB it is the normal path.
+
+## Scaling
+
+**PostgreSQL scaling looks like:** vertical growth of the primary, read replicas for read-heavy workloads, connection pooling with PgBouncer, partitioning large tables, and — when a single machine truly is not enough — application-level sharding or Citus. This is well-trodden and a single modern server handles a great deal: hundreds of thousands of transactions per second is achievable on good hardware with a well-tuned schema.
+
+**CockroachDB scaling looks like:** add a node. Ranges rebalance automatically, capacity grows roughly linearly for both reads and writes, and no application changes are required. There is no failover to configure, because there is no primary.
+
+The catch is hotspots. If your primary key is sequential — an auto-incrementing integer, or a timestamp — every insert goes to the same range, on the same leaseholder, and adding nodes does not help. This is the single most common CockroachDB performance problem:
+
+```sql
+-- Bad: sequential inserts hammer one range
+CREATE TABLE events (
+  id SERIAL PRIMARY KEY,
+  ...
+);
+
+-- Good: UUIDs distribute across ranges
+CREATE TABLE events (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  ...
+);
+
+-- Also good: hash-sharded index for a time-ordered access pattern
+CREATE TABLE events (
+  id         UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  INDEX (created_at) USING HASH WITH (bucket_count = 8)
+);
+```
+
+## Geo-distribution
+
+This is CockroachDB's clearest advantage and the reason most teams adopt it. Data placement is a schema-level property:
+
+```sql
+ALTER DATABASE app SET PRIMARY REGION 'us-east1';
+ALTER DATABASE app ADD REGION 'europe-west1';
+ALTER DATABASE app ADD REGION 'asia-northeast1';
+
+-- Each row lives in the region of its owning user: low local latency
+ALTER TABLE users SET LOCALITY REGIONAL BY ROW;
+
+-- Read-mostly reference data replicated everywhere for fast local reads
+ALTER TABLE product_catalog SET LOCALITY GLOBAL;
+
+-- Whole table homed in one region
+ALTER TABLE eu_invoices SET LOCALITY REGIONAL BY TABLE IN 'europe-west1';
+```
+
+`REGIONAL BY ROW` gives you data residency compliance — EU users' rows physically stored in the EU — as a declarative property rather than as three separate database deployments plus routing logic. Doing the equivalent with PostgreSQL means running separate clusters per region and handling the routing, cross-region queries and per-region backups yourself.
+
+The cost is latency for anything that crosses regions. A transaction touching rows in two regions pays the round trip. Multi-region schemas need to be designed so that the common transaction stays within one region.
+
+## Schema changes
+
+PostgreSQL DDL is transactional and mostly fast, but some operations take an `ACCESS EXCLUSIVE` lock that blocks all traffic to the table. `ALTER TABLE ... ADD COLUMN` with a non-volatile default is instant since PostgreSQL 11; `ALTER COLUMN ... TYPE` still rewrites the table. `CREATE INDEX CONCURRENTLY` avoids the lock at the cost of a slower build and the risk of leaving an invalid index behind.
+
+CockroachDB runs schema changes online as a background job, without long-held locks:
+
+```sql
+CREATE INDEX ON orders (status, created_at DESC);
+
+SHOW JOBS;   -- watch the backfill progress
+```
+
+The trade is that schema changes are asynchronous and eventually consistent — the index is not usable until the backfill finishes — and that DDL inside a transaction has restrictions PostgreSQL does not have. For teams doing frequent online migrations at scale, this is a real quality-of-life improvement.
+
+## Operations
+
+| | PostgreSQL | CockroachDB |
+| --- | --- | --- |
+| HA setup | Patroni / repmgr / managed service; failover to configure | Built in; survives node loss with no action |
+| Backups | `pg_dump`, `pg_basebackup`, pgBackRest, WAL archiving | `BACKUP` / `RESTORE` SQL statements to object storage |
+| Upgrades | Minor: restart. Major: `pg_upgrade` or logical replication, with downtime | Rolling, node by node, online |
+| Observability | `pg_stat_*` views, huge ecosystem of tools | Built-in DB Console, `crdb_internal` tables, statement diagnostics |
+| Tuning knobs | Very many (`work_mem`, `shared_buffers`, autovacuum, planner costs) | Far fewer, deliberately |
+| Ecosystem | Enormous: extensions, tools, decades of documented experience | Smaller, growing |
+
+PostgreSQL's observability ecosystem is a genuine advantage. Twenty years of `pg_stat_statements`-based tooling, every APM vendor supporting it, and a very large body of documented failure modes. CockroachDB's DB Console is good but you are more often on your own.
+
+Note that a client speaking the PostgreSQL wire protocol connects to both — [Chat2DB](https://chat2db.ai/download) works against CockroachDB's SQL port the same way it does against PostgreSQL, which is convenient if you are running both during a migration, and the [web version](https://app.chat2db.ai) needs no local install.
+
+## Cost
+
+PostgreSQL is free and runs on one machine. A managed instance from a cloud provider is inexpensive at small and medium scale, and self-hosting is entirely reasonable.
+
+CockroachDB needs a minimum of three nodes for fault tolerance, and multi-region means at least three regions. Every write is replicated three times, so storage and write I/O are roughly tripled. CockroachDB Core is source-available under a licence with usage restrictions; the self-hosted and cloud offerings are commercial. For a workload that fits comfortably on one PostgreSQL server, CockroachDB will cost several times more for no throughput gain — and with higher single-transaction latency.
+
+## Choosing
+
+**Choose PostgreSQL when:**
+- Your workload fits on one primary with replicas, which covers the large majority of applications
+- You need extensions: PostGIS, pgvector, TimescaleDB, full-text search
+- You have PL/pgSQL logic, triggers, or heavy stored-procedure use
+- Lowest possible single-transaction latency matters
+- You want the largest possible pool of tooling, documentation and hiring
+
+**Choose CockroachDB when:**
+- You genuinely need multi-region with data residency requirements
+- Surviving a zone or region failure with zero downtime and no failover procedure is a hard requirement
+- Write throughput exceeds what one primary can do and application-level sharding is unacceptable
+- Your team can write and test retry logic on every transaction
+- The operational simplicity of "add a node" is worth the per-transaction latency and the cost
+
+**A reasonable middle path** for PostgreSQL users hitting scale limits: partition large tables, add read replicas, consider Citus for distributed PostgreSQL that keeps the extension ecosystem, or use a managed PostgreSQL with automated failover. These solve most scaling problems without changing databases.
+
+## Migration realities
+
+If you do migrate, budget for more than a schema conversion. The concrete work items:
+
+1. **Add retry logic everywhere.** Every transaction, in every service. This is the largest change and it cannot be skipped.
+2. **Replace sequential primary keys with UUIDs.** Otherwise you get a single hot range and none of the scaling benefit.
+3. **Rewrite stored procedures and triggers** as application code.
+4. **Replace extensions.** pgvector, PostGIS and TimescaleDB features all need a different approach.
+5. **Re-tune queries.** The distributed cost model differs; plans that were fine on PostgreSQL may fan out across nodes.
+6. **Re-test transaction semantics** under serializable isolation. Code written for `READ COMMITTED` can behave differently.
+
+`MOLT` (CockroachDB's migration tooling) handles schema conversion and bulk data movement, which is the easy part. Items 1 through 6 are the project.
+
+## Summary
+
+PostgreSQL is a single-writer database with an enormous ecosystem, the lowest latency per transaction, and well-understood scaling limits that most applications never reach. CockroachDB is a Raft-based distributed database that scales writes horizontally, survives node and region failure without failover, and expresses data residency in the schema — at the cost of higher per-transaction latency, mandatory retry logic under serializable isolation, no extensions, and roughly triple the storage. Pick CockroachDB for genuine multi-region and always-on requirements; pick PostgreSQL for everything else, and exhaust partitioning, replicas and Citus before concluding you have outgrown it.

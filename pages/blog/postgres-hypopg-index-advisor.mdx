@@ -1,0 +1,284 @@
+---
+title: "HypoPG: Test Postgres Indexes Without Building Them"
+description: "Use HypoPG to create hypothetical indexes in PostgreSQL and check with EXPLAIN whether the planner would use them, before paying the cost of a real index build."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: September 5, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# HypoPG: Test Postgres Indexes Without Building Them
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="September 5, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+Adding an index to a large PostgreSQL table is an expensive experiment. `CREATE INDEX CONCURRENTLY` on a few hundred gigabytes takes hours, consumes I/O the whole time, and needs disk space you may not have spare. And after all that, the planner might ignore it — because the column was not selective enough, because the column order was wrong, or because a sequential scan was cheaper all along.
+
+HypoPG removes the cost from that experiment. It lets you define an index that does not exist, and then ask the planner whether it would use it.
+
+## How it works
+
+HypoPG is an extension that hooks into the planner. When you create a hypothetical index, HypoPG registers it in backend-local memory and injects it into the list of available indexes during planning. It estimates the index's size and cost from the table's existing statistics — the same `pg_statistic` rows the planner already uses — and then lets the planner decide normally.
+
+Nothing is written to disk. Nothing is visible to other sessions. When your connection closes, the hypothetical indexes disappear. That means it is safe to run on a production primary, and it also means you can experiment against a restored copy of production and get planner decisions that reflect real data distributions.
+
+The one thing it cannot do is tell you how fast the query will actually run. `EXPLAIN ANALYZE` is impossible against an index that does not exist — there is nothing to scan. What you get is the planner's cost estimate and its choice of plan shape, which is exactly the question "would this index be used at all?"
+
+## Installation
+
+```bash
+# Debian / Ubuntu
+sudo apt-get install postgresql-17-hypopg
+
+# RHEL / Rocky
+sudo dnf install hypopg_17
+
+# From source
+git clone https://github.com/HypoPG/hypopg.git
+cd hypopg && make && sudo make install
+```
+
+No restart is needed — HypoPG does not require `shared_preload_libraries`.
+
+```sql
+CREATE EXTENSION hypopg;
+SELECT extversion FROM pg_extension WHERE extname = 'hypopg';
+```
+
+It is available on several managed platforms, including Azure Database for PostgreSQL and Google Cloud SQL. AWS RDS does not currently offer it, so for RDS the usual approach is to restore a snapshot onto a self-managed instance and experiment there.
+
+## A worked example
+
+Set up a table with realistic skew:
+
+```sql
+CREATE TABLE orders (
+  id           bigserial PRIMARY KEY,
+  customer_id  bigint      NOT NULL,
+  status       text        NOT NULL,
+  country      text        NOT NULL,
+  amount       numeric(12,2) NOT NULL,
+  created_at   timestamptz NOT NULL
+);
+
+INSERT INTO orders (customer_id, status, country, amount, created_at)
+SELECT (random() * 200000)::bigint,
+       (ARRAY['pending','paid','shipped','delivered','cancelled'])[1 + (random()*4)::int],
+       (ARRAY['US','GB','DE','FR','JP','BR'])[1 + (random()*5)::int],
+       (random() * 500)::numeric(12,2),
+       now() - (random() * 730)::int * interval '1 day'
+FROM   generate_series(1, 5000000);
+
+ANALYZE orders;
+```
+
+Five million rows, only a primary key index. Now a query that has no good access path:
+
+```sql
+EXPLAIN (COSTS, BUFFERS)
+SELECT id, amount, created_at
+FROM   orders
+WHERE  customer_id = 12345
+  AND  status = 'paid'
+ORDER  BY created_at DESC
+LIMIT  20;
+```
+
+```
+ Limit  (cost=141230.18..141230.23 rows=20 width=26)
+   ->  Sort  (cost=141230.18..141232.68 rows=1002 width=26)
+         Sort Key: created_at DESC
+         ->  Gather  (cost=1000.00..141203.51 rows=1002 width=26)
+               Workers Planned: 2
+               ->  Parallel Seq Scan on orders  (cost=0.00..140103.31 rows=418 width=26)
+                     Filter: ((customer_id = 12345) AND (status = 'paid'::text))
+```
+
+A parallel sequential scan over five million rows to find about a thousand. Let us test an index without building it:
+
+```sql
+SELECT * FROM hypopg_create_index(
+  'CREATE INDEX ON orders (customer_id, status, created_at DESC)'
+);
+```
+
+```
+ indexrelid |                      indexname
+------------+------------------------------------------------------
+      13124 | <13124>btree_orders_customer_id_status_created_at
+```
+
+Now re-run the same `EXPLAIN` — plain `EXPLAIN`, never `EXPLAIN ANALYZE`:
+
+```sql
+EXPLAIN
+SELECT id, amount, created_at
+FROM   orders
+WHERE  customer_id = 12345
+  AND  status = 'paid'
+ORDER  BY created_at DESC
+LIMIT  20;
+```
+
+```
+ Limit  (cost=0.56..76.31 rows=20 width=26)
+   ->  Index Scan using "<13124>btree_orders_customer_id_status_created_at" on orders
+         (cost=0.56..3795.42 rows=1002 width=26)
+         Index Cond: ((customer_id = 12345) AND (status = 'paid'::text))
+```
+
+Estimated cost drops from roughly 141,000 to 76, and the sort disappears entirely because the index already provides `created_at DESC` order within each `(customer_id, status)` group. That is a strong signal the index is worth building.
+
+## Comparing candidate indexes
+
+The real value is comparing alternatives cheaply. Each `hypopg_create_index` call returns an OID you can drop individually:
+
+```sql
+SELECT hypopg_reset();   -- clear everything first
+
+-- Candidate A: the order above
+SELECT indexrelid, indexname FROM hypopg_create_index(
+  'CREATE INDEX ON orders (customer_id, status, created_at DESC)');
+
+-- Candidate B: leading with the low-cardinality column
+SELECT indexrelid, indexname FROM hypopg_create_index(
+  'CREATE INDEX ON orders (status, customer_id, created_at DESC)');
+
+-- Candidate C: partial index, only the status we query
+SELECT indexrelid, indexname FROM hypopg_create_index(
+  $$CREATE INDEX ON orders (customer_id, created_at DESC) WHERE status = 'paid'$$);
+```
+
+List what is defined and how big each would be:
+
+```sql
+SELECT indexname,
+       pg_size_pretty(hypopg_relation_size(indexrelid)) AS estimated_size
+FROM   hypopg_list_indexes();
+```
+
+```
+                      indexname                       | estimated_size
+------------------------------------------------------+----------------
+ <13124>btree_orders_customer_id_status_created_at    | 219 MB
+ <13125>btree_orders_status_customer_id_created_at    | 219 MB
+ <13126>btree_orders_customer_id_created_at           | 45 MB
+```
+
+The partial index is a fifth of the size. Test them one at a time by dropping the others:
+
+```sql
+SELECT hypopg_drop_index(13125);
+SELECT hypopg_drop_index(13126);
+EXPLAIN SELECT ... ;   -- candidate A alone
+```
+
+This is the loop that saves the most time in practice: three index builds on a 5-million-row table would take real minutes and gigabytes; three hypothetical ones take milliseconds. Because each step is just running `EXPLAIN` and reading a number, it goes quickly in any client where you can keep several query tabs side by side — [Chat2DB](https://chat2db.ai/download) or its [web version](https://app.chat2db.ai) work well for this because you can keep the candidates in one tab and the `EXPLAIN` in another.
+
+## The full API
+
+| Function | Purpose |
+| --- | --- |
+| `hypopg_create_index(sql text)` | Create a hypothetical index from a `CREATE INDEX` statement |
+| `hypopg_drop_index(oid)` | Drop one hypothetical index |
+| `hypopg_reset()` | Drop all of them in this session |
+| `hypopg_list_indexes()` | List the hypothetical indexes currently defined |
+| `hypopg()` | Same information in `pg_index`-like form |
+| `hypopg_relation_size(oid)` | Estimated size in bytes |
+| `hypopg_get_indexdef(oid)` | The `CREATE INDEX` statement that would build it |
+| `hypopg_hide_index(oid)` | Hide a *real* index from the planner (v1.4+) |
+| `hypopg_unhide_index(oid)` | Un-hide it |
+| `hypopg_hidden_indexes()` | List currently hidden real indexes |
+
+## Testing index removal
+
+`hypopg_hide_index` inverts the question. Instead of "would a new index help?", it asks "what breaks if I drop this one?" — which is the harder question, because unused-looking indexes still cost write throughput and disk.
+
+Start from the indexes that appear unused:
+
+```sql
+SELECT s.schemaname,
+       s.relname          AS table_name,
+       s.indexrelname     AS index_name,
+       s.idx_scan         AS times_used,
+       pg_size_pretty(pg_relation_size(s.indexrelid)) AS size,
+       i.indisunique
+FROM   pg_stat_user_indexes s
+JOIN   pg_index i ON i.indexrelid = s.indexrelid
+WHERE  s.idx_scan < 50
+  AND  NOT i.indisunique
+  AND  NOT i.indisprimary
+ORDER  BY pg_relation_size(s.indexrelid) DESC;
+```
+
+Then confirm before dropping:
+
+```sql
+SELECT hypopg_hide_index('orders_country_idx'::regclass);
+
+-- Now check the plans of the queries you care about
+EXPLAIN SELECT count(*) FROM orders WHERE country = 'DE';
+
+SELECT hypopg_unhide_index('orders_country_idx'::regclass);
+```
+
+Two caveats on `pg_stat_user_indexes`: `idx_scan` counts since the last `pg_stat_reset()`, so check `stats_reset` in `pg_stat_database` before trusting a low number, and an index used only by a quarterly report will look unused for eleven weeks out of twelve. Hiding it and checking the report's plan is the reliable test.
+
+## Limitations to be aware of
+
+**B-tree only, mostly.** HypoPG supports hypothetical B-tree indexes fully. BRIN and hash have partial support in recent versions; GIN, GiST and SP-GiST do not, so you cannot use it to evaluate a full-text or `jsonb` index.
+
+**Cost estimates, not timings.** The planner's cost model can be wrong. An index the planner loves may still be slow if the correlation between index order and heap order is poor and it ends up doing millions of random heap fetches. HypoPG tells you the planner *would choose* the index; it does not promise the query gets faster.
+
+**Statistics must be current.** Estimated index size and selectivity both come from `pg_statistic`. Run `ANALYZE` on the table first, or every conclusion is built on stale numbers.
+
+**No index-only scan modelling for the visibility map.** Whether an index-only scan is actually cheap depends on how much of the table is marked all-visible, which is a property of a real vacuumed table.
+
+**Session-local.** Two people testing at once do not interfere with each other, but equally you cannot set up hypothetical indexes for someone else to inspect.
+
+## A repeatable workflow
+
+Putting it together, the loop that works:
+
+```sql
+-- 1. Find the expensive queries
+SELECT round(total_exec_time::numeric / 1000, 1) AS total_sec,
+       calls,
+       round(mean_exec_time::numeric, 2)         AS mean_ms,
+       round(100.0 * shared_blks_read
+             / NULLIF(shared_blks_hit + shared_blks_read, 0), 1) AS miss_pct,
+       left(query, 120) AS query
+FROM   pg_stat_statements
+ORDER  BY total_exec_time DESC
+LIMIT  10;
+
+-- 2. Make sure statistics are fresh
+ANALYZE orders;
+
+-- 3. Baseline the plan
+EXPLAIN (COSTS) SELECT ...;
+
+-- 4. Propose indexes
+SELECT hypopg_reset();
+SELECT indexname FROM hypopg_create_index('CREATE INDEX ON ...');
+
+-- 5. Re-plan and compare cost, plan shape, and estimated size
+EXPLAIN (COSTS) SELECT ...;
+SELECT indexname, pg_size_pretty(hypopg_relation_size(indexrelid))
+FROM   hypopg_list_indexes();
+
+-- 6. Build the winner for real
+CREATE INDEX CONCURRENTLY orders_customer_status_created_idx
+  ON orders (customer_id, status, created_at DESC);
+
+-- 7. Verify with the real thing
+EXPLAIN (ANALYZE, BUFFERS) SELECT ...;
+```
+
+Step 7 is not optional. HypoPG narrows a long list of candidates down to one or two worth building; `EXPLAIN ANALYZE` on the real index is what confirms the decision.
+
+## Summary
+
+HypoPG creates hypothetical indexes in session-local memory so `EXPLAIN` can tell you whether the planner would use them, without building anything. Install the extension, run `hypopg_create_index` with an ordinary `CREATE INDEX` statement, and compare plans and estimated sizes across candidates. `hypopg_hide_index` answers the reverse question for indexes you suspect are dead weight. It is limited to cost estimates and mostly to B-tree indexes, so always confirm the winner with `EXPLAIN ANALYZE` after building it for real — but as a way to discard bad index ideas in seconds instead of hours, there is nothing else quite like it.

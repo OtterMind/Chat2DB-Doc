@@ -1,0 +1,339 @@
+---
+title: "pg_cron Tutorial: Schedule Jobs Inside PostgreSQL"
+description: "Install and use pg_cron to run scheduled SQL jobs inside PostgreSQL: cron syntax, cross-database jobs, monitoring runs, error handling and production gotchas."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: September 5, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# pg_cron Tutorial: Schedule Jobs Inside PostgreSQL
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="September 5, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+Most database maintenance ends up in a crontab on some server that nobody documented. Refreshing a materialized view, pruning an audit table, recalculating a summary — each becomes a shell script wrapping `psql`, with its own connection string, its own error handling and its own way of silently failing. `pg_cron` moves all of that inside the database, where the jobs live next to the data they operate on and their run history is queryable SQL.
+
+This guide covers installation, the schedule syntax, cross-database jobs, monitoring, and the failure modes that catch people in production.
+
+## What pg_cron is
+
+`pg_cron` is an extension that adds a background worker to PostgreSQL. The worker reads a table of scheduled jobs and executes their SQL at the right times, using the same cron expression syntax you already know. Jobs run as a specific role, in a specific database, and every run is recorded in a history table.
+
+It is maintained by Citus Data (now part of Microsoft) and is available on most managed PostgreSQL services — AWS RDS and Aurora, Azure Database for PostgreSQL, and Google Cloud SQL all support it, though each requires enabling it through their parameter interface rather than editing files directly.
+
+## Installing pg_cron
+
+On a self-managed server, install the package for your PostgreSQL major version:
+
+```bash
+# Debian / Ubuntu
+sudo apt-get install postgresql-17-cron
+
+# RHEL / Rocky / Alma
+sudo dnf install pg_cron_17
+```
+
+`pg_cron` needs to be loaded at server start, because it runs a background worker. Add it to `shared_preload_libraries` and tell it which database holds the job table:
+
+```sql
+ALTER SYSTEM SET shared_preload_libraries = 'pg_cron';
+ALTER SYSTEM SET cron.database_name = 'postgres';
+```
+
+Both settings need a full restart, not a reload:
+
+```bash
+sudo systemctl restart postgresql
+```
+
+Then create the extension in the database you named:
+
+```sql
+\c postgres
+CREATE EXTENSION pg_cron;
+
+-- Confirm the background worker is alive
+SELECT extname, extversion FROM pg_extension WHERE extname = 'pg_cron';
+SELECT pid, backend_type, state
+FROM   pg_stat_activity
+WHERE  backend_type LIKE '%cron%';
+```
+
+On RDS you set `shared_preload_libraries` in the parameter group and reboot the instance; `cron.database_name` defaults to `postgres` and can be changed the same way. On Azure and Cloud SQL, enable it through the flags interface. The SQL afterwards is identical everywhere.
+
+Grant access to a non-superuser so your application role can manage its own jobs:
+
+```sql
+GRANT USAGE ON SCHEMA cron TO app_owner;
+```
+
+## Scheduling your first job
+
+`cron.schedule(job_name, schedule, command)` creates or replaces a job:
+
+```sql
+-- Delete audit rows older than 90 days, every night at 02:30
+SELECT cron.schedule(
+  'purge-old-audit-rows',
+  '30 2 * * *',
+  $$DELETE FROM audit_log WHERE created_at < now() - interval '90 days'$$
+);
+```
+
+The `$$ ... $$` dollar quoting matters: the command is stored as text, and dollar quoting saves you from escaping every single quote inside it.
+
+The schedule uses standard five-field cron syntax — minute, hour, day of month, month, day of week:
+
+| Expression | Meaning |
+| --- | --- |
+| `* * * * *` | Every minute |
+| `*/5 * * * *` | Every five minutes |
+| `0 * * * *` | On the hour |
+| `30 2 * * *` | 02:30 every day |
+| `0 3 * * 0` | 03:00 every Sunday |
+| `0 0 1 * *` | Midnight on the first of the month |
+| `0 9-17 * * 1-5` | Hourly, 09:00–17:00, weekdays |
+
+Since pg_cron 1.5 you can also use natural-language intervals for sub-minute and simple schedules:
+
+```sql
+SELECT cron.schedule('heartbeat', '30 seconds', $$SELECT 1$$);
+SELECT cron.schedule('hourly-rollup', '1 hour', $$CALL refresh_rollups()$$);
+```
+
+**Times are in the server's timezone**, which is normally UTC. Check before you assume:
+
+```sql
+SHOW timezone;
+SELECT now(), current_setting('TimeZone');
+```
+
+A job scheduled for `0 2 * * *` on a UTC server does not run at 02:00 local time, and pg_cron does not adjust for daylight saving. If a job must run at a particular local hour, either set the schedule in UTC and accept the one-hour shift twice a year, or schedule it hourly and have the SQL itself check the local time before doing any work.
+
+## Jobs in another database
+
+The job table lives in one database, but jobs can target any database in the cluster with `cron.schedule_in_database`:
+
+```sql
+SELECT cron.schedule_in_database(
+  'refresh-analytics-view',
+  '*/15 * * * *',
+  $$REFRESH MATERIALIZED VIEW CONCURRENTLY analytics.daily_summary$$,
+  'app_production'      -- target database
+);
+```
+
+You can also pin the role a job runs as, which is worth doing so jobs are not silently running as a superuser:
+
+```sql
+SELECT cron.schedule_in_database(
+  'refresh-analytics-view',
+  '*/15 * * * *',
+  $$REFRESH MATERIALIZED VIEW CONCURRENTLY analytics.daily_summary$$,
+  'app_production',
+  'analytics_owner'     -- run as this role
+);
+```
+
+Note that `REFRESH MATERIALIZED VIEW CONCURRENTLY` requires a unique index on the view. Without one you must use the non-concurrent form, which takes an `ACCESS EXCLUSIVE` lock and blocks readers for the duration — rarely what you want on a schedule.
+
+## Listing, changing and removing jobs
+
+```sql
+-- Everything currently scheduled
+SELECT jobid, jobname, schedule, database, username, active, command
+FROM   cron.job
+ORDER  BY jobname;
+
+-- Pause a job without deleting it
+UPDATE cron.job SET active = false WHERE jobname = 'purge-old-audit-rows';
+
+-- Change the schedule (re-running schedule() with the same name replaces it)
+SELECT cron.schedule(
+  'purge-old-audit-rows',
+  '0 4 * * 0',
+  $$DELETE FROM audit_log WHERE created_at < now() - interval '90 days'$$
+);
+
+-- Remove it entirely
+SELECT cron.unschedule('purge-old-audit-rows');
+```
+
+`cron.unschedule` also accepts a job ID if you prefer: `SELECT cron.unschedule(7);`
+
+## Monitoring what actually ran
+
+This is where pg_cron earns its place over a shell crontab. Every run is a row in `cron.job_run_details`:
+
+```sql
+-- Last 20 runs across all jobs
+SELECT jobid,
+       runid,
+       job_pid,
+       database,
+       username,
+       status,
+       return_message,
+       start_time,
+       end_time,
+       end_time - start_time AS duration
+FROM   cron.job_run_details
+ORDER  BY start_time DESC
+LIMIT  20;
+```
+
+```sql
+-- Anything that failed in the last day
+SELECT d.jobid,
+       j.jobname,
+       d.status,
+       d.return_message,
+       d.start_time
+FROM   cron.job_run_details d
+JOIN   cron.job j USING (jobid)
+WHERE  d.status <> 'succeeded'
+  AND  d.start_time > now() - interval '1 day'
+ORDER  BY d.start_time DESC;
+```
+
+```sql
+-- Which jobs are getting slower? Compare last 7 days against the 7 before that
+SELECT j.jobname,
+       count(*) FILTER (WHERE d.start_time > now() - interval '7 days')  AS runs_recent,
+       round(avg(EXTRACT(epoch FROM d.end_time - d.start_time))
+             FILTER (WHERE d.start_time > now() - interval '7 days')::numeric, 2)  AS avg_sec_recent,
+       round(avg(EXTRACT(epoch FROM d.end_time - d.start_time))
+             FILTER (WHERE d.start_time BETWEEN now() - interval '14 days'
+                                            AND now() - interval '7 days')::numeric, 2) AS avg_sec_prior
+FROM   cron.job_run_details d
+JOIN   cron.job j USING (jobid)
+WHERE  d.start_time > now() - interval '14 days'
+GROUP  BY j.jobname
+ORDER  BY avg_sec_recent DESC NULLS LAST;
+```
+
+That last query is the one worth putting on a dashboard. A nightly job that has crept from 30 seconds to 20 minutes is a problem you want to find before it starts overlapping with itself. Charting these results is straightforward in a client that plots query output directly — [Chat2DB](https://app.chat2db.ai) will render the run history as a time series without exporting anything to a spreadsheet.
+
+**`cron.job_run_details` grows forever.** pg_cron does not prune it. Schedule the cleanup with pg_cron itself:
+
+```sql
+SELECT cron.schedule(
+  'prune-cron-history',
+  '0 5 * * *',
+  $$DELETE FROM cron.job_run_details WHERE end_time < now() - interval '30 days'$$
+);
+```
+
+Or disable logging entirely for very high-frequency jobs:
+
+```sql
+ALTER SYSTEM SET cron.log_run = off;
+SELECT pg_reload_conf();
+```
+
+## Practical patterns
+
+**Wrap real work in a function.** Putting a long SQL statement in the job command makes it hard to version, test or reuse. A function is better:
+
+```sql
+CREATE OR REPLACE FUNCTION maintenance.prune_audit_log(retain interval DEFAULT '90 days')
+RETURNS bigint
+LANGUAGE plpgsql
+AS $$
+DECLARE
+  deleted bigint := 0;
+  batch   bigint;
+BEGIN
+  -- Delete in batches so we never hold a huge transaction open
+  LOOP
+    DELETE FROM audit_log
+    WHERE  ctid IN (
+      SELECT ctid FROM audit_log
+      WHERE  created_at < now() - retain
+      LIMIT  10000
+    );
+    GET DIAGNOSTICS batch = ROW_COUNT;
+    deleted := deleted + batch;
+    EXIT WHEN batch = 0;
+    COMMIT;   -- requires a procedure; see note below
+  END LOOP;
+  RETURN deleted;
+END;
+$$;
+```
+
+A function cannot `COMMIT`. If you need batched commits, make it a `PROCEDURE` and call it with `CALL`:
+
+```sql
+CREATE OR REPLACE PROCEDURE maintenance.prune_audit_log(retain interval DEFAULT '90 days')
+LANGUAGE plpgsql
+AS $$
+DECLARE batch bigint;
+BEGIN
+  LOOP
+    DELETE FROM audit_log
+    WHERE  ctid IN (
+      SELECT ctid FROM audit_log WHERE created_at < now() - retain LIMIT 10000
+    );
+    GET DIAGNOSTICS batch = ROW_COUNT;
+    EXIT WHEN batch = 0;
+    COMMIT;
+  END LOOP;
+END;
+$$;
+
+SELECT cron.schedule('prune-audit', '0 3 * * *',
+                     $$CALL maintenance.prune_audit_log()$$);
+```
+
+**Prevent overlapping runs.** pg_cron will happily start a job while the previous run is still going. Guard with an advisory lock:
+
+```sql
+CREATE OR REPLACE PROCEDURE maintenance.rebuild_summary()
+LANGUAGE plpgsql
+AS $$
+BEGIN
+  IF NOT pg_try_advisory_lock(hashtext('rebuild_summary')) THEN
+    RAISE NOTICE 'previous run still in progress, skipping';
+    RETURN;
+  END IF;
+
+  -- ... the actual work ...
+
+  PERFORM pg_advisory_unlock(hashtext('rebuild_summary'));
+END;
+$$;
+```
+
+**Set a statement timeout per job** so a pathological run cannot occupy a worker indefinitely:
+
+```sql
+SELECT cron.schedule(
+  'bounded-job',
+  '*/10 * * * *',
+  $$SET LOCAL statement_timeout = '5min'; CALL maintenance.rebuild_summary();$$
+);
+```
+
+## Gotchas worth knowing before production
+
+**Concurrency is capped.** `cron.max_running_jobs` defaults to 32. If more jobs are due simultaneously than that, the extras are skipped for that tick, not queued. Stagger schedules rather than putting everything on `0 * * * *`.
+
+**Jobs only run on the primary.** On a streaming replica the background worker does not execute jobs, which is correct — but it also means that after a failover, the new primary starts running every job. Make sure jobs are idempotent.
+
+**A missed window is not retried.** If the server is down at 02:30, the 02:30 job does not run late. Jobs that must not be skipped need their own check for "did I already do today's work" rather than relying on the schedule.
+
+**Errors go to the PostgreSQL log and `job_run_details`, nowhere else.** There is no email, no exit code, no alert. If nothing queries `job_run_details` for failures, a broken nightly job can go unnoticed for months. Wire the failure query above into whatever alerting you already have.
+
+**The role matters.** Jobs created without an explicit username run as the role that scheduled them. Scheduling as a superuser means the job runs with superuser rights forever, including after the person who created it has left.
+
+## When to use something else
+
+pg_cron is the right tool for SQL that operates on the database it runs in: refreshing views, pruning tables, recomputing aggregates, calling maintenance procedures. It is the wrong tool for anything that needs to talk to the outside world, for workflows with dependencies between steps, or for jobs that need retries and backoff. Those belong in a job runner or an orchestrator that can express a DAG, retries and alerting — pg_cron deliberately does none of that.
+
+## Summary
+
+`pg_cron` adds cron scheduling to PostgreSQL through a background worker, with jobs stored in `cron.job` and every run recorded in `cron.job_run_details`. Install it via `shared_preload_libraries` and a restart, schedule with `cron.schedule` or `cron.schedule_in_database`, and use standard five-field cron syntax in the server's timezone. In production: wrap work in procedures, guard against overlap with advisory locks, set statement timeouts, prune the run-history table, and alert on failed runs — because nothing else will tell you.

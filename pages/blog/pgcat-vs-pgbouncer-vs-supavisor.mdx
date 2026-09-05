@@ -1,0 +1,278 @@
+---
+title: "PgCat vs PgBouncer vs Supavisor: Which Pooler in 2026?"
+description: "Compare PgCat, PgBouncer and Supavisor for PostgreSQL connection pooling: pooling modes, load balancing, sharding, prepared statements and when to pick each."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: September 5, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# PgCat vs PgBouncer vs Supavisor: Which Pooler in 2026?
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="September 5, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+PostgreSQL forks a process per connection. Each backend costs several megabytes of memory before it does any work, and past roughly `cores × 2` concurrent active connections the server spends more time context-switching than executing queries. Meanwhile your application layer — a hundred containers with a pool of ten each — wants a thousand connections. A pooler sits between the two and reconciles them.
+
+Three open-source poolers dominate the conversation in 2026: PgBouncer, PgCat and Supavisor. They solve the same core problem and differ substantially in everything else.
+
+## The pooling modes, first
+
+All three implement the same three modes, and choosing wrongly here causes more production incidents than choosing the wrong pooler.
+
+**Session pooling.** A client connection is assigned a server connection for its entire life. Everything works exactly as if the pooler were not there — `SET`, prepared statements, advisory locks, `LISTEN`/`NOTIFY`, temporary tables. You also get no multiplexing whatsoever: 500 client connections need 500 server connections. Useful only for connection *queueing* and for clients that need full session semantics.
+
+**Transaction pooling.** A server connection is handed to a client for the duration of one transaction, then returned to the pool. This is where the multiplexing happens — 1000 clients can share 20 server connections if their transactions are short. It is what almost everyone actually wants, and it breaks anything that holds session state across transactions.
+
+**Statement pooling.** The server connection is returned after every single statement. Multi-statement transactions are impossible. Reserved for very specific autocommit-only workloads.
+
+What transaction pooling breaks, concretely:
+
+```sql
+-- Broken: the SET may land on a different backend than the SELECT
+SET work_mem = '256MB';
+SELECT * FROM big_table ORDER BY x;
+
+-- Fine: SET LOCAL is scoped to the transaction
+BEGIN;
+SET LOCAL work_mem = '256MB';
+SELECT * FROM big_table ORDER BY x;
+COMMIT;
+```
+
+```sql
+-- Broken: session advisory lock may be released on a connection you no longer hold
+SELECT pg_advisory_lock(42);
+-- ... work ...
+SELECT pg_advisory_unlock(42);
+
+-- Fine: transaction-scoped, released automatically at COMMIT
+BEGIN;
+SELECT pg_advisory_xact_lock(42);
+-- ... work ...
+COMMIT;
+```
+
+`LISTEN`/`NOTIFY` cannot work under transaction pooling at all — the listener needs a persistent backend. Session-level temporary tables likewise. Plan for a second, session-mode port for the few components that need these.
+
+## PgBouncer
+
+PgBouncer is the incumbent: a single-threaded C program using libevent, first released in 2007, and by a wide margin the most deployed. Its virtue is that it is small, extremely well understood, and predictable.
+
+```ini
+# /etc/pgbouncer/pgbouncer.ini
+[databases]
+app = host=10.0.1.10 port=5432 dbname=app_production
+app_session = host=10.0.1.10 port=5432 dbname=app_production pool_mode=session
+
+[pgbouncer]
+listen_addr = 0.0.0.0
+listen_port = 6432
+auth_type = scram-sha-256
+auth_file = /etc/pgbouncer/userlist.txt
+
+pool_mode = transaction
+max_client_conn = 5000
+default_pool_size = 20
+reserve_pool_size = 5
+reserve_pool_timeout = 3
+
+server_idle_timeout = 600
+server_lifetime = 3600
+query_wait_timeout = 120
+
+max_prepared_statements = 200   # 1.21+ enables protocol-level prepared statements
+
+admin_users = pgbouncer_admin
+stats_users = monitoring
+```
+
+The admin console is genuinely good and is the main reason operators like it:
+
+```sql
+psql -p 6432 -U pgbouncer_admin pgbouncer
+
+SHOW POOLS;    -- per pool: cl_active, cl_waiting, sv_active, sv_idle, maxwait
+SHOW CLIENTS;
+SHOW SERVERS;
+SHOW STATS;    -- queries/sec, avg query time, bytes in/out
+```
+
+`cl_waiting` and `maxwait` in `SHOW POOLS` are the two numbers to alert on. Non-zero `maxwait` means clients are queuing for a server connection, which means `default_pool_size` is too small or something is holding transactions open.
+
+**The historical objections have largely been addressed.** Prepared statements in transaction mode — the classic complaint, which forced everyone using a driver with automatic prepared statements into `prepareThreshold=0` or `statement_cache_size=0` — are supported since 1.21 via `max_prepared_statements`. Multi-process operation via `SO_REUSEPORT` (`so_reuseport=1` plus multiple instances) works around the single-threaded ceiling.
+
+What remains true: PgBouncer does not do load balancing, does not do read/write splitting, does not do failover, and has no concept of sharding. It pools connections. Anything else is your load balancer's job.
+
+## PgCat
+
+PgCat is a Rust rewrite that treats the pooler as a proxy layer rather than purely a connection multiplexer. It is multithreaded (Tokio), and it adds the routing features PgBouncer deliberately omits.
+
+```toml
+# pgcat.toml
+[general]
+host = "0.0.0.0"
+port = 6432
+admin_username = "pgcat_admin"
+admin_password = "..."
+worker_threads = 4
+connect_timeout = 5000
+idle_timeout = 30000
+healthcheck_timeout = 1000
+
+[pools.app]
+pool_mode = "transaction"
+default_role = "any"
+query_parser_enabled = true          # inspect SQL to route reads vs writes
+query_parser_read_write_splitting = true
+primary_reads_enabled = false        # keep reads off the primary
+load_balancing_mode = "random"
+
+[pools.app.users.0]
+username = "app_user"
+password = "..."
+pool_size = 25
+statement_timeout = 30000
+
+[pools.app.shards.0]
+database = "app_production"
+servers = [
+  ["10.0.1.10", 5432, "primary"],
+  ["10.0.1.11", 5432, "replica"],
+  ["10.0.1.12", 5432, "replica"],
+]
+```
+
+The differentiating features:
+
+**Read/write splitting.** With `query_parser_enabled`, PgCat parses incoming SQL and sends `SELECT`s to replicas and writes to the primary — without the application knowing. This removes a whole category of application plumbing, at the cost of the pooler needing to be right about what is a read. Statements inside an explicit transaction go to the primary, and functions that write are a known hazard, so it is not free of surprises.
+
+**Load balancing with health checks.** PgCat probes each replica and takes unhealthy ones out of rotation automatically. PgBouncer would need HAProxy in front to do this.
+
+**Failover.** If the primary becomes unreachable, PgCat can be configured to fail over to another server in the shard rather than returning errors.
+
+**Sharding.** PgCat supports routing by a sharding key, either via a comment annotation or a `SET` before the query:
+
+```sql
+-- Route this query to a specific shard
+SET SHARD TO '2';
+SELECT * FROM users WHERE id = 90210;
+
+-- Or by sharding key, letting PgCat compute the shard
+SET SHARDING KEY TO '90210';
+SELECT * FROM users WHERE id = 90210;
+```
+
+This is genuinely useful for a specific architecture, and irrelevant if you do not have one.
+
+PgCat also speaks the PgBouncer admin protocol, so `SHOW POOLS` and friends work, and existing dashboards mostly carry over. It exposes Prometheus metrics natively, which PgBouncer needs an exporter for.
+
+The trade-off is maturity and operational surface area. PgBouncer's behaviour under every kind of failure has been documented by two decades of production use. PgCat is younger, and the query parser in particular is a component that can be wrong in ways that are hard to debug — a misrouted write to a read replica surfaces as a confusing read-only transaction error.
+
+## Supavisor
+
+Supavisor is Supabase's pooler, written in Elixir on the BEAM VM. Its design goal is different from the other two: multi-tenant, cloud-scale pooling where a single cluster fronts a very large number of separate PostgreSQL databases.
+
+The BEAM choice is deliberate. Erlang's process model handles enormous numbers of lightweight concurrent connections well, and it gives Supavisor clustering — several Supavisor nodes form a distributed cluster and share tenant state, so a client can connect to any node.
+
+Configuration is API-driven rather than file-driven, which suits a control-plane deployment and is awkward for a single application:
+
+```bash
+curl -X POST http://supavisor:4000/api/tenants \
+  -H "Authorization: Bearer $JWT" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "tenant": {
+      "external_id": "my-tenant",
+      "db_host": "10.0.1.10",
+      "db_port": 5432,
+      "db_database": "app_production",
+      "require_user": false,
+      "users": [{
+        "db_user": "app_user",
+        "db_password": "...",
+        "pool_size": 20,
+        "mode_type": "transaction",
+        "is_manager": true
+      }]
+    }
+  }'
+```
+
+Clients connect with the tenant encoded in the username:
+
+```
+postgresql://app_user.my-tenant:password@supavisor-host:6543/app_production
+```
+
+Supavisor supports both transaction mode (port 6543 by convention) and session mode (port 5432), and includes named prepared statement support in transaction mode. It also handles query cancellation across a cluster, which is a genuinely hard problem in a multi-node pooler.
+
+If you use Supabase, you are already using it and this is not really a decision. If you are building a platform that hosts many customers' databases, it is the only one of the three designed for that shape. For a single application in front of a single PostgreSQL cluster, it is more infrastructure than the problem requires.
+
+## Side by side
+
+| | PgBouncer | PgCat | Supavisor |
+| --- | --- | --- | --- |
+| Language | C | Rust | Elixir / BEAM |
+| Concurrency | Single-threaded (multi-process via SO_REUSEPORT) | Multithreaded | BEAM processes, clustered |
+| Session / transaction / statement modes | Yes | Yes | Session and transaction |
+| Prepared statements in txn mode | Yes (1.21+) | Yes | Yes |
+| Load balancing | No | Yes, with health checks | Yes |
+| Read/write splitting | No | Yes (query parser) | No |
+| Failover | No | Yes | Via cluster |
+| Sharding | No | Yes | No |
+| Multi-tenant control plane | No | No | Yes |
+| Config | INI file | TOML file | HTTP API |
+| Metrics | Admin console; exporter needed for Prometheus | Admin console + native Prometheus | Prometheus |
+| Maturity | Very high | Moderate | Moderate |
+
+## Choosing
+
+**Pick PgBouncer** if you have one PostgreSQL cluster and an application that opens too many connections. That is the overwhelmingly common case, and PgBouncer solves it with the least moving parts, the best-understood failure modes and the smallest resource footprint. Put HAProxy or your cloud load balancer in front if you also need to distribute across replicas.
+
+**Pick PgCat** if you specifically want read/write splitting or replica load balancing *inside* the pooler rather than as a separate layer, or if you have a sharded topology to route. Be prepared to test the query parser carefully against your actual workload.
+
+**Pick Supavisor** if you are on Supabase, or if you are operating a multi-tenant database platform where the pooler needs its own control plane.
+
+## Getting the pool size right, whichever you pick
+
+The pooler does not help if the pool size is wrong, and the number is smaller than most people expect. The PostgreSQL wiki formula is `connections = cores × 2 + effective_spindle_count`, where the spindle term is about 1 on SSD or NVMe. An 8-core server with NVMe wants roughly 17 concurrent server connections — total, across every application instance.
+
+```sql
+-- What are your connections actually doing right now?
+SELECT state,
+       count(*),
+       max(now() - state_change) AS longest_in_state
+FROM   pg_stat_activity
+WHERE  backend_type = 'client backend'
+GROUP  BY state
+ORDER  BY count(*) DESC;
+```
+
+```sql
+-- Headroom against max_connections
+SELECT current_setting('max_connections')::int          AS max_conn,
+       count(*)                                         AS in_use,
+       current_setting('max_connections')::int - count(*) AS free
+FROM   pg_stat_activity;
+```
+
+```sql
+-- The killer: sessions holding a transaction open while doing nothing
+SELECT pid, usename, application_name,
+       now() - state_change AS idle_for,
+       left(query, 100)     AS last_query
+FROM   pg_stat_activity
+WHERE  state = 'idle in transaction'
+ORDER  BY state_change;
+```
+
+That last query is worth running before you change any pooler setting. A transaction-mode pooler cannot return a server connection to the pool while the client is sitting in an open transaction — so a handful of leaked `idle in transaction` sessions can starve a pool that is sized perfectly well. Set `idle_in_transaction_session_timeout` on the server side and fix the code path.
+
+Watching these numbers over time is more useful than sampling them during an incident. Any client that charts query results — [Chat2DB](https://app.chat2db.ai) does this directly, or download it from [chat2db.ai/download](https://chat2db.ai/download) — will let you keep the connection-state breakdown next to the pooler's own `SHOW POOLS` output while you tune.
+
+## Summary
+
+All three poolers implement session, transaction and statement pooling, and transaction mode is what delivers the multiplexing — at the cost of breaking session-scoped state, so use `SET LOCAL` and `pg_advisory_xact_lock`. PgBouncer is the right default: mature, minimal, and no longer limited by the prepared-statement problem. PgCat adds load balancing, read/write splitting, failover and sharding in Rust, at the cost of a younger codebase and a query parser you must validate. Supavisor targets multi-tenant platforms and is the natural choice on Supabase. Whichever you deploy, size the pool from `cores × 2 + 1`, not from your container count, and hunt down `idle in transaction` sessions before blaming the pooler.
