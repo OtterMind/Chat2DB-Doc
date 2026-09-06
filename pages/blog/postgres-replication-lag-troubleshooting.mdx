@@ -1,0 +1,239 @@
+---
+title: "Fix PostgreSQL Replication Lag: A Debugging Guide"
+description: "Diagnose PostgreSQL replication lag: measure send, write, flush and replay lag, find the real bottleneck, and fix conflicts, slow disks and long queries."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: September 6, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# Fix PostgreSQL Replication Lag: A Debugging Guide
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="September 6, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+"The replica is lagging" is not a diagnosis. PostgreSQL replication has four distinct stages, and lag at each one has a different cause and a different fix. Measuring which stage is behind takes one query and turns a vague incident into a specific problem.
+
+## The four stages
+
+When a primary streams WAL to a standby, each byte passes through:
+
+1. **Sent** — the primary's walsender has pushed it onto the network.
+2. **Written** — the standby's walreceiver has written it to the operating system.
+3. **Flushed** — the standby has fsynced it to disk. At this point the data survives a crash on the standby.
+4. **Replayed** — the standby's startup process has applied it to the data files. Only now is it visible to queries on the standby.
+
+A standby can be fully caught up on flush and hours behind on replay. That is the most common shape of the problem, and it is invisible if you only look at one number.
+
+## Measuring lag correctly
+
+Run this on the **primary**:
+
+```sql
+SELECT client_addr,
+       application_name,
+       state,
+       sync_state,
+       pg_size_pretty(pg_wal_lsn_diff(pg_current_wal_lsn(), sent_lsn))   AS pending_send,
+       pg_size_pretty(pg_wal_lsn_diff(sent_lsn,  write_lsn))             AS write_lag_bytes,
+       pg_size_pretty(pg_wal_lsn_diff(write_lsn, flush_lsn))             AS flush_lag_bytes,
+       pg_size_pretty(pg_wal_lsn_diff(flush_lsn, replay_lsn))            AS replay_lag_bytes,
+       write_lag,
+       flush_lag,
+       replay_lag
+FROM   pg_stat_replication;
+```
+
+The three interval columns (`write_lag`, `flush_lag`, `replay_lag`) are time-based and are the ones to alert on. The byte columns tell you the volume involved.
+
+Run this on the **standby**:
+
+```sql
+SELECT pg_is_in_recovery() AS is_standby,
+       pg_last_wal_receive_lsn()  AS received,
+       pg_last_wal_replay_lsn()   AS replayed,
+       pg_size_pretty(pg_wal_lsn_diff(pg_last_wal_receive_lsn(),
+                                      pg_last_wal_replay_lsn())) AS unapplied,
+       now() - pg_last_xact_replay_timestamp() AS replay_delay;
+```
+
+One trap here: on a completely idle primary, `now() - pg_last_xact_replay_timestamp()` grows forever, because no new transaction has arrived to reset it. It is measuring "time since the last transaction", not lag. Always interpret it alongside `pg_wal_lsn_diff` — if received equals replayed, the standby is caught up no matter what the timestamp says.
+
+## Case 1: network lag (sent is behind current)
+
+`pending_send` is large and growing. The primary is generating WAL faster than it can push it out.
+
+```sql
+-- How much WAL is the primary producing?
+SELECT pg_current_wal_lsn();
+-- run twice, 60 seconds apart, then:
+SELECT pg_size_pretty(pg_wal_lsn_diff('0/AB000000', '0/A0000000')) AS wal_in_60s;
+```
+
+Fixes, in order of usefulness:
+
+- **Enable WAL compression** if the traffic is dominated by full-page images. `wal_compression = lz4` (or `zstd` on newer versions) typically cuts WAL volume noticeably for a small CPU cost.
+- **Reduce full-page writes** by spacing checkpoints out: raise `max_wal_size` and `checkpoint_timeout`. Every page's first modification after a checkpoint writes the entire page to WAL, so frequent checkpoints multiply WAL volume.
+- **Check the actual link.** Cross-region replication over a saturated or high-latency link cannot be tuned around in the database.
+
+```sql
+ALTER SYSTEM SET wal_compression = 'lz4';
+ALTER SYSTEM SET max_wal_size = '16GB';
+ALTER SYSTEM SET checkpoint_timeout = '15min';
+SELECT pg_reload_conf();
+```
+
+## Case 2: flush lag (write is fast, flush is slow)
+
+`flush_lag_bytes` is the large number. The standby receives WAL quickly but is slow to fsync it. This is a storage problem on the standby, almost always one of:
+
+- a smaller or cheaper disk than the primary — network-attached storage with a low IOPS tier is the usual culprit;
+- a noisy neighbour on shared infrastructure;
+- `synchronous_commit = on` with the standby in `synchronous_standby_names`, which makes primary commits wait for this fsync.
+
+If the standby is synchronous, this lag is not just the standby's problem — every commit on the primary is paying for it. Confirm with:
+
+```sql
+SELECT application_name, sync_state, sync_priority
+FROM   pg_stat_replication;
+
+SHOW synchronous_standby_names;
+SHOW synchronous_commit;
+```
+
+If the standby is a reporting replica that does not need to be synchronous, take it out of `synchronous_standby_names`. If it must be synchronous, `synchronous_commit = remote_write` instead of `on` removes the fsync from the commit path at the cost of losing the last few transactions if the standby's OS crashes at exactly the wrong moment.
+
+## Case 3: replay lag (the common one)
+
+Received and flushed are current; `replay_lag` is minutes or hours. The startup process on the standby applies WAL **single-threaded**. There is no parallel replay in core PostgreSQL. So replay falls behind when:
+
+**A long-running query on the standby blocks it.** With `hot_standby_feedback` or `max_standby_streaming_delay`, a query on the standby can pause replay so its snapshot stays valid.
+
+```sql
+-- On the standby: what is the startup process waiting for?
+SELECT pid, backend_type, wait_event_type, wait_event, state,
+       now() - query_start AS running_for, left(query, 80) AS query
+FROM   pg_stat_activity
+WHERE  backend_type = 'startup' OR state = 'active'
+ORDER  BY query_start;
+```
+
+If you see a reporting query that has been running for 40 minutes and the startup process is waiting, that is your answer. Options:
+
+```sql
+-- Let replay win after 30s, cancelling conflicting queries (the default is 30s):
+ALTER SYSTEM SET max_standby_streaming_delay = '30s';
+
+-- Or let queries win, at the cost of unbounded replay lag:
+ALTER SYSTEM SET max_standby_streaming_delay = -1;
+```
+
+Setting it to `-1` is a deliberate choice: the standby stays consistent but may lag indefinitely, which is fine for a reporting replica and catastrophic for one you intend to fail over to.
+
+**The primary is doing something replay-expensive.** A `VACUUM` on a huge table, a bulk `UPDATE`, an index build, or a `TRUNCATE` of many partitions generates WAL that is cheap to produce in parallel on the primary and expensive to apply serially on the standby. A primary with 16 cores writing concurrently can outpace one replay process.
+
+```sql
+-- On the primary, what is generating the WAL right now?
+SELECT pid, now() - xact_start AS xact_age, state,
+       left(query, 100) AS query
+FROM   pg_stat_activity
+WHERE  state <> 'idle' AND xact_start IS NOT NULL
+ORDER  BY xact_start;
+```
+
+The fix is on the primary: batch large writes into smaller transactions with pauses, so replay can keep up.
+
+**I/O on the standby cannot keep up with random reads.** Replay reads the pages it modifies. If the standby's cache is cold — because nothing queries it — every WAL record becomes a random read.
+
+```sql
+-- On the standby, PG 13+:
+SELECT * FROM pg_stat_progress_basebackup;   -- during a rebuild
+-- Wait events during replay tell the story:
+SELECT wait_event_type, wait_event, count(*)
+FROM   pg_stat_activity
+WHERE  backend_type = 'startup'
+GROUP  BY 1,2;
+```
+
+`IO / DataFileRead` dominating means the standby is disk-bound. Raise `effective_cache_size`, give the machine more RAM, or move to faster storage. There is no configuration setting that makes serial replay parallel.
+
+## Case 4: the standby has stopped entirely
+
+Replay lag that grows perfectly linearly usually means the standby is not receiving anything at all.
+
+```sql
+-- On the standby: is the walreceiver alive?
+SELECT status, sender_host, sender_port, conninfo
+FROM   pg_stat_wal_receiver;
+```
+
+Empty result means no receiver. Check the standby's log for the reason. Common ones:
+
+- **The primary recycled WAL the standby still needed** — `requested WAL segment ... has already been removed`. This is what replication slots prevent. Without a slot, the standby must be rebuilt or fed from the WAL archive.
+- **Authentication failure** after a password rotation.
+- **The standby was promoted by accident** — `pg_is_in_recovery()` returns false.
+
+Prevent the first case with a slot:
+
+```sql
+-- On the primary
+SELECT pg_create_physical_replication_slot('standby1');
+
+-- On the standby, in postgresql.conf
+-- primary_slot_name = 'standby1'
+```
+
+And bound its damage, so a dead standby cannot fill the primary's disk:
+
+```sql
+ALTER SYSTEM SET max_slot_wal_keep_size = '128GB';
+SELECT pg_reload_conf();
+
+SELECT slot_name, active, wal_status,
+       pg_size_pretty(pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn)) AS retained
+FROM   pg_replication_slots;
+```
+
+`wal_status = 'lost'` means the slot has already been invalidated and that standby needs rebuilding.
+
+## Logical replication lag is a different animal
+
+For logical replication, lag on the subscriber has its own causes:
+
+```sql
+-- On the publisher
+SELECT slot_name, plugin, active,
+       pg_size_pretty(pg_wal_lsn_diff(pg_current_wal_lsn(), confirmed_flush_lsn)) AS lag
+FROM   pg_replication_slots WHERE slot_type = 'logical';
+
+-- On the subscriber
+SELECT subname, pid, received_lsn, latest_end_lsn,
+       now() - latest_end_time AS since_last
+FROM   pg_stat_subscription;
+```
+
+The usual causes are: a table on the subscriber missing an index that the publisher has, so every replicated `UPDATE` does a sequential scan to find its row; a large transaction that must be fully decoded before any of it is sent (mitigated by `streaming = on` in the subscription on PG 14+); or an apply error that has stalled the worker, which you can see in `pg_stat_subscription_stats`.
+
+```sql
+SELECT * FROM pg_stat_subscription_stats;
+```
+
+Missing indexes on the subscriber are worth checking first — the replica identity lookup uses them, and a table that is only written by replication often never got the index its query patterns would have suggested.
+
+## A monitoring baseline
+
+Alert on replay lag in seconds, not bytes, and set the threshold from what a failover would cost you:
+
+```sql
+-- Suitable for a monitoring query on the standby
+SELECT CASE
+         WHEN pg_last_wal_receive_lsn() = pg_last_wal_replay_lsn() THEN 0
+         ELSE EXTRACT(EPOCH FROM (now() - pg_last_xact_replay_timestamp()))
+       END AS replay_lag_seconds;
+```
+
+The `CASE` handles the idle-primary trap. Keeping this query, `pg_stat_replication` and the slot query on one dashboard — or open together in a client such as [Chat2DB](https://app.chat2db.ai), which can hold connections to the primary and every standby at once — turns the first two minutes of a lag incident into reading three numbers instead of ssh-ing to four machines.
+
+Two rules keep most of these incidents from happening at all: give every standby a replication slot with `max_slot_wal_keep_size` set, and decide explicitly, per replica, whether queries or replay wins. Replicas that silently lag are almost always the ones where nobody made that second decision.

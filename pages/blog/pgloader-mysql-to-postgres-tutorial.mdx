@@ -1,0 +1,250 @@
+---
+title: "pgloader Tutorial: Migrate MySQL to PostgreSQL"
+description: "A practical pgloader tutorial: install it, write a .load file, fix tinyint and zero-date problems, tune throughput, and verify a MySQL to PostgreSQL migration."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: September 6, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# pgloader Tutorial: Migrate MySQL to PostgreSQL
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="September 6, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+Moving a database from MySQL to PostgreSQL is mostly a type-mapping problem. The rows themselves transfer easily; what costs you a weekend is discovering that `tinyint(1)` came across as a small integer instead of a boolean, that half your `datetime` columns contain `0000-00-00 00:00:00`, and that every sequence is sitting at 1 so the first insert after cutover throws a duplicate key error.
+
+pgloader exists to handle exactly that layer. It is a single command that reads the source schema, creates the PostgreSQL equivalent, streams the data across with COPY, then builds indexes and constraints and resets sequences. This tutorial walks through a real migration, including the parts that go wrong.
+
+## Installing pgloader
+
+pgloader is packaged for most distributions, but the packaged version is often several years old and misses cast rules you will want.
+
+```bash
+# Debian / Ubuntu
+sudo apt-get install -y pgloader
+pgloader --version
+
+# macOS
+brew install pgloader
+
+# Docker — the version that avoids "my distro ships 3.6.1" problems
+docker run --rm -v "$PWD":/work -w /work \
+  ghcr.io/dimitri/pgloader:latest pgloader --version
+```
+
+If you are on macOS with an Apple Silicon chip, the Docker image is the path of least resistance; the Homebrew build has historically been fragile because pgloader is written in Common Lisp and depends on SBCL.
+
+## The one-line migration, and why you outgrow it
+
+pgloader can run without a configuration file at all:
+
+```bash
+pgloader mysql://migrator:secret@mysql.internal/shop \
+         postgresql://postgres:secret@pg.internal/shop
+```
+
+That command connects to MySQL, reads the schema, creates every table in PostgreSQL, copies the data, creates the indexes and foreign keys, and resets the sequences. For a small database with clean data it genuinely works, and it is the right first thing to try — the failures it produces tell you what you need to configure.
+
+What it does not give you is control. You cannot exclude the 40 GB audit log you do not want to migrate, you cannot say that `tinyint(1)` means boolean, and you cannot tune the batching. For that you need a `.load` file.
+
+## Writing a .load file
+
+A `.load` file is pgloader's own command language. Save this as `mysql-to-postgres.load`:
+
+```lisp
+LOAD DATABASE
+     FROM      mysql://migrator:secret@mysql.internal:3306/shop
+     INTO      postgresql://postgres:secret@pg.internal:5432/shop
+
+     WITH create tables,
+          create indexes,
+          reset sequences,
+          downcase identifiers,
+          on error stop,
+          workers = 8,
+          concurrency = 2,
+          multiple readers per thread,
+          rows per range = 100000,
+          batch rows = 25000,
+          batch size = 20MB
+
+      SET PostgreSQL PARAMETERS
+          maintenance_work_mem to '512MB',
+          work_mem to '64MB'
+
+      SET MySQL PARAMETERS
+          net_read_timeout  = '600',
+          net_write_timeout = '600'
+
+     CAST type tinyint when (= 1 precision) to boolean using tinyint-to-boolean drop typemod,
+          type datetime  to timestamptz drop default drop not null using zero-dates-to-null,
+          type timestamp to timestamptz drop default drop not null using zero-dates-to-null,
+          type date      drop not null drop default using zero-dates-to-null,
+          type enum      to text drop typemod
+
+     EXCLUDING TABLE NAMES MATCHING 'audit_log', 'sessions'
+
+     BEFORE LOAD DO
+       $$ CREATE SCHEMA IF NOT EXISTS public; $$
+
+     AFTER LOAD DO
+       $$ ANALYZE; $$
+;
+```
+
+Run it:
+
+```bash
+chmod 600 mysql-to-postgres.load          # it contains passwords
+pgloader --dry-run mysql-to-postgres.load # parse and connect only
+pgloader --verbose --logfile pgloader.log mysql-to-postgres.load
+```
+
+If you would rather not hand-write this file, the [pgloader config generator](https://chat2db.ai/tools/pgloader-config-generator) builds one from a form, including the cast rules and the verification SQL discussed below.
+
+## The type mappings that actually matter
+
+### tinyint(1) is a boolean, except when it is not
+
+MySQL has no boolean type. `BOOLEAN` is an alias for `tinyint(1)`, so an ORM writing `is_active BOOLEAN` produces a `tinyint(1)` column holding 0 and 1. But a column declared `tinyint(4)` holding a small counter is a genuine integer. The `when (= 1 precision)` guard is what separates them:
+
+```lisp
+CAST type tinyint when (= 1 precision) to boolean using tinyint-to-boolean drop typemod
+```
+
+Without the guard you turn every small integer in the database into a boolean, which fails loudly for values above 1 — and silently corrupts meaning where it does not fail.
+
+### Zero dates
+
+MySQL in its default historical configuration accepts `0000-00-00` as a date. PostgreSQL does not, and will not. pgloader's `zero-dates-to-null` transformation converts them to `NULL`, which means the target column cannot be `NOT NULL` — hence `drop not null` in the same rule. After the migration you can find and fix them:
+
+```sql
+-- How many rows lost a value?
+SELECT count(*) FROM orders WHERE shipped_at IS NULL;
+
+-- Once you have decided on a replacement, restore the constraint:
+UPDATE orders SET shipped_at = created_at WHERE shipped_at IS NULL;
+ALTER TABLE orders ALTER COLUMN shipped_at SET NOT NULL;
+```
+
+### ENUM columns
+
+By default pgloader creates a real PostgreSQL enum type per column. That is faithful, but it makes future changes painful: adding a value means `ALTER TYPE ... ADD VALUE`, and enum types cannot be dropped while a column uses them. Casting to `text` plus a check constraint is usually easier to live with:
+
+```lisp
+CAST type enum to text drop typemod
+```
+
+```sql
+ALTER TABLE orders
+  ADD CONSTRAINT orders_status_check
+  CHECK (status IN ('pending','paid','shipped','cancelled'));
+```
+
+### Unsigned integers
+
+PostgreSQL has no unsigned types. pgloader promotes them: `int unsigned` becomes `bigint`, `bigint unsigned` becomes `numeric`. A column that was four bytes in MySQL is now eight, and one that was eight is now a variable-width numeric with slower arithmetic. If you know the real range, narrow it back afterwards:
+
+```sql
+ALTER TABLE events ALTER COLUMN view_count TYPE integer USING view_count::integer;
+```
+
+## Making it fast
+
+Throughput is bounded by the source read, the network, and the work PostgreSQL does per row. In practice these four changes account for most of the difference:
+
+1. **Raise `workers` and `concurrency`.** `workers` is the number of threads pgloader uses in total; `concurrency` is how many tables it loads at once. `workers = 8, concurrency = 2` is a reasonable start on a machine with 8 cores.
+2. **Raise the batch settings.** `batch rows = 25000` and `batch size = 20MB` mean fewer, larger COPY round trips.
+3. **Skip indexes during the load.** Use `create no indexes` and build them yourself afterwards, in parallel and at your own pace:
+
+```sql
+CREATE INDEX CONCURRENTLY idx_orders_customer ON orders (customer_id);
+CREATE INDEX CONCURRENTLY idx_orders_created ON orders (created_at DESC);
+```
+
+4. **Tune the target for the duration.** On the PostgreSQL side, for the migration window only:
+
+```sql
+ALTER SYSTEM SET maintenance_work_mem = '2GB';
+ALTER SYSTEM SET max_wal_size = '32GB';
+ALTER SYSTEM SET checkpoint_timeout = '30min';
+SELECT pg_reload_conf();
+```
+
+Revert those afterwards. Do not turn `fsync` off on data you cannot recreate — the time saved is not worth a torn cluster if the machine loses power mid-load.
+
+## Verifying the migration
+
+pgloader prints a summary table of rows read and rows written per table. That summary is necessary but not sufficient; check the target directly.
+
+```sql
+-- Row counts. Compare against SELECT COUNT(*) on the MySQL side.
+SELECT relname, n_live_tup
+FROM   pg_stat_user_tables
+ORDER  BY n_live_tup DESC;
+
+-- Sequences. This is the check people skip, and the one that breaks
+-- production ten minutes after cutover.
+SELECT s.relname AS sequence_name, pg_sequence_last_value(s.oid) AS last_value
+FROM   pg_class s
+JOIN   pg_namespace n ON n.oid = s.relnamespace
+WHERE  s.relkind = 'S' AND n.nspname = 'public';
+
+-- Fix any that are behind:
+SELECT setval(pg_get_serial_sequence('orders','id'),
+              (SELECT COALESCE(max(id), 1) FROM orders));
+
+-- Columns that landed as text but should not have been.
+SELECT table_name, column_name, data_type
+FROM   information_schema.columns
+WHERE  table_schema = 'public' AND data_type = 'text'
+ORDER  BY table_name;
+
+-- Constraints that came across.
+SELECT conrelid::regclass AS table_name, conname, contype
+FROM   pg_constraint
+WHERE  connamespace = 'public'::regnamespace
+ORDER  BY 1, 3;
+```
+
+Finally, refresh statistics. pgloader's `AFTER LOAD DO ... ANALYZE` covers the current database, but the staged version is better on a large one:
+
+```bash
+vacuumdb --analyze-in-stages --dbname shop --jobs 4
+```
+
+Comparing the two schemas side by side is where a GUI earns its keep — you can keep the MySQL and PostgreSQL connections open in [Chat2DB](https://app.chat2db.ai) at the same time, run the count queries against both, and inspect the columns that came across with a type you did not expect.
+
+## Handling errors
+
+With `on error stop`, pgloader aborts on the first rejected row. That is what you want during a rehearsal: you find the problem, add a cast rule, and rerun.
+
+With `on error resume next`, pgloader logs the bad rows and keeps going. The rejected rows land in the root directory as `.dat` and `.log` files per table:
+
+```bash
+pgloader --root-dir /tmp/pgloader --verbose mysql-to-postgres.load
+ls /tmp/pgloader/shop/         # one pair of files per table with rejects
+head /tmp/pgloader/shop/orders.log
+```
+
+Use that mode for the real cutover only if you have a plan for reconciling those rows, and only after a rehearsal has told you roughly how many to expect.
+
+## What pgloader does not do
+
+- **It does not migrate stored procedures, triggers or views' logic.** MySQL and PostgreSQL procedural languages are not compatible; those get rewritten by hand. `MATERIALIZE VIEWS` copies a view's *result* into a table, which is a different thing.
+- **It is a one-shot copy, not replication.** There is no ongoing sync. If your downtime budget cannot absorb the full load time, you need a change-data-capture setup instead — Debezium reading the MySQL binlog into PostgreSQL, with pgloader doing the initial snapshot.
+- **It does not fix application SQL.** `LIMIT 10, 20` syntax, backtick quoting, `GROUP BY` with unaggregated columns, `IFNULL`, `DATE_FORMAT` — all of that is your job afterwards.
+
+## A realistic migration plan
+
+1. Run pgloader against a *copy* of production. Time it. Read every error.
+2. Add cast rules until the run is clean, and commit the `.load` file (with the credentials replaced by placeholders).
+3. Run it again, on a fresh copy, from the committed file. The second run is your rehearsal — it must be clean and it tells you the duration.
+4. Fix the application's SQL against the rehearsal target while the old database still serves traffic.
+5. On cutover day: stop writes, run pgloader, run the verification queries, run `vacuumdb --analyze-in-stages`, repoint the application.
+6. Keep the MySQL instance running, read-only, for a week. It costs almost nothing and it is the only cheap way to answer "was this column always like that?"
+
+The migration itself is a command. The schedule above is what makes it uneventful.

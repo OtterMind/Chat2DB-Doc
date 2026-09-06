@@ -1,0 +1,236 @@
+---
+title: "PostgreSQL WAL Archiving: archive_command Guide"
+description: "Set up PostgreSQL WAL archiving correctly: archive_command rules, safe testing, monitoring pg_stat_archiver, and what to do when archiving falls behind."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: September 6, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# PostgreSQL WAL Archiving: archive_command Guide
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="September 6, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+WAL archiving is the difference between "we have a backup from last night" and "we can restore to 14:32:07 this afternoon". It is also the single most common place where a PostgreSQL backup strategy is quietly broken: archiving is configured, nobody checks it, and the failure is discovered during the restore that was supposed to save the company.
+
+This guide covers what `archive_command` actually has to guarantee, how to write one that does not lie, and how to monitor and unblock archiving in production.
+
+## What WAL archiving is for
+
+PostgreSQL writes every change to the write-ahead log before it touches a data file. The WAL is split into segments — 16 MB each by default — under `pg_wal/`. Once a segment is full and no longer needed for crash recovery, PostgreSQL is free to recycle it.
+
+Archiving inserts a step before that recycling: PostgreSQL calls your `archive_command` for each completed segment, and only recycles the segment once the command reports success. Copy those segments somewhere durable and you can:
+
+- restore a base backup and replay WAL forward to any point in time (PITR);
+- feed a standby that has fallen too far behind for streaming replication to catch it up;
+- recover from a data-loss mistake — a `DELETE` without a `WHERE` — by restoring to the moment before it.
+
+## Turning it on
+
+Two settings, and both require a restart of the server for `wal_level` (`archive_mode` also requires a restart):
+
+```sql
+ALTER SYSTEM SET wal_level = 'replica';       -- 'replica' is the default and is enough
+ALTER SYSTEM SET archive_mode = 'on';
+ALTER SYSTEM SET archive_command = 'test ! -f /mnt/wal_archive/%f && cp %p /mnt/wal_archive/%f';
+```
+
+Then restart. Check what took effect:
+
+```sql
+SELECT name, setting, pending_restart
+FROM   pg_settings
+WHERE  name IN ('wal_level','archive_mode','archive_command','archive_timeout');
+```
+
+The placeholders in the command are:
+
+| Placeholder | Meaning |
+| --- | --- |
+| `%p` | Path to the WAL file to archive, relative to the data directory |
+| `%f` | The file name only, without any directory |
+
+There is no `%r` in `archive_command` (that one belongs to `restore_command`).
+
+## The rules an archive_command must follow
+
+An `archive_command` is trusted absolutely. If it exits 0, PostgreSQL considers that segment safely stored and will recycle it. Get this wrong and you lose WAL without any error appearing anywhere.
+
+**It must not overwrite an existing file.** This is why the example above starts with `test ! -f`. A crashed and restarted server can retry a segment that was already archived; if the retry writes a partial file over a good one, the archive is silently corrupt. Refuse and exit non-zero instead.
+
+**It must return non-zero on any failure.** A command like `cp %p /mnt/archive/%f || true` — or any pipeline where the last command succeeds regardless — reports success for a failed copy. So does `scp` to a full disk in some configurations. Test the exit code, not the appearance of the output.
+
+**It must be durable before it returns.** A `cp` to a local filesystem returns as soon as the write is in the page cache. If the machine loses power, that segment may not be on disk. For a local archive directory, sync it:
+
+```bash
+archive_command = 'test ! -f /mnt/wal_archive/%f && cp %p /mnt/wal_archive/%f && sync -f /mnt/wal_archive/%f'
+```
+
+**It must be fast enough.** Archiving is single-threaded per segment and sequential. If your server produces 16 MB segments faster than the command can ship them, `pg_wal/` grows without bound until the volume fills and PostgreSQL shuts down. Measure it under peak write load, not at 3am.
+
+**It must not depend on the shell's environment.** The command runs as the postgres user with a minimal environment. Absolute paths for binaries, explicit credentials files, no `~` expansion assumptions.
+
+Given all of that, the honest recommendation is: for anything beyond a lab, do not hand-write an `archive_command` that talks to object storage. Use a tool built for it — pgBackRest, Barman or WAL-G — and set `archive_command` to call that tool:
+
+```bash
+# pgBackRest
+archive_command = 'pgbackrest --stanza=main archive-push %p'
+
+# WAL-G
+archive_command = 'envdir /etc/wal-g.d/env /usr/local/bin/wal-g wal-push %p'
+
+# Barman, via the streaming/hook script
+archive_command = 'barman-wal-archive backup.internal main %p'
+```
+
+These handle retries, compression, parallelism, checksums and the do-not-overwrite rule, all of which you would otherwise be reimplementing in shell.
+
+## archive_library, the modern alternative
+
+PostgreSQL 15 introduced `archive_library`, which lets a shared library archive segments in-process instead of forking a shell command per segment. On a busy server that fork-per-16MB cost is real.
+
+```sql
+ALTER SYSTEM SET archive_library = 'basic_archive';   -- contrib example module
+ALTER SYSTEM SET basic_archive.archive_directory = '/mnt/wal_archive';
+```
+
+`basic_archive` ships in contrib as a *reference implementation*, not a production tool — its own documentation says so. Its value is as a template. Check whether your backup tool ships an archive library; several now do, and it is the direction the ecosystem is moving.
+
+You cannot set both `archive_command` and `archive_library`; if `archive_library` is set, it wins.
+
+## Testing it without waiting
+
+You do not want to discover a broken archive command in a week's worth of missing WAL. Force a segment switch and watch:
+
+```sql
+-- Write something, then force the current WAL segment to close.
+SELECT pg_switch_wal();
+
+-- Wait a moment, then look at the archiver's own statistics.
+SELECT archived_count,
+       last_archived_wal,
+       last_archived_time,
+       failed_count,
+       last_failed_wal,
+       last_failed_time,
+       stats_reset
+FROM   pg_stat_archiver;
+```
+
+If `failed_count` is climbing and `last_failed_wal` names a file, the command is failing. The reason is in the server log:
+
+```bash
+tail -f /var/log/postgresql/postgresql-17-main.log | grep -i archive
+```
+
+Typical messages and what they mean:
+
+- `archive command failed with exit code 1` — your command returned non-zero. Run it by hand as the postgres user with a real file name to see why.
+- `archive command was terminated by signal 9` — something killed it, usually the OOM killer or a timeout wrapper.
+- `archiver process exited with exit code 1` — repeated failures; PostgreSQL will retry, and `pg_wal/` will grow in the meantime.
+
+Reproduce the failure manually — this is the fastest debugging loop:
+
+```bash
+sudo -u postgres bash -c \
+  'test ! -f /mnt/wal_archive/000000010000000000000042 && cp pg_wal/000000010000000000000042 /mnt/wal_archive/000000010000000000000042; echo "exit=$?"'
+```
+
+## Monitoring, so you find out before the restore does
+
+Three things are worth an alert.
+
+**1. Archiving is failing.**
+
+```sql
+SELECT failed_count, last_failed_wal, last_failed_time
+FROM   pg_stat_archiver
+WHERE  failed_count > 0;
+```
+
+**2. Archiving has stalled.** A count of zero failures means nothing if the last successful archive was six hours ago on a busy database.
+
+```sql
+SELECT last_archived_time,
+       now() - last_archived_time AS since_last_archive
+FROM   pg_stat_archiver;
+```
+
+**3. The archive queue is growing.** Segments waiting to be archived are marked `.ready` in the status directory. A handful is normal; hundreds means you are falling behind.
+
+```sql
+SELECT count(*) AS ready_to_archive
+FROM   pg_ls_dir('pg_wal/archive_status') AS f
+WHERE  f LIKE '%.ready';
+
+-- And the size of pg_wal itself:
+SELECT pg_size_pretty(sum((pg_stat_file('pg_wal/' || name)).size)) AS pg_wal_size
+FROM   pg_ls_dir('pg_wal') AS name
+WHERE  name ~ '^[0-9A-F]{24}$';
+```
+
+Both of those functions require superuser or membership in `pg_monitor`. Running them from a dashboard or an ad-hoc client such as [Chat2DB](https://app.chat2db.ai) alongside your replication checks gives you the whole picture on one screen.
+
+## When archiving falls behind
+
+The dangerous case: `pg_wal/` is growing, the volume is filling, and PostgreSQL will shut down when it runs out. You have three levers, in order of preference:
+
+1. **Fix the command.** Usually the archive destination is full, unreachable, or its credentials expired. Fixing that lets the backlog drain on its own — PostgreSQL retries continuously.
+2. **Make the archive faster.** If the destination is fine but slow, a tool with parallel `archive-push` (pgBackRest's `process-max`, WAL-G's `WALG_UPLOAD_CONCURRENCY`) can drain a backlog that a serial `cp` cannot.
+3. **Give it more disk.** Buying time is legitimate. Extending the `pg_wal` volume is far better than the fourth option.
+
+The fourth option — turning `archive_mode` off, or pointing `archive_command` at `/bin/true` to drain the queue — throws away the WAL. It ends the incident and quietly ends your ability to do point-in-time recovery to any moment covered by the discarded segments. If you do it, take a fresh base backup immediately afterwards, and write down that the archive has a hole.
+
+Note also that an inactive **replication slot** can pin WAL just as effectively as a broken archive command, and the symptom looks identical. Check both:
+
+```sql
+SELECT slot_name, active, wal_status,
+       pg_size_pretty(pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn)) AS retained
+FROM   pg_replication_slots
+ORDER  BY pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn) DESC;
+```
+
+Set `max_slot_wal_keep_size` so a forgotten slot cannot fill the disk:
+
+```sql
+ALTER SYSTEM SET max_slot_wal_keep_size = '64GB';
+SELECT pg_reload_conf();
+```
+
+## Low-traffic databases and archive_timeout
+
+On a database that writes rarely, a WAL segment may not fill for hours, and until it fills it is not archived — so your recovery point is as old as the last full segment. `archive_timeout` forces a switch:
+
+```sql
+ALTER SYSTEM SET archive_timeout = '300s';   -- close and archive at least every 5 minutes
+SELECT pg_reload_conf();
+```
+
+The cost is a full 16 MB segment archived every timeout period regardless of how little is in it. Five minutes is a common compromise; do not set it to a few seconds on a large fleet unless you enjoy paying for storage of mostly-empty files.
+
+## Verifying the archive is actually restorable
+
+An archive you have never restored from is a hypothesis. Test it on a schedule, on a separate machine:
+
+```bash
+# Restore a base backup into a scratch directory
+pg_basebackup -h primary.internal -D /var/lib/postgresql/restore -Fp -Xs -P
+
+# Point-in-time recovery configuration
+cat >> /var/lib/postgresql/restore/postgresql.conf <<'CONF'
+restore_command = 'cp /mnt/wal_archive/%f %p'
+recovery_target_time = '2026-09-06 14:32:07+00'
+recovery_target_action = 'promote'
+CONF
+
+touch /var/lib/postgresql/restore/recovery.signal
+pg_ctl -D /var/lib/postgresql/restore -l restore.log start
+
+# Then confirm you landed where you meant to:
+psql -c "SELECT pg_last_wal_replay_lsn(), now();"
+```
+
+If that procedure has never been executed end to end, you do not have point-in-time recovery — you have a directory full of files that resemble it. Run it quarterly, and write down how long it took, because that number is your real recovery time objective.

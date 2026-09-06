@@ -1,0 +1,240 @@
+---
+title: "PostgreSQL search_path and Schemas Explained"
+description: "How the PostgreSQL search_path works, why unqualified names resolve unexpectedly, the security risk of a mutable path, and how to set it safely per role."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: September 6, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# PostgreSQL search_path and Schemas Explained
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="September 6, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+Every unqualified name in a PostgreSQL query — `orders` rather than `public.orders` — is resolved through `search_path`. Get it wrong and you read from the wrong schema, a migration creates a table where you did not expect, or a function runs against an attacker-controlled table. It is a small setting with a large blast radius.
+
+## What a schema is
+
+A schema is a namespace inside a database. Two tables can both be called `orders` as long as they are in different schemas:
+
+```sql
+CREATE SCHEMA tenant_a;
+CREATE SCHEMA tenant_b;
+
+CREATE TABLE tenant_a.orders (id bigserial PRIMARY KEY, total_cents integer);
+CREATE TABLE tenant_b.orders (id bigserial PRIMARY KEY, total_cents integer);
+```
+
+Schemas are cheap, so they are used for multi-tenancy, for separating an application's tables from reporting views, for staging areas during a migration, and for isolating extensions.
+
+Objects live in schemas; schemas live in databases. A query can cross schemas freely within one database, but cannot cross databases without a foreign data wrapper.
+
+## How search_path resolves a name
+
+`search_path` is an ordered list of schemas. When you write an unqualified name, PostgreSQL walks the list in order and uses the **first** match. When you `CREATE` an object without qualifying it, it goes into the **first** schema in the list.
+
+```sql
+SHOW search_path;
+--   "$user", public
+```
+
+The default is `"$user", public`, which means: a schema named after the current user if it exists, then `public`. On most databases no per-user schema exists, so everything lands in `public`.
+
+```sql
+SET search_path TO tenant_a, public;
+
+SELECT * FROM orders;    -- reads tenant_a.orders
+CREATE TABLE items (…);  -- creates tenant_a.items
+```
+
+Two schemas are always searched implicitly and do not need to appear in the list: `pg_catalog` (the system catalogue) and `pg_temp` (your session's temporary objects). `pg_catalog` is searched **first** unless you name it explicitly later in the path — which is why you cannot shadow a built-in function such as `count()` simply by creating one in `public`.
+
+Find where a name actually resolves:
+
+```sql
+-- The one query that answers "which table am I really reading?"
+SELECT 'orders'::regclass;              -- prints the schema-qualified name
+
+-- Full picture for a name that exists in several schemas
+SELECT n.nspname AS schema, c.relname, c.relkind
+FROM   pg_class c
+JOIN   pg_namespace n ON n.oid = c.relnamespace
+WHERE  c.relname = 'orders'
+ORDER  BY array_position(current_schemas(true), n.nspname) NULLS LAST;
+
+-- What is actually being searched right now, including implicit schemas
+SELECT current_schemas(true);
+```
+
+`current_schemas(true)` including `pg_catalog` and `pg_temp` is the honest answer to "what is my search path", and it differs from `SHOW search_path` in exactly the way that causes confusion.
+
+## Setting it at the right scope
+
+`SET` lasts for the session only. That is fine interactively and useless for an application, because a pooled connection may be handed to the next request with your setting still on it.
+
+The durable options, from narrowest to broadest:
+
+```sql
+-- For one function, permanently attached to it:
+ALTER FUNCTION calculate_totals() SET search_path = tenant_a, pg_temp;
+
+-- For one role, applied at every login:
+ALTER ROLE app_user SET search_path = app, public;
+
+-- For one role in one database:
+ALTER ROLE app_user IN DATABASE shop SET search_path = app, public;
+
+-- For everyone connecting to one database:
+ALTER DATABASE shop SET search_path = app, public;
+
+-- Cluster-wide default:
+ALTER SYSTEM SET search_path = 'app, public';
+SELECT pg_reload_conf();
+```
+
+Per-role is usually the right level: the application user gets the schema it should write to, while a reporting user gets a path that puts views first.
+
+You can also set it in the connection string, which survives pooling because it is applied when the connection is established:
+
+```
+postgresql://app_user:secret@db.internal/shop?options=-csearch_path%3Dapp,public
+```
+
+For JDBC:
+
+```
+jdbc:postgresql://db.internal/shop?currentSchema=app,public
+```
+
+Note the trap with poolers: with PgBouncer in **transaction** pooling mode, a `SET search_path` issued mid-session may not apply to the next transaction, because it may run on a different server connection. Set it per role or in the connection options instead of issuing `SET` from application code.
+
+## The security problem
+
+Consider a function that does not qualify its names:
+
+```sql
+CREATE FUNCTION account_balance(uid bigint) RETURNS numeric AS $$
+  SELECT sum(amount) FROM transactions WHERE user_id = uid;
+$$ LANGUAGE sql SECURITY DEFINER;
+```
+
+`SECURITY DEFINER` means it runs with the privileges of its owner. If the caller controls `search_path`, they can create their own `transactions` table in a schema earlier in the path, and the function will read *theirs* — while running as the owner. On older PostgreSQL versions where `public` was writable by everyone, this was a straightforward privilege escalation.
+
+The fix is to pin the path on the function itself:
+
+```sql
+CREATE FUNCTION account_balance(uid bigint) RETURNS numeric AS $$
+  SELECT sum(amount) FROM transactions WHERE user_id = uid;
+$$ LANGUAGE sql
+  SECURITY DEFINER
+  SET search_path = app, pg_temp;
+```
+
+Including `pg_temp` **last** is deliberate: if you omit it entirely, PostgreSQL still searches temporary objects, and putting it last means a caller cannot shadow a real table with a temporary one. Any `SECURITY DEFINER` function without an explicit `search_path` should be treated as a finding in review.
+
+Audit them:
+
+```sql
+SELECT n.nspname AS schema, p.proname, p.proconfig
+FROM   pg_proc p
+JOIN   pg_namespace n ON n.oid = p.pronamespace
+WHERE  p.prosecdef                                  -- SECURITY DEFINER
+  AND (p.proconfig IS NULL
+       OR NOT EXISTS (SELECT 1 FROM unnest(p.proconfig) c WHERE c LIKE 'search\_path=%'))
+  AND  n.nspname NOT IN ('pg_catalog','information_schema');
+```
+
+Any row returned is a function whose behaviour depends on its caller's session settings.
+
+## The PostgreSQL 15 change
+
+Before PostgreSQL 15, the `public` schema granted `CREATE` to `PUBLIC` — every role could create objects in it. From 15 onwards it does not, and the first thing many teams hit after upgrading is:
+
+```
+ERROR:  permission denied for schema public
+```
+
+typically from a migration tool or a test harness that creates tables at runtime. The fix is explicit and is the behaviour you wanted anyway:
+
+```sql
+GRANT USAGE  ON SCHEMA public TO app_user;
+GRANT CREATE ON SCHEMA public TO app_user;
+```
+
+Better still, give the application its own schema and leave `public` empty:
+
+```sql
+CREATE SCHEMA app AUTHORIZATION app_user;
+ALTER ROLE app_user SET search_path = app, public;
+```
+
+Now the application owns its namespace, extensions can live in `public` or their own schema, and nothing collides.
+
+## Schemas for multi-tenancy
+
+Schema-per-tenant is a common pattern, and `search_path` is what makes the application code tenant-agnostic:
+
+```sql
+-- Per request, after checking out a connection:
+SET search_path TO tenant_042, shared, public;
+-- ... all subsequent queries use unqualified names ...
+RESET search_path;
+```
+
+It works, and it has real limits worth knowing before you commit:
+
+- **The catalogue grows.** A thousand tenants with fifty tables each is fifty thousand tables. `pg_dump`, autovacuum and the planner all slow down; connection startup gets heavier.
+- **Migrations multiply.** Every schema change runs N times, in a loop, and a failure halfway through leaves tenants on different versions.
+- **Prepared statement caching** in your driver may key plans by unqualified name, producing surprising results when the path changes underneath. Test this specifically with your driver.
+
+For a small number of large tenants it is excellent. For thousands of small ones, a `tenant_id` column with row-level security is usually the better shape.
+
+Loop over schemas when you do need to apply something everywhere:
+
+```sql
+DO $$
+DECLARE s text;
+BEGIN
+  FOR s IN SELECT nspname FROM pg_namespace WHERE nspname LIKE 'tenant\_%'
+  LOOP
+    EXECUTE format('ALTER TABLE %I.orders ADD COLUMN IF NOT EXISTS notes text', s);
+  END LOOP;
+END $$;
+```
+
+Always use `format` with `%I` rather than string concatenation — schema names coming from a table are user input.
+
+## Extensions and search_path
+
+Extensions install into a schema, and by default that is the first schema in your path. Putting them in `public` clutters it and makes `pg_dump` output messier. A dedicated schema is cleaner:
+
+```sql
+CREATE SCHEMA extensions;
+CREATE EXTENSION IF NOT EXISTS pg_trgm WITH SCHEMA extensions;
+
+ALTER DATABASE shop SET search_path = app, public, extensions;
+```
+
+Where an extension lives:
+
+```sql
+SELECT e.extname, n.nspname AS schema
+FROM   pg_extension e
+JOIN   pg_namespace n ON n.oid = e.extnamespace
+ORDER  BY 1;
+```
+
+One caveat: some extensions must be in a specific schema, and some (notably `postgis` in certain setups) are painful to relocate afterwards. Decide at install time.
+
+## A practical checklist
+
+1. Give the application its own schema, owned by the application role.
+2. Set `search_path` with `ALTER ROLE`, not with `SET` from application code.
+3. Every `SECURITY DEFINER` function gets an explicit `SET search_path = …, pg_temp`.
+4. In code that runs anywhere important, qualify names fully. `app.orders` is three extra characters and removes a whole class of ambiguity.
+5. When something reads the wrong data, `SELECT 'tablename'::regclass;` before you debug anything else.
+
+That last one settles more arguments than any amount of reasoning about the path. If you find yourself checking it often — across several databases, or against a schema you did not design — a client that shows the full schema tree next to your results, such as [Chat2DB](https://app.chat2db.ai), makes the ambiguity visible instead of implied.

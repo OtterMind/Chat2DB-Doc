@@ -1,0 +1,222 @@
+---
+title: "Azure Database for PostgreSQL Flexible Server Guide"
+description: "A practical guide to Azure Database for PostgreSQL Flexible Server: tiers, HA, networking, extensions, backups and the settings that decide your bill."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: September 6, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# Azure Database for PostgreSQL Flexible Server Guide
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="September 6, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+Flexible Server is Azure's current managed PostgreSQL offering, and it replaced Single Server as the default choice some time ago. The name refers to the two things it gives you that its predecessor did not: control over the maintenance window and the ability to stop the server, and a networking model that can put the database inside your own virtual network rather than behind a public endpoint.
+
+This guide covers the decisions you make at creation time — the ones that are painful to change later — and the operational settings that matter once it is running.
+
+## Choosing a compute tier
+
+Three tiers, and the choice mostly follows the workload shape:
+
+- **Burstable (B-series)** — a fraction of a vCPU with credits that accumulate while idle and drain under load. Correct for development, CI databases and genuinely low-traffic internal tools. Wrong for anything user-facing: when credits run out, the CPU is throttled hard, and the symptom is a database that is fine for six days and unusable on the seventh.
+- **General Purpose (D-series)** — balanced vCPU to memory ratio, roughly 4 GB per vCPU. The default for most applications.
+- **Memory Optimized (E-series)** — roughly 8 GB per vCPU. Worth it when the working set nearly fits in RAM and you want it to actually fit, which for PostgreSQL is often the highest-leverage change available.
+
+Compute can be scaled up and down later, with a restart. Storage can be grown but **not shrunk**, so oversizing storage is a permanent decision about your bill.
+
+## Storage, IOPS, and the thing that surprises people
+
+Storage size and IOPS are coupled in the standard (Premium SSD) configuration: a larger disk comes with more IOPS. This means the common performance complaint — "the database is slow but CPU is at 20%" — is very often a disk-throughput ceiling reached because storage was provisioned for capacity, not for throughput.
+
+Check what you are actually hitting before scaling compute:
+
+```sql
+-- Are backends waiting on I/O?
+SELECT wait_event_type, wait_event, count(*)
+FROM   pg_stat_activity
+WHERE  wait_event IS NOT NULL
+GROUP  BY 1, 2
+ORDER  BY 3 DESC;
+
+-- Cache hit ratio: below ~0.99 on an OLTP workload means you are reading from disk a lot
+SELECT sum(blks_hit) * 1.0 / nullif(sum(blks_hit) + sum(blks_read), 0) AS cache_hit_ratio
+FROM   pg_stat_database;
+
+-- The tables doing the most physical reads
+SELECT relname, heap_blks_read, heap_blks_hit,
+       heap_blks_hit * 1.0 / nullif(heap_blks_hit + heap_blks_read, 0) AS hit_ratio
+FROM   pg_statio_user_tables
+ORDER  BY heap_blks_read DESC
+LIMIT  10;
+```
+
+If the hit ratio is low and the wait events are dominated by `IO`, more memory (Memory Optimized tier) or more IOPS is the fix — not more vCPU.
+
+## Networking: pick this carefully, it is hard to change
+
+Two access models, chosen at creation:
+
+**Public access with firewall rules.** The server gets a public FQDN and you allow specific IP ranges. Simple, works from anywhere, and fine for development. Every connection traverses the public internet unless you add Private Link.
+
+**Private access (VNet integration).** The server is injected into a delegated subnet in your virtual network and has no public endpoint at all. This is the right choice for production, and it is the one you cannot switch to later — changing the networking model requires creating a new server and migrating.
+
+For private access you need a subnet delegated to `Microsoft.DBforPostgreSQL/flexibleServers`, and a private DNS zone so the server's name resolves inside the VNet:
+
+```bash
+az postgres flexible-server create \
+  --resource-group rg-data \
+  --name pg-shop-prod \
+  --location westeurope \
+  --tier GeneralPurpose \
+  --sku-name Standard_D4ds_v5 \
+  --storage-size 512 \
+  --version 17 \
+  --vnet vnet-prod \
+  --subnet snet-postgres \
+  --private-dns-zone pg-shop-prod.private.postgres.database.azure.com \
+  --high-availability ZoneRedundant
+```
+
+Connections require TLS by default, and you should keep it that way:
+
+```bash
+psql "host=pg-shop-prod.postgres.database.azure.com port=5432 dbname=shop \
+      user=appuser sslmode=verify-full \
+      sslrootcert=/etc/ssl/certs/DigiCertGlobalRootCA.crt.pem"
+```
+
+Note that Flexible Server, unlike the old Single Server, does **not** require the `user@servername` login format — the plain username works.
+
+## High availability
+
+Two HA modes, both based on a synchronous standby with automatic failover:
+
+- **Zone-redundant HA** places the standby in a different availability zone in the same region. This protects against a zone failure and is what "production HA" normally means on Azure.
+- **Same-zone HA** places the standby in the same zone. It protects against a node failure only, and exists for regions without zones.
+
+Both roughly double the compute cost, because you are paying for the standby. Both add commit latency, because the standby is synchronous — this is a real, measurable cost on write-heavy workloads, and it is the reason to benchmark with HA enabled rather than without.
+
+Read replicas are separate from HA: they are asynchronous, readable, and can be in other regions. They are for read scaling and disaster recovery, not for automatic failover.
+
+## Backups and point-in-time restore
+
+Automated backups run daily with continuous WAL archiving, retained for 7 to 35 days (configurable). Restore creates a **new server** — there is no in-place restore.
+
+```bash
+# Restore to a point in time into a new server
+az postgres flexible-server restore \
+  --resource-group rg-data \
+  --name pg-shop-restored \
+  --source-server pg-shop-prod \
+  --restore-time "2026-09-06T14:32:00Z"
+```
+
+Two things to plan for. First, the restored server is a new resource with a new name and endpoint, so a real recovery involves an application change or a DNS cutover — rehearse it. Second, restore time scales with database size, and Azure does not promise a specific duration; the only way to know your recovery time objective is to test a restore of a production-sized database and time it.
+
+Enable geo-redundant backup at creation if you need cross-region restore. Like the networking model, it cannot be turned on afterwards.
+
+## Extensions
+
+Flexible Server allows a curated list of extensions, and they must be allow-listed at the server level before `CREATE EXTENSION` works. This is the single most common "it works locally but not on Azure" issue.
+
+```bash
+az postgres flexible-server parameter set \
+  --resource-group rg-data \
+  --server-name pg-shop-prod \
+  --name azure.extensions \
+  --value "pg_stat_statements,pgcrypto,uuid-ossp,vector,postgis"
+```
+
+Then, in the database:
+
+```sql
+CREATE EXTENSION IF NOT EXISTS pg_stat_statements;
+CREATE EXTENSION IF NOT EXISTS vector;
+
+-- What is available on this server?
+SELECT name, default_version, installed_version, comment
+FROM   pg_available_extensions
+ORDER  BY name;
+```
+
+`pg_stat_statements` is worth enabling on day one. Without it you have no query-level performance history, and adding it after an incident does not help with the incident.
+
+## Server parameters you should set
+
+You do not have superuser, and you do not edit `postgresql.conf`. Parameters are set through the portal, CLI or Terraform:
+
+```bash
+az postgres flexible-server parameter set -g rg-data -s pg-shop-prod \
+  --name work_mem --value 16384          # 16 MB, in kB
+
+az postgres flexible-server parameter set -g rg-data -s pg-shop-prod \
+  --name log_min_duration_statement --value 1000   # log queries over 1s
+
+az postgres flexible-server parameter set -g rg-data -s pg-shop-prod \
+  --name idle_in_transaction_session_timeout --value 300000   # 5 minutes
+```
+
+Azure sets `shared_buffers`, `max_connections` and `effective_cache_size` from the SKU and does not let you override the first two freely. What you should tune:
+
+- `work_mem` — per sort or hash operation, per node. The default is conservative. Raise it based on your query shapes, remembering a single query can use it many times over.
+- `log_min_duration_statement` — turn slow query logging on; it is off by default.
+- `idle_in_transaction_session_timeout` — a session left idle inside a transaction blocks vacuum and holds locks. Five minutes is a sane ceiling for most applications.
+- `max_standby_streaming_delay` — on read replicas, decide whether reporting queries or replication lag wins.
+
+Check what is actually in effect and which parameters need a restart:
+
+```sql
+SELECT name, setting, unit, source, pending_restart
+FROM   pg_settings
+WHERE  source NOT IN ('default', 'client')
+ORDER  BY name;
+```
+
+## Connection management
+
+Flexible Server includes PgBouncer as a built-in option, and enabling it is usually the right call for anything with many application instances:
+
+```bash
+az postgres flexible-server parameter set -g rg-data -s pg-shop-prod \
+  --name pgbouncer.enabled --value true
+```
+
+It listens on port 6432. Point your application at that port and keep 5432 for migrations and administrative work, because transaction pooling does not support session-level features such as advisory locks, `LISTEN`/`NOTIFY`, or session-scoped `SET`.
+
+Watch connection usage:
+
+```sql
+SELECT count(*) AS total,
+       count(*) FILTER (WHERE state = 'active') AS active,
+       count(*) FILTER (WHERE state = 'idle in transaction') AS idle_in_txn
+FROM   pg_stat_activity;
+
+SHOW max_connections;
+```
+
+`idle in transaction` sessions climbing is the leading indicator of an application that forgets to commit, and it will eventually block autovacuum on the tables those transactions touched.
+
+## Cost control
+
+The two levers that matter most:
+
+**Stop the server when it is not needed.** Non-production servers can be stopped, and stopped compute is not billed (storage still is). Azure automatically restarts a stopped server after seven days, so this fits a development environment, not an archive.
+
+```bash
+az postgres flexible-server stop  -g rg-data -n pg-shop-dev
+az postgres flexible-server start -g rg-data -n pg-shop-dev
+```
+
+**Reserved capacity** for anything with a predictable steady-state, which is a substantial discount over pay-as-you-go for a one or three year commitment.
+
+Beyond that: storage only grows, so provisioning 4 TB "to be safe" is a permanent monthly cost; HA doubles compute; and read replicas each cost a full server. None of those are wrong, they just need to be deliberate.
+
+## Day-to-day work
+
+Once the server is up, you interact with it as ordinary PostgreSQL. Any client with TLS support connects — `psql`, pgAdmin, or a GUI such as [Chat2DB](https://app.chat2db.ai), which is convenient here because a typical Azure setup involves several servers (production, replica, staging) and you end up comparing them constantly. It is free to start with at [chat2db.ai/download](https://chat2db.ai/download).
+
+The decisions worth getting right on day one, because they are expensive to change later, are: private networking, geo-redundant backups, and the major version. Everything else — tier, storage size, parameters, extensions, HA — can be adjusted as you learn what the workload actually does.

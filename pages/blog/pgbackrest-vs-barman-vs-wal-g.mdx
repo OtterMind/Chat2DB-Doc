@@ -1,0 +1,230 @@
+---
+title: "pgBackRest vs Barman vs WAL-G: PostgreSQL Backups"
+description: "Compare pgBackRest, Barman and WAL-G for PostgreSQL backups: incremental support, cloud storage, restore speed, verification and which fits your recovery goals."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: September 6, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# pgBackRest vs Barman vs WAL-G: PostgreSQL Backups
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="September 6, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+`pg_dump` is not a backup strategy for a production database. It gives you one recovery point — the moment it started — and restoring it means reloading and re-indexing every row. For anything where downtime costs money you need physical backups plus WAL archiving, and that means one of three tools: pgBackRest, Barman or WAL-G.
+
+All three do base backups, WAL archiving and point-in-time recovery. They differ in where they store data, how they handle incrementals, and what they cost you operationally.
+
+## What you are actually buying
+
+Two numbers drive the decision:
+
+- **RPO (recovery point objective)** — how much data you can afford to lose. With continuous WAL archiving this is roughly the time between WAL segment archives, so seconds to minutes.
+- **RTO (recovery time objective)** — how long a restore takes. This is where the tools differ most, and it is the number people never measure until they need it.
+
+Everything below should be evaluated against those two numbers for your data size, not in the abstract.
+
+## pgBackRest
+
+pgBackRest is written in C, has no external dependencies beyond libpq, and is the most feature-complete of the three.
+
+**What sets it apart:**
+
+- **True incremental and differential backups** at page level. An incremental backup copies only the file pages that changed since the previous backup, so daily backups of a multi-terabyte cluster are small.
+- **Parallel everything.** Backup, restore and WAL archiving all run with configurable process counts. On a large database this is the difference between a restore measured in hours and one measured in days.
+- **Delta restore.** When restoring over an existing data directory, it compares checksums and only transfers what differs — invaluable for rebuilding a standby that fell behind.
+- **Multiple repositories.** Back up to local disk *and* S3 simultaneously, with different retention on each.
+- **Backup verification.** It checksums everything, and `pgbackrest verify` re-reads the repository to confirm it is intact.
+
+```ini
+# /etc/pgbackrest/pgbackrest.conf
+[global]
+repo1-path=/var/lib/pgbackrest
+repo1-retention-full=2
+repo1-bundle=y
+process-max=8
+compress-type=zst
+start-fast=y
+
+[global:archive-push]
+process-max=4
+
+[main]
+pg1-path=/var/lib/postgresql/17/main
+```
+
+```bash
+# One-time
+pgbackrest --stanza=main stanza-create
+pgbackrest --stanza=main check
+
+# In postgresql.conf
+# archive_mode = on
+# archive_command = 'pgbackrest --stanza=main archive-push %p'
+
+pgbackrest --stanza=main --type=full backup
+pgbackrest --stanza=main --type=incr backup
+pgbackrest --stanza=main info
+```
+
+Restoring to a point in time:
+
+```bash
+systemctl stop postgresql@17-main
+pgbackrest --stanza=main \
+  --delta \
+  --type=time --target="2026-09-06 14:32:00+00" \
+  --target-action=promote \
+  --process-max=8 \
+  restore
+systemctl start postgresql@17-main
+```
+
+**The trade-off:** the configuration file has a lot of surface area, and the mental model (stanzas, repositories, backup types) takes an afternoon to learn properly.
+
+## Barman
+
+Barman comes from 2ndQuadrant/EDB, is written in Python, and is built around the idea of a **dedicated backup server** that pulls from one or more PostgreSQL instances.
+
+**What sets it apart:**
+
+- **Centralised management.** One Barman host backs up your whole fleet, with a single `barman list-server` view and one place for retention policy.
+- **Two backup methods.** `rsync` (with hard-link-based incrementals and parallel jobs) or `postgres` (using `pg_basebackup`). The rsync method gives you incremental-style efficiency via file-level deduplication.
+- **Streaming WAL** via `pg_receivewal` with replication slots, so WAL reaches the backup server continuously rather than one 16 MB segment at a time — a materially better RPO than segment-based archiving.
+- **Geo-redundancy** through passive Barman nodes that sync from the primary Barman server.
+
+```ini
+# /etc/barman.d/main.conf
+[main]
+description = "Production PostgreSQL"
+conninfo = host=pg.internal user=barman dbname=postgres
+streaming_conninfo = host=pg.internal user=streaming_barman
+backup_method = postgres
+streaming_archiver = on
+slot_name = barman
+retention_policy = RECOVERY WINDOW OF 4 WEEKS
+parallel_jobs = 4
+```
+
+```bash
+barman check main
+barman backup main
+barman list-backup main
+
+# Restore to a point in time, onto a target host
+barman recover \
+  --target-time "2026-09-06 14:32:00+00" \
+  --remote-ssh-command "ssh postgres@restore-host" \
+  main latest /var/lib/postgresql/17/main
+```
+
+**The trade-off:** it is a pull model, so you are operating an extra server — one that must have capacity, monitoring and its own backup story. Its object-storage support (`barman-cloud-*` commands) is real but feels bolted on next to pgBackRest's or WAL-G's native design.
+
+## WAL-G
+
+WAL-G is written in Go, is cloud-native by design, and is the successor to WAL-E. There is no repository server: it talks directly to object storage.
+
+**What sets it apart:**
+
+- **Cloud storage is the only model.** S3, GCS, Azure Blob, Swift, and S3-compatible services. No backup host to run.
+- **A single static binary.** Deployment is copying one file, which makes it a natural fit for containers and immutable infrastructure.
+- **Fast, parallel, compressed.** Brotli, LZ4 and zstd; concurrency controlled by environment variables.
+- **Delta backups** relative to a previous backup, plus `catchup` for bringing a standby up to date.
+- **It is not only PostgreSQL** — it also handles MySQL, MongoDB and others, which matters if you run a mixed fleet.
+
+```bash
+# Environment (typically via envdir or systemd)
+export WALG_S3_PREFIX="s3://backups/pg-prod"
+export AWS_REGION="eu-west-1"
+export PGDATA="/var/lib/postgresql/17/main"
+export WALG_COMPRESSION_METHOD="zstd"
+export WALG_UPLOAD_CONCURRENCY="8"
+export WALG_DELTA_MAX_STEPS="6"
+
+# In postgresql.conf
+# archive_command = 'envdir /etc/wal-g.d/env wal-g wal-push %p'
+
+wal-g backup-push "$PGDATA"
+wal-g backup-list --detail
+```
+
+Restore:
+
+```bash
+wal-g backup-fetch "$PGDATA" LATEST
+# or to a specific backup:
+wal-g backup-fetch "$PGDATA" base_000000010000000000000042
+
+touch "$PGDATA/recovery.signal"
+cat >> "$PGDATA/postgresql.conf" <<'CONF'
+restore_command = 'envdir /etc/wal-g.d/env wal-g wal-fetch %f %p'
+recovery_target_time = '2026-09-06 14:32:00+00'
+recovery_target_action = 'promote'
+CONF
+pg_ctl -D "$PGDATA" start
+```
+
+**The trade-off:** configuration is environment variables rather than a config file, which is fine in Kubernetes and awkward on a traditional server. Its operational surface is thinner than pgBackRest's — fewer verification and repository-management features — and error messages assume you know what it is doing.
+
+## Head to head
+
+| | pgBackRest | Barman | WAL-G |
+| --- | --- | --- | --- |
+| Language | C | Python | Go |
+| Architecture | Agent on the DB host | Dedicated backup server | Agent, direct to object storage |
+| Incremental backups | Page-level incr + diff | File-level (rsync method) | Delta backups |
+| Object storage | Native (S3, GCS, Azure) | Via barman-cloud tools | Native, primary model |
+| Parallel backup/restore | Yes, both | Yes (rsync method) | Yes |
+| Delta restore | Yes | Partial | Partial |
+| Repository verification | Yes (`verify`) | `barman check` | Limited |
+| Fleet management | Per host | Central, strong | Per host |
+| Other databases | No | No | Yes (MySQL, MongoDB) |
+
+## Choosing
+
+**Pick pgBackRest** if the database is large and the restore time matters. Page-level incrementals, parallel restore and delta restore are the features that keep RTO down as the database grows, and it is the most thoroughly engineered of the three. This is the default recommendation for a serious self-managed PostgreSQL deployment.
+
+**Pick Barman** if you run a fleet from a central operations team and want one place to see every server's backup state, or if you specifically want streaming WAL through `pg_receivewal` for the tightest RPO without a custom setup.
+
+**Pick WAL-G** if you are in containers or a cloud-native environment where a dedicated backup host is an anti-pattern, or if you back up several database engines and want one tool for all of them.
+
+Managed services — RDS, Cloud SQL, Azure Flexible Server — do this for you, and none of these tools is needed there. What is still needed is testing the provider's restore, which nobody does often enough.
+
+## The part that matters more than the tool
+
+A backup you have never restored is a hypothesis. All three tools will happily produce backups forever while a misconfiguration makes them unrestorable, and you find out on the worst possible day.
+
+Automate a restore drill:
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+
+RESTORE_DIR=/var/lib/postgresql/drill
+rm -rf "$RESTORE_DIR"
+
+pgbackrest --stanza=main --pg1-path="$RESTORE_DIR" \
+  --type=time --target="$(date -u -d '1 hour ago' '+%Y-%m-%d %H:%M:%S+00')" \
+  --target-action=promote restore
+
+pg_ctl -D "$RESTORE_DIR" -o "-p 5499" -l "$RESTORE_DIR/drill.log" start
+sleep 20
+
+psql -p 5499 -d shop -v ON_ERROR_STOP=1 <<'SQL'
+SELECT pg_is_in_recovery();
+SELECT count(*) FROM orders;
+SELECT max(created_at) FROM orders;
+SQL
+
+pg_ctl -D "$RESTORE_DIR" stop
+echo "Restore drill passed at $(date -u)"
+```
+
+Run it weekly, alert on failure, and record how long it takes — that duration is your actual RTO, and it is usually larger than anyone assumed.
+
+Verifying the restored data is where a client with both connections open helps: run the same counts and aggregates against production and the drill instance and compare. [Chat2DB](https://app.chat2db.ai) handles multiple simultaneous connections and is free to download at [chat2db.ai/download](https://chat2db.ai/download).
+
+Finally: keep logical dumps as well as physical backups. When someone drops a single table, restoring a 4 TB cluster to recover 200 MB is absurd — a nightly `pg_dump -Fd` of the important schemas costs little and covers the far more common failure mode.
