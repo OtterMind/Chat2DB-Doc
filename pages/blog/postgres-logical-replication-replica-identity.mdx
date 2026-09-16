@@ -1,0 +1,250 @@
+---
+title: "Postgres Replica Identity and No Primary Key"
+description: "Fix cannot update table because it does not have a replica identity. All four REPLICA IDENTITY modes, the real cost of FULL, and a catalog audit query."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: September 16, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# Postgres Replica Identity and No Primary Key
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="September 16, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+Logical replication is usually set up in an afternoon and runs quietly for weeks. Then someone updates a row in a lookup table nobody thought about, and the application takes an error it has never seen before:
+
+```
+ERROR:  cannot update table "widgets" because it does not have a replica identity
+        and publishes updates
+HINT:  To enable updating the table, set REPLICA IDENTITY using ALTER TABLE.
+```
+
+Two things about this error surprise people. First, it fires on the **publisher**, inside the user's own transaction — this is not a background replication worker failing quietly in a log file somewhere, it is your application's `UPDATE` being rejected. Second, it had nothing to do with the table until the moment you added it to a publication. The same statement worked perfectly the day before.
+
+This article is the dedicated treatment of replica identity: what it actually stores, the four modes and when each is right, how to use a unique index when a primary key is not an option, what `REPLICA IDENTITY FULL` really costs on both ends, and how to audit an entire schema before it bites you. For the wider setup story — publications, subscriptions, slots, conflict handling and version upgrades — start with the [practical guide to PostgreSQL logical replication](/blog/postgres-logical-replication-guide).
+
+## What replica identity is
+
+Physical replication ships WAL byte for byte, so the standby reproduces the primary's disk pages exactly and never has to *find* anything. Logical replication is different: it decodes WAL into row-level change events and replays them as SQL-equivalent operations on a subscriber whose physical layout is completely unrelated. Table OIDs differ, page layouts differ, and a row's physical location on the publisher means nothing on the subscriber.
+
+That poses a problem for `UPDATE` and `DELETE`. An `INSERT` is self-contained — here is a new row, add it. But "update this row" and "delete this row" both require the subscriber to identify *which* row, using only data that travelled in the change stream.
+
+Replica identity is the answer: it is a per-table setting that tells PostgreSQL **which columns of the old row version to write into WAL** so the subscriber can locate the matching row. It is metadata plus a WAL-logging rule, nothing more. It does not create an index, does not enforce uniqueness, and has no effect at all on a table that is not published for updates or deletes.
+
+That last point matters. A table with no primary key is perfectly fine in a standalone database, and it is fine in a publication declared with `WITH (publish = 'insert')`. The requirement appears only when the combination of "no usable identity" and "publishes updates or deletes" occurs.
+
+## The four modes
+
+```sql
+ALTER TABLE widgets REPLICA IDENTITY DEFAULT;
+ALTER TABLE widgets REPLICA IDENTITY USING INDEX widgets_uid_key;
+ALTER TABLE widgets REPLICA IDENTITY FULL;
+ALTER TABLE widgets REPLICA IDENTITY NOTHING;
+```
+
+**DEFAULT** logs the primary key columns of the old row. This is what every table starts with, and it is exactly right — as long as the table has a primary key. If it does not, DEFAULT behaves as if nothing were configured, and you get the error above. This is the trap: the mode is "default" and looks configured, but is silently useless on a PK-less table.
+
+**USING INDEX** logs the columns of a nominated unique index instead. This is the escape hatch for tables that have a natural unique key but, for historical reasons, no declared primary key.
+
+**FULL** logs the entire old row — every column. It always works, on any table, with no index at all. It is also the expensive option, in ways described in detail below.
+
+**NOTHING** logs no old-row information. Use it for insert-only tables (append-only event logs, audit trails) where you have deliberately excluded updates and deletes from the publication. A table set to NOTHING that does receive an `UPDATE` while published for updates raises exactly the same error as a PK-less DEFAULT table.
+
+Note that the identity setting affects the *old* row image. The new values in an `UPDATE` are logged regardless; replica identity governs the key used to find the target.
+
+## The exact errors, and where they come from
+
+On the publisher, with the table in a publication that publishes updates:
+
+```
+ERROR:  cannot update table "widgets" because it does not have a replica identity
+        and publishes updates
+HINT:  To enable updating the table, set REPLICA IDENTITY using ALTER TABLE.
+```
+
+And for deletes:
+
+```
+ERROR:  cannot delete from table "widgets" because it does not have a replica identity
+        and publishes deletes
+HINT:  To enable deleting from the table, set REPLICA IDENTITY using ALTER TABLE.
+```
+
+Neither `CREATE PUBLICATION` nor `ALTER PUBLICATION ... ADD TABLE` warns you about this. The publication is created happily, the initial data copy succeeds, inserts stream across, and the failure waits for the first `UPDATE`. On a table that is written rarely, that can be weeks after the change went live — which is why the audit query later in this article belongs in your pre-deployment checks rather than your incident response.
+
+Row filters and column lists tighten the rules further. A publication row filter that references a column may require that column to be part of the replica identity when the publication publishes updates or deletes, and a column list must include the replica identity columns for the same reason. If you use those features, set the replica identity first and define the publication afterwards, so any mismatch surfaces at DDL time.
+
+On the subscriber side the symptom is different: an apply worker that cannot find a matching row does not error. It logs and moves on, so the update is simply lost and the two databases drift apart. Silent divergence is worse than a loud error, which is one more argument for auditing proactively.
+
+## Using a unique index instead of a primary key
+
+Plenty of production tables have a perfectly good unique column and no primary key — a legacy import, a table created by an ORM migration that used a unique constraint, a natural key like an external system's identifier. You do not have to add a primary key to replicate them.
+
+The index you nominate must satisfy all of the following:
+
+- It must be a **unique** btree index.
+- It must **not be partial** — no `WHERE` clause in the index definition.
+- It must **not be deferrable**.
+- Every column it covers must be a **plain column**, not an expression or a function call.
+- Every column it covers must be declared **NOT NULL**.
+
+Miss any of these and `ALTER TABLE` rejects the statement rather than accepting a broken configuration. The NOT NULL requirement is the one that trips people up most, because a `UNIQUE` constraint in PostgreSQL permits nulls.
+
+A full worked sequence on a large, live table:
+
+```sql
+-- 1. The column must be NOT NULL. On a big table, adding the constraint
+--    directly takes a long ACCESS EXCLUSIVE lock while it scans. Instead,
+--    add a NOT VALID check constraint first — that is instant.
+ALTER TABLE widgets ADD CONSTRAINT widgets_uid_not_null
+  CHECK (uid IS NOT NULL) NOT VALID;
+
+-- 2. Validate it. This scans the table but takes only a SHARE UPDATE
+--    EXCLUSIVE lock, so reads and writes continue.
+ALTER TABLE widgets VALIDATE CONSTRAINT widgets_uid_not_null;
+
+-- 3. Now SET NOT NULL is cheap: PostgreSQL 12 and later use the validated
+--    check constraint as proof and skip the scan.
+ALTER TABLE widgets ALTER COLUMN uid SET NOT NULL;
+ALTER TABLE widgets DROP CONSTRAINT widgets_uid_not_null;
+
+-- 4. Build the unique index without blocking writes.
+CREATE UNIQUE INDEX CONCURRENTLY widgets_uid_key ON widgets (uid);
+
+-- 5. Nominate it as the replica identity.
+ALTER TABLE widgets REPLICA IDENTITY USING INDEX widgets_uid_key;
+```
+
+Step 5 takes a brief `ACCESS EXCLUSIVE` lock on the table. It rewrites one catalog field and does not touch the heap, so it is fast — but on a busy table it will still queue behind long-running transactions and then block everything behind it. Use a short `lock_timeout` and retry rather than letting it stall the application:
+
+```sql
+SET lock_timeout = '3s';
+ALTER TABLE widgets REPLICA IDENTITY USING INDEX widgets_uid_key;
+```
+
+One important caveat: if that index is later dropped, the table's replica identity behaves as if `NOTHING` were set — you are back to the original error, with no warning at drop time. If you have a migration tool that rebuilds indexes, make sure it does not silently take the replica identity with it. Declaring an actual primary key is more durable for this reason, since a primary key cannot be dropped without a deliberate `ALTER TABLE ... DROP CONSTRAINT`.
+
+If you can take the lock, converting the unique index into a real primary key is the better end state and reuses the index you already built:
+
+```sql
+ALTER TABLE widgets ADD CONSTRAINT widgets_pkey
+  PRIMARY KEY USING INDEX widgets_uid_key;
+```
+
+Because `uid` is already NOT NULL from steps 1 to 3, this does not need to scan the table to verify nullability.
+
+## What REPLICA IDENTITY FULL actually costs
+
+`REPLICA IDENTITY FULL` is the universal answer and it is genuinely useful — for small, rarely updated tables it is the pragmatic choice. But it imposes a cost at both ends of the pipeline, and the two costs are independent.
+
+### On the publisher: WAL volume
+
+Normally an `UPDATE` writes the changed columns plus enough key information to identify the row. With FULL, PostgreSQL additionally writes a **complete image of the old row** into WAL for every `UPDATE` and every `DELETE`. A delete on a DEFAULT table logs a key; a delete on a FULL table logs every column of the row being removed.
+
+The size of that overhead scales with how wide your rows are, so a narrow three-column table barely notices while a wide denormalised table with dozens of columns pays on every single write. The effect compounds through the rest of the stack: more WAL means more to archive, more to ship to physical standbys, more retained behind replication slots, and larger backups.
+
+The practical rule is to scope FULL to tables where row width times update rate is genuinely small, and to measure rather than assume — compare `pg_current_wal_lsn()` before and after a representative workload on your own data instead of trusting a rule of thumb.
+
+### On the subscriber: how rows are found
+
+This is the cost people underestimate. When a change arrives for a table whose replica identity is FULL, the subscriber has no key to look up. It has to find a row where **every column matches** the old image it received.
+
+Through PostgreSQL 15, the apply worker could not use an index for this, so it performed a **sequential scan of the target table for every single changed row**. A transaction that updates a thousand rows on the publisher means a thousand full table scans on the subscriber. This is the mechanism behind the classic complaint that logical replication "falls hopelessly behind" after somebody sets FULL on a medium-sized table — the publisher is fine, the subscriber apply worker is pinned at 100% CPU scanning.
+
+PostgreSQL 16 improved this substantially: the apply worker can now use an index on the subscriber for tables with `REPLICA IDENTITY FULL`. The index does not have to be unique, which is the key advantage — you can index whichever column is most selective. To be usable it needs to be a btree index whose leftmost field is a plain column rather than an expression, and it must not be partial. Creating one on the subscriber is entirely a subscriber-side decision and needs no change on the publisher:
+
+```sql
+-- On the SUBSCRIBER only, for a table replicated with REPLICA IDENTITY FULL
+CREATE INDEX CONCURRENTLY widgets_lookup_idx ON widgets (uid);
+```
+
+If you are running PostgreSQL 15 or earlier and cannot upgrade, treat FULL as viable only for small tables, and check the subscriber's apply lag after enabling it rather than assuming it is fine.
+
+### Matching semantics and duplicate rows
+
+Two behaviours are worth knowing before you rely on FULL.
+
+Row matching compares column values using equality operators for their data types. A column of a type that lacks a usable default equality operator cannot participate, so tables containing such columns are not candidates for FULL.
+
+And if the old-row image matches **more than one** row on the subscriber — entirely possible on a table with no unique key, which is the situation that led you to FULL in the first place — only one of the matching rows is updated or deleted, and which one is not defined. Publisher and subscriber can end up with the same multiset of rows but different content per row after a subsequent partial update. If duplicate rows are genuinely possible in your table, FULL is a correctness compromise, not just a performance one.
+
+## Auditing every table's replica identity
+
+The setting lives in `pg_class.relreplident`, a single character: `d` for default, `i` for using index, `f` for full, `n` for nothing. This query reports every ordinary and partitioned table, resolves the nominated index where one exists, and flags the tables that will fail:
+
+```sql
+SELECT n.nspname AS schema,
+       c.relname AS table_name,
+       CASE c.relreplident
+         WHEN 'd' THEN 'default (primary key)'
+         WHEN 'i' THEN 'using index'
+         WHEN 'f' THEN 'full'
+         WHEN 'n' THEN 'nothing'
+       END AS replica_identity,
+       i.indexrelid::regclass::text AS identity_index,
+       EXISTS (SELECT 1 FROM pg_index pk
+               WHERE pk.indrelid = c.oid AND pk.indisprimary) AS has_primary_key,
+       CASE
+         WHEN c.relreplident = 'd'
+          AND NOT EXISTS (SELECT 1 FROM pg_index pk
+                          WHERE pk.indrelid = c.oid AND pk.indisprimary)
+           THEN 'NO IDENTITY - updates and deletes will fail if published'
+         WHEN c.relreplident = 'n'
+           THEN 'NOTHING - insert-only publications only'
+         WHEN c.relreplident = 'f'
+           THEN 'FULL - check subscriber apply cost'
+         ELSE 'ok'
+       END AS assessment
+FROM   pg_class c
+JOIN   pg_namespace n ON n.oid = c.relnamespace
+LEFT   JOIN pg_index i ON i.indrelid = c.oid AND i.indisreplident
+WHERE  c.relkind IN ('r', 'p')
+  AND  n.nspname NOT IN ('pg_catalog', 'information_schema')
+ORDER  BY (c.relreplident = 'd'
+           AND NOT EXISTS (SELECT 1 FROM pg_index pk
+                           WHERE pk.indrelid = c.oid AND pk.indisprimary)) DESC,
+          1, 2;
+```
+
+The `pg_index.indisreplident` flag is how PostgreSQL records which index was nominated, so joining on it gives you the index name for every `i` row.
+
+Narrow it to tables that are actually published, which is where the risk really lives:
+
+```sql
+SELECT pt.pubname,
+       pt.schemaname,
+       pt.tablename,
+       c.relreplident,
+       p.pubupdate,
+       p.pubdelete
+FROM   pg_publication_tables pt
+JOIN   pg_publication p  ON p.pubname = pt.pubname
+JOIN   pg_class c        ON c.relname = pt.tablename
+JOIN   pg_namespace n    ON n.oid = c.relnamespace AND n.nspname = pt.schemaname
+WHERE  (p.pubupdate OR p.pubdelete)
+  AND  c.relreplident = 'd'
+  AND  NOT EXISTS (SELECT 1 FROM pg_index pk
+                   WHERE pk.indrelid = c.oid AND pk.indisprimary);
+```
+
+Any row this returns is a future outage with a date on it. An empty result is the state you want before every deployment that touches a publication. Running it as a saved query against publisher and subscriber side by side is quick in a client like [Chat2DB](https://app.chat2db.ai), and it is the kind of check worth pinning next to your replication lag dashboard.
+
+Partitioned tables deserve an explicit look. Unless the publication is declared with `publish_via_partition_root`, changes are published from the individual partitions, so it is each leaf partition's replica identity that matters. The query above includes partitioned parents and leaves alike — read the results for the leaves, not just the parent.
+
+## A decision checklist
+
+Work down this list and stop at the first line that applies:
+
+1. **Does the table have a primary key?** Leave it on `DEFAULT`. There is nothing to do, and this is the right answer for the overwhelming majority of tables.
+2. **Is the table insert-only and published with `WITH (publish = 'insert')`?** Set `NOTHING` explicitly. It documents the intent and prevents an accidental future `UPDATE` from replicating a half-identified row.
+3. **Does it have a unique, non-partial, non-deferrable btree index on NOT NULL columns?** Use `REPLICA IDENTITY USING INDEX`. Consider promoting that index to a primary key so a later index rebuild cannot silently strip the identity.
+4. **Can you add a primary key?** Do it. `CREATE UNIQUE INDEX CONCURRENTLY` followed by `ADD CONSTRAINT ... PRIMARY KEY USING INDEX` keeps the locking short, and it fixes the problem permanently rather than working around it.
+5. **None of the above, and the table is small and rarely updated?** `REPLICA IDENTITY FULL` is fine. Note it in your runbook so the next person knows why.
+6. **None of the above, and the table is large or hot?** Do not reach for FULL. Add a surrogate key column, backfill it, index it, and use it as the identity. The migration is more work than one `ALTER TABLE`, but it is far less work than diagnosing an apply worker that has been falling behind for three days.
+
+If you do land on FULL, add two follow-ups: on PostgreSQL 16 or later, create a selective index on the subscriber so the apply worker can use it; and on any version, watch subscriber apply lag closely for the first day, because that is where the cost shows up first.
+
+The underlying lesson is smaller than the machinery around it. Logical replication needs to name a row, and a table without a key cannot name one. Everything in this article is a way of supplying that name — cheaply with a primary key, adequately with a unique index, or expensively by shipping the whole row. Give your tables real keys and replica identity stops being something you ever think about.

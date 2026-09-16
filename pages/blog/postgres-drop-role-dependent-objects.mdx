@@ -1,0 +1,406 @@
+---
+title: "Postgres Drop Role: Fix Dependent Objects"
+description: "Fix ERROR: role cannot be dropped because some objects depend on it. Decode the DETAIL lines, audit pg_shdepend, then REASSIGN OWNED and DROP OWNED correctly."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: September 16, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# Postgres Drop Role: Fix Dependent Objects
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="September 16, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+You type a two-word command and PostgreSQL refuses:
+
+```
+DROP ROLE alice;
+ERROR:  role "alice" cannot be dropped because some objects depend on it
+DETAIL:  owner of table public.orders
+         privileges for table public.customers
+         2 objects in database analytics
+```
+
+Nothing here is broken. PostgreSQL is enforcing referential integrity on its own catalogs: every object has an owner column, every access control list names grantees, and the server will not leave dangling references behind. The role stays until you deal with each dependency.
+
+The frustrating part is that the error tells you only some of what you need. The lines naming tables are dependencies in the database you are currently connected to. The line that says "2 objects in database analytics" is deliberately vague, because the backend cannot read another database's catalog to name them. This guide decodes each DETAIL line, shows you how to enumerate every dependency across the whole cluster from a single connection, and gives you the exact order of operations that makes `DROP ROLE` succeed on the first attempt.
+
+If you want the broader tour of role management rather than this specific error, see [how to drop a user or role in PostgreSQL](/blog/postgres-drop-user-role-guide). What follows is the deep treatment of the dependency failure itself.
+
+## Reading the DETAIL lines
+
+The error code is `2BP01`, `dependent_objects_still_exist`. PostgreSQL emits up to a handful of DETAIL lines and then truncates, so a short list does not mean a short job. There are three shapes.
+
+### "owner of table public.orders"
+
+The role is recorded in the object's owner column — `pg_class.relowner` for tables, views, sequences and indexes, `pg_proc.proowner` for functions, `pg_namespace.nspowner` for schemas, and so on. Dropping the role would leave an object with an owner OID pointing at nothing.
+
+Ownership is fixed with `REASSIGN OWNED BY`, which hands the objects to somebody else, or with `DROP OWNED BY`, which destroys them. Those are very different outcomes and the difference is the single most important thing in this article.
+
+### "privileges for table public.customers"
+
+Nobody granted the role ownership of anything here. Someone ran `GRANT SELECT ON customers TO alice`, which appended an entry to `pg_class.relacl`. The role is a grantee inside an access control list.
+
+`REASSIGN OWNED BY` does not touch this. Reassignment only changes owner columns; it explicitly leaves privileges that were granted *to* the role on other people's objects alone. This is why so many people run `REASSIGN OWNED`, retry the drop, and see the error again with a shorter DETAIL list. Granted privileges are cleared by `DROP OWNED BY` or by explicit `REVOKE` statements.
+
+Column-level grants count too. `GRANT SELECT (email) ON customers TO alice` writes into `pg_attribute.attacl`, and it will block the drop just as firmly as a table-level grant while being invisible to any query that only looks at table privileges.
+
+### "2 objects in database analytics"
+
+Roles are cluster-wide objects. They live in `pg_authid`, a shared catalog visible from every database. Tables, functions, schemas and their ACLs are per-database objects, living in catalogs that only exist inside the database that owns them.
+
+A backend connected to `appdb` cannot open `analytics`'s `pg_class` to describe those two objects, so it reports a count and the database name. It is telling you, correctly, that you have more work to do somewhere else.
+
+This is the root cause of nearly every stubborn case of this error: `REASSIGN OWNED BY` and `DROP OWNED BY` only operate on the database you are connected to. You have to connect to each database in turn and run them again.
+
+### A fourth line you may see
+
+If the role is referenced by a row-level security policy, you get something like `target of policy orders_tenant_policy on table orders`. That is a third kind of dependency, recorded with its own type code, and it is also cleared by `DROP OWNED BY`.
+
+## Auditing every dependency from one connection
+
+Here is the useful piece of trivia that turns this from guesswork into a checklist: `pg_shdepend` is itself a **shared** catalog. Every database's dependencies on roles are recorded in one table that you can query from anywhere.
+
+Its columns are `dbid` (the database the dependency lives in, or `0` for shared objects), `classid` and `objid` and `objsubid` (which catalog and row the dependent object is), `refclassid` and `refobjid` (what it depends on — for our purposes, a row in `pg_authid`), and `deptype`, a single character:
+
+- `o` — the role **owns** the object.
+- `a` — the role holds a granted **privilege** (an ACL entry).
+- `r` — the role is referenced by an **RLS policy**.
+- `p` and `i` — pinned or internal system dependencies, which you will not see for an ordinary role.
+
+So the first thing to run, from any database in the cluster, is this summary:
+
+```sql
+SELECT COALESCE(d.datname, '(cluster-wide / shared object)') AS database,
+       s.deptype,
+       count(*) AS dependencies
+FROM   pg_shdepend s
+LEFT   JOIN pg_database d ON d.oid = s.dbid
+WHERE  s.refclassid = 'pg_authid'::regclass
+  AND  s.refobjid   = 'alice'::regrole
+GROUP  BY 1, 2
+ORDER  BY 1, 2;
+```
+
+This answers the question the error message refuses to: exactly which databases still hold something, and whether it is ownership, privileges or policies. Every database that appears in this result is a database you must connect to.
+
+Once you are connected to one of them, `pg_describe_object` renders each dependency using the same wording the error message uses:
+
+```sql
+SELECT s.deptype,
+       pg_describe_object(s.classid, s.objid, s.objsubid) AS object
+FROM   pg_shdepend s
+WHERE  s.dbid = (SELECT oid FROM pg_database WHERE datname = current_database())
+  AND  s.refclassid = 'pg_authid'::regclass
+  AND  s.refobjid   = 'alice'::regrole
+ORDER  BY 1, 2;
+```
+
+`pg_describe_object` only resolves objects in the current database, which is precisely why the DROP ROLE error had to fall back to a count for the others.
+
+If you want the schema-qualified relation view rather than a generic description, join through to `pg_class` and `pg_namespace` yourself:
+
+```sql
+SELECT CASE s.deptype WHEN 'o' THEN 'owner'
+                      WHEN 'a' THEN 'privilege'
+                      WHEN 'r' THEN 'policy target' END AS dependency,
+       n.nspname AS schema,
+       c.relname AS relation,
+       CASE c.relkind WHEN 'r' THEN 'table'
+                      WHEN 'p' THEN 'partitioned table'
+                      WHEN 'v' THEN 'view'
+                      WHEN 'm' THEN 'materialized view'
+                      WHEN 'S' THEN 'sequence'
+                      WHEN 'f' THEN 'foreign table'
+                      WHEN 'i' THEN 'index'
+                      ELSE c.relkind::text END AS kind
+FROM   pg_shdepend s
+JOIN   pg_class     c ON c.oid = s.objid AND s.classid = 'pg_class'::regclass
+JOIN   pg_namespace n ON n.oid = c.relnamespace
+WHERE  s.dbid = (SELECT oid FROM pg_database WHERE datname = current_database())
+  AND  s.refclassid = 'pg_authid'::regclass
+  AND  s.refobjid   = 'alice'::regrole
+ORDER  BY 2, 3;
+```
+
+### Default privileges are a separate catalog
+
+`ALTER DEFAULT PRIVILEGES` does not grant anything immediately. It records a rule in `pg_default_acl` saying "whenever this role creates a table in this schema, grant these privileges to that role". The rule survives independently of any table, which makes it the classic cause of a DROP ROLE that fails even though the role demonstrably owns nothing.
+
+In psql, `\ddp` lists them. In SQL:
+
+```sql
+SELECT pg_get_userbyid(d.defaclrole)     AS rules_apply_to_creator,
+       n.nspname                         AS schema,
+       CASE d.defaclobjtype WHEN 'r' THEN 'tables'
+                            WHEN 'S' THEN 'sequences'
+                            WHEN 'f' THEN 'functions'
+                            WHEN 'T' THEN 'types'
+                            WHEN 'n' THEN 'schemas' END AS object_type,
+       d.defaclacl                       AS granted_privileges
+FROM   pg_default_acl d
+LEFT   JOIN pg_namespace n ON n.oid = d.defaclnamespace;
+```
+
+Two cases, and they are fixed differently:
+
+- The role appears as a **grantee inside `defaclacl`**. `DROP OWNED BY alice` removes it.
+- The role **is** `defaclrole` — the rules were created by or for that role. You have to unwind them explicitly, matching the original statement exactly:
+
+```sql
+ALTER DEFAULT PRIVILEGES FOR ROLE alice IN SCHEMA public
+  REVOKE ALL ON TABLES FROM reporting;
+ALTER DEFAULT PRIVILEGES FOR ROLE alice IN SCHEMA public
+  REVOKE ALL ON SEQUENCES FROM reporting;
+```
+
+If the original grant had no `IN SCHEMA` clause, the revoke must not have one either — a schema-scoped revoke will not cancel a database-wide rule.
+
+## The correct order of operations
+
+### Step one: stop the role logging in
+
+Terminating sessions before you start prevents a background job from creating a new table half way through your cleanup.
+
+```sql
+ALTER ROLE alice NOLOGIN;
+
+SELECT pg_terminate_backend(pid)
+FROM   pg_stat_activity
+WHERE  usename = 'alice'
+  AND  pid <> pg_backend_pid();
+```
+
+`ALTER ROLE ... NOLOGIN` comes first on purpose. If you only terminate the backends, a connection pooler will reconnect within a second and you are back where you started. Revoking login first closes that door, and `pg_terminate_backend` then clears whatever is already connected. Note that `DROP ROLE` does not require the role to be idle, but a session that is actively creating objects will keep re-adding dependencies.
+
+### Step two: reassign ownership, in every database
+
+```sql
+REASSIGN OWNED BY alice TO app_owner;
+```
+
+This rewrites the owner column of every object `alice` owns **in the current database** to `app_owner`. Tables, views, sequences, functions, schemas, types, operators — all of it, in one transaction, without touching the data. You must be a member of both the old and the new role, or a superuser.
+
+Choose the target carefully. Reassigning to `postgres` works and is what most people reach for, but it leaves your application tables owned by a superuser, which quietly weakens your permission model. A non-login group role that already owns the application schema is a better home.
+
+### Step three: drop what is left, in every database
+
+```sql
+DROP OWNED BY alice;
+```
+
+Two things happen here, and the second is the one that finally clears "privileges for table public.customers":
+
+1. Every object still owned by the role in the current database is **dropped**.
+2. Every privilege granted to the role is **revoked** — on objects in the current database, and on shared objects such as databases and tablespaces. Row-level security policies referencing the role are cleaned up as well.
+
+Because step two already moved every owned object to `app_owner`, part one has nothing left to destroy and only part two does any work. That is the whole reason for the ordering.
+
+### The warning, stated plainly
+
+If you run `DROP OWNED BY alice` **without** reassigning first, PostgreSQL will delete her tables, views, functions and sequences, along with the data in them. There is no confirmation prompt and no undo. `DROP OWNED BY alice CASCADE` goes further and removes other roles' objects that depended on hers.
+
+That behaviour is occasionally what you want — cleaning up a throwaway test role, for example — but it must be a deliberate choice. Take a dump first if there is any doubt:
+
+```sql
+-- Preview exactly what DROP OWNED would destroy, before running it
+SELECT pg_describe_object(s.classid, s.objid, s.objsubid) AS would_be_dropped
+FROM   pg_shdepend s
+WHERE  s.dbid = (SELECT oid FROM pg_database WHERE datname = current_database())
+  AND  s.refclassid = 'pg_authid'::regclass
+  AND  s.refobjid   = 'alice'::regrole
+  AND  s.deptype    = 'o';
+```
+
+### Step four: shared objects neither command will reach
+
+`REASSIGN OWNED` scans dependency rows for the current database only. Databases and tablespaces are shared objects recorded with `dbid = 0`, so ownership of them is never reassigned, no matter which database you run the command from. `DROP OWNED` revokes *privileges* on shared objects but does not change their ownership either.
+
+So if the DETAIL line says `owner of database analytics` or `owner of tablespace fast_ssd`, only an explicit statement will fix it:
+
+```sql
+SELECT datname FROM pg_database   WHERE datdba  = 'alice'::regrole;
+SELECT spcname FROM pg_tablespace WHERE spcowner = 'alice'::regrole;
+
+ALTER DATABASE analytics   OWNER TO app_owner;
+ALTER TABLESPACE fast_ssd  OWNER TO app_owner;
+```
+
+Run these once, as a superuser, from any database.
+
+### Step five: role memberships
+
+Memberships do not block the drop — PostgreSQL removes rows from `pg_auth_members` automatically. But look at them before you commit to anything, because dropping a group role revokes everyone's inherited access the instant it disappears:
+
+```sql
+SELECT grantee.rolname AS role,
+       granted.rolname AS is_member_of,
+       am.admin_option
+FROM   pg_auth_members am
+JOIN   pg_roles grantee ON grantee.oid = am.member
+JOIN   pg_roles granted ON granted.oid = am.roleid
+WHERE  grantee.rolname = 'alice' OR granted.rolname = 'alice';
+```
+
+If `alice` is a group with five members, move those members to a replacement group first:
+
+```sql
+GRANT analysts TO bob, carol;
+REVOKE alice FROM bob, carol;
+```
+
+### Step six: drop the role
+
+```sql
+DROP ROLE alice;
+```
+
+If it still fails, re-run the `pg_shdepend` summary query. The remaining row will name the database you skipped — often one with `datallowconn = false`, which you must temporarily re-enable to clean up.
+
+## A complete worked example
+
+A cluster with three databases: `appdb`, `analytics` and `postgres`. `alice` owns tables in `appdb`, has `SELECT` grants in `analytics`, owns the `analytics` database itself, and has a default-privilege rule in `appdb`.
+
+```sql
+-- === Connected to any database, as a superuser ===
+
+-- 1. Where is the work?
+SELECT COALESCE(d.datname, '(shared)') AS database, s.deptype, count(*)
+FROM   pg_shdepend s LEFT JOIN pg_database d ON d.oid = s.dbid
+WHERE  s.refclassid = 'pg_authid'::regclass AND s.refobjid = 'alice'::regrole
+GROUP  BY 1, 2;
+--  appdb      | o | 14
+--  appdb      | a |  3
+--  analytics  | a |  9
+--  (shared)   | o |  1
+
+-- 2. Lock the role out and clear its sessions.
+ALTER ROLE alice NOLOGIN;
+SELECT pg_terminate_backend(pid) FROM pg_stat_activity
+WHERE  usename = 'alice' AND pid <> pg_backend_pid();
+
+-- 3. Create the destination owner if it does not exist.
+CREATE ROLE app_owner NOLOGIN;
+
+-- 4. The shared object: the (shared)/o row above.
+ALTER DATABASE analytics OWNER TO app_owner;
+```
+
+```sql
+-- === Connected to appdb ===
+ALTER DEFAULT PRIVILEGES FOR ROLE alice IN SCHEMA public
+  REVOKE ALL ON TABLES FROM reporting;      -- unwind the pg_default_acl rule
+REASSIGN OWNED BY alice TO app_owner;       -- clears the 14 'o' rows
+DROP OWNED BY alice;                        -- clears the 3 'a' rows
+```
+
+```sql
+-- === Connected to analytics ===
+REASSIGN OWNED BY alice TO app_owner;       -- no-op here, but harmless
+DROP OWNED BY alice;                        -- clears the 9 'a' rows
+```
+
+```sql
+-- === Back in postgres ===
+SELECT count(*) FROM pg_shdepend
+WHERE  refclassid = 'pg_authid'::regclass AND refobjid = 'alice'::regrole;
+--  0
+
+DROP ROLE alice;
+-- DROP ROLE
+```
+
+The `pg_shdepend` count reaching zero is the reliable signal that the next command will succeed. Checking it beats retrying `DROP ROLE` and reading error messages.
+
+## The copy-paste audit script
+
+Save this as `audit-role.sh`. It reports every dependency the role has across the cluster, without changing anything:
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+ROLE="${1:?usage: audit-role.sh <rolename>}"
+PSQL="psql -qtAX -v ON_ERROR_STOP=1"
+
+echo "=== Cluster-wide summary for role: $ROLE ==="
+$PSQL -d postgres -c "
+  SELECT COALESCE(d.datname, '(shared)') || E'\t' || s.deptype || E'\t' || count(*)
+  FROM   pg_shdepend s LEFT JOIN pg_database d ON d.oid = s.dbid
+  WHERE  s.refclassid = 'pg_authid'::regclass
+    AND  s.refobjid = (SELECT oid FROM pg_authid WHERE rolname = '$ROLE')
+  GROUP  BY 1, 2 ORDER BY 1, 2;"
+
+echo
+echo "=== Shared objects owned (fix with ALTER DATABASE / ALTER TABLESPACE) ==="
+$PSQL -d postgres -c "
+  SELECT 'database: '   || datname FROM pg_database
+  WHERE  datdba = (SELECT oid FROM pg_authid WHERE rolname = '$ROLE')
+  UNION ALL
+  SELECT 'tablespace: ' || spcname FROM pg_tablespace
+  WHERE  spcowner = (SELECT oid FROM pg_authid WHERE rolname = '$ROLE');"
+
+echo
+for db in $($PSQL -d postgres -c \
+    "SELECT datname FROM pg_database WHERE datallowconn AND datname <> 'template0'"); do
+  echo "=== $db ==="
+  $PSQL -d "$db" -c "
+    SELECT s.deptype || E'\t' || pg_describe_object(s.classid, s.objid, s.objsubid)
+    FROM   pg_shdepend s
+    WHERE  s.dbid = (SELECT oid FROM pg_database WHERE datname = current_database())
+      AND  s.refclassid = 'pg_authid'::regclass
+      AND  s.refobjid = (SELECT oid FROM pg_authid WHERE rolname = '$ROLE')
+    ORDER  BY 1, 2;"
+
+  echo "--- default privilege rules ---"
+  $PSQL -d "$db" -c "
+    SELECT pg_get_userbyid(defaclrole) || ' / ' ||
+           COALESCE(defaclnamespace::regnamespace::text, '(all schemas)') || ' / ' ||
+           defaclobjtype || ' / ' || defaclacl::text
+    FROM   pg_default_acl
+    WHERE  defaclrole = (SELECT oid FROM pg_authid WHERE rolname = '$ROLE')
+       OR  array_to_string(defaclacl, ',') LIKE '%$ROLE%';"
+done
+```
+
+And the companion that performs the cleanup — read the audit output first, and set `NEW_OWNER` deliberately:
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+ROLE="${1:?usage: drop-role.sh <rolename> <new_owner>}"
+NEW_OWNER="${2:?usage: drop-role.sh <rolename> <new_owner>}"
+
+psql -qX -v ON_ERROR_STOP=1 -d postgres -c "ALTER ROLE \"$ROLE\" NOLOGIN;" -c "
+  SELECT pg_terminate_backend(pid) FROM pg_stat_activity
+  WHERE  usename = '$ROLE' AND pid <> pg_backend_pid();"
+
+for db in $(psql -qtAX -d postgres -c \
+    "SELECT datname FROM pg_database WHERE datallowconn AND datname <> 'template0'"); do
+  echo "--- cleaning $db"
+  psql -qX -v ON_ERROR_STOP=1 -d "$db" \
+       -c "REASSIGN OWNED BY \"$ROLE\" TO \"$NEW_OWNER\";" \
+       -c "DROP OWNED BY \"$ROLE\";"
+done
+
+psql -qX -v ON_ERROR_STOP=1 -d postgres -c "DROP ROLE \"$ROLE\";"
+```
+
+The `REASSIGN` runs before the `DROP OWNED` in the same invocation, which is the ordering that keeps the data. Do not reverse those two lines.
+
+## The habit that prevents this entirely
+
+Every occurrence of this error traces back to a person's login account owning production objects. If humans never own anything, the problem does not arise:
+
+```sql
+CREATE ROLE app_owner NOLOGIN;              -- owns every application object
+CREATE ROLE alice LOGIN PASSWORD 'xxx';
+GRANT app_owner TO alice;                   -- she works through membership
+ALTER ROLE alice SET role = 'app_owner';    -- new objects land on app_owner
+```
+
+Now an offboarding is `REVOKE app_owner FROM alice; DROP ROLE alice;` and it succeeds immediately, because `pg_shdepend` never held a row for her in the first place.
+
+While you are untangling an existing mess, a client that can show roles, memberships, object ownership and grants side by side saves a lot of catalog-query typing — [Chat2DB](https://chat2db.ai/download) is a free AI-powered SQL client that surfaces all of it in one panel and lets you keep the audit queries above as saved snippets across every database in the cluster.
