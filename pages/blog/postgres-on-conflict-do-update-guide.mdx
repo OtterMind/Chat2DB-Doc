@@ -1,0 +1,240 @@
+---
+title: "Postgres ON CONFLICT DO UPDATE: Upsert Guide"
+description: "How INSERT ... ON CONFLICT DO UPDATE works in PostgreSQL: the EXCLUDED pseudo-table, conflict targets, partial indexes, WHERE clauses and concurrency gotchas."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: September 17, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# Postgres ON CONFLICT DO UPDATE: Upsert Guide
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="September 17, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+An upsert is "insert this row, or update it if it already exists". PostgreSQL spells it `INSERT ... ON CONFLICT`, and it is atomic, concurrency-safe and considerably faster than the read-then-write loop most people reach for first. It also has three sharp edges that cause almost every bug: the conflict target, the `EXCLUDED` pseudo-table, and what happens when two upserts race.
+
+This guide covers the whole clause with runnable examples.
+
+## The table we will use
+
+```sql
+CREATE TABLE product_inventory (
+    sku          text PRIMARY KEY,
+    warehouse    text NOT NULL,
+    quantity     integer NOT NULL DEFAULT 0,
+    price        numeric(10,2),
+    last_seen_at timestamptz NOT NULL DEFAULT now(),
+    updated_at   timestamptz NOT NULL DEFAULT now()
+);
+
+INSERT INTO product_inventory (sku, warehouse, quantity, price)
+VALUES ('SKU-001', 'east', 10, 19.99);
+```
+
+## The two forms
+
+`ON CONFLICT` has exactly two actions.
+
+**DO NOTHING** — skip the row silently if it would violate a constraint:
+
+```sql
+INSERT INTO product_inventory (sku, warehouse, quantity, price)
+VALUES ('SKU-001', 'east', 99, 24.99)
+ON CONFLICT DO NOTHING;
+-- INSERT 0 0  → nothing happened, no error
+```
+
+**DO UPDATE** — update the existing row instead:
+
+```sql
+INSERT INTO product_inventory (sku, warehouse, quantity, price)
+VALUES ('SKU-001', 'east', 99, 24.99)
+ON CONFLICT (sku) DO UPDATE
+SET quantity   = EXCLUDED.quantity,
+    price      = EXCLUDED.price,
+    updated_at = now();
+-- INSERT 0 1  → the existing row was updated
+```
+
+Note the asymmetry: `DO NOTHING` can omit the conflict target and will then catch *any* unique violation on the table. `DO UPDATE` **requires** a conflict target, because Postgres has to know which row you mean.
+
+## EXCLUDED: the row that did not get inserted
+
+`EXCLUDED` is a pseudo-table holding the values you *proposed*. The bare column names refer to the row already in the table. This is the single most important thing to internalize:
+
+```sql
+ON CONFLICT (sku) DO UPDATE
+SET quantity = product_inventory.quantity + EXCLUDED.quantity;
+--             ^ existing value             ^ value you tried to insert
+```
+
+That example accumulates rather than overwrites — an ingestion pattern worth knowing. Compare the three behaviours:
+
+```sql
+-- Overwrite with the new value
+SET quantity = EXCLUDED.quantity
+
+-- Add the new value to the old one
+SET quantity = product_inventory.quantity + EXCLUDED.quantity
+
+-- Keep the larger of the two (useful for watermarks)
+SET quantity = GREATEST(product_inventory.quantity, EXCLUDED.quantity)
+```
+
+When a column name is ambiguous, qualify it with the table name. Inside `ON CONFLICT`, an unqualified `quantity` means the stored row, but being explicit makes the intent readable to the next person.
+
+## Choosing the conflict target
+
+The conflict target must match an actual unique index or constraint. There are two syntaxes.
+
+**By column list** — matches any unique index on those columns:
+
+```sql
+ON CONFLICT (sku) DO UPDATE ...
+ON CONFLICT (warehouse, sku) DO UPDATE ...   -- composite
+```
+
+**By constraint name** — explicit, and the only option for a constraint with a non-obvious definition:
+
+```sql
+ALTER TABLE product_inventory
+  ADD CONSTRAINT inventory_sku_warehouse_key UNIQUE (sku, warehouse);
+
+INSERT INTO product_inventory (sku, warehouse, quantity)
+VALUES ('SKU-002', 'west', 5)
+ON CONFLICT ON CONSTRAINT inventory_sku_warehouse_key
+DO UPDATE SET quantity = EXCLUDED.quantity;
+```
+
+If you get `there is no unique or exclusion constraint matching the ON CONFLICT specification`, it means exactly what it says: there is no unique index on those columns. Check with:
+
+```sql
+SELECT indexname, indexdef
+FROM pg_indexes
+WHERE tablename = 'product_inventory';
+```
+
+A composite conflict target must name **all** the columns of the index, in any order — naming a subset does not work.
+
+## Partial indexes need an index predicate
+
+This one costs people hours. If your unique index is partial, the conflict target must repeat the predicate:
+
+```sql
+CREATE UNIQUE INDEX active_sku_idx
+  ON product_inventory (sku)
+  WHERE quantity > 0;
+
+-- Fails: no matching constraint
+INSERT INTO product_inventory (sku, warehouse, quantity)
+VALUES ('SKU-001', 'east', 3)
+ON CONFLICT (sku) DO UPDATE SET quantity = EXCLUDED.quantity;
+
+-- Works: the predicate identifies the partial index
+INSERT INTO product_inventory (sku, warehouse, quantity)
+VALUES ('SKU-001', 'east', 3)
+ON CONFLICT (sku) WHERE quantity > 0
+DO UPDATE SET quantity = EXCLUDED.quantity;
+```
+
+The `WHERE` immediately after the conflict target is the *index predicate*. A `WHERE` after `DO UPDATE SET ...` is something different, which is the next section — the two are easy to confuse.
+
+## Conditional updates with a WHERE clause
+
+A `WHERE` on the `DO UPDATE` decides whether the update actually happens. This is how you build idempotent, out-of-order-safe ingestion:
+
+```sql
+INSERT INTO product_inventory (sku, warehouse, quantity, price, last_seen_at)
+VALUES ('SKU-001', 'east', 42, 21.50, '2026-09-17 10:00:00+00')
+ON CONFLICT (sku) DO UPDATE
+SET quantity     = EXCLUDED.quantity,
+    price        = EXCLUDED.price,
+    last_seen_at = EXCLUDED.last_seen_at,
+    updated_at   = now()
+WHERE product_inventory.last_seen_at < EXCLUDED.last_seen_at;
+```
+
+A late-arriving message with an older timestamp now leaves the row untouched instead of overwriting fresher data. Two further uses of the same idea:
+
+```sql
+-- Skip no-op updates: avoids dead tuples and spurious trigger fires
+WHERE product_inventory.quantity IS DISTINCT FROM EXCLUDED.quantity
+   OR product_inventory.price    IS DISTINCT FROM EXCLUDED.price
+
+-- Never let a manual override be clobbered by the feed
+WHERE product_inventory.price_locked = false
+```
+
+`IS DISTINCT FROM` rather than `<>` matters here: `<>` is NULL-unsafe, so a column going from `NULL` to a value would not be detected.
+
+## Knowing what happened
+
+`INSERT 0 1` looks identical for an insert and an update. Use `RETURNING` with the `xmax` system column to tell them apart:
+
+```sql
+INSERT INTO product_inventory (sku, warehouse, quantity)
+VALUES ('SKU-003', 'north', 7)
+ON CONFLICT (sku) DO UPDATE SET quantity = EXCLUDED.quantity
+RETURNING sku,
+          quantity,
+          (xmax = 0) AS was_inserted;
+```
+
+`xmax = 0` means a fresh insert; a non-zero `xmax` means the row was updated. It is an implementation detail rather than documented API, but it is widely used and reliable in practice.
+
+Note that `RETURNING` emits nothing for rows filtered out by a `DO UPDATE ... WHERE`, and nothing at all for `DO NOTHING` rows — so `RETURNING` is not a reliable way to fetch the id of an existing row.
+
+## Bulk upserts
+
+The clause works with multi-row `VALUES`, which is dramatically faster than one statement per row:
+
+```sql
+INSERT INTO product_inventory (sku, warehouse, quantity, price)
+VALUES
+    ('SKU-001', 'east',  10, 19.99),
+    ('SKU-002', 'west',  25, 34.50),
+    ('SKU-003', 'north',  8, 12.00)
+ON CONFLICT (sku) DO UPDATE
+SET quantity = EXCLUDED.quantity,
+    price    = EXCLUDED.price;
+```
+
+One constraint: **a single statement cannot affect the same row twice.** Duplicate `SKU-001` inside the `VALUES` list and Postgres raises `ON CONFLICT DO UPDATE command cannot affect row a second time`. Deduplicate first:
+
+```sql
+INSERT INTO product_inventory (sku, warehouse, quantity)
+SELECT DISTINCT ON (sku) sku, warehouse, quantity
+FROM staging_inventory
+ORDER BY sku, loaded_at DESC          -- keep the newest per sku
+ON CONFLICT (sku) DO UPDATE SET quantity = EXCLUDED.quantity;
+```
+
+## Concurrency and the sequence gap
+
+Under concurrent load, `ON CONFLICT` is safe: Postgres takes the insert path, detects the unique violation internally, and converts it to an update within the same statement. No serialization failure, no application retry loop.
+
+Two side effects surprise people:
+
+**Sequences are consumed by failed inserts.** A `serial` or `IDENTITY` value is drawn before the conflict is detected, and it is not returned. Heavy upsert traffic will therefore burn through ids with visible gaps. That is normal and harmless — unless you exposed the id as a business number, which you should not.
+
+**DO NOTHING can block.** If a concurrent transaction has inserted a conflicting row but not yet committed, your statement waits for it. Under `READ COMMITTED` it then does nothing; under `REPEATABLE READ` or `SERIALIZABLE` you may get a serialization failure to retry.
+
+## ON CONFLICT or MERGE?
+
+PostgreSQL 15 added standard `MERGE`. Reach for it when you need `DELETE` as an outcome, or several different conditional branches:
+
+```sql
+MERGE INTO product_inventory AS t
+USING staging_inventory AS s ON t.sku = s.sku
+WHEN MATCHED AND s.quantity = 0 THEN DELETE
+WHEN MATCHED THEN UPDATE SET quantity = s.quantity
+WHEN NOT MATCHED THEN INSERT (sku, warehouse, quantity)
+     VALUES (s.sku, s.warehouse, s.quantity);
+```
+
+For plain upserts, stay with `ON CONFLICT`. It is the better tool precisely because it is built on the unique index: `MERGE` is not concurrency-safe in the same way and can still raise a unique violation under load, which means you need a retry loop that `ON CONFLICT` does not require.
+
+If you would rather assemble these statements visually, the [Postgres upsert generator](https://chat2db.ai/tools/postgres-upsert-generator) builds them from a column list, and [Chat2DB](https://chat2db.ai/download) will run them and show the affected rows without leaving the editor.

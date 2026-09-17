@@ -1,0 +1,238 @@
+---
+title: "ClickHouse Keeper vs ZooKeeper: Migration Guide"
+description: "What ClickHouse Keeper is, how it differs from Apache ZooKeeper, why it uses far less memory, and how to migrate a replicated cluster to it safely."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: September 17, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# ClickHouse Keeper vs ZooKeeper: Migration Guide
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="September 17, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+Any replicated ClickHouse table needs a coordination service. It stores the replication log, the part metadata each replica must agree on, and the leader election that decides who merges what. Historically that meant running Apache ZooKeeper — a JVM service with its own tuning, its own failure modes and its own on-call knowledge.
+
+ClickHouse Keeper replaces it with a drop-in, C++ implementation of the same protocol. It is now the default for new deployments, and for most clusters running ZooKeeper there is a good case for migrating.
+
+## Why coordination is needed at all
+
+`ReplicatedMergeTree` is the reason. When you create one:
+
+```sql
+CREATE TABLE events ON CLUSTER my_cluster
+(
+    event_time DateTime,
+    user_id    UInt64,
+    event_type LowCardinality(String)
+)
+ENGINE = ReplicatedMergeTree('/clickhouse/tables/{shard}/events', '{replica}')
+PARTITION BY toYYYYMM(event_time)
+ORDER BY (event_type, user_id, event_time);
+```
+
+The two engine arguments are a coordination path and a replica name. Everything replication-related — which parts exist, which merges are queued, which replica is the leader — lives at that path in the coordination service. If it is down, inserts into replicated tables fail and the tables go read-only. It is not an optional component.
+
+Note that non-replicated `MergeTree` tables need none of this. A single-node ClickHouse install requires no Keeper at all.
+
+## The differences that matter
+
+**Memory.** This is the headline. ZooKeeper holds its entire data tree in the JVM heap with substantial per-node overhead. Keeper stores the same tree far more compactly in native code. Clusters with many tables and parts routinely report Keeper using a small fraction of the memory ZooKeeper needed for identical data — which is what makes it practical to co-locate Keeper with ClickHouse on smaller clusters.
+
+**No JVM.** No heap sizing, no GC pauses, no separate JDK to patch. A GC pause in ZooKeeper long enough to break a session causes replicas to disconnect and re-sync; that failure mode disappears.
+
+**Compressed logs and snapshots.** Keeper compresses both by default, so disk use and recovery times are lower.
+
+**Linearizable writes with better batching.** Keeper uses Raft (via NuRaft) rather than ZAB. Both give the same consistency guarantees; Keeper's implementation batches requests more aggressively, which helps clusters that insert frequently and therefore write a lot of coordination traffic.
+
+**Same client protocol.** Keeper implements the ZooKeeper wire protocol, so ClickHouse — and ZooKeeper CLI tools — talk to it unchanged. This is what makes migration tractable.
+
+The practical summary: Keeper does the same job with less memory, fewer moving parts and no JVM. There is no meaningful feature regression for ClickHouse's use of it.
+
+## Configuring Keeper
+
+Keeper runs either inside `clickhouse-server` or as a standalone `clickhouse-keeper` binary. Use an odd number of nodes — three tolerates one failure, five tolerates two. Two nodes are worse than one, because losing either loses quorum.
+
+```xml
+<!-- /etc/clickhouse-server/config.d/keeper.xml -->
+<clickhouse>
+    <keeper_server>
+        <tcp_port>9181</tcp_port>
+        <server_id>1</server_id>
+        <log_storage_path>/var/lib/clickhouse/coordination/log</log_storage_path>
+        <snapshot_storage_path>/var/lib/clickhouse/coordination/snapshots</snapshot_storage_path>
+
+        <coordination_settings>
+            <operation_timeout_ms>10000</operation_timeout_ms>
+            <session_timeout_ms>30000</session_timeout_ms>
+            <raft_logs_level>information</raft_logs_level>
+        </coordination_settings>
+
+        <raft_configuration>
+            <server><id>1</id><hostname>ch-1.internal</hostname><port>9234</port></server>
+            <server><id>2</id><hostname>ch-2.internal</hostname><port>9234</port></server>
+            <server><id>3</id><hostname>ch-3.internal</hostname><port>9234</port></server>
+        </raft_configuration>
+    </keeper_server>
+</clickhouse>
+```
+
+`server_id` must be unique per node and must match the id in `raft_configuration`. Then point ClickHouse at it:
+
+```xml
+<clickhouse>
+    <zookeeper>
+        <node><host>ch-1.internal</host><port>9181</port></node>
+        <node><host>ch-2.internal</host><port>9181</port></node>
+        <node><host>ch-3.internal</host><port>9181</port></node>
+    </zookeeper>
+</clickhouse>
+```
+
+The element is still called `<zookeeper>`. That is deliberate backward compatibility, not a mistake.
+
+## Migrating from ZooKeeper
+
+The data in ZooKeeper is not disposable — it is the replication state of every replicated table. Recreating it from scratch means re-syncing every replica.
+
+**1. Check your current state.** From any ClickHouse node:
+
+```sql
+SELECT * FROM system.zookeeper WHERE path = '/clickhouse/tables';
+
+SELECT database, table, is_readonly, absolute_delay, queue_size
+FROM system.replicas
+WHERE is_readonly OR absolute_delay > 60 OR queue_size > 100;
+```
+
+The second query must return no rows. Migrating a cluster that already has lagging replicas or a stuck queue turns one problem into two.
+
+**2. Stop writes and stop ZooKeeper cleanly.** The conversion tool reads ZooKeeper's on-disk state, so the ensemble must be shut down — a snapshot taken while it is running can be inconsistent.
+
+**3. Convert the snapshot.** ClickHouse ships a converter that turns ZooKeeper log and snapshot files into a Keeper snapshot:
+
+```bash
+clickhouse keeper-converter \
+    --zookeeper-logs-dir  /var/lib/zookeeper/version-2 \
+    --zookeeper-snapshots-dir /var/lib/zookeeper/version-2 \
+    --output-dir /var/lib/clickhouse/coordination/snapshots
+```
+
+Copy the resulting snapshot to every Keeper node before starting any of them.
+
+**4. Start Keeper and verify quorum.**
+
+```bash
+echo mntr | nc localhost 9181
+# zk_server_state should be "leader" on exactly one node, "follower" elsewhere
+# zk_znode_count should roughly match what ZooKeeper reported
+```
+
+Confirm the data survived:
+
+```bash
+echo 'ls /clickhouse/tables' | nc localhost 9181
+```
+
+**5. Repoint ClickHouse** at the Keeper ports and restart the servers.
+
+**6. Verify replication recovered:**
+
+```sql
+SELECT database, table, replica_name, is_readonly,
+       absolute_delay, queue_size, log_pointer, log_max_index
+FROM system.replicas;
+```
+
+`is_readonly` must be 0 everywhere. A read-only replica means ClickHouse cannot reach coordination — check connectivity to port 9181 before touching anything else. Then confirm writes work end to end:
+
+```sql
+INSERT INTO events VALUES (now(), 1, 'migration_test');
+SELECT count() FROM events WHERE event_type = 'migration_test';
+-- Run the SELECT on a different replica to confirm replication flows.
+```
+
+Keep the ZooKeeper data directory until you have run for a week without incident. It is your rollback.
+
+## Operating Keeper
+
+Monitor it from ClickHouse itself:
+
+```sql
+-- Keeper's own metrics, exposed as a table
+SELECT * FROM system.zookeeper_connection;
+
+-- Replication queue health: the number that signals trouble early
+SELECT database, table, type, count() AS entries,
+       min(create_time) AS oldest
+FROM system.replication_queue
+GROUP BY database, table, type
+ORDER BY entries DESC;
+```
+
+A `replication_queue` that grows steadily means replicas cannot keep up with merges or cannot reach Keeper. Four things worth watching in production:
+
+- **Odd node counts, spread across failure domains.** Three Keeper nodes in one availability zone protect against process failure but not zone failure.
+- **Disk latency.** Raft commits are fsynced; slow disks show up directly as slow inserts into replicated tables.
+- **`session_timeout_ms` versus real network variance.** Too low and replicas flap under transient latency; too short a timeout is a more common cause of instability than genuine failures.
+- **znode growth.** Every part creates coordination entries. Tables with thousands of small parts — usually from inserting too frequently — inflate Keeper's dataset. Batch your inserts.
+
+## Sizing and placement
+
+Keeper's low memory footprint changes the deployment calculus. With ZooKeeper, most teams ran a dedicated three-node ensemble because the JVM heap competed with ClickHouse for RAM. With Keeper, co-locating the process on three of your ClickHouse nodes is a reasonable default for small and medium clusters.
+
+Two caveats apply even then. Keeper commits Raft entries to disk synchronously, so it wants its own disk — or at least a separate volume from the one ClickHouse is writing parts to. Putting both on one saturated device means a merge storm slows down coordination, which slows down every insert into a replicated table. And on large clusters with heavy insert rates, a dedicated ensemble is still worth it: coordination latency then has no correlation with query load at all.
+
+```xml
+<!-- Put coordination on its own volume -->
+<log_storage_path>/mnt/keeper/log</log_storage_path>
+<snapshot_storage_path>/mnt/keeper/snapshots</snapshot_storage_path>
+```
+
+Snapshot and log retention are worth setting explicitly, because the defaults keep more history than most clusters need:
+
+```xml
+<coordination_settings>
+    <snapshot_distance>100000</snapshot_distance>
+    <reserved_log_items>100000</reserved_log_items>
+    <rotate_log_storage_interval>100000</rotate_log_storage_interval>
+</coordination_settings>
+```
+
+## Common failures and what they mean
+
+**`Cannot get consistent metadata from ZooKeeper`** — usually a quorum problem, not a data problem. Check `echo mntr | nc <host> 9181` on each node: exactly one should report `zk_server_state leader`. Two leaders means a split configuration, typically a mismatched `raft_configuration` after someone edited one node's config.
+
+**Tables become read-only after a restart.** ClickHouse could not reach Keeper at startup. It retries, but a replica that was offline long enough to fall behind the retained log needs to re-fetch parts from a peer. Watch it recover:
+
+```sql
+SELECT database, table, is_readonly, absolute_delay,
+       log_pointer, log_max_index, total_replicas, active_replicas
+FROM system.replicas
+WHERE is_readonly OR absolute_delay > 0;
+```
+
+**`Too many parts`** on insert. This is rarely a Keeper fault, but it is a Keeper symptom: each part creates coordination entries, so an application inserting single rows inflates the znode count until Keeper is doing far more work than the data justifies. Batch inserts, or turn on async inserts:
+
+```sql
+SET async_insert = 1, wait_for_async_insert = 1;
+```
+
+**Growing `system.replication_queue` with `MUTATE_PART` entries.** A long-running `ALTER TABLE ... UPDATE` is rewriting parts. Check whether it is progressing before assuming coordination is broken:
+
+```sql
+SELECT database, table, mutation_id, command, parts_to_do, is_done
+FROM system.mutations
+WHERE NOT is_done;
+```
+
+## Should you migrate?
+
+If you are starting a new replicated cluster, use Keeper; ZooKeeper offers nothing extra for ClickHouse, and the project treats Keeper as the path forward.
+
+If you run ZooKeeper today and it is stable, the migration is worthwhile but not urgent. The strongest triggers are ZooKeeper memory pressure on a growing cluster, GC pauses causing replica disconnects, or wanting to stop maintaining a JVM service for a single consumer. The conversion itself is short; the planning around stopping writes is the real work.
+
+For inspecting the cluster during and after the move, [Chat2DB](https://chat2db.ai/download) connects to ClickHouse and lets you query `system.replicas` and `system.replication_queue` alongside your application tables in one place — useful when you are checking replica health across several nodes at once. There is a browser version at [app.chat2db.ai](https://app.chat2db.ai).

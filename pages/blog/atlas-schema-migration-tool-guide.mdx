@@ -1,0 +1,255 @@
+---
+title: "Atlas Migrations: Declarative Schema as Code"
+description: "A practical guide to Atlas, the declarative schema migration tool: HCL and SQL schemas, versioned vs declarative workflows, linting and CI checks."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: September 17, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# Atlas Migrations: Declarative Schema as Code
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="September 17, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+Most migration tools ask you to write the *change*: an `ALTER TABLE` per step, numbered and applied in order. Atlas asks you to describe the *desired state* and works out the changes itself — the model Terraform brought to infrastructure, applied to database schemas.
+
+That difference sounds academic until you have spent an afternoon reconciling a migration history against a database someone hotfixed by hand. This guide covers both of Atlas's workflows, its linting, and where it fits against Flyway and Liquibase.
+
+## Installing and connecting
+
+```bash
+curl -sSf https://atlasgo.sh | sh
+atlas version
+```
+
+Atlas needs two things for most commands: the schema you *want*, and the database you are pointing at. It also needs a **dev database** — a scratch Postgres or MySQL it uses to compute diffs safely without touching production. Docker is the easiest source:
+
+```bash
+export DEV_URL="docker://postgres/16/dev"
+export DB_URL="postgres://user:pass@localhost:5432/app?sslmode=disable"
+```
+
+## Inspecting an existing database
+
+Start by having Atlas read what you already have:
+
+```bash
+atlas schema inspect -u "$DB_URL" > schema.hcl
+atlas schema inspect -u "$DB_URL" --format '{{ sql . }}' > schema.sql
+```
+
+The HCL output is Atlas's native representation:
+
+```hcl
+table "users" {
+  schema = schema.public
+  column "id" {
+    null = false
+    type = bigserial
+  }
+  column "email" {
+    null = false
+    type = varchar(255)
+  }
+  column "created_at" {
+    null    = false
+    type    = timestamptz
+    default = sql("now()")
+  }
+  primary_key {
+    columns = [column.id]
+  }
+  index "users_email_key" {
+    unique  = true
+    columns = [column.email]
+  }
+}
+```
+
+You can also just use plain SQL as your desired state, which most teams prefer:
+
+```sql
+-- schema.sql
+CREATE TABLE users (
+    id         bigserial PRIMARY KEY,
+    email      varchar(255) NOT NULL UNIQUE,
+    created_at timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE TABLE orders (
+    id         bigserial PRIMARY KEY,
+    user_id    bigint NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    amount     numeric(10,2) NOT NULL,
+    status     text NOT NULL DEFAULT 'pending',
+    created_at timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE INDEX orders_user_id_idx ON orders (user_id);
+```
+
+## Workflow 1: declarative
+
+Edit the schema file, then ask Atlas to make the database match.
+
+```bash
+# Preview the plan - always do this first
+atlas schema apply \
+  --url "$DB_URL" \
+  --to file://schema.sql \
+  --dev-url "$DEV_URL" \
+  --dry-run
+```
+
+Add a column to `schema.sql` and the plan shows exactly the `ALTER TABLE` needed. Drop the `--dry-run` to apply, or `--auto-approve` in automation.
+
+The appeal is that the schema file is a single readable description of the current truth. There is no archaeology across forty migration files to answer "what columns does `orders` have?"
+
+The risk is equally clear: **a declarative apply will happily generate destructive statements.** Delete a column from the file and Atlas plans to drop it. Always read the dry run, and constrain what it may do:
+
+```bash
+atlas schema apply \
+  --url "$DB_URL" \
+  --to file://schema.sql \
+  --dev-url "$DEV_URL" \
+  --exclude "audit_log,temp_*"
+```
+
+## Workflow 2: versioned
+
+Most teams running production databases want reviewable migration files in git. Atlas generates them for you by diffing the desired state against the migration history:
+
+```bash
+atlas migrate diff add_orders_status_index \
+  --dir "file://migrations" \
+  --to  "file://schema.sql" \
+  --dev-url "$DEV_URL"
+```
+
+This writes a timestamped SQL file plus an `atlas.sum` integrity file:
+
+```
+migrations/
+  20260917103000_add_orders_status_index.sql
+  atlas.sum
+```
+
+You edit the file if the generated SQL needs refinement, review it in a pull request, and apply it:
+
+```bash
+atlas migrate apply --dir "file://migrations" --url "$DB_URL"
+atlas migrate status --dir "file://migrations" --url "$DB_URL"
+```
+
+`atlas.sum` is a checksum of the directory. Modify an already-applied migration and Atlas refuses to proceed — the safeguard Flyway users know as a checksum mismatch, which catches the genuinely dangerous mistake of editing history.
+
+This is the best of both: you author declaratively, but what ships is an ordinary reviewable SQL file.
+
+## Linting: the feature that justifies the tool
+
+`atlas migrate lint` analyzes pending migrations for destructive and blocking changes *before* they run. This is where Atlas clearly exceeds Flyway and Liquibase.
+
+```bash
+atlas migrate lint \
+  --dir "file://migrations" \
+  --dev-url "$DEV_URL" \
+  --latest 1
+```
+
+It catches the changes that cause production incidents:
+
+- **Destructive** — dropping a column or table, narrowing a type.
+- **Backward-incompatible** — renaming a column, which breaks running application code mid-deploy.
+- **Blocking** — adding a `NOT NULL` column without a default, or creating an index without `CONCURRENTLY` on Postgres, both of which take locks that stall writes on a large table.
+- **Data-dependent** — adding a `UNIQUE` constraint that will fail if duplicates exist.
+
+That last category is the one experience teaches painfully. Atlas checks it against the dev database structurally and warns; the fix is to verify against real data first:
+
+```sql
+SELECT email, count(*)
+FROM users
+GROUP BY email
+HAVING count(*) > 1;
+```
+
+Configure which rules block a build in `atlas.hcl`:
+
+```hcl
+env "ci" {
+  dev = "docker://postgres/16/dev"
+  migration {
+    dir = "file://migrations"
+  }
+  lint {
+    destructive {
+      error = true
+    }
+    concurrent_index {
+      error = true
+    }
+  }
+}
+```
+
+## Wiring it into CI
+
+A minimal GitHub Actions job that fails the PR on a dangerous migration:
+
+```yaml
+name: schema
+on: pull_request
+
+jobs:
+  atlas:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: pass
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd pg_isready --health-interval 10s --health-retries 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0          # lint needs history to find new migrations
+      - uses: ariga/setup-atlas@v0
+      - run: |
+          atlas migrate lint \
+            --dir "file://migrations" \
+            --dev-url "postgres://postgres:pass@localhost:5432/postgres?sslmode=disable" \
+            --git-base origin/${{ github.base_ref }}
+```
+
+`fetch-depth: 0` matters — without full history, `--git-base` cannot determine which migrations the PR added.
+
+## Atlas versus Flyway and Liquibase
+
+| | Atlas | Flyway | Liquibase |
+| --- | --- | --- | --- |
+| Model | Declarative or versioned | Versioned | Versioned |
+| Authoring | Generated from desired state | Hand-written SQL | XML/YAML/JSON/SQL |
+| Safety linting | Extensive | Minimal | Minimal |
+| Rollback | Generated down migrations | Paid tier | Built-in |
+| Schema as one file | Yes | No | Partially |
+| Maturity | Newer | Very mature | Very mature |
+| ORM integration | Reads GORM, Ent, Prisma, SQLAlchemy models | No | No |
+
+The ORM row is worth expanding: Atlas can take your ORM models as the desired state, so migrations are generated from application code without the ORM's own (often weaker) migration engine:
+
+```bash
+atlas migrate diff --env sqlalchemy
+```
+
+**Choose Atlas** if you want a single readable schema definition, generated migrations, and real safety checks in CI. **Stay with Flyway** if you have a large existing migration history that works and your team is comfortable writing SQL by hand — Flyway's maturity and ecosystem are hard to argue with. **Liquibase** remains the answer where database-agnostic changelogs and built-in rollback are organizational requirements.
+
+## Practical advice
+
+1. **Start versioned, not declarative.** Declarative applies against production are where the accidents happen. Generate migration files, review them, then apply.
+2. **Run lint in CI from day one.** It is most of the value, and it costs one job.
+3. **Always read the dry run.** Atlas's diff is good but it cannot know your intent — a rename looks identical to a drop plus an add.
+4. **Keep the dev database ephemeral.** The `docker://` URL gives a clean database per run; a long-lived dev database drifts and produces wrong diffs.
+5. **Inspect the real schema before trusting any tool's view of it.** [Chat2DB](https://chat2db.ai/download) connects to Postgres, MySQL and the rest and shows the live schema, indexes and constraints, which is the fastest way to confirm a migration did what the plan promised; there is a web version at [app.chat2db.ai](https://app.chat2db.ai).
