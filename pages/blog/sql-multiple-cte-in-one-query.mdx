@@ -1,0 +1,369 @@
+---
+title: "Multiple CTEs in One SQL Query: Syntax and Tips"
+description: "Learn how to write multiple CTEs in one SQL query with a single WITH clause, chain CTEs that reference each other, add recursive CTEs, and debug them."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: September 11, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# Multiple CTEs in One SQL Query: Syntax and Tips
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="September 11, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+
+A Common Table Expression (CTE) gives a subquery a name so the rest of the statement can treat it like a temporary table. One CTE is easy. The confusion starts when you need several: how do you declare them, can one CTE read from another, and why does the database complain when you write `WITH` a second time? This article answers those questions with runnable examples on a small sales schema.
+
+## Sample schema
+
+Every example below runs on these three tables. Create them first in any database that supports CTEs (PostgreSQL, MySQL 8+, SQL Server, Oracle, SQLite). A few later sections use PostgreSQL-only features and are marked as such.
+
+```sql
+CREATE TABLE regions (
+  region_id   INT PRIMARY KEY,
+  region_name VARCHAR(50) NOT NULL
+);
+
+CREATE TABLE customers (
+  customer_id   INT PRIMARY KEY,
+  customer_name VARCHAR(100) NOT NULL,
+  region_id     INT NOT NULL REFERENCES regions(region_id)
+);
+
+CREATE TABLE orders (
+  order_id    INT PRIMARY KEY,
+  customer_id INT NOT NULL REFERENCES customers(customer_id),
+  order_date  DATE NOT NULL,
+  status      VARCHAR(20) NOT NULL,
+  amount      DECIMAL(10,2) NOT NULL
+);
+
+INSERT INTO regions VALUES (1, 'North'), (2, 'South');
+
+INSERT INTO customers VALUES
+  (101, 'Acme Corp',    1),
+  (102, 'Blue Sky Ltd', 1),
+  (103, 'Crown Foods',  2),
+  (104, 'Delta Tools',  2),
+  (105, 'Echo Media',   2);
+
+INSERT INTO orders VALUES
+  (1,  101, '2026-01-05', 'shipped',   1200.00),
+  (2,  101, '2026-02-10', 'shipped',    800.00),
+  (3,  102, '2026-01-20', 'shipped',   1500.00),
+  (4,  102, '2026-03-01', 'cancelled',  900.00),
+  (5,  103, '2026-01-15', 'shipped',    700.00),
+  (6,  103, '2026-02-18', 'shipped',    650.00),
+  (7,  104, '2026-02-25', 'shipped',   2100.00),
+  (8,  105, '2026-03-03', 'shipped',    300.00),
+  (9,  105, '2026-03-10', 'cancelled',  450.00),
+  (10, 101, '2026-03-12', 'shipped',    500.00);
+```
+
+## The syntax: one WITH, many named blocks
+
+The rule is simple: a statement has exactly one `WITH` keyword. After it you list as many CTEs as you need, separated by commas. Each CTE is `name AS (subquery)`. The main query follows the last closing parenthesis with no comma in between.
+
+```sql
+WITH north_customers AS (
+  SELECT customer_id, customer_name
+  FROM customers
+  WHERE region_id = 1
+),
+big_orders AS (
+  SELECT order_id, customer_id, amount
+  FROM orders
+  WHERE amount >= 1000
+)
+SELECT nc.customer_name, bo.order_id, bo.amount
+FROM north_customers nc
+JOIN big_orders bo ON bo.customer_id = nc.customer_id
+ORDER BY bo.amount DESC;
+```
+
+```text
+customer_name | order_id | amount
+--------------+----------+---------
+Blue Sky Ltd  |        3 | 1500.00
+Acme Corp     |        1 | 1200.00
+```
+
+Notice the shape: `WITH a AS (...), b AS (...) SELECT ...`. The comma sits between CTE definitions, never before the main `SELECT`.
+
+## The classic mistake: writing WITH twice
+
+People who learn CTEs one at a time often try to stack them like this:
+
+```sql
+WITH north_customers AS (
+  SELECT customer_id, customer_name FROM customers WHERE region_id = 1
+)
+WITH big_orders AS (
+  SELECT order_id, customer_id, amount FROM orders WHERE amount >= 1000
+)
+SELECT * FROM north_customers nc JOIN big_orders bo ON bo.customer_id = nc.customer_id;
+```
+
+PostgreSQL rejects it immediately:
+
+```text
+ERROR:  syntax error at or near "WITH"
+LINE 4: WITH big_orders AS (
+        ^
+```
+
+MySQL reports the same problem as `ERROR 1064 (42000): You have an error in your SQL syntax`, and SQL Server says `Incorrect syntax near the keyword 'WITH'`. The fix is always the same: delete the second `WITH` and replace the line break before it with a comma.
+
+## Chaining: a CTE referencing another CTE
+
+The real power of multiple CTEs is that a later CTE can read from an earlier one. This lets you build a query as a sequence of small, named steps instead of nesting subqueries five levels deep.
+
+```sql
+WITH shipped_orders AS (
+  SELECT order_id, customer_id, amount
+  FROM orders
+  WHERE status = 'shipped'
+),
+customer_totals AS (
+  SELECT customer_id, COUNT(*) AS order_count, SUM(amount) AS total_amount
+  FROM shipped_orders
+  GROUP BY customer_id
+)
+SELECT c.customer_name, t.order_count, t.total_amount
+FROM customer_totals t
+JOIN customers c ON c.customer_id = t.customer_id
+ORDER BY t.total_amount DESC;
+```
+
+```text
+customer_name | order_count | total_amount
+--------------+-------------+--------------
+Acme Corp     |           3 |      2500.00
+Delta Tools   |           1 |      2100.00
+Blue Sky Ltd  |           1 |      1500.00
+Crown Foods   |           2 |      1350.00
+Echo Media    |           1 |       300.00
+```
+
+`customer_totals` never touches the base table. It reads only from `shipped_orders`, so the status filter lives in exactly one place.
+
+### Ordering rules
+
+A CTE can reference any CTE that appears before it in the same `WITH` list. It cannot reference one that appears after it. Swap the two blocks above and PostgreSQL responds:
+
+```text
+ERROR:  relation "shipped_orders" does not exist
+```
+
+The only exception is a recursive CTE, which is allowed to reference itself inside its own definition. Forward references to other CTEs are still not allowed even then. The practical rule: define things in the order you would explain them to a colleague.
+
+## A realistic four-step pipeline
+
+Here is a typical reporting question: for each region, which two customers generated the most shipped revenue, and how many orders did they place? Solve it in four steps: filter, aggregate, rank, join.
+
+```sql
+WITH shipped_orders AS (
+  -- Step 1: keep only orders that actually shipped
+  SELECT order_id, customer_id, amount
+  FROM orders
+  WHERE status = 'shipped'
+),
+customer_totals AS (
+  -- Step 2: aggregate per customer
+  SELECT customer_id, COUNT(*) AS order_count, SUM(amount) AS total_amount
+  FROM shipped_orders
+  GROUP BY customer_id
+),
+ranked_customers AS (
+  -- Step 3: rank customers inside their region with a window function
+  SELECT c.customer_id,
+         c.customer_name,
+         c.region_id,
+         t.order_count,
+         t.total_amount,
+         RANK() OVER (PARTITION BY c.region_id ORDER BY t.total_amount DESC) AS region_rank
+  FROM customer_totals t
+  JOIN customers c ON c.customer_id = t.customer_id
+)
+-- Step 4: attach region names and keep the top two per region
+SELECT r.region_name, rc.customer_name, rc.order_count, rc.total_amount, rc.region_rank
+FROM ranked_customers rc
+JOIN regions r ON r.region_id = rc.region_id
+WHERE rc.region_rank <= 2
+ORDER BY r.region_name, rc.region_rank;
+```
+
+```text
+region_name | customer_name | order_count | total_amount | region_rank
+------------+---------------+-------------+--------------+-------------
+North       | Acme Corp     |           3 |      2500.00 |           1
+North       | Blue Sky Ltd  |           1 |      1500.00 |           2
+South       | Delta Tools   |           1 |      2100.00 |           1
+South       | Crown Foods   |           2 |      1350.00 |           2
+```
+
+Each step has one job, and the window function sits in its own CTE because you cannot filter on a window function result in the same `SELECT` that computes it. Putting `RANK()` in `ranked_customers` and filtering in the main query is the standard pattern.
+
+## Mixing a recursive CTE with normal CTEs
+
+A recursive CTE can live in the same `WITH` list as ordinary CTEs. In PostgreSQL, SQLite, and MySQL the `RECURSIVE` keyword is written once, directly after `WITH`, even if only one of the CTEs is actually recursive. The example below generates a list of month start dates, then left joins monthly totals onto it so months with no sales still appear. This version uses PostgreSQL date syntax.
+
+```sql
+WITH RECURSIVE months AS (
+  SELECT DATE '2026-01-01' AS month_start
+  UNION ALL
+  SELECT (month_start + INTERVAL '1 month')::date
+  FROM months
+  WHERE month_start < DATE '2026-04-01'
+),
+shipped_orders AS (
+  SELECT order_id, order_date, amount
+  FROM orders
+  WHERE status = 'shipped'
+),
+monthly_totals AS (
+  SELECT date_trunc('month', order_date)::date AS month_start,
+         SUM(amount) AS total_amount
+  FROM shipped_orders
+  GROUP BY date_trunc('month', order_date)::date
+)
+SELECT m.month_start, COALESCE(t.total_amount, 0) AS total_amount
+FROM months m
+LEFT JOIN monthly_totals t ON t.month_start = m.month_start
+ORDER BY m.month_start;
+```
+
+```text
+month_start | total_amount
+------------+--------------
+2026-01-01  |      3400.00
+2026-02-01  |      3550.00
+2026-03-01  |       800.00
+2026-04-01  |         0
+```
+
+The non-recursive CTEs (`shipped_orders`, `monthly_totals`) follow the normal ordering rules. Only `months` is allowed to reference itself.
+
+## Using one CTE several times in the main query
+
+Once defined, a CTE can be referenced as many times as you like: in the `FROM` clause, in a subquery, in a join to itself. This is where CTEs beat inline subqueries most clearly, because you would otherwise have to paste the same subquery twice and keep both copies in sync.
+
+```sql
+WITH customer_totals AS (
+  SELECT customer_id, SUM(amount) AS total_amount
+  FROM orders
+  WHERE status = 'shipped'
+  GROUP BY customer_id
+)
+SELECT c.customer_name,
+       t.total_amount,
+       ROUND(t.total_amount * 100.0 / (SELECT SUM(total_amount) FROM customer_totals), 1) AS pct_of_total
+FROM customer_totals t
+JOIN customers c ON c.customer_id = t.customer_id
+ORDER BY t.total_amount DESC;
+```
+
+```text
+customer_name | total_amount | pct_of_total
+--------------+--------------+--------------
+Acme Corp     |      2500.00 |         32.3
+Delta Tools   |      2100.00 |         27.1
+Blue Sky Ltd  |      1500.00 |         19.4
+Crown Foods   |      1350.00 |         17.4
+Echo Media    |       300.00 |          3.9
+```
+
+`customer_totals` is read once in the `FROM` clause and once in the scalar subquery that computes the grand total.
+
+## Data-modifying CTE chains (PostgreSQL)
+
+PostgreSQL allows `INSERT`, `UPDATE`, and `DELETE` inside a CTE as long as the statement ends with `RETURNING`. The returned rows become the CTE's output, and a later CTE can consume them. This turns a two-step "copy then mark" job into one atomic statement.
+
+```sql
+CREATE TABLE order_archive (
+  order_id    INT PRIMARY KEY,
+  customer_id INT NOT NULL,
+  amount      DECIMAL(10,2) NOT NULL,
+  archived_at TIMESTAMP NOT NULL DEFAULT now()
+);
+
+WITH archived AS (
+  INSERT INTO order_archive (order_id, customer_id, amount)
+  SELECT order_id, customer_id, amount
+  FROM orders
+  WHERE status = 'cancelled'
+  RETURNING order_id
+),
+updated AS (
+  UPDATE orders
+  SET status = 'archived'
+  WHERE order_id IN (SELECT order_id FROM archived)
+  RETURNING order_id
+)
+SELECT COUNT(*) AS archived_count FROM updated;
+```
+
+```text
+archived_count
+----------------
+              2
+```
+
+Two details matter here. First, every data-modifying CTE runs exactly once, whether or not the main query references it. Second, all parts of the statement see the same snapshot of the data, so the `UPDATE` cannot observe the rows that the `INSERT` just wrote in `order_archive`; it only sees the `RETURNING` output passed through the CTE. That is exactly what you want for this pattern.
+
+## Dialect notes
+
+- **PostgreSQL**: full support, including recursive and data-modifying CTEs and the `MATERIALIZED` / `NOT MATERIALIZED` hints (12+).
+- **MySQL 8.0+**: supports `WITH` and `WITH RECURSIVE`. Older MySQL 5.7 has no CTEs at all; use derived tables or temporary tables. MariaDB has supported CTEs since 10.2.
+- **SQL Server**: supports multiple comma-separated CTEs. There is no `RECURSIVE` keyword; a recursive CTE is written with plain `WITH`. The statement immediately before a `WITH` must be terminated with a semicolon, otherwise you get `Incorrect syntax near 'WITH'`.
+- **Oracle**: `WITH` has been supported for a long time, recursive (called "recursive subquery factoring") since 11g Release 2. No `RECURSIVE` keyword, and a recursive CTE must list its column names: `WITH months (month_start) AS (...)`.
+- **SQLite**: supports `WITH` and `WITH RECURSIVE` since 3.8.3, and `MATERIALIZED` / `NOT MATERIALIZED` since 3.35.
+
+## Debugging a long CTE chain
+
+When a multi-CTE query returns the wrong answer, do not stare at the whole thing. Keep the `WITH` list intact and replace the main query with `SELECT * FROM <cte_name>`, working from the first CTE to the last:
+
+```sql
+WITH shipped_orders AS (
+  SELECT order_id, customer_id, amount FROM orders WHERE status = 'shipped'
+),
+customer_totals AS (
+  SELECT customer_id, COUNT(*) AS order_count, SUM(amount) AS total_amount
+  FROM shipped_orders GROUP BY customer_id
+)
+SELECT * FROM customer_totals;
+```
+
+Unused CTEs are allowed, so you can leave later blocks in place while you inspect an earlier one (PostgreSQL will simply not execute a non-referenced `SELECT` CTE). Running these intermediate checks in a client like Chat2DB, which you can download at https://chat2db.ai/download or use in the browser at https://app.chat2db.ai, makes it quick to compare the row counts of each stage side by side.
+
+## Performance notes
+
+A CTE is a way of writing a query, not a promise about how it will run.
+
+- **PostgreSQL 12 and later** inlines a CTE into the main query when it is referenced only once and has no side effects, so it is optimized like a subquery. When a CTE is referenced more than once, it is materialized (computed once and stored in memory or on disk).
+- You can override this with `WITH name AS MATERIALIZED (...)` to force one evaluation, or `AS NOT MATERIALIZED (...)` to force inlining. Forcing materialization is useful when a CTE is expensive and referenced many times; forcing inlining is useful when you want a `WHERE` condition from the outer query pushed down into the CTE.
+- **PostgreSQL 11 and earlier** always materialized CTEs, which acted as an optimization fence. If you maintain queries written for those versions, the same query may plan differently after an upgrade.
+- **MySQL** and **SQL Server** generally treat a non-recursive CTE like a derived table and merge it where possible. **SQLite** decides per query unless you give the `MATERIALIZED` hint.
+
+Because behavior differs by engine and version, use `EXPLAIN` (or `EXPLAIN ANALYZE` in PostgreSQL) rather than assumptions when a CTE chain is slow.
+
+## Summary
+
+Multiple CTEs in one SQL query share a single `WITH` keyword and are separated by commas. A CTE may reference any CTE defined before it, which lets you build a query as a readable pipeline of filter, aggregate, rank, and join steps. Writing `WITH` twice or referencing a later CTE are the two most common errors, and both produce clear messages. Recursive CTEs can sit in the same list (with `RECURSIVE` written once after `WITH` in PostgreSQL, MySQL, and SQLite), a CTE can be reused several times in the main query, and PostgreSQL additionally allows data-modifying CTEs chained through `RETURNING`. Debug long chains one CTE at a time, and check `EXPLAIN` before assuming a CTE is or is not materialized.
+
+## FAQ
+
+### Can I use two WITH clauses in one SQL query?
+
+No. A single statement has one `WITH` keyword followed by a comma-separated list of CTE definitions. If you need a second CTE, add a comma after the first closing parenthesis and write `second_name AS (...)`. Writing `WITH` twice is a syntax error in every major database.
+
+### Can a CTE reference another CTE?
+
+Yes, as long as the referenced CTE is defined earlier in the same `WITH` list. Later CTEs can read from earlier ones, which is how you chain steps. A CTE cannot reference one defined after it, and only a recursive CTE can reference itself.
+
+### Does splitting a query into several CTEs make it slower?
+
+Not by itself. PostgreSQL 12+, MySQL 8, and SQL Server usually inline single-use CTEs so they plan the same as subqueries. A CTE referenced multiple times is typically computed once and reused, which is often faster than repeating the subquery. Use `EXPLAIN` to confirm on your engine and version.

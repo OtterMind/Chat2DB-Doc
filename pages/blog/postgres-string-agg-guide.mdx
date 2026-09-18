@@ -1,0 +1,266 @@
+---
+title: "Postgres string_agg: Concatenate Rows to Text"
+description: "PostgreSQL string_agg explained: delimiters, ORDER BY inside the aggregate, DISTINCT, FILTER, NULL rules, and how it replaces MySQL GROUP_CONCAT."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: September 12, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# Postgres string_agg: Concatenate Rows to Text
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="September 12, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+
+Sooner or later every report needs the same thing: one row per customer, with all of that customer's order numbers in a single cell. In MySQL you reach for `GROUP_CONCAT`. PostgreSQL does not have that function at all, and developers coming from MySQL often conclude the feature is missing. It is not. The equivalent is `string_agg`, and it is strictly more capable: the delimiter is a real argument rather than a keyword, the sort order is part of the aggregate, and there is no silently truncating length limit.
+
+This article covers `string_agg` end to end: the basic form, ordering inside the aggregate, deduplication, filtering, what happens to NULLs, how to use it as a window function, and where it becomes a performance problem.
+
+## Sample data
+
+Every example below runs against these two tables.
+
+```sql
+CREATE TABLE customers (
+  id    int PRIMARY KEY,
+  name  text NOT NULL
+);
+
+CREATE TABLE orders (
+  id           int PRIMARY KEY,
+  customer_id  int NOT NULL REFERENCES customers(id),
+  reference    text,
+  status       text NOT NULL,
+  total        numeric(10,2) NOT NULL,
+  created_at   timestamptz NOT NULL
+);
+
+INSERT INTO customers VALUES
+  (1, 'Ada Lovelace'),
+  (2, 'Grace Hopper'),
+  (3, 'Alan Turing');
+
+INSERT INTO orders VALUES
+  (101, 1, 'INV-2026-0007', 'paid',    120.00, '2026-03-02 10:00+00'),
+  (102, 1, 'INV-2026-0031', 'pending',  75.50, '2026-03-09 11:30+00'),
+  (103, 1, NULL,            'paid',     18.00, '2026-04-01 09:15+00'),
+  (104, 2, 'INV-2026-0044', 'paid',    310.25, '2026-02-18 16:45+00'),
+  (105, 2, 'INV-2026-0044', 'refunded', -310.25, '2026-02-20 08:05+00');
+```
+
+Note that customer 3 has no orders at all, order 103 has a NULL reference, and customers 2's two rows share a reference. Each of those details exposes a different behaviour of the aggregate.
+
+## The basic form
+
+`string_agg(expression, delimiter)` concatenates the non-null values of `expression` within each group, separating them with `delimiter`.
+
+```sql
+SELECT c.name,
+       string_agg(o.reference, ', ') AS references
+FROM customers c
+JOIN orders o ON o.customer_id = c.id
+GROUP BY c.name;
+```
+
+```
+     name      |            references
+---------------+-----------------------------------
+ Ada Lovelace  | INV-2026-0007, INV-2026-0031
+ Grace Hopper  | INV-2026-0044, INV-2026-0044
+```
+
+Two things already stand out. Alan Turing is absent, because an inner `JOIN` removed him before the aggregate ran; switch to `LEFT JOIN` and he appears with a NULL result. And order 103, whose reference is NULL, contributed nothing at all - not an empty string, not a stray delimiter. That is the single most useful property of `string_agg`: like every other aggregate in SQL, it ignores NULL inputs entirely, so you never end up with `A, , C`.
+
+If you want a placeholder instead of a silently dropped row, make the value non-null before it reaches the aggregate:
+
+```sql
+SELECT c.name,
+       string_agg(coalesce(o.reference, '(no reference)'), ', ') AS references
+FROM customers c
+LEFT JOIN orders o ON o.customer_id = c.id
+GROUP BY c.name;
+```
+
+And if a group has no rows at all, `string_agg` returns NULL rather than an empty string, which is why the outer `coalesce` in the next example matters:
+
+```sql
+SELECT c.name,
+       coalesce(string_agg(o.reference, ', '), '') AS references
+FROM customers c
+LEFT JOIN orders o ON o.customer_id = c.id
+GROUP BY c.name;
+```
+
+## Ordering inside the aggregate
+
+The results above came out in an order PostgreSQL happened to produce. That order is not guaranteed and will change as soon as the plan changes - after a `VACUUM`, after an index is added, or as soon as the table is large enough for a parallel scan. If the order matters, say so explicitly. SQL allows an `ORDER BY` clause *inside* the aggregate call:
+
+```sql
+SELECT c.name,
+       string_agg(o.reference, ', ' ORDER BY o.created_at DESC) AS newest_first
+FROM customers c
+JOIN orders o ON o.customer_id = c.id
+GROUP BY c.name;
+```
+
+```
+     name      |           newest_first
+---------------+-----------------------------------
+ Ada Lovelace  | INV-2026-0031, INV-2026-0007
+ Grace Hopper  | INV-2026-0044, INV-2026-0044
+```
+
+You can sort by a column that is not the one being aggregated, which is exactly what you want here: concatenate the reference, but order by the date. This is the piece MySQL's `GROUP_CONCAT(... ORDER BY ... SEPARATOR ...)` also supports, and it is the piece people most often forget to write, producing reports that are subtly non-deterministic between runs.
+
+## DISTINCT and FILTER
+
+Grace Hopper's two orders share a reference, so it appears twice. `DISTINCT` inside the aggregate removes the duplicate:
+
+```sql
+SELECT c.name,
+       string_agg(DISTINCT o.reference, ', ') AS refs
+FROM customers c
+JOIN orders o ON o.customer_id = c.id
+GROUP BY c.name;
+```
+
+There is one restriction worth knowing before it bites you: when you use `DISTINCT`, any `ORDER BY` inside the same aggregate must sort by the expression being aggregated. `string_agg(DISTINCT o.reference, ', ' ORDER BY o.created_at)` raises `ERROR: in an aggregate with DISTINCT, ORDER BY expressions must appear in argument list`. The reason is straightforward: after deduplication there may be several `created_at` values for one surviving reference, so the sort would be ambiguous. If you need both, deduplicate in a subquery first:
+
+```sql
+SELECT name, string_agg(reference, ', ' ORDER BY first_seen) AS refs
+FROM (
+  SELECT c.name, o.reference, min(o.created_at) AS first_seen
+  FROM customers c
+  JOIN orders o ON o.customer_id = c.id
+  GROUP BY c.name, o.reference
+) d
+GROUP BY name;
+```
+
+To concatenate only some of the rows, use the `FILTER` clause rather than a `CASE` expression. It reads better and, unlike `CASE`, does not need a NULL branch:
+
+```sql
+SELECT c.name,
+       string_agg(o.reference, ', ') FILTER (WHERE o.status = 'paid') AS paid_refs,
+       count(*) FILTER (WHERE o.status = 'refunded')                  AS refunds
+FROM customers c
+JOIN orders o ON o.customer_id = c.id
+GROUP BY c.name;
+```
+
+`FILTER` works on any aggregate, and several aggregates in the same `SELECT` can each carry their own filter, which is how you build a wide summary row in one pass over the table instead of one subquery per column.
+
+## Building formatted output
+
+Because the first argument is an expression, not just a column, you can compose the text inside the aggregate. Combined with `E'\n'` as the delimiter this produces multi-line cells that are genuinely readable:
+
+```sql
+SELECT c.name,
+       string_agg(
+         coalesce(o.reference, 'order ' || o.id) || ' (' || o.status || ', ' || to_char(o.total, 'FM999990.00') || ')',
+         E'\n' ORDER BY o.created_at
+       ) AS order_lines
+FROM customers c
+JOIN orders o ON o.customer_id = c.id
+GROUP BY c.name;
+```
+
+A frequent variant is generating a comma-separated list for an `IN` clause or a CSV export:
+
+```sql
+SELECT string_agg(quote_literal(reference), ', ' ORDER BY reference) AS in_list
+FROM orders
+WHERE status = 'paid' AND reference IS NOT NULL;
+```
+
+`quote_literal` escapes embedded quotes properly, which plain concatenation does not. If you are assembling SQL rather than a display string, use it - or better, pass an array to the query and use `= ANY($1)` instead of building text at all.
+
+## string_agg as a window function
+
+Every aggregate in PostgreSQL can also run as a window function, which means you can attach the concatenated list to each individual row without collapsing the result set:
+
+```sql
+SELECT o.id,
+       o.reference,
+       string_agg(o.reference, ', ') OVER (PARTITION BY o.customer_id) AS all_refs_for_customer
+FROM orders o
+WHERE o.reference IS NOT NULL;
+```
+
+This is useful when you need both the detail rows and a summary in one query, for example rendering a table where each row also shows its siblings. Note that `ORDER BY` inside a window-function call behaves differently from `ORDER BY` inside a grouped aggregate: in a window, adding `ORDER BY` creates a running frame, so `string_agg(x, ',') OVER (PARTITION BY g ORDER BY t)` produces a *cumulative* concatenation, growing row by row. That is occasionally exactly what you want, and frequently a surprise.
+
+## Related aggregates
+
+`string_agg` has siblings that solve the same shape of problem with different output types, and picking the right one saves a round trip through text:
+
+```sql
+SELECT c.name,
+       string_agg(o.reference, ',')  AS as_text,
+       array_agg(o.reference)        AS as_array,
+       json_agg(o.reference)         AS as_json,
+       jsonb_agg(
+         jsonb_build_object('ref', o.reference, 'total', o.total)
+       )                             AS as_objects
+FROM customers c
+JOIN orders o ON o.customer_id = c.id
+GROUP BY c.name;
+```
+
+If the consumer is an application rather than a human, prefer `array_agg` or `jsonb_agg`. Returning an array avoids the split-on-comma step in application code, and avoids the bug that appears the day one of the values legitimately contains a comma. Reserve `string_agg` for output people read.
+
+The inverse operations are just as useful. `string_to_array` and `unnest` turn the text back into rows, which is how you fix a legacy column that stores a comma-separated list:
+
+```sql
+SELECT id, trim(tag) AS tag
+FROM legacy_articles, unnest(string_to_array(tags_csv, ',')) AS tag;
+```
+
+## Performance and limits
+
+Unlike MySQL's `GROUP_CONCAT`, `string_agg` has no `group_concat_max_len` equivalent that silently truncates output. The only ceiling is PostgreSQL's 1 GB limit on a single `text` value, and hitting it raises an error instead of quietly producing a wrong answer. That is the behaviour you want, but it means an unbounded aggregate over a large table can consume serious memory before it fails.
+
+Two practical guards:
+
+```sql
+-- Cap the number of elements per group
+SELECT customer_id,
+       string_agg(reference, ', ' ORDER BY created_at DESC) AS recent_refs
+FROM (
+  SELECT customer_id, reference, created_at,
+         row_number() OVER (PARTITION BY customer_id ORDER BY created_at DESC) AS rn
+  FROM orders
+  WHERE reference IS NOT NULL
+) t
+WHERE rn <= 10
+GROUP BY customer_id;
+
+-- Cap the resulting length
+SELECT customer_id,
+       left(string_agg(reference, ', '), 500) AS refs_preview
+FROM orders
+GROUP BY customer_id;
+```
+
+Also remember that the aggregate runs after the join, so the cost is dominated by the join itself. If the grouped query is slow, look at whether `orders.customer_id` is indexed and whether the plan is using a `HashAggregate` or a `GroupAggregate` before blaming the concatenation. Running `EXPLAIN (ANALYZE, BUFFERS)` on the grouped query tells you which of the two you have; a `GroupAggregate` preceded by a sort of millions of rows is the usual culprit.
+
+## Migrating from MySQL GROUP_CONCAT
+
+The translation is mechanical once you know the mapping:
+
+| MySQL | PostgreSQL |
+| --- | --- |
+| `GROUP_CONCAT(ref)` | `string_agg(ref, ',')` |
+| `GROUP_CONCAT(ref SEPARATOR '; ')` | `string_agg(ref, '; ')` |
+| `GROUP_CONCAT(DISTINCT ref)` | `string_agg(DISTINCT ref, ',')` |
+| `GROUP_CONCAT(ref ORDER BY created_at)` | `string_agg(ref, ',' ORDER BY created_at)` |
+
+The two differences that catch people out: PostgreSQL requires the delimiter argument (there is no default comma), and the result is NULL for an empty group in both engines, so existing `IFNULL` wrappers become `coalesce`.
+
+If you are working across both engines, a client that speaks each dialect natively saves a lot of guesswork - [Chat2DB](https://chat2db.ai/download) connects to MySQL and PostgreSQL side by side and will explain or translate a query between them, and the [web version](https://app.chat2db.ai) does the same without installing anything.
+
+## Summary
+
+`string_agg(expr, delimiter)` is PostgreSQL's row-to-text aggregate. Put `ORDER BY` inside the call whenever order matters, because without it the order is whatever the plan produces. Use `DISTINCT` for deduplication and `FILTER` for conditional lists. Remember that NULL inputs are skipped and an empty group yields NULL, so `coalesce` at the right level. And when the consumer is code rather than a person, reach for `array_agg` or `jsonb_agg` instead - they carry the same information without the ambiguity of a delimiter.

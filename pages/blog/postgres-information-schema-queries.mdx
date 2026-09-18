@@ -1,0 +1,311 @@
+---
+title: "Postgres information_schema Query Cookbook"
+description: "Ready-to-run information_schema queries for PostgreSQL: list tables and columns, find foreign keys, constraints, indexes, and when to use pg_catalog."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: September 12, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# Postgres information_schema Query Cookbook
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="September 12, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+
+Every database question that starts with "which tables have..." is answered by querying the catalog. PostgreSQL exposes two of them: `information_schema`, the SQL standard set of views that also exists in MySQL and SQL Server, and `pg_catalog`, the native system tables that know about things the standard has never heard of.
+
+This is a cookbook of queries against both, with a note on when each is the right choice.
+
+## The one thing to know first
+
+`information_schema` views are **filtered by privilege**. They show only objects you own or have some privilege on. Run the same query as a superuser and as an application role and you will get different results - which is a feature, not a bug, but it surprises people debugging "my table is missing from the list".
+
+`pg_catalog` has no such filter. If you need the complete picture, or you need PostgreSQL-specific information such as index definitions, table sizes, partitioning or `TOAST` settings, use `pg_catalog`. Use `information_schema` when you want a query that also runs on MySQL or SQL Server.
+
+Both are always on the search path, so no schema qualification is needed.
+
+## List tables
+
+```sql
+-- Your own schemas only (excludes system schemas)
+SELECT table_schema, table_name, table_type
+FROM information_schema.tables
+WHERE table_schema NOT IN ('pg_catalog', 'information_schema')
+ORDER BY table_schema, table_name;
+```
+
+`table_type` is `BASE TABLE`, `VIEW`, `FOREIGN` or `LOCAL TEMPORARY`. To get only real tables, filter on `'BASE TABLE'`.
+
+The `pg_catalog` equivalent adds size, owner and row estimates, which the standard views cannot express:
+
+```sql
+SELECT n.nspname AS schema,
+       c.relname AS table,
+       pg_size_pretty(pg_total_relation_size(c.oid)) AS total_size,
+       pg_size_pretty(pg_relation_size(c.oid))       AS table_size,
+       c.reltuples::bigint                           AS row_estimate,
+       pg_get_userbyid(c.relowner)                   AS owner
+FROM pg_class c
+JOIN pg_namespace n ON n.oid = c.relnamespace
+WHERE c.relkind = 'r'
+  AND n.nspname NOT IN ('pg_catalog', 'information_schema')
+ORDER BY pg_total_relation_size(c.oid) DESC;
+```
+
+`pg_total_relation_size` includes indexes and TOAST; `pg_relation_size` is the table heap alone. The gap between them is usually where a surprise lives.
+
+In `psql`, `\dt` and `\dt+` run versions of this for you, and `\d+ tablename` describes one table. `\set ECHO_HIDDEN on` prints the underlying SQL, which is an excellent way to learn the catalog.
+
+## Describe a table's columns
+
+```sql
+SELECT ordinal_position AS pos,
+       column_name,
+       data_type,
+       character_maximum_length AS max_len,
+       numeric_precision, numeric_scale,
+       is_nullable,
+       column_default
+FROM information_schema.columns
+WHERE table_schema = 'public' AND table_name = 'orders'
+ORDER BY ordinal_position;
+```
+
+`data_type` here is the standard name, so a `text` column reports `text` but a `varchar(50)` reports `character varying` with `max_len = 50`, and a custom enum reports `USER-DEFINED`. When you want the name PostgreSQL would print, `format_type` gives it:
+
+```sql
+SELECT a.attnum AS pos,
+       a.attname AS column,
+       format_type(a.atttypid, a.atttypmod) AS type,   -- 'character varying(50)', 'numeric(10,2)'
+       a.attnotnull AS not_null,
+       pg_get_expr(d.adbin, d.adrelid) AS default,
+       col_description(a.attrelid, a.attnum) AS comment
+FROM pg_attribute a
+LEFT JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum
+WHERE a.attrelid = 'public.orders'::regclass
+  AND a.attnum > 0
+  AND NOT a.attisdropped
+ORDER BY a.attnum;
+```
+
+Two details in that query are worth stealing. `'public.orders'::regclass` casts a table name to its OID, which is far more readable than joining `pg_class` to `pg_namespace`. And `NOT a.attisdropped` matters: dropped columns physically remain in `pg_attribute` as placeholders, so omitting that filter returns phantom entries named `........pg.dropped.3........`.
+
+## Find a column across the whole database
+
+The query you reach for when you need to know where `customer_id` appears:
+
+```sql
+SELECT table_schema, table_name, data_type
+FROM information_schema.columns
+WHERE column_name = 'customer_id'
+  AND table_schema NOT IN ('pg_catalog', 'information_schema')
+ORDER BY table_schema, table_name;
+```
+
+Or fuzzily, to audit for anything that looks like personal data:
+
+```sql
+SELECT table_schema, table_name, column_name, data_type
+FROM information_schema.columns
+WHERE table_schema NOT IN ('pg_catalog', 'information_schema')
+  AND (column_name ILIKE '%email%'
+    OR column_name ILIKE '%phone%'
+    OR column_name ILIKE '%ssn%'
+    OR column_name ILIKE '%passwo%')
+ORDER BY 1, 2, 3;
+```
+
+## Primary keys
+
+```sql
+SELECT tc.table_schema, tc.table_name, kcu.column_name, kcu.ordinal_position
+FROM information_schema.table_constraints tc
+JOIN information_schema.key_column_usage kcu
+  ON kcu.constraint_name = tc.constraint_name
+ AND kcu.table_schema    = tc.table_schema
+WHERE tc.constraint_type = 'PRIMARY KEY'
+  AND tc.table_schema NOT IN ('pg_catalog', 'information_schema')
+ORDER BY tc.table_name, kcu.ordinal_position;
+```
+
+Note the join on both `constraint_name` and `table_schema`. Constraint names are only unique per schema, and joining on the name alone produces a cross product the first time two schemas have a constraint called `pk_id`. This is the most common bug in copied catalog queries.
+
+To find tables *without* a primary key - usually a replication or upsert problem waiting to happen:
+
+```sql
+SELECT n.nspname AS schema, c.relname AS table
+FROM pg_class c
+JOIN pg_namespace n ON n.oid = c.relnamespace
+WHERE c.relkind = 'r'
+  AND n.nspname NOT IN ('pg_catalog', 'information_schema')
+  AND NOT EXISTS (
+    SELECT 1 FROM pg_constraint k
+    WHERE k.conrelid = c.oid AND k.contype = 'p'
+  )
+ORDER BY 1, 2;
+```
+
+## Foreign keys
+
+The `information_schema` version needs three views joined together:
+
+```sql
+SELECT tc.table_schema  AS child_schema,
+       tc.table_name    AS child_table,
+       kcu.column_name  AS child_column,
+       ccu.table_schema AS parent_schema,
+       ccu.table_name   AS parent_table,
+       ccu.column_name  AS parent_column,
+       rc.update_rule,
+       rc.delete_rule,
+       tc.constraint_name
+FROM information_schema.table_constraints tc
+JOIN information_schema.key_column_usage kcu
+  ON kcu.constraint_name = tc.constraint_name
+ AND kcu.constraint_schema = tc.constraint_schema
+JOIN information_schema.referential_constraints rc
+  ON rc.constraint_name = tc.constraint_name
+ AND rc.constraint_schema = tc.constraint_schema
+JOIN information_schema.constraint_column_usage ccu
+  ON ccu.constraint_name = tc.constraint_name
+ AND ccu.constraint_schema = tc.constraint_schema
+WHERE tc.constraint_type = 'FOREIGN KEY'
+ORDER BY 1, 2;
+```
+
+The `pg_catalog` version is shorter and, for multi-column keys, more correct - the `information_schema` join above can pair columns incorrectly when a composite key references columns in a different order:
+
+```sql
+SELECT conrelid::regclass  AS child_table,
+       conname             AS constraint_name,
+       confrelid::regclass AS parent_table,
+       pg_get_constraintdef(oid) AS definition
+FROM pg_constraint
+WHERE contype = 'f'
+ORDER BY conrelid::regclass::text;
+```
+
+`pg_get_constraintdef` returns the exact `FOREIGN KEY (a, b) REFERENCES parent(x, y) ON DELETE CASCADE` text, which is both easier to read and directly reusable in a migration.
+
+### Unindexed foreign keys
+
+PostgreSQL indexes the parent side of a foreign key automatically (it must be unique) but **not** the child side. Every `DELETE` on the parent then scans the child table to check the constraint, and the child table takes a lock while it does. This query finds the missing indexes:
+
+```sql
+SELECT c.conrelid::regclass AS child_table,
+       a.attname            AS column,
+       c.conname            AS fk_name
+FROM pg_constraint c
+JOIN pg_attribute a
+  ON a.attrelid = c.conrelid AND a.attnum = c.conkey[1]
+WHERE c.contype = 'f'
+  AND NOT EXISTS (
+    SELECT 1 FROM pg_index i
+    WHERE i.indrelid = c.conrelid
+      AND i.indkey[0] = c.conkey[1]
+  )
+ORDER BY 1;
+```
+
+This is one of the highest-value catalog queries there is: run it on any database that has grown organically and you will usually find several.
+
+## Other constraints
+
+```sql
+-- CHECK constraints with their expressions
+SELECT conrelid::regclass AS table, conname, pg_get_constraintdef(oid) AS definition
+FROM pg_constraint
+WHERE contype = 'c'
+  AND connamespace::regnamespace::text NOT IN ('pg_catalog', 'information_schema')
+ORDER BY 1;
+
+-- UNIQUE constraints
+SELECT tc.table_name, tc.constraint_name, kcu.column_name
+FROM information_schema.table_constraints tc
+JOIN information_schema.key_column_usage kcu
+  ON kcu.constraint_name = tc.constraint_name
+ AND kcu.table_schema = tc.table_schema
+WHERE tc.constraint_type = 'UNIQUE'
+ORDER BY 1, tc.constraint_name, kcu.ordinal_position;
+```
+
+Constraint types in `pg_constraint.contype`: `p` primary key, `f` foreign key, `u` unique, `c` check, `x` exclusion, `t` constraint trigger.
+
+## Indexes
+
+`information_schema` has no index view at all - indexes are not in the SQL standard. This is `pg_catalog` territory:
+
+```sql
+SELECT schemaname, tablename, indexname, indexdef
+FROM pg_indexes
+WHERE schemaname NOT IN ('pg_catalog', 'information_schema')
+ORDER BY tablename, indexname;
+
+-- With size and usage, which is what you actually want
+SELECT s.schemaname,
+       s.relname   AS table,
+       s.indexrelname AS index,
+       pg_size_pretty(pg_relation_size(s.indexrelid)) AS size,
+       s.idx_scan  AS scans,
+       s.idx_tup_read,
+       i.indisunique AS is_unique
+FROM pg_stat_user_indexes s
+JOIN pg_index i ON i.indexrelid = s.indexrelid
+ORDER BY s.idx_scan ASC, pg_relation_size(s.indexrelid) DESC;
+```
+
+Sorting by `idx_scan` ascending puts never-used indexes at the top. Before dropping any of them, confirm the counters have been accumulating for long enough - `SELECT stats_reset FROM pg_stat_database WHERE datname = current_database();` tells you since when - and never drop an index backing a unique or primary key constraint.
+
+## Views, functions and privileges
+
+```sql
+-- View definitions
+SELECT table_schema, table_name, view_definition
+FROM information_schema.views
+WHERE table_schema NOT IN ('pg_catalog', 'information_schema');
+
+-- Which views depend on a table (the query to run before ALTER TABLE)
+SELECT DISTINCT dependent.relname AS view_name
+FROM pg_depend d
+JOIN pg_rewrite r    ON r.oid = d.objid
+JOIN pg_class dependent ON dependent.oid = r.ev_class
+WHERE d.refobjid = 'public.orders'::regclass
+  AND dependent.relname <> 'orders';
+
+-- Table privileges granted to roles
+SELECT grantee, table_schema, table_name, privilege_type
+FROM information_schema.role_table_grants
+WHERE table_schema NOT IN ('pg_catalog', 'information_schema')
+ORDER BY grantee, table_name;
+
+-- Functions and their signatures
+SELECT n.nspname AS schema,
+       p.proname AS name,
+       pg_get_function_identity_arguments(p.oid) AS args,
+       pg_get_function_result(p.oid) AS returns
+FROM pg_proc p
+JOIN pg_namespace n ON n.oid = p.pronamespace
+WHERE n.nspname NOT IN ('pg_catalog', 'information_schema')
+ORDER BY 1, 2;
+```
+
+## Choosing between the two catalogs
+
+| Need | Use |
+| --- | --- |
+| Portable query across PostgreSQL, MySQL, SQL Server | `information_schema` |
+| Indexes, sizes, bloat, partitions, TOAST | `pg_catalog` |
+| Exact DDL text of a constraint or index | `pg_get_constraintdef`, `pg_get_indexdef` |
+| Complete list regardless of the current role's privileges | `pg_catalog` |
+| Usage statistics (scans, tuples, cache hits) | `pg_stat_*` views |
+
+A practical compromise: write schema documentation and migration tooling against `information_schema` so it ports, and write operational checks against `pg_catalog` because that is where the operational facts live.
+
+If you would rather browse the schema than query it, a client that reads these catalogs for you saves time - [Chat2DB](https://chat2db.ai/download) shows tables, columns, keys and indexes in a tree and can generate the DDL, and the [web version](https://app.chat2db.ai) does the same in a browser.
+
+## Summary
+
+`information_schema` is the portable, privilege-filtered view of your schema; `pg_catalog` is the complete, PostgreSQL-specific one. Join catalog views on schema *and* name, never on name alone. Filter out `attisdropped` columns. And keep two queries from this page permanently to hand: the unindexed-foreign-key finder and the unused-index report - between them they explain a surprising share of unexplained slowness.

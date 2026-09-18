@@ -1,0 +1,388 @@
+---
+title: "pgvector with Python: A Practical Guide"
+description: "Use pgvector from Python with psycopg3 and SQLAlchemy: store embeddings, build HNSW indexes, filter by metadata, and avoid the common recall mistakes."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: September 14, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# pgvector with Python: A Practical Guide
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="September 14, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+Most applications that need vector search already have a PostgreSQL database holding the data those vectors describe. `pgvector` lets you keep them together, which removes an entire category of problem: no second datastore to operate, no synchronisation job, no consistency window between "the document was deleted" and "the embedding was deleted", and metadata filters that are just SQL `WHERE` clauses.
+
+This guide covers the Python side end to end — schema, insertion, indexing, querying, and the mistakes that quietly destroy recall.
+
+## Setup
+
+Install the extension in your database and the Python bindings in your environment:
+
+```sql
+CREATE EXTENSION IF NOT EXISTS vector;
+
+SELECT extversion FROM pg_extension WHERE extname = 'vector';
+```
+
+```bash
+pip install "psycopg[binary]" pgvector
+# For the SQLAlchemy examples:
+pip install sqlalchemy
+```
+
+The `pgvector` Python package does one important job: it registers type adapters so Postgres `vector` values convert to and from Python lists and NumPy arrays automatically. Without it you would be formatting vector literals by hand, which is both tedious and slow.
+
+## Designing the table
+
+```sql
+CREATE TABLE documents (
+    id          bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    content     text NOT NULL,
+    source      text NOT NULL,
+    tenant_id   bigint NOT NULL,
+    created_at  timestamptz NOT NULL DEFAULT now(),
+    embedding   vector(1536)
+);
+```
+
+Two decisions are baked in here and both are hard to change later.
+
+**The dimension is fixed at declaration.** `vector(1536)` matches the output of the embedding model you have chosen. Changing models later usually means a different dimension, which means a new column and a full re-embedding pass. Pick deliberately.
+
+**Metadata lives in real columns.** It is tempting to dump everything into a `jsonb` blob. Resist it for anything you filter on — `tenant_id` as a `bigint` column can be indexed and used by the planner far more effectively than a key inside a document.
+
+## Inserting embeddings
+
+```python
+import psycopg
+from pgvector.psycopg import register_vector
+
+conn = psycopg.connect("postgresql://app@localhost/mydb")
+register_vector(conn)          # must run after connecting
+
+embedding = get_embedding("the quick brown fox")   # list[float], length 1536
+
+with conn.cursor() as cur:
+    cur.execute(
+        """
+        INSERT INTO documents (content, source, tenant_id, embedding)
+        VALUES (%s, %s, %s, %s)
+        RETURNING id
+        """,
+        ("the quick brown fox", "docs/animals.md", 42, embedding),
+    )
+    doc_id = cur.fetchone()[0]
+
+conn.commit()
+```
+
+`register_vector(conn)` is the line people forget. Without it, passing a Python list where a `vector` is expected raises a type error — or, worse, silently inserts a string representation that behaves oddly later.
+
+### Bulk loading
+
+Inserting a few thousand rows one statement at a time is slow enough to matter. Use `COPY`:
+
+```python
+import numpy as np
+from pgvector.psycopg import register_vector
+
+def bulk_load(conn, rows):
+    """rows: iterable of (content, source, tenant_id, embedding)"""
+    register_vector(conn)
+    with conn.cursor() as cur:
+        with cur.copy(
+            "COPY documents (content, source, tenant_id, embedding) FROM STDIN WITH (FORMAT BINARY)"
+        ) as copy:
+            copy.set_types(["text", "text", "int8", "vector"])
+            for content, source, tenant_id, embedding in rows:
+                copy.write_row([content, source, tenant_id, np.asarray(embedding, dtype=np.float32)])
+    conn.commit()
+```
+
+Binary `COPY` avoids formatting every float as text and is typically an order of magnitude faster than row-by-row inserts for a large backfill.
+
+**Build the vector index after the bulk load, not before.** Maintaining an HNSW graph while inserting millions of rows is far slower than building it once at the end.
+
+## Choosing a distance operator
+
+pgvector provides several distance operators, and this choice has to be consistent everywhere:
+
+| Operator | Distance | Use with |
+| --- | --- | --- |
+| `<=>` | Cosine distance | Most text embedding models |
+| `<->` | L2 (Euclidean) distance | Models trained with Euclidean objectives |
+| `<#>` | Negative inner product | Models where magnitude carries meaning |
+
+For most modern text embedding models, cosine distance (`<=>`) is correct. Note that `<#>` returns the *negative* inner product, because Postgres index scans only order ascending — so smaller is still better, but the values are negative.
+
+Since cosine distance is `1 - cosine_similarity`, convert when you need a similarity score:
+
+```sql
+SELECT id, content, 1 - (embedding <=> $1) AS similarity
+FROM documents
+ORDER BY embedding <=> $1
+LIMIT 10;
+```
+
+## Indexing
+
+Without an index, pgvector performs an exact scan of every row. That is correct but linear, and fine only up to a few thousand rows. Beyond that you need an approximate index.
+
+### HNSW
+
+The better default. It builds a navigable small-world graph and gives strong recall at good speed.
+
+```sql
+CREATE INDEX CONCURRENTLY documents_embedding_hnsw
+  ON documents
+  USING hnsw (embedding vector_cosine_ops)
+  WITH (m = 16, ef_construction = 64);
+```
+
+- `m` — connections per node. Higher means better recall and a larger index.
+- `ef_construction` — candidate list size during build. Higher means better graph quality and a slower build.
+
+Speed the build up by giving it memory and parallelism:
+
+```sql
+SET maintenance_work_mem = '4GB';
+SET max_parallel_maintenance_workers = 4;
+```
+
+If `maintenance_work_mem` is too small to hold the graph, the build spills to disk and slows down enormously — this is the single biggest factor in HNSW build time.
+
+### IVFFlat
+
+Builds much faster and uses less memory, at the cost of recall that depends on tuning:
+
+```sql
+-- Rule of thumb: lists = rows / 1000 for up to 1M rows,
+-- then sqrt(rows) beyond that.
+CREATE INDEX documents_embedding_ivfflat
+  ON documents
+  USING ivfflat (embedding vector_cosine_ops)
+  WITH (lists = 1000);
+```
+
+IVFFlat has a hard requirement that HNSW does not: **the table must already contain representative data when you build the index**, because it clusters the existing vectors. Building it on an empty table produces a useless index.
+
+### The operator class must match
+
+```sql
+-- Cosine
+USING hnsw (embedding vector_cosine_ops)   -- for <=>
+-- L2
+USING hnsw (embedding vector_l2_ops)       -- for <->
+-- Inner product
+USING hnsw (embedding vector_ip_ops)       -- for <#>
+```
+
+A mismatch does not error. The index simply never gets used, and you get exact-but-slow scans while believing you have an index. Always verify:
+
+```sql
+EXPLAIN ANALYZE
+SELECT id FROM documents ORDER BY embedding <=> '[...]'::vector LIMIT 10;
+```
+
+Look for `Index Scan using documents_embedding_hnsw`. If you see `Seq Scan`, something is wrong.
+
+## Querying from Python
+
+```python
+import numpy as np
+
+def search(conn, query_embedding, tenant_id, limit=10):
+    with conn.cursor() as cur:
+        cur.execute("SET LOCAL hnsw.ef_search = 100")
+        cur.execute(
+            """
+            SELECT id, content, source,
+                   1 - (embedding <=> %s) AS similarity
+            FROM documents
+            WHERE tenant_id = %s
+            ORDER BY embedding <=> %s
+            LIMIT %s
+            """,
+            (np.asarray(query_embedding, dtype=np.float32),
+             tenant_id,
+             np.asarray(query_embedding, dtype=np.float32),
+             limit),
+        )
+        return cur.fetchall()
+```
+
+`hnsw.ef_search` controls how many candidates the search explores. It defaults to 40; raising it improves recall at the cost of latency. This is the main runtime tuning knob, and `SET LOCAL` scopes it to the current transaction so it does not leak into other queries on a pooled connection.
+
+## The filtering problem
+
+This is the part that surprises people, and it is worth understanding properly.
+
+```sql
+-- Looks reasonable. Often returns fewer than 10 rows.
+SELECT id, content
+FROM documents
+WHERE tenant_id = 42
+ORDER BY embedding <=> $1
+LIMIT 10;
+```
+
+An approximate index finds roughly `ef_search` nearest neighbours **across the whole table**, and the `tenant_id` filter is then applied to those results. If tenant 42 owns a small share of your documents, most candidates are discarded and you get back three rows instead of ten — with no error and no warning.
+
+There are three good answers.
+
+**Raise `ef_search`** so more candidates survive filtering. Simple, and often sufficient when the filter is not very selective:
+
+```sql
+SET LOCAL hnsw.ef_search = 500;
+```
+
+**Use a partial index** when you have a small number of hot filter values:
+
+```sql
+CREATE INDEX CONCURRENTLY documents_embedding_tenant42
+  ON documents USING hnsw (embedding vector_cosine_ops)
+  WHERE tenant_id = 42;
+```
+
+**Partition the table** when the filter is genuinely a tenancy boundary. Each partition gets its own index, and the filter becomes partition pruning rather than post-filtering:
+
+```sql
+CREATE TABLE documents (
+    id bigint GENERATED ALWAYS AS IDENTITY,
+    content text NOT NULL,
+    tenant_id bigint NOT NULL,
+    embedding vector(1536),
+    PRIMARY KEY (id, tenant_id)
+) PARTITION BY LIST (tenant_id);
+
+CREATE TABLE documents_t42 PARTITION OF documents FOR VALUES IN (42);
+```
+
+For highly selective filters that match very few rows, the opposite approach is best: force an exact scan, which is cheap when the filtered set is small.
+
+```sql
+SET LOCAL enable_indexscan = off;   -- within the transaction only
+```
+
+## SQLAlchemy
+
+```python
+from sqlalchemy import create_engine, select, Column, BigInteger, Text, Index
+from sqlalchemy.orm import declarative_base, Session
+from pgvector.sqlalchemy import Vector
+
+Base = declarative_base()
+
+class Document(Base):
+    __tablename__ = "documents"
+    id = Column(BigInteger, primary_key=True)
+    content = Column(Text, nullable=False)
+    tenant_id = Column(BigInteger, nullable=False)
+    embedding = Column(Vector(1536))
+
+    __table_args__ = (
+        Index(
+            "documents_embedding_hnsw",
+            "embedding",
+            postgresql_using="hnsw",
+            postgresql_with={"m": 16, "ef_construction": 64},
+            postgresql_ops={"embedding": "vector_cosine_ops"},
+        ),
+    )
+
+engine = create_engine("postgresql+psycopg://app@localhost/mydb")
+
+with Session(engine) as session:
+    stmt = (
+        select(Document, Document.embedding.cosine_distance(query_vec).label("distance"))
+        .where(Document.tenant_id == 42)
+        .order_by(Document.embedding.cosine_distance(query_vec))
+        .limit(10)
+    )
+    for doc, distance in session.execute(stmt):
+        print(doc.id, round(1 - distance, 4))
+```
+
+`pgvector.sqlalchemy` provides `cosine_distance`, `l2_distance` and `max_inner_product` as column methods, so the ORM generates the right operator.
+
+## Measuring recall
+
+Approximate search trades accuracy for speed, and the only way to know what you are getting is to measure it. Compare against an exact scan:
+
+```python
+def measure_recall(conn, query_vecs, k=10):
+    hits = 0
+    with conn.cursor() as cur:
+        for q in query_vecs:
+            cur.execute("SET LOCAL enable_indexscan = off")
+            cur.execute(
+                "SELECT id FROM documents ORDER BY embedding <=> %s LIMIT %s", (q, k)
+            )
+            truth = {r[0] for r in cur.fetchall()}
+
+            cur.execute("SET LOCAL enable_indexscan = on")
+            cur.execute("SET LOCAL hnsw.ef_search = 100")
+            cur.execute(
+                "SELECT id FROM documents ORDER BY embedding <=> %s LIMIT %s", (q, k)
+            )
+            approx = {r[0] for r in cur.fetchall()}
+
+            hits += len(truth & approx)
+    return hits / (len(query_vecs) * k)
+```
+
+Run this on a sample of real queries. If recall is below what your application needs, raise `ef_search` first, then rebuild with a higher `m` and `ef_construction`.
+
+## Operational checks
+
+```sql
+-- Index size — HNSW indexes get large
+SELECT indexrelname,
+       pg_size_pretty(pg_relation_size(indexrelid)) AS size,
+       idx_scan
+FROM pg_stat_user_indexes
+WHERE relname = 'documents';
+
+-- Rows still missing an embedding
+SELECT count(*) FROM documents WHERE embedding IS NULL;
+
+-- Confirm dimension consistency
+SELECT DISTINCT vector_dims(embedding) FROM documents;
+```
+
+That last query is worth running after any backfill. A single row embedded with the wrong model is enough to make results inexplicable.
+
+Inspecting vector columns, index definitions and plans is easier in a client that renders them properly — [Chat2DB](https://chat2db.ai/download) shows extension types and index methods in its schema browser and visualises query plans, and it runs in the browser at [app.chat2db.ai](https://app.chat2db.ai).
+
+## Storage and dimension reduction
+
+Embeddings are large, and the storage cost is easy to underestimate. A 1536-dimension `vector` stores each component as a 4-byte float, so every row carries roughly 6 KB of vector data before any index. A million documents is several gigabytes of embeddings alone, and the HNSW index adds substantially more on top.
+
+Two levers help. Many current embedding models support shortening the output dimension at generation time with limited quality loss, so requesting 768 dimensions instead of 1536 halves both storage and index size. Because the dimension is fixed in the column type, this is a decision to make before you backfill rather than after.
+
+pgvector also offers reduced-precision types. `halfvec` stores each component as a 2-byte float, halving storage while keeping recall close to the full-precision original for most text embedding workloads:
+
+```sql
+ALTER TABLE documents
+  ALTER COLUMN embedding TYPE halfvec(1536);
+
+CREATE INDEX CONCURRENTLY documents_embedding_hnsw
+  ON documents USING hnsw (embedding halfvec_cosine_ops);
+```
+
+Measure before and after rather than assuming — the recall measurement below is exactly the tool for that. Check where the space is actually going:
+
+```sql
+SELECT
+  pg_size_pretty(pg_total_relation_size('documents'))    AS total,
+  pg_size_pretty(pg_relation_size('documents'))          AS table_only,
+  pg_size_pretty(pg_indexes_size('documents'))           AS all_indexes;
+```
+
+## Summary
+
+pgvector puts embeddings next to the data they describe, which turns metadata filtering into ordinary SQL and eliminates a synchronisation problem. From Python, the essentials are: call `register_vector` after connecting, bulk load with binary `COPY` and build the index afterwards, match the operator class to your distance operator or the index will be silently ignored, and tune `hnsw.ef_search` at query time. The one behaviour that catches everyone is filtered search returning too few rows, because filters apply after approximate retrieval — raise `ef_search`, use a partial index, or partition by the filter column. Finally, measure recall against an exact scan rather than assuming it, because approximate search fails quietly.

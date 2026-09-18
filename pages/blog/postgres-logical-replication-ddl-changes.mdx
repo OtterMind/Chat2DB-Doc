@@ -1,0 +1,435 @@
+---
+title: "Postgres Logical Replication and DDL Changes"
+description: "PostgreSQL logical replication does not replicate DDL. The safe ordering per migration type, how to refresh a publication, and how to unstick a subscription."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: September 16, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# Postgres Logical Replication and DDL Changes
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="September 16, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+Logical replication is the best tool PostgreSQL gives you for selective, cross-version, writable replication. It has one property that turns an ordinary Tuesday migration into an incident: it does not replicate DDL. You run `ALTER TABLE orders ADD COLUMN status text` on the publisher, the migration succeeds, your application starts writing to the new column, and within seconds the subscriber's apply worker is stuck in an error loop while the replication slot on the publisher quietly begins hoarding WAL.
+
+The [general logical replication guide](/blog/postgres-logical-replication-guide) covers setup and mentions this in passing. This article is the dedicated treatment: why DDL is absent from the decoding stream, exactly what breaks, the safe ordering rule for each kind of migration, and how to recover a subscription that has already stalled.
+
+## Why DDL never reaches the subscriber
+
+Logical decoding works by reading WAL and reconstructing *row-level* changes. The output plugin — `pgoutput` for built-in logical replication — turns WAL records into a stream of INSERT, UPDATE, DELETE and TRUNCATE messages for tables in the publication, each carrying a relation identifier and a tuple.
+
+A DDL statement produces WAL too, but what it produces is physical modifications to system catalog tables such as `pg_class` and `pg_attribute`, plus relation-file operations. Those catalog tables are not in your publication, so the decoder skips them. Even if it did not, the messages would be useless: the subscriber would receive "a row was inserted into pg_attribute with attrelid 16384", which means nothing on a cluster where OIDs are assigned independently.
+
+PostgreSQL has never had a statement-level DDL capture mechanism inside logical decoding. There is no `ALTER TABLE` message type in the `pgoutput` protocol. The design assumption is explicit: schema is your responsibility to keep in sync on both ends.
+
+The practical consequence is that publisher and subscriber each carry their own copy of the schema, and the replication stream silently assumes those copies are compatible. "Compatible" is narrower than you might expect, which is the next section.
+
+## What actually breaks on the subscriber
+
+The apply worker maps an incoming relation to a local table by schema-qualified name, then maps each replicated column by name. Two failure modes follow.
+
+**The target relation is missing a column.** You added a column on the publisher and the publication now sends it:
+
+```
+ERROR:  logical replication target relation "public.orders" is missing replicated column: "status"
+```
+
+**The target relation does not exist at all.** You added a table to the publication before creating it on the subscriber:
+
+```
+ERROR:  logical replication target relation "public.shipments" does not exist
+```
+
+Either way the apply worker exits with an error, the launcher restarts it after a short delay, it hits the same transaction again, and it errors again. This is an infinite loop, not a skip. Three things follow from it:
+
+1. **The subscription stops applying anything.** Not just the offending table — all tables in the subscription are behind the same apply worker, so a broken `orders` table stops `customers` too.
+2. **The publisher's replication slot stops advancing.** `confirmed_flush_lsn` freezes at the last successfully applied transaction. Every WAL segment after that point is pinned on the publisher and cannot be recycled.
+3. **Vacuum is held back cluster-wide on the publisher.** A logical slot pins `catalog_xmin`, so dead tuples accumulate and tables bloat — including tables that have nothing to do with replication.
+
+A stalled subscription during a busy write period is a disk-space clock. On a system writing a few hundred megabytes of WAL an hour, an overnight stall is an outage.
+
+Note the asymmetry that makes this survivable: an **extra** column on the subscriber is fine. The apply worker only needs every column the publisher sends to exist locally; local columns the publisher does not know about are left at their default. That asymmetry is the whole basis of the ordering rule.
+
+## The ordering rule
+
+Two sentences cover ninety percent of migrations:
+
+- **Additive changes: subscriber first, then publisher.** Adding a column or a table makes the subscriber tolerant of a schema it has not seen yet.
+- **Destructive changes: publisher first, then subscriber.** Dropping a column or table stops the publisher sending it before the subscriber loses the ability to receive it.
+
+In both directions you are arranging for the subscriber's schema to be a *superset* of what the publisher transmits at every instant, including the window between the two deployments. If your migration tool applies changes to both ends in a single pipeline step, split it into two.
+
+## A playbook per migration type
+
+### Add a nullable column
+
+The easy case, and the template for everything else.
+
+```sql
+-- 1. On the SUBSCRIBER
+ALTER TABLE orders ADD COLUMN status text;
+
+-- 2. On the PUBLISHER
+ALTER TABLE orders ADD COLUMN status text;
+```
+
+Between step 1 and step 2 the subscriber has a column nobody writes to; harmless. After step 2, new INSERTs and UPDATEs carry `status` and the subscriber accepts them. No `REFRESH PUBLICATION` is needed, because the publication's table list did not change — only the column list of an existing table, which the apply worker renegotiates automatically.
+
+One caveat: rows written on the publisher *before* step 2 are not resent. If you backfill on the publisher with an `UPDATE`, that backfill replicates normally, which is usually what you want. If you backfill with a batched `UPDATE` over a large table, expect a spike in replication lag while the subscriber applies it.
+
+### Add a column with a default or NOT NULL
+
+Since PostgreSQL 11, adding a column with a constant default does not rewrite the table — it stores the default in the catalog. It is still a DDL change, so the ordering rule stands, but there is a subtlety: defaults are evaluated on the **publisher** for publisher-side writes, and the subscriber applies the resulting value. A default defined only on the subscriber applies only to rows the subscriber inserts locally, which in a normal one-way setup is none.
+
+Order the deployment as:
+
+```sql
+-- 1. On the SUBSCRIBER: nullable, no constraint yet
+ALTER TABLE orders ADD COLUMN currency text;
+
+-- 2. On the PUBLISHER: add with the default
+ALTER TABLE orders ADD COLUMN currency text NOT NULL DEFAULT 'USD';
+
+-- 3. On the SUBSCRIBER, after the backfill has replicated
+ALTER TABLE orders ALTER COLUMN currency SET DEFAULT 'USD';
+ALTER TABLE orders ALTER COLUMN currency SET NOT NULL;
+```
+
+Adding `NOT NULL` on the subscriber first would be a trap: any replicated row created before step 2 would fail the constraint. Add the constraint on the subscriber last, once you have verified there are no NULLs.
+
+### Drop a column
+
+Reverse the order.
+
+```sql
+-- 1. On the PUBLISHER
+ALTER TABLE orders DROP COLUMN legacy_ref;
+
+-- 2. On the SUBSCRIBER, after the publisher change has replicated through
+ALTER TABLE orders DROP COLUMN legacy_ref;
+```
+
+After step 1 the publisher stops sending the column and the subscriber leaves its copy at NULL — fine. If you drop on the subscriber first, every in-flight transaction that still carries `legacy_ref` fails with the "missing replicated column" error.
+
+Wait for the stream to drain between the two steps. The check is that `pg_stat_subscription.latest_end_lsn` on the subscriber has caught up to the publisher's `pg_current_wal_lsn()`.
+
+### Rename a column or table
+
+There is no safe single-statement rename. A rename is a drop plus an add from the apply worker's point of view, and it is atomic on the publisher, so there is no window where both names exist.
+
+Two workable approaches:
+
+**Expand and contract (preferred).** Add the new column on both ends using the additive rule, dual-write from the application, backfill, switch reads, then drop the old column using the destructive rule. Slow, but it never stalls replication.
+
+**Coordinated pause.** Disable the subscription, rename on both ends, re-enable:
+
+```sql
+-- On the SUBSCRIBER
+ALTER SUBSCRIPTION app_sub DISABLE;
+
+-- On the PUBLISHER, with writes to the table quiesced
+ALTER TABLE orders RENAME COLUMN ref TO reference;
+
+-- On the SUBSCRIBER
+ALTER TABLE orders RENAME COLUMN ref TO reference;
+ALTER SUBSCRIPTION app_sub ENABLE;
+```
+
+This works only if you actually stop writes to the table on the publisher for the duration. If a write slips through under the old name while the subscription is disabled, it is queued in the slot and will fail on resume. Disabling the subscription also means the slot retains WAL for as long as the maintenance window lasts, so keep it short.
+
+### Change a column type
+
+The apply worker converts incoming values using the input function of the subscriber's column type, so the two types do not have to match exactly — they have to be compatible in the text representation. Widening `integer` to `bigint`, or `varchar(50)` to `text`, is safe in either order because the wider type accepts everything the narrower one produces.
+
+Narrowing is not safe. Apply the widening on the subscriber first and the narrowing on the subscriber last:
+
+```sql
+-- Widening: subscriber first is safest
+-- On the SUBSCRIBER
+ALTER TABLE orders ALTER COLUMN amount TYPE numeric(18,2);
+-- On the PUBLISHER
+ALTER TABLE orders ALTER COLUMN amount TYPE numeric(18,2);
+```
+
+Remember that a type change usually rewrites the whole table on the publisher, and a rewrite of a replicated table produces a large volume of WAL — but *not* a large volume of logical replication traffic, because a rewrite is not a row-level change the decoder emits. The subscriber keeps its old physical data and its own new type. That surprises people: after `ALTER TABLE ... TYPE`, the two sides are converted independently.
+
+### Add a table to the publication
+
+This is the case that needs `REFRESH PUBLICATION`.
+
+```sql
+-- 1. On the SUBSCRIBER: create the table with a matching schema
+CREATE TABLE shipments (
+  id          bigint PRIMARY KEY,
+  order_id    bigint NOT NULL,
+  carrier     text,
+  shipped_at  timestamptz
+);
+
+-- 2. On the PUBLISHER
+ALTER PUBLICATION app_pub ADD TABLE shipments;
+
+-- 3. On the SUBSCRIBER
+ALTER SUBSCRIPTION app_sub REFRESH PUBLICATION;
+```
+
+Until step 3, the subscriber's copy of the publication's table list is stale and it ignores `shipments` entirely. `REFRESH PUBLICATION` reconciles the list and, by default, starts an initial data copy for newly added tables.
+
+### Drop a table from the publication
+
+```sql
+-- 1. On the PUBLISHER
+ALTER PUBLICATION app_pub DROP TABLE shipments;
+
+-- 2. On the SUBSCRIBER
+ALTER SUBSCRIPTION app_sub REFRESH PUBLICATION;
+
+-- 3. On the SUBSCRIBER, once you are sure you want the data gone
+DROP TABLE shipments;
+```
+
+After step 2 the subscriber stops tracking the table but keeps the rows it already has as an ordinary local table. Dropping the table on the subscriber before step 2 gives you the "target relation does not exist" stall.
+
+### Add or drop an index
+
+Indexes are not replicated and do not need to match. `CREATE INDEX` on the publisher does nothing on the subscriber, and vice versa. Treat them as independent per-node decisions.
+
+There is one index you genuinely need on the subscriber: something for the apply worker to find rows by. UPDATE and DELETE are applied by matching the replica identity, and without a usable index that is a sequential scan per replicated row. On a table of any size, this is the single most common cause of an apply worker that is slow rather than broken. A primary key on both sides is the normal answer; since PostgreSQL 16 the apply worker can also use a suitable non-unique B-tree index.
+
+Use `CREATE INDEX CONCURRENTLY` on the publisher so you do not hold an `ACCESS EXCLUSIVE` lock that blocks the writes feeding replication.
+
+## REFRESH PUBLICATION and copy_data
+
+```sql
+ALTER SUBSCRIPTION app_sub REFRESH PUBLICATION;
+```
+
+This asks the publisher for the current table list and updates `pg_subscription_rel` on the subscriber: new tables are added in the initial state, removed tables are dropped from tracking. It does **not** detect column changes on tables that were already in the publication, and it does not re-copy tables that are already synchronized.
+
+The `copy_data` option controls what happens to newly added tables:
+
+```sql
+-- Default: copy the existing contents of newly added tables first
+ALTER SUBSCRIPTION app_sub REFRESH PUBLICATION WITH (copy_data = true);
+
+-- Skip the copy: start streaming from now, assume the data is already there
+ALTER SUBSCRIPTION app_sub REFRESH PUBLICATION WITH (copy_data = false);
+```
+
+Use `copy_data = false` when you have loaded the table yourself — for example from a `pg_dump` taken at a known snapshot — and only want ongoing changes. Get this wrong and you either duplicate rows (primary key violations, which stall the apply worker) or silently miss the pre-existing data.
+
+## Resyncing a single table
+
+When one table has drifted — a bad manual fix on the subscriber, a skipped transaction, a botched migration — you do not have to rebuild the whole subscription. Remove it from the publication, refresh, then add it back and refresh with a copy:
+
+```sql
+-- On the PUBLISHER
+ALTER PUBLICATION app_pub DROP TABLE orders;
+
+-- On the SUBSCRIBER
+ALTER SUBSCRIPTION app_sub REFRESH PUBLICATION;
+TRUNCATE orders;
+
+-- On the PUBLISHER
+ALTER PUBLICATION app_pub ADD TABLE orders;
+
+-- On the SUBSCRIBER
+ALTER SUBSCRIPTION app_sub REFRESH PUBLICATION WITH (copy_data = true);
+```
+
+The re-add triggers a table sync worker that takes a snapshot on the publisher, copies the table with `COPY`, then catches up on changes since the snapshot and hands the table back to the main apply worker. Watch it with:
+
+```sql
+SELECT sr.srrelid::regclass AS table_name,
+       sr.srsubstate,
+       sr.srsublsn
+FROM pg_subscription_rel sr
+JOIN pg_subscription s ON s.oid = sr.srsubid
+WHERE s.subname = 'app_sub'
+ORDER BY 1;
+```
+
+The `srsubstate` codes are worth memorizing:
+
+| Code | Meaning |
+| --- | --- |
+| `i` | initialize — queued, sync has not started |
+| `d` | data is being copied |
+| `f` | finished the table copy, catching up |
+| `s` | synchronized with the apply worker |
+| `r` | ready — normal replication |
+
+A table parked at `d` for a long time is a large `COPY` in progress. A table parked at `i` usually means you have hit `max_sync_workers_per_subscription` (default 2) and it is waiting its turn. Anything not at `r` after the copy should have finished deserves a look at the subscriber log.
+
+Because a resync briefly removes the table from the publication, changes made on the publisher during the gap arrive via the snapshot copy rather than the stream — which is exactly why the copy is required.
+
+## Detecting a stalled subscription
+
+Four signals, checked in this order.
+
+**The subscriber's apply worker state:**
+
+```sql
+SELECT subname,
+       pid,
+       received_lsn,
+       latest_end_lsn,
+       last_msg_receipt_time,
+       latest_end_time
+FROM pg_stat_subscription;
+```
+
+A NULL `pid` means no worker is running — the subscription is disabled, or it is between crash-restart cycles. A `latest_end_time` that is minutes old while the publisher is taking writes means the stream has stopped moving.
+
+On PostgreSQL 15 and later there is a dedicated error counter, which is the fastest confirmation you will get:
+
+```sql
+SELECT subname, apply_error_count, sync_error_count, stats_reset
+FROM pg_stat_subscription_stats;
+```
+
+A climbing `apply_error_count` is the error loop, in one number.
+
+**The publisher's sender view:**
+
+```sql
+SELECT application_name,
+       state,
+       sent_lsn,
+       write_lsn,
+       flush_lsn,
+       replay_lsn,
+       pg_size_pretty(pg_wal_lsn_diff(pg_current_wal_lsn(), replay_lsn)) AS lag_bytes
+FROM pg_stat_replication;
+```
+
+`application_name` defaults to the subscription name. If the row is missing entirely, the subscriber is not even connected.
+
+**Retained WAL on the publisher** — the part that turns a stall into an outage:
+
+```sql
+SELECT slot_name,
+       active,
+       wal_status,
+       pg_size_pretty(pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn)) AS retained_wal,
+       age(catalog_xmin) AS catalog_xmin_age
+FROM pg_replication_slots
+WHERE slot_type = 'logical'
+ORDER BY pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn) DESC;
+```
+
+Alert on `retained_wal` long before the disk fills. A growing `catalog_xmin_age` is the bloat side of the same problem.
+
+**The subscriber's log.** This is where the actual reason lives. The error line names the relation and the column, which tells you which migration went out in the wrong order.
+
+A useful pre-emptive setting, available from PostgreSQL 15, stops the error loop from spinning forever:
+
+```sql
+ALTER SUBSCRIPTION app_sub SET (disable_on_error = true);
+```
+
+The subscription disables itself on the first apply error instead of retrying. You still have a stalled subscription and a growing slot, but you get one clean log line and no log flood, and you will not discover the problem only when the disk alert fires.
+
+## Skipping a bad transaction
+
+Sometimes the offending transaction is not worth replicating — a one-off statement against a table you are about to resync anyway. Fix the schema if you can; skip only when you have decided the data loss is acceptable and understood, because skipping leaves the two sides permanently divergent for those rows.
+
+First get the LSN from the subscriber's error message. It appears as `finished processing remote transaction ... at LSN 0/1A2B3C4`, or you can read it from the statistics view on PostgreSQL 15 and later.
+
+On **PostgreSQL 15 and later**:
+
+```sql
+ALTER SUBSCRIPTION app_sub SKIP (lsn = '0/1A2B3C4');
+```
+
+This tells the apply worker to discard exactly the transaction that ends at that LSN, then continue. The setting clears itself once the transaction has been skipped. It only works while the subscription is stopped on that transaction — you cannot queue up a skip for a future LSN.
+
+An alternative on the same versions is to change the conflict behaviour at the table level with `ALTER SUBSCRIPTION ... SET (streaming = ...)`, but for a genuine schema mismatch, fixing the schema and letting the retry succeed is almost always better than skipping.
+
+On **PostgreSQL 14 and earlier** there is no `SKIP`; you advance the replication origin by hand. The origin is named `pg_` followed by the subscription's OID:
+
+```sql
+-- On the SUBSCRIBER
+ALTER SUBSCRIPTION app_sub DISABLE;
+
+SELECT 'pg_' || oid::text AS origin_name
+FROM pg_subscription
+WHERE subname = 'app_sub';
+
+-- Advance past the failing transaction using the name from above
+SELECT pg_replication_origin_advance('pg_16395', '0/1A2B3C5');
+
+ALTER SUBSCRIPTION app_sub ENABLE;
+```
+
+Note the LSN is the position *after* the transaction you want to skip. Getting this wrong by a byte either replays the bad transaction again or skips a good one, and there is no undo. Disable the subscription first — calling `pg_replication_origin_advance` while a worker holds the origin fails.
+
+## The other headline limitations
+
+DDL is the famous one. These are the rest, and each has produced its own share of surprised cutovers.
+
+**Sequences are not replicated.** Through PostgreSQL 17, sequence values do not travel over logical replication. The table's rows replicate, but the subscriber's sequence stays wherever `pg_dump --schema-only` left it. On a failover to the subscriber, the next `nextval()` collides with existing rows. Fix it as part of the cutover:
+
+```sql
+-- Run on the SUBSCRIBER at cutover, after writes to the publisher have stopped
+SELECT setval(
+  pg_get_serial_sequence('public.orders', 'id'),
+  (SELECT COALESCE(max(id), 1) FROM public.orders)
+);
+```
+
+Generate these for every serial and identity column rather than hand-writing them; missing one is a silent data-integrity bug that only appears under load.
+
+**TRUNCATE has its own rules.** `TRUNCATE` is replicated from PostgreSQL 11 onward, but only if `truncate` is in the publication's `publish` list (it is by default):
+
+```sql
+CREATE PUBLICATION app_pub FOR TABLE orders, customers
+  WITH (publish = 'insert, update, delete, truncate');
+```
+
+A `TRUNCATE ... CASCADE` on the publisher propagates as a truncate of the cascaded tables too. If any of those tables are not part of the same subscription, or the subscriber has a foreign key referencing a table that is not being truncated, the apply fails. Truncate related tables as a set, in a single statement, and make sure the whole set is in the publication.
+
+**Large objects are not replicated.** Data stored through the `lo` interface lives in `pg_largeobject`, a system catalog, so it is invisible to logical decoding. If you use large objects, logical replication cannot be your only copy mechanism. `bytea` columns replicate normally and are the easier choice for new designs.
+
+**Partitioned tables need a decision.** By default a publication on a partitioned table replicates the individual leaf partitions, so the subscriber must have a matching partition layout. The `publish_via_partition_root` option changes that:
+
+```sql
+CREATE PUBLICATION app_pub FOR TABLE measurements
+  WITH (publish_via_partition_root = true);
+```
+
+With it on, changes are published as if they happened on the root table, so the subscriber can have a plain unpartitioned table, or a different partitioning scheme. This is the setting to use when you are replicating from a partitioned source into a differently-shaped analytics target. Note that adding a new partition on the publisher is DDL, so the same ordering rules apply to your partition-creation job.
+
+**Other things that do not replicate:** roles and permissions, tablespaces, extensions and their objects, views, materialized views and their contents, and anything else that is not a row in a published table.
+
+## Tooling for DDL replication
+
+If the two-step deployment dance is too fragile for your team, there are options — all with real trade-offs.
+
+**Event triggers.** PostgreSQL's `ddl_command_end` event triggers fire after DDL and can inspect what happened through `pg_event_trigger_ddl_commands()`. You can capture the command and ship it somewhere. This is the mechanism the third-party tools build on, and writing your own is a genuine project: you have to handle command reconstruction, ordering against the data stream, and the fact that event triggers do not fire for every command type.
+
+**pglogical.** The 2ndQuadrant/EDB extension that predates built-in logical replication offers a `pglogical.replicate_ddl_command()` function. You call it instead of running DDL directly, and it executes the statement locally and injects it into the replication stream so subscribers run the same text. It works well, but it requires the extension on both ends and requires discipline: DDL run the ordinary way is still not replicated.
+
+**pgl_ddl_deploy.** An extension built on event triggers that automates the capture-and-ship step on top of pglogical, so ordinary DDL is picked up without wrapping every statement. It reduces the discipline problem at the cost of another extension and more moving parts to debug when something does not fire.
+
+**Your migration tool.** The option most teams end up on. A schema migration framework that can target two connections, plus an explicit ordering convention (additive changes deploy to the subscriber first, destructive changes to the publisher first), gets you most of the benefit with no extra database extensions. The conventions are the hard part, not the tooling.
+
+None of these make PostgreSQL replicate DDL natively. Be skeptical of any description that implies otherwise — what they do is send the statement text out of band and run it on the other side, which means they inherit every ordering problem described above and add a few of their own around timing relative to the data stream.
+
+## A pre-migration checklist
+
+Before any schema change on a publisher, confirm:
+
+1. The subscription is healthy right now — `apply_error_count` flat, `retained_wal` small, `latest_end_time` current. Do not deploy onto an existing stall.
+2. The change is classified as additive or destructive, and the deployment order matches.
+3. If the publication's table list changes, a `REFRESH PUBLICATION` is scheduled, with the right `copy_data` value.
+4. `disable_on_error = true` is set, so a mistake fails loudly and stops instead of looping.
+5. Someone is watching `pg_stat_subscription` and `pg_replication_slots` for the next few minutes.
+
+Comparing the two schemas side by side before and after is the check that catches the drift you did not plan for; a client like [Chat2DB](https://chat2db.ai/download) lets you hold publisher and subscriber connections open together and diff column lists and row counts without juggling two terminals.
+
+The short version: PostgreSQL will never tell you your schemas have drifted until an apply worker dies on it. Additive changes go to the subscriber first, destructive changes go to the publisher first, publication membership changes need a refresh, and sequences need a manual `setval` at cutover. Internalize those four and logical replication stops being the thing that breaks every time you ship a migration.

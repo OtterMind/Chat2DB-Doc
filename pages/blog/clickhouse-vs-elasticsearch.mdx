@@ -1,0 +1,272 @@
+---
+title: "ClickHouse vs Elasticsearch for Log Analytics"
+description: "Compare ClickHouse and Elasticsearch for logs and observability: storage cost, indexing model, full-text search, aggregations and when to migrate."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: September 14, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# ClickHouse vs Elasticsearch for Log Analytics
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="September 14, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+A large share of Elasticsearch clusters in production are not doing search. They are storing logs, metrics and events, and the queries against them are overwhelmingly filters and aggregations over a time range. Elasticsearch can do that, but it was designed for something else, and the mismatch shows up as a storage bill.
+
+ClickHouse is increasingly the alternative for that workload. This guide covers what actually differs, where Elasticsearch remains clearly better, and how to evaluate a migration.
+
+## The short version
+
+| | ClickHouse | Elasticsearch |
+| --- | --- | --- |
+| Designed for | Analytical queries over columnar data | Full-text search and document retrieval |
+| Storage model | Columnar, heavily compressed | Inverted index + doc values + `_source` |
+| Storage footprint | Typically much smaller for logs | Larger, because of index structures |
+| Full-text search | Basic; tokens, `ngram`, inverted index support | Excellent: relevance, analyzers, fuzzy |
+| Aggregations | Very fast, arbitrary SQL | Fast for supported shapes, limited by DSL |
+| Query language | SQL | Query DSL, plus ES\|QL and SQL subset |
+| Joins | Limited but present | Essentially none |
+| Ingestion cost | Low CPU per row | Higher: indexing and analysis per document |
+| Best fit | Logs, metrics, events, analytics | Search, relevance ranking, document lookup |
+
+## Why the storage difference is so large
+
+This is the headline reason teams migrate, and the mechanism is worth understanding rather than taking on faith.
+
+**Elasticsearch** indexes documents for retrieval. For a typical log document it may store: the inverted index (which terms appear in which documents), doc values (a columnar structure for sorting and aggregation), and `_source` (the original JSON, kept so it can be returned in results). Three representations of overlapping information, each earning its keep only if you use the corresponding capability.
+
+**ClickHouse** stores columns. Each column is compressed independently with a codec suited to its data, and because a column holds values of one type from one domain, compression is extremely effective. A `LowCardinality(String)` column holding service names becomes a dictionary of a few dozen entries plus small integer references. A sorted timestamp column compresses with delta encoding to a tiny fraction of its raw size.
+
+```sql
+CREATE TABLE logs
+(
+    timestamp    DateTime CODEC(DoubleDelta, ZSTD(1)),
+    level        LowCardinality(String),
+    service      LowCardinality(String),
+    host         LowCardinality(String),
+    trace_id     String CODEC(ZSTD(1)),
+    message      String CODEC(ZSTD(3)),
+    attributes   Map(LowCardinality(String), String)
+)
+ENGINE = MergeTree
+PARTITION BY toDate(timestamp)
+ORDER BY (service, level, timestamp)
+TTL timestamp + INTERVAL 30 DAY;
+```
+
+Every element of that schema is doing work:
+
+- `LowCardinality` for repeated values — service names, levels, hostnames — replaces string storage with dictionary encoding.
+- `DoubleDelta` on a sorted timestamp column stores differences-of-differences, which for regularly spaced events is close to nothing.
+- `ZSTD(3)` on `message` trades a little CPU for stronger compression on the one genuinely large field.
+- `ORDER BY (service, level, timestamp)` means a query filtered by service and time reads only the relevant granules.
+- `TTL` drops old partitions automatically, which is a metadata operation rather than a delete.
+
+Measure the result on your own data rather than trusting a ratio from a blog post:
+
+```sql
+SELECT
+    table,
+    formatReadableSize(sum(data_compressed_bytes))   AS compressed,
+    formatReadableSize(sum(data_uncompressed_bytes)) AS uncompressed,
+    round(sum(data_uncompressed_bytes) / sum(data_compressed_bytes), 2) AS ratio
+FROM system.columns
+WHERE database = currentDatabase()
+GROUP BY table;
+```
+
+And per column, which tells you where to focus:
+
+```sql
+SELECT
+    name,
+    formatReadableSize(sum(data_compressed_bytes)) AS compressed,
+    round(sum(data_uncompressed_bytes) / sum(data_compressed_bytes), 2) AS ratio
+FROM system.columns
+WHERE table = 'logs'
+GROUP BY name
+ORDER BY sum(data_compressed_bytes) DESC;
+```
+
+## Querying
+
+**Elasticsearch** uses a JSON DSL. It is expressive but verbose, and complex analytical questions become deeply nested structures:
+
+```json
+{
+  "size": 0,
+  "query": {
+    "bool": {
+      "filter": [
+        { "term":  { "service": "checkout" } },
+        { "term":  { "level": "error" } },
+        { "range": { "timestamp": { "gte": "now-1h" } } }
+      ]
+    }
+  },
+  "aggs": {
+    "by_host": {
+      "terms": { "field": "host", "size": 10 },
+      "aggs": {
+        "over_time": {
+          "date_histogram": { "field": "timestamp", "fixed_interval": "5m" }
+        }
+      }
+    }
+  }
+}
+```
+
+**ClickHouse** uses SQL, so the same question is a query you can read:
+
+```sql
+SELECT
+    host,
+    toStartOfFiveMinute(timestamp) AS bucket,
+    count() AS errors
+FROM logs
+WHERE service = 'checkout'
+  AND level = 'error'
+  AND timestamp >= now() - INTERVAL 1 HOUR
+GROUP BY host, bucket
+ORDER BY bucket, errors DESC;
+```
+
+More importantly, SQL composes. Window functions, CTEs, subqueries and joins are all available, so questions that require a multi-step analysis are expressible:
+
+```sql
+-- Error rate per service, and how it compares to the previous hour
+WITH hourly AS (
+    SELECT
+        service,
+        toStartOfHour(timestamp) AS hour,
+        countIf(level = 'error') AS errors,
+        count() AS total
+    FROM logs
+    WHERE timestamp >= now() - INTERVAL 24 HOUR
+    GROUP BY service, hour
+)
+SELECT
+    service,
+    hour,
+    round(100.0 * errors / total, 2) AS error_pct,
+    round(100.0 * errors / total, 2)
+      - lagInFrame(round(100.0 * errors / total, 2))
+          OVER (PARTITION BY service ORDER BY hour) AS change_vs_prev_hour
+FROM hourly
+ORDER BY service, hour;
+```
+
+Elasticsearch has added ES|QL, a piped query language, and a SQL subset, which narrow this gap. Neither yet matches full SQL for analytical composition.
+
+## Where Elasticsearch clearly wins
+
+It would be a mistake to read the above as "ClickHouse is better". For its actual design goal, Elasticsearch is not close to being matched.
+
+**Relevance-ranked full-text search.** If your users type words into a box and expect the best results first, Elasticsearch's BM25 scoring, analyzers, stemming, synonyms, fuzzy matching and highlighting are a complete solution built over many years. ClickHouse has token-based and n-gram text functions — useful for filtering logs by substring — but it does not rank by relevance.
+
+```sql
+-- ClickHouse: filtering, not ranking
+SELECT * FROM logs
+WHERE hasToken(message, 'timeout')
+  AND timestamp >= now() - INTERVAL 1 HOUR
+LIMIT 100;
+
+-- Speed this up with a skip index
+ALTER TABLE logs ADD INDEX msg_tokens message TYPE tokenbf_v1(32768, 3, 0) GRANULARITY 4;
+```
+
+That finds matching rows. It does not tell you which match is *best*, and for a search product that is the whole job.
+
+**Single-document retrieval by id.** Elasticsearch fetches a document by id essentially instantly. ClickHouse is built to scan ranges, not to do point lookups, and a query for one row by a non-sort-key column reads far more than it needs.
+
+**The ecosystem.** Kibana, Beats, Logstash, APM and the broader Elastic Stack form an integrated observability product. ClickHouse-based observability tooling has grown considerably but remains more assembly-required.
+
+**Schema flexibility.** Elasticsearch's dynamic mapping accepts documents with new fields without intervention. ClickHouse wants a schema — though `Map` and `JSON` columns give you a reasonable amount of flexibility for semi-structured attributes.
+
+## Ingestion
+
+Elasticsearch does substantial work per document: analysis, tokenisation, index updates. That is CPU spent on capabilities you may not use, and at high log volumes it dominates cluster sizing.
+
+ClickHouse writes are cheap, but must be batched. Every insert creates a data part, and too many small parts triggers the familiar `Too many parts` error.
+
+```sql
+-- Let the server batch for you when producers emit rows individually
+INSERT INTO logs SETTINGS async_insert = 1, wait_for_async_insert = 0
+VALUES (now(), 'error', 'checkout', 'host-1', 'abc', 'connection timeout', {});
+```
+
+Watch part counts as an operational signal:
+
+```sql
+SELECT table, count() AS parts, formatReadableSize(sum(bytes_on_disk)) AS size
+FROM system.parts
+WHERE active AND database = currentDatabase()
+GROUP BY table
+ORDER BY parts DESC;
+```
+
+A part count that grows steadily means inserts are outpacing background merges — batch harder or enable async inserts.
+
+## Retention
+
+Elasticsearch manages retention with Index Lifecycle Management, moving indices through hot, warm, cold and frozen tiers before deleting them. It works well and is well integrated with Kibana.
+
+ClickHouse expresses the same policy declaratively in the table definition:
+
+```sql
+ALTER TABLE logs MODIFY TTL
+    timestamp + INTERVAL 7 DAY  TO VOLUME 'hot',
+    timestamp + INTERVAL 30 DAY TO VOLUME 'cold',
+    timestamp + INTERVAL 90 DAY DELETE;
+```
+
+Combined with partitioning by day, dropping old data is a metadata operation:
+
+```sql
+ALTER TABLE logs DROP PARTITION '2026-06-01';
+```
+
+You can also keep long-term aggregates cheaply while discarding raw rows, using a materialised view that maintains rollups as data arrives:
+
+```sql
+CREATE MATERIALIZED VIEW logs_hourly
+ENGINE = SummingMergeTree
+ORDER BY (service, level, hour)
+AS SELECT
+    service,
+    level,
+    toStartOfHour(timestamp) AS hour,
+    count() AS events
+FROM logs
+GROUP BY service, level, hour;
+```
+
+That pattern — full-fidelity logs for 30 days, hourly rollups for two years — is much harder to arrange in Elasticsearch.
+
+## Evaluating a migration
+
+If you are considering moving a logging workload, do it empirically:
+
+1. **Check what your queries actually are.** If they are filters and aggregations over a time range, ClickHouse fits. If a meaningful share are relevance-ranked text search, keep Elasticsearch for those.
+2. **Dual-write for a period.** Send the same log stream to both and compare storage growth on your real data.
+3. **Port your ten most-used queries.** Measure latency and confirm results match.
+4. **Model the cost** including compute, storage and the operational effort of running another system.
+5. **Decide per workload, not globally.** Running ClickHouse for logs and Elasticsearch for product search is a perfectly coherent outcome.
+
+For working with both during an evaluation, a client that connects to each saves setting up two toolchains. [Chat2DB](https://chat2db.ai/download) connects to ClickHouse alongside PostgreSQL, MySQL and other engines, with AI-assisted SQL generation and plan visualisation for tuning the ported queries — available as a desktop app or at [app.chat2db.ai](https://app.chat2db.ai).
+
+## Choosing
+
+**Choose ClickHouse when** you are storing logs, metrics or events at volume; your queries are aggregations and filters over time ranges; storage cost is a significant line item; you want SQL and the composability that comes with it; and you need long retention.
+
+**Choose Elasticsearch when** relevance-ranked full-text search is a product feature; you need fast single-document retrieval; you depend on Kibana and the Elastic Stack; your documents have unpredictable, evolving structure; or your log volume is modest enough that storage cost is not a concern.
+
+**Run both when** you have genuine search requirements alongside high-volume observability data — which is common, and is not a failure to commit.
+
+## Summary
+
+Elasticsearch is a search engine being used as a log store in a great many organisations, and it carries the cost of capabilities that workload never exercises: inverted indexes, per-document analysis, and multiple stored representations of the same data. ClickHouse stores the same logs as compressed columns, answers aggregation queries in SQL, and expresses retention declaratively — typically at a fraction of the storage footprint. Where Elasticsearch remains unmatched is its actual purpose: ranking text results by relevance, retrieving documents by id, and the Kibana ecosystem around it. Look at the queries you actually run; if none of them need a relevance score, you are probably paying for a search engine and using a database.

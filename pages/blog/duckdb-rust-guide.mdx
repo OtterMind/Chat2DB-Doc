@@ -1,0 +1,417 @@
+---
+title: "DuckDB with Rust: Embedded Analytics Guide"
+description: "Use DuckDB from Rust with the duckdb crate: connections, prepared statements, the Appender for fast inserts, Arrow record batches, Parquet and threading."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: September 14, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# DuckDB with Rust: Embedded Analytics Guide
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="September 14, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+Rust is a natural host for an embedded analytical database. There is no runtime to fight, no garbage collector interfering with a columnar engine's memory behaviour, and the Arrow ecosystem gives DuckDB and Rust a shared, zero-copy data representation. If you are building a CLI that crunches Parquet files, a service that computes aggregates on demand, or a data pipeline that needs SQL without a server, the `duckdb` crate is worth knowing.
+
+This guide covers the crate end to end — the API, the fast paths, and the parts that differ from what a SQLite background would lead you to expect.
+
+## Getting started
+
+```toml
+[dependencies]
+duckdb = { version = "1", features = ["bundled"] }
+```
+
+The `bundled` feature compiles DuckDB from source as part of your build. It makes the first build slow — DuckDB is a large C++ codebase — but it removes any dependency on a system-installed library, which is usually what you want for a distributable binary. Without it, the crate links against a DuckDB installation you provide.
+
+```rust
+use duckdb::{Connection, Result};
+
+fn main() -> Result<()> {
+    // In-memory: nothing persists, fastest for one-shot analysis
+    let conn = Connection::open_in_memory()?;
+
+    // Or a file-backed database
+    // let conn = Connection::open("analytics.duckdb")?;
+
+    conn.execute_batch(
+        r"
+        CREATE TABLE orders (
+            id          BIGINT,
+            customer_id BIGINT,
+            country     VARCHAR,
+            amount      DECIMAL(12,2),
+            ordered_at  TIMESTAMP
+        );
+        ",
+    )?;
+
+    Ok(())
+}
+```
+
+If the API feels familiar, that is deliberate — the crate is modelled closely on `rusqlite`, so `execute`, `prepare`, `query_map` and the `params!` macro all behave as you would expect.
+
+## Queries and parameters
+
+```rust
+use duckdb::{params, Connection, Result};
+
+#[derive(Debug)]
+struct CountryRevenue {
+    country: String,
+    orders: i64,
+    revenue: f64,
+}
+
+fn revenue_by_country(conn: &Connection, since: &str) -> Result<Vec<CountryRevenue>> {
+    let mut stmt = conn.prepare(
+        r"
+        SELECT country,
+               count(*)              AS orders,
+               sum(amount)::DOUBLE   AS revenue
+        FROM orders
+        WHERE ordered_at >= ?
+        GROUP BY country
+        ORDER BY revenue DESC
+        ",
+    )?;
+
+    let rows = stmt.query_map(params![since], |row| {
+        Ok(CountryRevenue {
+            country: row.get(0)?,
+            orders: row.get(1)?,
+            revenue: row.get(2)?,
+        })
+    })?;
+
+    rows.collect()
+}
+```
+
+Two things worth noting.
+
+**Always use parameters, never string formatting.** `params![]` sends values separately from the SQL text, which is both safer and lets DuckDB reuse the prepared plan.
+
+**Cast decimals explicitly when you want a float.** DuckDB's `DECIMAL` maps to a fixed-point representation; asking for it as `f64` without the `::DOUBLE` cast produces a type error at `row.get`. Being explicit in the SQL is clearer than wrestling with conversions in Rust.
+
+For a single scalar result, `query_row` avoids the iterator ceremony:
+
+```rust
+let total: i64 = conn.query_row(
+    "SELECT count(*) FROM orders WHERE country = ?",
+    params!["DE"],
+    |row| row.get(0),
+)?;
+```
+
+## Inserting data fast
+
+This is where the crate differs most from a naive expectation, and where most performance problems come from.
+
+Executing one `INSERT` per row is slow. DuckDB is columnar and optimised for bulk operations; row-at-a-time insertion fights the design. The crate provides an **Appender** for exactly this:
+
+```rust
+use duckdb::{Connection, Result};
+
+fn load_orders(conn: &Connection, orders: &[Order]) -> Result<()> {
+    let mut app = conn.appender("orders")?;
+
+    for o in orders {
+        app.append_row(duckdb::params![
+            o.id,
+            o.customer_id,
+            &o.country,
+            o.amount,
+            o.ordered_at,
+        ])?;
+    }
+
+    // Explicit flush makes the error handling obvious; Drop would also flush
+    app.flush()?;
+    Ok(())
+}
+```
+
+The Appender buffers rows and writes them in columnar chunks, which is typically an order of magnitude faster than individual inserts for a large load.
+
+One caveat that costs people time: the Appender flushes on `Drop`, and `Drop` cannot return an error. If a flush fails during drop, the failure is silent. Call `flush()` explicitly so you see the error.
+
+### Loading from files instead
+
+If the data is already in a file, do not read it in Rust and push it through the Appender. Let DuckDB read it directly — it will be faster and use less memory:
+
+```rust
+conn.execute_batch(
+    r"
+    CREATE TABLE orders AS
+    SELECT * FROM read_parquet('data/orders/*.parquet');
+    ",
+)?;
+
+// CSV, with type inference
+conn.execute_batch(
+    r"
+    CREATE TABLE customers AS
+    SELECT * FROM read_csv('data/customers.csv', header = true, auto_detect = true);
+    ",
+)?;
+```
+
+You can also query files without materialising a table at all, which is often the right choice:
+
+```rust
+let mut stmt = conn.prepare(
+    r"
+    SELECT country, sum(amount) AS revenue
+    FROM read_parquet('data/orders/**/*.parquet')
+    WHERE ordered_at >= ?
+    GROUP BY country
+    ",
+)?;
+```
+
+DuckDB pushes the filter and the column selection into the Parquet reader, so it only reads the row groups and columns the query touches.
+
+## Arrow integration
+
+For anything beyond a handful of rows, pulling results row by row through `query_map` wastes the columnar representation DuckDB already has. Arrow is the fast path:
+
+```toml
+[dependencies]
+duckdb = { version = "1", features = ["bundled"] }
+arrow = "5"
+```
+
+```rust
+use duckdb::{Connection, Result};
+use duckdb::arrow::record_batch::RecordBatch;
+use duckdb::arrow::array::{Array, Float64Array, StringArray};
+
+fn arrow_query(conn: &Connection) -> Result<()> {
+    let mut stmt = conn.prepare(
+        "SELECT country, sum(amount)::DOUBLE AS revenue FROM orders GROUP BY country",
+    )?;
+
+    let batches: Vec<RecordBatch> = stmt.query_arrow([])?.collect();
+
+    for batch in &batches {
+        let countries = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("column 0 is not a StringArray");
+        let revenues = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .expect("column 1 is not a Float64Array");
+
+        for i in 0..batch.num_rows() {
+            println!("{}: {:.2}", countries.value(i), revenues.value(i));
+        }
+    }
+
+    Ok(())
+}
+```
+
+This matters when results feed something else that speaks Arrow — Polars, a Parquet writer, an IPC stream over the network. The data never gets converted into individual Rust values and back.
+
+Keep the `arrow` crate version aligned with what the `duckdb` crate expects. A mismatch produces type errors that look mysterious because two different `RecordBatch` types are in scope. Using the re-export (`duckdb::arrow`) avoids the problem entirely.
+
+## Extensions, Parquet output and S3
+
+```rust
+conn.execute_batch(
+    r"
+    INSTALL httpfs;
+    LOAD httpfs;
+
+    CREATE SECRET (
+        TYPE S3,
+        PROVIDER credential_chain
+    );
+    ",
+)?;
+
+let mut stmt = conn.prepare(
+    "SELECT count(*) FROM read_parquet('s3://my-bucket/orders/**/*.parquet')",
+)?;
+let count: i64 = stmt.query_row([], |r| r.get(0))?;
+```
+
+`PROVIDER credential_chain` picks up credentials the way the AWS SDK does — environment variables, instance metadata, profile — so you are not embedding keys in source.
+
+Writing results out:
+
+```rust
+conn.execute_batch(
+    r"
+    COPY (
+        SELECT country, date_trunc('day', ordered_at) AS day, sum(amount) AS revenue
+        FROM orders
+        GROUP BY country, day
+    ) TO 'output/daily_revenue.parquet' (FORMAT PARQUET, COMPRESSION ZSTD);
+    ",
+)?;
+```
+
+## Transactions
+
+```rust
+use duckdb::Connection;
+
+fn transfer(conn: &mut Connection) -> duckdb::Result<()> {
+    let tx = conn.transaction()?;
+
+    tx.execute("UPDATE accounts SET balance = balance - ? WHERE id = ?", params![100, 1])?;
+    tx.execute("UPDATE accounts SET balance = balance + ? WHERE id = ?", params![100, 2])?;
+
+    tx.commit()?;
+    Ok(())
+}
+```
+
+`transaction()` takes `&mut Connection`, so the borrow checker prevents you using the connection concurrently while a transaction is open. If you do not call `commit()`, the transaction rolls back when the guard drops — which is the safe default, but means a forgotten `commit` silently discards work rather than erroring.
+
+## Threading
+
+DuckDB itself parallelises query execution across threads internally. What it does not do is allow a single `Connection` to be used from multiple threads at once — `Connection` is not `Sync`.
+
+The right pattern is one connection per thread, all pointing at the same database:
+
+```rust
+use duckdb::{Connection, Result};
+use std::thread;
+
+fn parallel_queries(path: &str) -> Result<()> {
+    let handles: Vec<_> = (0..4)
+        .map(|i| {
+            let path = path.to_string();
+            thread::spawn(move || -> Result<i64> {
+                let conn = Connection::open(&path)?;
+                conn.query_row(
+                    "SELECT count(*) FROM orders WHERE id % 4 = ?",
+                    duckdb::params![i],
+                    |r| r.get(0),
+                )
+            })
+        })
+        .collect();
+
+    for h in handles {
+        println!("{:?}", h.join().unwrap()?);
+    }
+    Ok(())
+}
+```
+
+For an in-memory database that several threads must share, `try_clone()` gives each thread its own connection handle onto the same underlying instance:
+
+```rust
+let conn = Connection::open_in_memory()?;
+let conn2 = conn.try_clone()?;   // separate handle, same database
+```
+
+Remember that DuckDB permits one writer at a time. Concurrent readers are fine; concurrent writers will serialise or conflict. If your service has a write path, funnel it through a single connection or a mutex rather than hoping.
+
+Also worth setting explicitly for a server process, since DuckDB otherwise sizes itself to the machine:
+
+```rust
+conn.execute_batch(
+    r"
+    SET memory_limit = '4GB';
+    SET threads = 4;
+    SET temp_directory = '/tmp/duckdb';
+    ",
+)?;
+```
+
+Without a `memory_limit`, a large query in a containerised service can be killed by the OOM killer rather than spilling to disk.
+
+## Error handling
+
+```rust
+use duckdb::Error;
+
+match conn.execute("INSERT INTO orders VALUES (?, ?, ?, ?, ?)", params![/* ... */]) {
+    Ok(n) => println!("inserted {n} rows"),
+    Err(Error::DuckDBFailure(e, msg)) => {
+        eprintln!("DuckDB error {e:?}: {}", msg.unwrap_or_default());
+    }
+    Err(e) => eprintln!("other error: {e}"),
+}
+```
+
+In application code, converting to `anyhow::Error` or a custom error type with `thiserror` is usually cleaner than matching on variants, since most DuckDB failures are not individually recoverable.
+
+## A realistic example
+
+Putting it together — a small tool that reads Parquet from S3, aggregates, and writes results locally:
+
+```rust
+use duckdb::{Connection, Result};
+
+fn main() -> Result<()> {
+    let conn = Connection::open_in_memory()?;
+
+    conn.execute_batch(
+        r"
+        INSTALL httpfs; LOAD httpfs;
+        CREATE SECRET (TYPE S3, PROVIDER credential_chain);
+        SET memory_limit = '8GB';
+        SET threads = 8;
+        ",
+    )?;
+
+    conn.execute_batch(
+        r"
+        COPY (
+            SELECT
+                country,
+                date_trunc('month', ordered_at) AS month,
+                count(*)            AS orders,
+                sum(amount)         AS revenue,
+                approx_quantile(amount, 0.5) AS median_order
+            FROM read_parquet('s3://my-bucket/orders/**/*.parquet')
+            WHERE ordered_at >= DATE '2026-01-01'
+            GROUP BY country, month
+            ORDER BY country, month
+        ) TO 'monthly_revenue.parquet' (FORMAT PARQUET, COMPRESSION ZSTD);
+        ",
+    )?;
+
+    let rows: i64 = conn.query_row(
+        "SELECT count(*) FROM read_parquet('monthly_revenue.parquet')",
+        [],
+        |r| r.get(0),
+    )?;
+    println!("wrote {rows} rows");
+
+    Ok(())
+}
+```
+
+No server, no cluster, no data loading step — a single binary that reads columnar data from object storage and writes an aggregate.
+
+While developing queries like this, it helps to iterate against the same DuckDB file in a SQL client before embedding the finished query in Rust. [Chat2DB](https://chat2db.ai/download) connects to DuckDB alongside PostgreSQL, MySQL, ClickHouse and others, with AI-assisted SQL generation, and runs in the browser at [app.chat2db.ai](https://app.chat2db.ai).
+
+## Why embed a database at all
+
+It is worth being explicit about what this buys you, because "embedded analytical database" can sound like a niche concern.
+
+The alternative to DuckDB in a Rust data tool is usually one of two things. Either you write the analysis by hand — iterating over records, grouping into a `HashMap`, accumulating sums — which works but grows unwieldy the moment the question involves a join, a window function or a percentile. Or you stand up a database server, which means connection management, credentials, a deployment story and an operational dependency for what may be a single binary run from a cron job.
+
+DuckDB removes that choice. You get the full expressiveness of analytical SQL — window functions, CTEs, `QUALIFY`, `PIVOT`, approximate quantiles — with the deployment profile of a static binary. The engine parallelises across cores on its own, spills to disk when a query exceeds memory, and reads Parquet and CSV without an import step.
+
+That combination fits several shapes of program particularly well. A CLI that analyses log or telemetry files, where users point it at a directory and expect answers in seconds. A service endpoint computing aggregates over columnar data in object storage, without a warehouse behind it. A batch job in a pipeline that needs one non-trivial transformation between two Parquet datasets. And test suites, where an in-memory database gives you a real SQL engine with no fixtures to tear down.
+
+The place it does not fit is as a system of record for concurrent writers. DuckDB allows one writing process at a time, and offers no replication or failover. Treat the database file as a derived artefact you can rebuild from source data, and that constraint stops mattering.
+
+## Summary
+
+The `duckdb` crate gives Rust a full analytical SQL engine with no server and no runtime overhead. The API follows `rusqlite`, so `prepare`, `query_map` and `params!` work as expected, but the performance comes from the paths that are not row-oriented: use the Appender for bulk inserts and flush it explicitly, let DuckDB read Parquet and CSV files directly rather than shuttling rows through Rust, and use `query_arrow` when results feed anything else that speaks Arrow. Give each thread its own connection since `Connection` is not `Sync`, set `memory_limit` explicitly in any long-running process, and use the `bundled` feature when you want a self-contained binary.

@@ -1,0 +1,369 @@
+---
+title: "SQL Table Variable vs Temp Table: Key Differences"
+description: "Learn how a SQL table variable differs from a temp table in SQL Server: DECLARE syntax, scope, statistics, transactions, SELECT INTO, and when to use each."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: September 11, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# SQL Table Variable vs Temp Table: Key Differences
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="September 11, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+
+When you need to hold an intermediate result set inside a T-SQL script or stored procedure, SQL Server gives you two main tools: the table variable (`DECLARE @t TABLE`) and the local temporary table (`CREATE TABLE #t`). They look similar, and for a few hundred rows they often behave the same. Under the surface they differ in scope, statistics, transaction handling, and what DDL you are allowed to run against them. Those differences decide whether a query plan is good or terrible.
+
+This article walks through both objects with runnable examples, demonstrates the transaction behaviour difference, and ends with a decision table plus the PostgreSQL and MySQL equivalents.
+
+## Sample data
+
+All examples use a small `orders` table. Run this once in a scratch database.
+
+```sql
+CREATE TABLE orders (
+    order_id    INT          NOT NULL PRIMARY KEY,
+    customer_id INT          NOT NULL,
+    status      VARCHAR(20)  NOT NULL,
+    amount      DECIMAL(10,2) NOT NULL,
+    created_at  DATE         NOT NULL
+);
+
+INSERT INTO orders (order_id, customer_id, status, amount, created_at) VALUES
+(1, 101, 'paid',      120.00, '2026-08-01'),
+(2, 101, 'paid',       80.50, '2026-08-03'),
+(3, 102, 'cancelled',  45.00, '2026-08-03'),
+(4, 103, 'paid',      300.00, '2026-08-05'),
+(5, 102, 'paid',       60.00, '2026-08-07'),
+(6, 104, 'pending',   210.00, '2026-08-09');
+```
+
+## SQL table variable: DECLARE @t TABLE
+
+A table variable is declared like any other variable, but its type is a table definition.
+
+```sql
+DECLARE @paid_orders TABLE (
+    order_id    INT PRIMARY KEY,
+    customer_id INT NOT NULL,
+    amount      DECIMAL(10,2) NOT NULL
+);
+
+INSERT INTO @paid_orders (order_id, customer_id, amount)
+SELECT order_id, customer_id, amount
+FROM orders
+WHERE status = 'paid';
+
+SELECT customer_id, SUM(amount) AS total_paid
+FROM @paid_orders
+GROUP BY customer_id
+ORDER BY customer_id;
+```
+
+```text
+customer_id  total_paid
+-----------  ----------
+101          200.50
+102          60.00
+103          300.00
+```
+
+Note the `INSERT ... SELECT` pattern. That is the only way to load a table variable from a query, because a table variable cannot be the target of `SELECT ... INTO`. The following fails at parse time:
+
+```sql
+-- Error: Incorrect syntax. A table variable cannot be created by SELECT INTO.
+SELECT order_id, amount
+INTO @paid_orders
+FROM orders;
+```
+
+### Scope of a table variable
+
+A table variable lives only for the batch, stored procedure, or function in which it is declared. It is not visible to other batches, and it does not survive a `GO` separator.
+
+```sql
+DECLARE @t TABLE (id INT);
+INSERT INTO @t VALUES (1);
+GO
+-- Error: Must declare the table variable "@t".
+SELECT * FROM @t;
+```
+
+Because of this, table variables never need an explicit `DROP`. They also cannot be referenced from dynamic SQL executed with `EXEC` or `sp_executesql`, since that runs in a separate batch.
+
+### Constraints and inline indexes
+
+You can declare `PRIMARY KEY`, `UNIQUE`, `CHECK`, and `DEFAULT` constraints on a table variable. Since SQL Server 2014 you can also declare non-unique indexes inline. What you cannot do is name the constraints, and you cannot add them later.
+
+```sql
+DECLARE @stats TABLE (
+    customer_id INT NOT NULL PRIMARY KEY,
+    order_count INT NOT NULL DEFAULT 0,
+    last_order  DATE NULL,
+    CONSTRAINT ck_count CHECK (order_count >= 0),
+    INDEX ix_last_order (last_order)
+);
+```
+
+The `CONSTRAINT ck_count` line above will fail: named constraints are not permitted on table variables. Remove the name and it compiles:
+
+```sql
+DECLARE @stats TABLE (
+    customer_id INT NOT NULL PRIMARY KEY,
+    order_count INT NOT NULL DEFAULT 0,
+    last_order  DATE NULL,
+    CHECK (order_count >= 0),
+    INDEX ix_last_order (last_order)
+);
+
+INSERT INTO @stats (customer_id, order_count, last_order)
+SELECT customer_id, COUNT(*), MAX(created_at)
+FROM orders
+GROUP BY customer_id;
+
+SELECT * FROM @stats ORDER BY customer_id;
+```
+
+```text
+customer_id  order_count  last_order
+-----------  -----------  ----------
+101          2            2026-08-03
+102          2            2026-08-07
+103          1            2026-08-05
+104          1            2026-08-09
+```
+
+### No ALTER TABLE
+
+The structure of a table variable is fixed at declaration. `ALTER TABLE @stats ADD ...` is a syntax error. If you need to add a column halfway through a procedure, you need a temp table.
+
+### No statistics and the cardinality estimate problem
+
+This is the most important difference for performance. SQL Server does not maintain column statistics on table variables. Before SQL Server 2019, the optimizer compiled the plan for a statement that read a table variable before any rows were inserted, so it assumed the table variable contained exactly one row. If you then joined a 500,000 row table variable to a large table, the optimizer would often pick a nested loops join and the query would run far slower than expected.
+
+SQL Server 2019 (compatibility level 150) added table variable deferred compilation. The statement that references the table variable is compiled the first time it actually executes, so the optimizer sees the real row count. This fixes the row count guess, but it still does not create histograms on the columns, so predicates like `WHERE amount > 100` on a table variable still get a generic estimate.
+
+Two ways to work around the issue on older versions or when the estimate is still off:
+
+```sql
+-- Option 1: force a statement level recompile so the row count is seen
+SELECT o.customer_id, SUM(p.amount)
+FROM @paid_orders AS p
+JOIN orders AS o ON o.order_id = p.order_id
+GROUP BY o.customer_id
+OPTION (RECOMPILE);
+
+-- Option 2: switch to a temp table (covered below)
+```
+
+### Table variables ignore ROLLBACK
+
+Table variables are not part of the user transaction. Modifications to them are not undone by `ROLLBACK`. This is sometimes a problem and sometimes exactly what you want, for example when logging errors inside a transaction that you are about to roll back.
+
+```sql
+DECLARE @log TABLE (msg VARCHAR(100));
+CREATE TABLE #log (msg VARCHAR(100));
+
+BEGIN TRANSACTION;
+    INSERT INTO @log VALUES ('table variable row');
+    INSERT INTO #log VALUES ('temp table row');
+ROLLBACK TRANSACTION;
+
+SELECT 'table variable' AS source, COUNT(*) AS rows_left FROM @log
+UNION ALL
+SELECT 'temp table', COUNT(*) FROM #log;
+
+DROP TABLE #log;
+```
+
+```text
+source          rows_left
+--------------  ---------
+table variable  1
+temp table      0
+```
+
+The temp table row was rolled back. The table variable row survived. Note that a single statement against a table variable is still atomic: if an `INSERT ... SELECT` fails halfway, that statement's rows are removed. It is only the surrounding user transaction that the table variable ignores.
+
+## Local temp table: CREATE TABLE #t and SELECT INTO
+
+A local temporary table is a real table stored in `tempdb`. Its name starts with a single `#`. You can create it explicitly, or let `SELECT ... INTO` create it from a query's result shape.
+
+```sql
+-- Explicit definition
+CREATE TABLE #paid_orders (
+    order_id    INT PRIMARY KEY,
+    customer_id INT NOT NULL,
+    amount      DECIMAL(10,2) NOT NULL
+);
+
+INSERT INTO #paid_orders
+SELECT order_id, customer_id, amount
+FROM orders
+WHERE status = 'paid';
+
+DROP TABLE #paid_orders;
+
+-- Implicit definition with SELECT INTO
+SELECT order_id, customer_id, amount
+INTO #paid_orders
+FROM orders
+WHERE status = 'paid';
+
+SELECT COUNT(*) AS paid_count FROM #paid_orders;
+```
+
+```text
+paid_count
+----------
+4
+```
+
+`SELECT INTO` is convenient, but the resulting table has no primary key and its column types are inferred from the query. For anything beyond a quick script, an explicit `CREATE TABLE` is clearer.
+
+### Scope of a temp table
+
+A local temp table is visible for the whole session (connection) that created it, across `GO` batches, until the session ends or you drop it. When created inside a stored procedure it is dropped automatically when the procedure finishes, and it is visible to any procedures that the creating procedure calls. Dynamic SQL executed with `sp_executesql` can see a temp table created by the caller.
+
+Since SQL Server 2016 you can drop it safely without checking `OBJECT_ID` first:
+
+```sql
+DROP TABLE IF EXISTS #paid_orders;
+```
+
+On older versions use:
+
+```sql
+IF OBJECT_ID('tempdb..#paid_orders') IS NOT NULL
+    DROP TABLE #paid_orders;
+```
+
+### Statistics, indexes and ALTER
+
+Temp tables behave like permanent tables for the optimizer. SQL Server automatically creates statistics on columns used in predicates and joins, so cardinality estimates are usually accurate. You can create indexes after loading, and you can `ALTER TABLE` to add columns.
+
+```sql
+SELECT order_id, customer_id, status, amount
+INTO #o
+FROM orders;
+
+CREATE NONCLUSTERED INDEX ix_o_customer ON #o (customer_id) INCLUDE (amount);
+
+ALTER TABLE #o ADD amount_with_tax DECIMAL(10,2) NULL;
+
+UPDATE #o SET amount_with_tax = amount * 1.10;
+
+SELECT customer_id, SUM(amount_with_tax) AS total
+FROM #o
+WHERE status = 'paid'
+GROUP BY customer_id
+ORDER BY customer_id;
+
+DROP TABLE IF EXISTS #o;
+```
+
+```text
+customer_id  total
+-----------  ------
+101          220.55
+102          66.00
+103          330.00
+```
+
+The cost of this flexibility is recompilation. When a temp table's row count changes significantly, or when you create an index or alter it, statements that reference it are recompiled. In a procedure that runs thousands of times per minute with tiny row counts, those recompiles can matter, and a table variable may be the lighter choice.
+
+### Global temp tables: ##t
+
+A name starting with two hashes creates a global temporary table. It is visible to every session and is dropped when the creating session ends and no other session is still referencing it. Global temp tables are rarely the right tool; they are mostly used for hand-offs between separate connections in maintenance scripts.
+
+```sql
+CREATE TABLE ##shared (id INT);
+INSERT INTO ##shared VALUES (1);
+-- another connection can now SELECT * FROM ##shared
+DROP TABLE ##shared;
+```
+
+## Related concepts
+
+### Table-valued parameters
+
+A table-valued parameter (TVP) lets you pass a whole result set into a stored procedure. You first create a user-defined table type with `CREATE TYPE ... AS TABLE`, then declare a `READONLY` parameter of that type. Inside the procedure a TVP behaves like a table variable: same scope rules, no statistics, no `ALTER`. TVPs are the standard way to send a list of IDs from an application to SQL Server without building a comma-separated string.
+
+```sql
+CREATE TYPE dbo.OrderIdList AS TABLE (order_id INT PRIMARY KEY);
+GO
+CREATE PROCEDURE dbo.GetOrders @ids dbo.OrderIdList READONLY
+AS
+BEGIN
+    SELECT o.order_id, o.amount
+    FROM orders AS o
+    JOIN @ids AS i ON i.order_id = o.order_id;
+END;
+GO
+DECLARE @list dbo.OrderIdList;
+INSERT INTO @list VALUES (1), (4);
+EXEC dbo.GetOrders @list;
+```
+
+### Memory-optimized table variables
+
+If your database has a memory-optimized filegroup, you can create a memory-optimized table type with `WITH (MEMORY_OPTIMIZED = ON)` and declare table variables of that type. They live in memory rather than in `tempdb`, which removes tempdb contention for workloads that create and drop many small table variables. They require at least one index in the type definition and follow the same scope and transaction rules as regular table variables. Measure on your own workload before committing to them, because the benefit depends heavily on how many concurrent sessions are involved.
+
+## Decision table
+
+| Feature | Table variable `@t` | Local temp table `#t` |
+|---|---|---|
+| Creation | `DECLARE @t TABLE (...)` | `CREATE TABLE #t` or `SELECT ... INTO #t` |
+| Scope | Current batch, procedure or function | Session, or procedure and its callees |
+| Survives `GO` | No | Yes |
+| Column statistics | No | Yes, created automatically |
+| Row count estimate | Deferred compilation on 2019+, otherwise 1 row | Accurate |
+| Indexes | Inline only, at declaration (2014+) | `CREATE INDEX` any time |
+| `ALTER TABLE` | Not allowed | Allowed |
+| Named constraints | Not allowed | Allowed |
+| Target of `SELECT INTO` | No | Yes |
+| Affected by `ROLLBACK` | No | Yes |
+| Visible to dynamic SQL | No | Yes |
+| Recompilation triggers | Few | Row count and schema changes |
+| Storage | tempdb | tempdb |
+
+Use a table variable when the row count is small and predictable, the object is used in one or two simple statements, you need the data to survive a `ROLLBACK`, or you need to pass rows into a procedure (TVP). Use a temp table when you join the intermediate set to large tables, when you need to filter it by columns that benefit from statistics, when you need to add indexes or columns after loading, or when several batches or dynamic SQL must see it.
+
+If you want to compare the two side by side, paste the examples above into Chat2DB, which runs T-SQL against SQL Server and shows result grids for each statement. You can download it at https://chat2db.ai/download or use the web version at https://app.chat2db.ai.
+
+## PostgreSQL and MySQL equivalents
+
+PostgreSQL has no table variables. The closest options are a CTE (`WITH paid AS (SELECT ...)`) for single-statement use, an array variable inside a PL/pgSQL function for small lists, or a temporary table. PostgreSQL temp tables are session scoped and transactional, and they support `ON COMMIT DROP` to disappear at the end of the current transaction:
+
+```sql
+CREATE TEMP TABLE paid_orders ON COMMIT DROP AS
+SELECT order_id, customer_id, amount FROM orders WHERE status = 'paid';
+```
+
+MySQL likewise has no table variables. `CREATE TEMPORARY TABLE` creates a session scoped table that is dropped when the connection closes. Unlike SQL Server and PostgreSQL, MySQL DDL is not transactional, so creating or dropping a temporary table inside a transaction causes an implicit commit in some storage engine and version combinations; check your version's documentation before relying on that behaviour.
+
+```sql
+CREATE TEMPORARY TABLE paid_orders AS
+SELECT order_id, customer_id, amount FROM orders WHERE status = 'paid';
+```
+
+## Summary
+
+A SQL table variable is a lightweight, batch scoped container with fixed structure, no statistics, and no participation in user transactions. A local temp table is a real tempdb table with statistics, indexes, `ALTER` support, session scope, and normal transaction behaviour, at the cost of recompilations. Pick the table variable for small, simple, short-lived sets and for passing rows into procedures; pick the temp table whenever the optimizer needs to know how many rows it is dealing with. SQL Server 2019 deferred compilation narrows the gap, but histograms still only exist on temp tables.
+
+## FAQ
+
+### Can I use SELECT INTO with a table variable?
+
+No. `SELECT ... INTO` creates a new table from the query result, and a table variable already exists once declared. Use `INSERT INTO @t (...) SELECT ...` instead. If you want the shape of the table inferred from a query, use `SELECT ... INTO #t` with a temp table.
+
+### Why is my query using a table variable so slow?
+
+Most often because the optimizer assumed the table variable held one row and chose a plan suited to that size. Check the compatibility level; on 150 or higher, deferred compilation gives the correct row count. On older levels, add `OPTION (RECOMPILE)` to the affected statement or switch to a temp table so statistics are available.
+
+### Is a table variable stored in memory instead of tempdb?
+
+Not by default. Ordinary table variables are backed by tempdb, just like temp tables, and can spill to disk when large. Only table variables declared with a memory-optimized table type are guaranteed to live in memory.

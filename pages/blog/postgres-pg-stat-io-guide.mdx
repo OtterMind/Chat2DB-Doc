@@ -1,0 +1,294 @@
+---
+title: "Postgres pg_stat_io: Find Real I/O Bottlenecks"
+description: "Use pg_stat_io in PostgreSQL 16+ to attribute reads, writes and evictions by backend type and context, and fix cache, vacuum and checkpoint problems."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: September 14, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# Postgres pg_stat_io: Find Real I/O Bottlenecks
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="September 14, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+For most of PostgreSQL's history, answering "where is my I/O coming from?" involved a lot of guessing. You could see that `blks_read` was high in `pg_stat_database`, but not whether those reads came from user queries, from autovacuum, from a background worker, or from a checkpoint flushing dirty buffers. Two databases with identical read counts could need completely opposite fixes.
+
+`pg_stat_io`, added in PostgreSQL 16, closes that gap. It breaks I/O down along the dimensions that actually determine what you should do about it. This guide covers how to read it, what the columns mean, and the specific diagnoses it makes possible.
+
+## Checking availability
+
+`pg_stat_io` requires PostgreSQL 16 or later and `track_io_timing` for the timing columns to be populated.
+
+```sql
+SELECT current_setting('server_version_num')::int >= 160000 AS has_pg_stat_io;
+
+SHOW track_io_timing;
+```
+
+If `track_io_timing` is `off`, you still get operation counts but every timing column will be zero. Turn it on — but measure the overhead first, because it depends on how fast your platform's clock source is:
+
+```bash
+pg_test_timing
+```
+
+If the output shows the bulk of measurements under 100 nanoseconds, the overhead is negligible and you can safely enable timing:
+
+```sql
+ALTER SYSTEM SET track_io_timing = on;
+SELECT pg_reload_conf();
+```
+
+This is a `sighup` parameter, so no restart is required.
+
+## The shape of the view
+
+`pg_stat_io` is a matrix. Each row is a combination of three dimensions, and the columns are counters for that combination.
+
+```sql
+SELECT backend_type, object, context, reads, writes, extends, hits, evictions
+FROM pg_stat_io
+WHERE reads > 0 OR writes > 0
+ORDER BY reads + writes DESC;
+```
+
+**`backend_type`** — who did the I/O. `client backend` is a user query. `autovacuum worker`, `checkpointer`, `background writer`, `walwriter`, `autovacuum launcher` and `background worker` are the rest. This single column answers questions that used to require inference.
+
+**`object`** — `relation` for normal table and index data, or `temp relation` for temporary tables and the spill files produced by sorts and hashes.
+
+**`context`** — the most interesting dimension, and the one that takes a moment to understand:
+
+- `normal` — ordinary access through shared buffers.
+- `vacuum` — vacuum and analyze reading through the ring buffer, a small dedicated region of shared buffers that stops a large vacuum from evicting your entire working set.
+- `bulkread` — large sequential scans, which also use a ring buffer for the same reason.
+- `bulkwrite` — bulk writes such as `COPY` and `CREATE TABLE AS`.
+
+Note that counters are in **block units**, not bytes. Multiply by `block_size` (8 kB by default) to get a size:
+
+```sql
+SELECT
+  backend_type,
+  context,
+  pg_size_pretty(reads  * current_setting('block_size')::bigint) AS read_bytes,
+  pg_size_pretty(writes * current_setting('block_size')::bigint) AS write_bytes
+FROM pg_stat_io
+WHERE reads > 0 OR writes > 0
+ORDER BY reads DESC;
+```
+
+## The first query: cache hit ratio that means something
+
+The traditional cache hit ratio from `pg_stat_database` blends every kind of access together. A nightly bulk export can drag it down and send you chasing a problem that does not exist. `pg_stat_io` lets you compute it for the context you care about:
+
+```sql
+SELECT
+  backend_type,
+  context,
+  hits,
+  reads,
+  round(100.0 * hits / nullif(hits + reads, 0), 2) AS hit_pct
+FROM pg_stat_io
+WHERE object = 'relation'
+  AND hits + reads > 0
+ORDER BY reads DESC;
+```
+
+Read it like this:
+
+- Low `hit_pct` in **`client backend` / `normal`** is the one that matters. Your queries are going to disk for data they should be finding in memory. That points at `shared_buffers` being too small for the working set, or at queries scanning far more data than they need.
+- Low `hit_pct` in **`bulkread`** is expected and fine. Sequential scans of large tables are supposed to miss; the ring buffer exists precisely so they do not pollute the cache.
+- Low `hit_pct` in **`vacuum`** is also normal for the same reason.
+
+That distinction alone prevents a lot of misdirected tuning.
+
+## Diagnosing eviction pressure
+
+`evictions` counts how often a backend had to throw an existing buffer out of shared buffers to make room. High evictions in the `normal` context is the clearest signal that `shared_buffers` is undersized:
+
+```sql
+SELECT
+  backend_type,
+  context,
+  evictions,
+  reuses,
+  reads,
+  round(100.0 * evictions / nullif(reads, 0), 2) AS evict_per_read_pct
+FROM pg_stat_io
+WHERE evictions > 0
+ORDER BY evictions DESC;
+```
+
+`reuses` is the ring-buffer counterpart: a buffer reused within the ring rather than evicted from the general pool. Seeing high `reuses` alongside `bulkread` or `vacuum` is the ring buffer doing its job, and is healthy.
+
+Sustained, high `evictions` under `client backend` / `normal` means every read is costing you a write-out of something else. That is the textbook case for increasing `shared_buffers` — commonly set to around 25% of system memory as a starting point, then tuned by measurement.
+
+## Finding out whether autovacuum is your I/O problem
+
+This is the diagnosis that was genuinely hard before PostgreSQL 16.
+
+```sql
+SELECT
+  backend_type,
+  sum(reads)  AS reads,
+  sum(writes) AS writes,
+  round(100.0 * sum(reads + writes) OVER () / nullif(sum(reads + writes) OVER (), 0), 2) AS ignore
+FROM pg_stat_io
+GROUP BY backend_type
+ORDER BY reads + writes DESC;
+```
+
+More directly:
+
+```sql
+WITH totals AS (
+  SELECT sum(reads + writes)::numeric AS total FROM pg_stat_io
+)
+SELECT
+  backend_type,
+  sum(reads + writes) AS io_blocks,
+  round(100.0 * sum(reads + writes) / nullif((SELECT total FROM totals), 0), 1) AS pct_of_io
+FROM pg_stat_io
+GROUP BY backend_type
+ORDER BY io_blocks DESC;
+```
+
+If `autovacuum worker` accounts for a large share of total I/O, you have a concrete decision to make rather than a vague suspicion. The usual levers:
+
+```sql
+-- Autovacuum is throttled by a cost budget. The default cost_delay of 2ms
+-- is often far too conservative on modern SSDs, which makes vacuum run
+-- slowly and for a long time rather than quickly and briefly.
+ALTER SYSTEM SET autovacuum_vacuum_cost_delay = '2ms';
+ALTER SYSTEM SET autovacuum_vacuum_cost_limit = 1000;
+
+-- More workers only helps if you have many tables needing vacuum at once
+ALTER SYSTEM SET autovacuum_max_workers = 5;
+
+SELECT pg_reload_conf();
+```
+
+Counter-intuitively, when autovacuum I/O is high and sustained, the answer is usually to let it run *faster* — raising `autovacuum_vacuum_cost_limit` — so it finishes and gets out of the way, rather than throttling it further and having it run constantly.
+
+## Spotting sort and hash spills
+
+`object = 'temp relation'` tells you when queries are exceeding `work_mem` and spilling to disk:
+
+```sql
+SELECT
+  backend_type,
+  context,
+  reads,
+  writes,
+  pg_size_pretty(
+    (reads + writes) * current_setting('block_size')::bigint
+  ) AS temp_io
+FROM pg_stat_io
+WHERE object = 'temp relation'
+  AND reads + writes > 0;
+```
+
+Significant temp I/O means sorts, hash joins or hash aggregates are not fitting in memory. Before raising `work_mem` globally — remember it is allocated **per sort or hash node, per connection**, so a global increase multiplies alarmingly — find the specific queries:
+
+```sql
+SELECT
+  substring(query, 1, 80) AS query,
+  calls,
+  temp_blks_read,
+  temp_blks_written
+FROM pg_stat_statements
+WHERE temp_blks_written > 0
+ORDER BY temp_blks_written DESC
+LIMIT 10;
+```
+
+Then set `work_mem` for just those sessions or roles, which is nearly always safer than a global change:
+
+```sql
+ALTER ROLE reporting SET work_mem = '256MB';
+```
+
+## Checking whether checkpoints are tuned correctly
+
+Writes should mostly come from the `checkpointer`, which flushes dirty buffers in a controlled, spread-out way. Writes coming from `client backend` mean your queries are being forced to flush buffers themselves in order to find a free one — a direct latency hit for users.
+
+```sql
+SELECT
+  backend_type,
+  writes,
+  round(100.0 * writes / nullif(sum(writes) OVER (), 0), 1) AS pct_of_writes,
+  fsyncs
+FROM pg_stat_io
+WHERE writes > 0
+ORDER BY writes DESC;
+```
+
+A meaningful share of writes attributed to `client backend` in the `normal` context suggests checkpoints are too infrequent, so too much accumulates between them:
+
+```sql
+-- Spread checkpoints out and make them less frequent but larger
+ALTER SYSTEM SET checkpoint_timeout = '15min';
+ALTER SYSTEM SET checkpoint_completion_target = 0.9;
+ALTER SYSTEM SET max_wal_size = '8GB';
+SELECT pg_reload_conf();
+```
+
+Raising `max_wal_size` is usually the highest-leverage change here: it stops checkpoints being triggered by WAL volume rather than by the timeout, which is what produces sudden write storms.
+
+## Measuring a window rather than all time
+
+The counters in `pg_stat_io` are cumulative since the last reset, which makes raw values nearly useless for diagnosing a problem happening right now. Take a snapshot, wait, and diff:
+
+```sql
+CREATE TEMP TABLE io_before AS SELECT * FROM pg_stat_io;
+
+-- wait, or run the workload you want to measure
+SELECT pg_sleep(60);
+
+SELECT
+  a.backend_type,
+  a.object,
+  a.context,
+  a.reads   - b.reads   AS reads,
+  a.writes  - b.writes  AS writes,
+  a.extends - b.extends AS extends,
+  a.hits    - b.hits    AS hits,
+  a.evictions - b.evictions AS evictions
+FROM pg_stat_io a
+JOIN io_before b
+  ON a.backend_type = b.backend_type
+ AND a.object       = b.object
+ AND a.context      = b.context
+WHERE a.reads + a.writes > b.reads + b.writes
+ORDER BY (a.reads - b.reads) + (a.writes - b.writes) DESC;
+```
+
+This is how you should use the view in practice. A sixty-second window during a slowdown tells you far more than lifetime totals dominated by whatever happened at 3am last Tuesday.
+
+To reset the counters entirely:
+
+```sql
+SELECT pg_stat_reset_shared('io');
+
+-- When the stats were last reset
+SELECT stats_reset FROM pg_stat_io LIMIT 1;
+```
+
+Running these snapshot queries repeatedly is much easier from a client that keeps a query history and can chart results over time. [Chat2DB](https://chat2db.ai/download) does both, and it works in the browser at [app.chat2db.ai](https://app.chat2db.ai) if you would rather not install anything.
+
+## A quick diagnostic table
+
+| What you see | Likely meaning | First thing to try |
+| --- | --- | --- |
+| Low hit % in `client backend` / `normal` | Working set exceeds shared buffers | Increase `shared_buffers`; find the queries reading most |
+| High `evictions` in `normal` | Buffer pressure | Increase `shared_buffers` |
+| Low hit % in `bulkread` | Healthy — ring buffer working as designed | Nothing |
+| High I/O from `autovacuum worker` | Vacuum throttled and running constantly | Raise `autovacuum_vacuum_cost_limit` |
+| High `temp relation` I/O | Sorts and hashes spilling | Raise `work_mem` per role, not globally |
+| Many writes from `client backend` | Checkpoints too infrequent | Raise `max_wal_size`, `checkpoint_timeout` |
+| High `extends` | Rapid table growth | Expected during bulk load; otherwise check bloat |
+
+## Summary
+
+`pg_stat_io` replaces guesswork about PostgreSQL I/O with attribution. Reading it along its three dimensions — who (`backend_type`), what (`object`) and how (`context`) — tells you whether high read volume is a cache sizing problem or a healthy sequential scan, whether writes are being handled properly by the checkpointer or dumped on user queries, and whether autovacuum is consuming a share of your I/O budget that warrants tuning. Enable `track_io_timing`, take snapshots and diff them over a short window rather than reading lifetime totals, and let the `context` column stop you from tuning away behaviour that was correct all along.

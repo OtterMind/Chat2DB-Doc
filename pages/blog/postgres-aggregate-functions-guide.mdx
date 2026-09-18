@@ -1,0 +1,283 @@
+---
+title: "Postgres Aggregate Functions: A Complete Guide"
+description: "Every PostgreSQL aggregate that matters: count, sum, array_agg, string_agg, jsonb_agg, FILTER, percentiles, GROUPING SETS and custom aggregates."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: September 17, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# Postgres Aggregate Functions: A Complete Guide
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="September 17, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+Most SQL tutorials stop at `COUNT`, `SUM` and `AVG`. PostgreSQL ships a far richer set of aggregates — array and JSON collectors, statistical functions, ordered-set aggregates for percentiles, and a `FILTER` clause that removes the need for most `CASE WHEN` gymnastics. Knowing them well replaces a surprising amount of application code.
+
+## Setup
+
+```sql
+CREATE TABLE orders (
+    id          bigserial PRIMARY KEY,
+    customer_id integer NOT NULL,
+    region      text NOT NULL,
+    status      text NOT NULL,
+    amount      numeric(10,2) NOT NULL,
+    tags        text[],
+    created_at  timestamptz NOT NULL DEFAULT now()
+);
+
+INSERT INTO orders (customer_id, region, status, amount, tags, created_at) VALUES
+    (1, 'east',  'paid',     120.00, '{priority}',       '2026-09-01'),
+    (1, 'east',  'paid',      80.50, '{gift}',           '2026-09-03'),
+    (2, 'west',  'refunded',  45.00, NULL,               '2026-09-04'),
+    (2, 'west',  'paid',     310.25, '{priority,gift}',  '2026-09-06'),
+    (3, 'east',  'pending',   99.99, NULL,               '2026-09-08'),
+    (3, 'north', 'paid',     250.00, '{bulk}',           '2026-09-10');
+```
+
+## The counting trap
+
+`count(*)` and `count(column)` are not the same function, and the difference is NULLs:
+
+```sql
+SELECT
+    count(*)          AS all_rows,        -- 6
+    count(tags)       AS rows_with_tags,  -- 4, NULLs skipped
+    count(DISTINCT customer_id) AS customers  -- 3
+FROM orders;
+```
+
+**Every aggregate except `count(*)` ignores NULL inputs.** That is why `avg(amount)` over a column with NULLs divides by the count of non-null values, not by the row count. When you need NULLs treated as zero, say so explicitly with `coalesce(amount, 0)`.
+
+An aggregate over zero rows returns NULL, not 0 — except `count`, which returns 0. This is behind the classic bug where a report shows an empty cell instead of a zero:
+
+```sql
+SELECT coalesce(sum(amount), 0) AS total
+FROM orders WHERE region = 'south';   -- no rows → 0, not NULL
+```
+
+## FILTER: conditional aggregation done right
+
+The `FILTER` clause applies a predicate to one aggregate without affecting the others. It replaces the older `CASE WHEN` idiom and reads far better:
+
+```sql
+SELECT
+    region,
+    count(*)                                        AS orders,
+    count(*) FILTER (WHERE status = 'paid')         AS paid_orders,
+    sum(amount) FILTER (WHERE status = 'paid')      AS paid_revenue,
+    sum(amount) FILTER (WHERE status = 'refunded')  AS refunded,
+    round(avg(amount) FILTER (WHERE status = 'paid'), 2) AS avg_paid
+FROM orders
+GROUP BY region
+ORDER BY region;
+```
+
+The equivalent without `FILTER` needs a `CASE` inside every aggregate, and the `count` version has a genuine trap:
+
+```sql
+-- Wrong: counts every row, because count(*) has no NULLs to skip
+count(CASE WHEN status = 'paid' THEN 1 ELSE 0 END)
+-- Right: the ELSE must produce NULL
+count(CASE WHEN status = 'paid' THEN 1 END)
+```
+
+`FILTER` sidesteps the whole class of mistake. It also composes with window functions, which `CASE` does less cleanly.
+
+## Collecting values: array_agg and string_agg
+
+These turn many rows into one value — the single biggest reduction in round trips you can make.
+
+```sql
+SELECT
+    customer_id,
+    count(*)                                 AS order_count,
+    array_agg(id ORDER BY created_at)        AS order_ids,
+    string_agg(status, ', ' ORDER BY created_at) AS status_history,
+    sum(amount)                              AS lifetime_value
+FROM orders
+GROUP BY customer_id
+ORDER BY customer_id;
+```
+
+Two details matter. The `ORDER BY` goes **inside** the aggregate's parentheses — without it, the order is whatever the executor happened to produce, which changes between runs and after a plan flip. And `array_agg` keeps NULLs while `string_agg` skips them, so strip them yourself when it matters:
+
+```sql
+array_remove(array_agg(tags[1]), NULL)
+array_agg(t) FILTER (WHERE t IS NOT NULL)
+```
+
+To go the other way, `unnest` expands an array back into rows:
+
+```sql
+SELECT tag, count(*) AS uses
+FROM orders, unnest(tags) AS tag
+GROUP BY tag
+ORDER BY uses DESC;
+```
+
+## Building JSON directly in the database
+
+`jsonb_agg` and `jsonb_object_agg` let one query return the exact document an API needs:
+
+```sql
+SELECT jsonb_pretty(jsonb_agg(o)) AS payload
+FROM (
+    SELECT id, region, status, amount
+    FROM orders
+    WHERE status = 'paid'
+    ORDER BY amount DESC
+) o;
+```
+
+Nested structures compose naturally:
+
+```sql
+SELECT jsonb_build_object(
+    'region',  region,
+    'total',   sum(amount),
+    'orders',  jsonb_agg(
+                   jsonb_build_object('id', id, 'amount', amount)
+                   ORDER BY amount DESC
+               )
+)
+FROM orders
+GROUP BY region;
+```
+
+`jsonb_object_agg` builds a key/value map, which is ideal for lookup tables:
+
+```sql
+SELECT jsonb_object_agg(region, total)
+FROM (SELECT region, sum(amount) AS total FROM orders GROUP BY region) t;
+-- {"east": 300.49, "north": 250.00, "west": 355.25}
+```
+
+Use `jsonb_agg` rather than `json_agg` unless you specifically need to preserve key order and duplicate keys; `jsonb` is stored parsed, is indexable, and deduplicates keys.
+
+## Percentiles and ordered-set aggregates
+
+Averages hide outliers. Percentiles do not, and Postgres computes them with the `WITHIN GROUP` syntax:
+
+```sql
+SELECT
+    region,
+    round(avg(amount), 2) AS mean,
+    percentile_cont(0.5)  WITHIN GROUP (ORDER BY amount) AS median,
+    percentile_cont(0.95) WITHIN GROUP (ORDER BY amount) AS p95,
+    percentile_disc(0.5)  WITHIN GROUP (ORDER BY amount) AS median_actual_row,
+    mode() WITHIN GROUP (ORDER BY status)                AS most_common_status
+FROM orders
+GROUP BY region;
+```
+
+`percentile_cont` interpolates between the two neighbouring values and can return a number that does not exist in the table — right for latencies and money. `percentile_disc` returns an actual observed value — right when the result must be a real row, like a representative order id.
+
+Both accept an array to compute several percentiles in one pass, which is much cheaper than three separate calls:
+
+```sql
+SELECT percentile_cont(ARRAY[0.5, 0.9, 0.99])
+       WITHIN GROUP (ORDER BY amount) AS p50_p90_p99
+FROM orders;
+```
+
+## Statistical aggregates
+
+Useful and frequently reimplemented in application code for no reason:
+
+```sql
+SELECT
+    round(stddev_samp(amount), 2) AS stddev,
+    round(var_samp(amount), 2)    AS variance,
+    corr(amount, customer_id)     AS correlation,
+    regr_slope(amount, customer_id) AS slope,
+    min(amount), max(amount),
+    max(amount) - min(amount)     AS spread
+FROM orders;
+```
+
+`bool_and` and `bool_or` answer "did every / did any" without a subquery:
+
+```sql
+SELECT customer_id,
+       bool_and(status = 'paid') AS all_paid,
+       bool_or(amount > 300)     AS has_large_order
+FROM orders
+GROUP BY customer_id;
+```
+
+## GROUPING SETS, ROLLUP and CUBE
+
+One pass, several levels of subtotal — far cheaper than `UNION ALL` of three queries:
+
+```sql
+SELECT
+    coalesce(region, 'ALL REGIONS') AS region,
+    coalesce(status, 'ALL STATUSES') AS status,
+    sum(amount) AS total,
+    grouping(region, status) AS grouping_level
+FROM orders
+GROUP BY ROLLUP (region, status)
+ORDER BY region, status;
+```
+
+The `grouping()` function tells you *why* a column is NULL: because it is a subtotal row, or because the data itself was NULL. Without it, those two cases are indistinguishable.
+
+## Aggregates as window functions
+
+Add `OVER` and the aggregate stops collapsing rows — it computes across a frame instead. The same function, a different shape of answer:
+
+```sql
+SELECT
+    id, region, amount, created_at,
+    sum(amount) OVER (PARTITION BY region ORDER BY created_at) AS running_total,
+    sum(amount) OVER (PARTITION BY region)                     AS region_total,
+    round(100.0 * amount / sum(amount) OVER (), 1)             AS pct_of_all,
+    avg(amount) OVER (ORDER BY created_at
+                      ROWS BETWEEN 2 PRECEDING AND CURRENT ROW) AS moving_avg_3
+FROM orders
+ORDER BY region, created_at;
+```
+
+Note the default frame: with an `ORDER BY` and no explicit frame clause, the window is `RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW` — a running total. Without `ORDER BY`, the frame is the whole partition. Getting a total where you expected a running total, or vice versa, is almost always this.
+
+## Writing your own aggregate
+
+When nothing fits, define one. An aggregate is a state type, a transition function and an optional final function:
+
+```sql
+CREATE FUNCTION geomean_state(numeric[], numeric)
+RETURNS numeric[] AS $$
+    SELECT ARRAY[$1[1] + ln($2), $1[2] + 1];
+$$ LANGUAGE sql IMMUTABLE STRICT;
+
+CREATE FUNCTION geomean_final(numeric[])
+RETURNS numeric AS $$
+    SELECT CASE WHEN $1[2] = 0 THEN NULL
+                ELSE exp($1[1] / $1[2]) END;
+$$ LANGUAGE sql IMMUTABLE STRICT;
+
+CREATE AGGREGATE geomean(numeric) (
+    sfunc     = geomean_state,
+    stype     = numeric[],
+    finalfunc = geomean_final,
+    initcond  = '{0,0}'
+);
+
+SELECT region, round(geomean(amount), 2) FROM orders GROUP BY region;
+```
+
+Marking the helpers `STRICT` gives you NULL-skipping for free, matching built-in behaviour.
+
+## Performance notes
+
+Three things decide whether an aggregate query is fast:
+
+- **`count(*)` is not free.** Postgres has no stored row count; it scans. For an approximate total, `SELECT reltuples::bigint FROM pg_class WHERE relname = 'orders'` is instant and usually close enough.
+- **Filter before you aggregate.** A `WHERE` clause reduces rows before aggregation; a `HAVING` clause filters groups after. `HAVING amount > 100` where a `WHERE` would do makes the database do the work twice.
+- **Index the GROUP BY columns.** A B-tree on `(region, created_at)` can let the planner use a sorted `GroupAggregate` instead of building a hash table, which matters once the hash no longer fits in `work_mem` and spills to disk. Check with `EXPLAIN (ANALYZE, BUFFERS)` and look for `Batches: 1` versus a higher number.
+
+To inspect plans and iterate on these queries without leaving your editor, [Chat2DB](https://chat2db.ai/download) runs them against Postgres and renders the execution plan alongside the result set; there is a browser version at [app.chat2db.ai](https://app.chat2db.ai).

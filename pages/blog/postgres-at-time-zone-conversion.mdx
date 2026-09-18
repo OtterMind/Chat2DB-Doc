@@ -1,0 +1,452 @@
+---
+title: "Postgres AT TIME ZONE: Convert Between Time Zones"
+description: "Learn how Postgres stores timestamptz, how AT TIME ZONE converts in both directions, how to set the session time zone, and how to avoid DST and offset mistakes."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: September 11, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# Postgres AT TIME ZONE: Convert Between Time Zones
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="September 11, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+
+Time zone handling is one of the most common sources of confusion in PostgreSQL. The rules are actually simple once you understand two things: how `timestamp with time zone` stores its value, and that `AT TIME ZONE` behaves differently depending on the type of its left operand. This guide walks through both, with examples you can run as written.
+
+## Set Up a Sample Table
+
+Every example below uses this table. Create it first so you can follow along.
+
+```sql
+CREATE TABLE events (
+    id          serial PRIMARY KEY,
+    name        text NOT NULL,
+    occurred_at timestamptz NOT NULL,
+    user_zone   text NOT NULL
+);
+
+INSERT INTO events (name, occurred_at, user_zone) VALUES
+    ('login',    '2026-03-07 23:30:00+00', 'America/New_York'),
+    ('purchase', '2026-03-08 07:15:00+00', 'Europe/Berlin'),
+    ('logout',   '2026-03-08 22:45:00+00', 'Asia/Tokyo'),
+    ('refund',   '2026-06-15 13:00:00+00', 'America/New_York');
+```
+
+`timestamptz` is the PostgreSQL shorthand for `timestamp with time zone`, and `timestamp` is shorthand for `timestamp without time zone`. We will use the short forms from here on.
+
+## How timestamptz Stores Values
+
+Despite the name, `timestamptz` does not store a time zone. It stores a single instant in time, internally as microseconds since 2000-01-01 00:00:00 UTC. When you insert a literal with an offset such as `'2026-03-08 07:15:00+00'`, PostgreSQL converts it to that UTC instant. When you insert a literal with no offset, PostgreSQL interprets it in the current session `TimeZone` setting, then converts to UTC.
+
+On output, the instant is rendered in the session `TimeZone`. That is why the same row can look different to two clients.
+
+```sql
+SET timezone = 'UTC';
+SELECT name, occurred_at FROM events WHERE name = 'purchase';
+```
+
+```text
+   name   |      occurred_at
+----------+------------------------
+ purchase | 2026-03-08 07:15:00+00
+```
+
+```sql
+SET timezone = 'Asia/Tokyo';
+SELECT name, occurred_at FROM events WHERE name = 'purchase';
+```
+
+```text
+   name   |      occurred_at
+----------+------------------------
+ purchase | 2026-03-08 16:15:00+09
+```
+
+The stored value did not change. Only the display did. This is the key mental model: `timestamptz` is an absolute point on the timeline, and the session zone is a lens for viewing it.
+
+## Postgres Set Timezone: Session, Role, Database and Server
+
+There are four levels at which the default time zone can be set. The most specific one wins.
+
+### Check the current value
+
+```sql
+SHOW timezone;
+```
+
+```text
+  TimeZone
+------------
+ Asia/Tokyo
+```
+
+You can also read it as a function call, which is useful inside larger queries:
+
+```sql
+SELECT current_setting('TimeZone');
+```
+
+### Session level
+
+```sql
+SET timezone = 'Europe/Berlin';
+-- or, only for the current transaction:
+SET LOCAL timezone = 'Europe/Berlin';
+```
+
+`SET` lasts until the connection closes or another `SET` runs. `SET LOCAL` reverts at the end of the transaction.
+
+### Role level
+
+```sql
+ALTER ROLE reporting_user SET timezone = 'America/New_York';
+```
+
+Every new session opened by `reporting_user` starts with that zone. Existing sessions are unaffected.
+
+### Database level
+
+```sql
+ALTER DATABASE analytics SET timezone = 'UTC';
+```
+
+New connections to `analytics` start with UTC unless the role or the client overrides it.
+
+### Server level
+
+In `postgresql.conf`, the `timezone` parameter sets the default for the whole cluster. If it is not set, PostgreSQL uses the operating system's zone at initdb time. A common and safe choice for servers is:
+
+```text
+timezone = 'UTC'
+```
+
+Reload the configuration after editing:
+
+```sql
+SELECT pg_reload_conf();
+```
+
+## The Two Directions of AT TIME ZONE
+
+`AT TIME ZONE` is a single operator with two behaviors. Which one you get depends entirely on the type of the expression on its left.
+
+| Left operand type | Meaning of `expr AT TIME ZONE 'zone'` | Result type |
+|---|---|---|
+| `timestamptz` | Take this instant and show the wall-clock time in `zone` | `timestamp` (no zone) |
+| `timestamp` | Treat this wall-clock time as if it were in `zone`, find the instant | `timestamptz` |
+
+The asymmetry is deliberate. One direction removes zone information by picking a viewpoint; the other adds zone information by declaring where the clock was.
+
+### timestamptz to timestamp: "what time was it there?"
+
+```sql
+SELECT name,
+       occurred_at,
+       occurred_at AT TIME ZONE 'America/New_York' AS ny_local
+FROM events
+WHERE name = 'login';
+```
+
+With the session zone set to UTC:
+
+```text
+ name  |      occurred_at       |      ny_local
+-------+------------------------+---------------------
+ login | 2026-03-07 23:30:00+00 | 2026-03-07 18:30:00
+```
+
+Note that `ny_local` has no offset suffix. It is a plain `timestamp`. It answers the question "what did the clock on the wall in New York say at that instant?"
+
+### timestamp to timestamptz: "which instant was this?"
+
+```sql
+SELECT TIMESTAMP '2026-03-08 09:00:00' AT TIME ZONE 'Europe/Berlin' AS instant;
+```
+
+With the session zone set to UTC:
+
+```text
+        instant
+------------------------
+ 2026-03-08 08:00:00+00
+```
+
+Here we said "a clock in Berlin showed 09:00 on March 8th" and PostgreSQL computed the absolute instant, which is 08:00 UTC because Berlin is at UTC+1 in March before its DST switch.
+
+## Postgres Convert Timezone: The Double AT TIME ZONE Idiom
+
+If you have a wall-clock time in one zone and want the equivalent wall-clock time in another zone, chain the two directions. First convert the local time to an instant, then view that instant in the target zone.
+
+```sql
+SELECT (TIMESTAMP '2026-03-08 09:00:00' AT TIME ZONE 'Europe/Berlin')
+           AT TIME ZONE 'Asia/Tokyo' AS tokyo_wall_clock;
+```
+
+```text
+  tokyo_wall_clock
+---------------------
+ 2026-03-08 17:00:00
+```
+
+Reading left to right: the inner expression produces a `timestamptz` (the instant), and the outer expression renders that instant as a `timestamp` in Tokyo. This pattern is independent of the session zone, which makes it safe to embed in views and functions.
+
+If you would rather not type the expression by hand, the online Postgres Timezone Converter at https://chat2db.ai/tools/postgres-timezone-converter generates the `AT TIME ZONE` expression for a pair of zones.
+
+## IANA Names, Abbreviations and POSIX Offsets
+
+PostgreSQL accepts three kinds of zone specifiers, and they behave very differently.
+
+### IANA names handle DST
+
+`'America/New_York'`, `'Europe/Berlin'` and `'Asia/Tokyo'` are IANA (Olson) names. They carry the full history of offset changes and DST rules, so the same name gives UTC-5 in January and UTC-4 in July.
+
+```sql
+SELECT TIMESTAMPTZ '2026-01-15 12:00:00+00' AT TIME ZONE 'America/New_York' AS winter,
+       TIMESTAMPTZ '2026-07-15 12:00:00+00' AT TIME ZONE 'America/New_York' AS summer;
+```
+
+```text
+       winter        |       summer
+---------------------+---------------------
+ 2026-01-15 07:00:00 | 2026-07-15 08:00:00
+```
+
+### Abbreviations are fixed offsets
+
+`'EST'` is not the same as `'America/New_York'`. In PostgreSQL an abbreviation is a fixed offset with no DST rules. `'EST'` always means UTC-5.
+
+```sql
+SELECT TIMESTAMPTZ '2026-07-15 12:00:00+00' AT TIME ZONE 'EST' AS est_fixed,
+       TIMESTAMPTZ '2026-07-15 12:00:00+00' AT TIME ZONE 'America/New_York' AS ny_dst;
+```
+
+```text
+      est_fixed      |       ny_dst
+---------------------+---------------------
+ 2026-07-15 07:00:00 | 2026-07-15 08:00:00
+```
+
+In July, New York is actually on EDT (UTC-4), so `'EST'` gives the wrong answer by one hour. Use IANA names for anything involving real locations.
+
+### POSIX offsets invert the sign
+
+A specifier like `'UTC+3'` is parsed using POSIX rules, where the sign means "hours west of UTC". So `'UTC+3'` is actually three hours behind UTC, the opposite of what most people expect.
+
+```sql
+SELECT TIMESTAMPTZ '2026-03-08 12:00:00+00' AT TIME ZONE 'UTC+3' AS posix_style,
+       TIMESTAMPTZ '2026-03-08 12:00:00+00' AT TIME ZONE '+03:00' AS iso_style;
+```
+
+```text
+     posix_style     |      iso_style
+---------------------+---------------------
+ 2026-03-08 09:00:00 | 2026-03-08 15:00:00
+```
+
+The safest fixed-offset syntax is the ISO form with a colon, such as `'+03:00'` or `'-05:00'`, or an `INTERVAL`:
+
+```sql
+SELECT TIMESTAMPTZ '2026-03-08 12:00:00+00' AT TIME ZONE INTERVAL '+03:00';
+```
+
+## Looking Up Zones in the Catalog
+
+PostgreSQL ships two views that list what it knows.
+
+```sql
+SELECT name, abbrev, utc_offset, is_dst
+FROM pg_timezone_names
+WHERE name LIKE 'America/New%' OR name = 'Europe/Berlin'
+ORDER BY name;
+```
+
+```text
+       name       | abbrev | utc_offset | is_dst
+------------------+--------+------------+--------
+ America/New_York | EDT    | -04:00:00  | t
+ Europe/Berlin    | CEST   | 02:00:00   | t
+```
+
+The `utc_offset` and `is_dst` columns reflect the current moment, so the output changes with the calendar. For abbreviations:
+
+```sql
+SELECT abbrev, utc_offset, is_dst
+FROM pg_timezone_abbrevs
+WHERE abbrev IN ('EST', 'EDT', 'CET', 'CEST', 'JST');
+```
+
+## DST Gaps and Overlaps
+
+When clocks jump forward, a range of wall-clock times does not exist. In New York, on 2026-03-08 the clock goes from 01:59:59 straight to 03:00:00. So `02:30:00` on that date never happened.
+
+```sql
+SET timezone = 'UTC';
+SELECT TIMESTAMP '2026-03-08 02:30:00' AT TIME ZONE 'America/New_York' AS gap_time;
+```
+
+```text
+        gap_time
+------------------------
+ 2026-03-08 07:30:00+00
+```
+
+PostgreSQL does not raise an error. It interprets the nonexistent time using the offset that was in effect before the transition (UTC-5), which yields 07:30 UTC. Viewed back in New York, that instant is 03:30 EDT. If your application generates local times from user input, validate them, because the database will silently accept a time that could not appear on any clock.
+
+The reverse happens in autumn. On 2026-11-01, New York repeats the hour from 01:00 to 02:00, so `01:30:00` occurs twice. PostgreSQL resolves the ambiguity by choosing the later offset (standard time, UTC-5):
+
+```sql
+SELECT TIMESTAMP '2026-11-01 01:30:00' AT TIME ZONE 'America/New_York' AS overlap_time;
+```
+
+```text
+      overlap_time
+------------------------
+ 2026-11-01 06:30:00+00
+```
+
+If you need the other interpretation, write the offset explicitly: `TIMESTAMPTZ '2026-11-01 01:30:00-04'`.
+
+## Grouping by Local Day
+
+Aggregating "per day" is only meaningful in a specific zone, because a UTC day boundary falls in the middle of the afternoon in Tokyo. Convert to local wall-clock time first, then truncate.
+
+```sql
+SELECT date_trunc('day', occurred_at AT TIME ZONE 'Europe/Berlin') AS berlin_day,
+       count(*) AS events
+FROM events
+GROUP BY 1
+ORDER BY 1;
+```
+
+```text
+     berlin_day      | events
+---------------------+--------
+ 2026-03-08 00:00:00 |      3
+ 2026-06-15 00:00:00 |      1
+```
+
+The `login` event at 23:30 UTC on March 7th lands on March 8th in Berlin, so it groups with the other two March events.
+
+PostgreSQL 16 added a three-argument form of `date_trunc` that takes a zone and returns a `timestamptz`, which keeps the result on the absolute timeline:
+
+```sql
+SELECT date_trunc('day', occurred_at, 'Europe/Berlin') AS berlin_day_start,
+       count(*) AS events
+FROM events
+GROUP BY 1
+ORDER BY 1;
+```
+
+With the session zone set to UTC:
+
+```text
+    berlin_day_start    | events
+------------------------+--------
+ 2026-03-07 23:00:00+00 |      3
+ 2026-06-14 22:00:00+00 |      1
+```
+
+Each row is the exact instant midnight began in Berlin. The offsets differ (23:00 in March, 22:00 in June) because Berlin's DST is in effect for the second row.
+
+## Storing the User's Zone in a Column
+
+For per-user local times, keep the zone name next to the event and reference the column in `AT TIME ZONE`. The right operand can be any text expression.
+
+```sql
+SELECT name,
+       occurred_at,
+       user_zone,
+       occurred_at AT TIME ZONE user_zone AS user_local_time
+FROM events
+ORDER BY occurred_at;
+```
+
+```text
+   name   |      occurred_at       |    user_zone     |   user_local_time
+----------+------------------------+------------------+---------------------
+ login    | 2026-03-07 23:30:00+00 | America/New_York | 2026-03-07 18:30:00
+ purchase | 2026-03-08 07:15:00+00 | Europe/Berlin    | 2026-03-08 08:15:00
+ logout   | 2026-03-08 22:45:00+00 | Asia/Tokyo       | 2026-03-09 07:45:00
+ refund   | 2026-06-15 13:00:00+00 | America/New_York | 2026-06-15 09:00:00
+```
+
+If the zone lives in a separate `users` table, join it in:
+
+```sql
+CREATE TABLE users (
+    id       serial PRIMARY KEY,
+    email    text NOT NULL,
+    timezone text NOT NULL
+);
+
+INSERT INTO users (email, timezone) VALUES
+    ('a@example.com', 'America/New_York'),
+    ('b@example.com', 'Asia/Tokyo');
+
+SELECT u.email,
+       e.name,
+       e.occurred_at AT TIME ZONE u.timezone AS local_time
+FROM events e
+JOIN users u ON u.timezone = e.user_zone
+ORDER BY e.occurred_at;
+```
+
+PostgreSQL does not allow subqueries in `CHECK` constraints, so you cannot enforce zone validity declaratively against `pg_timezone_names`. Validate in application code or a trigger, and run a periodic query to catch typos that slipped through:
+
+```sql
+SELECT u.id, u.email, u.timezone
+FROM users u
+WHERE NOT EXISTS (
+    SELECT 1 FROM pg_timezone_names t WHERE t.name = u.timezone
+);
+```
+
+An empty result means every stored zone name is one PostgreSQL recognizes.
+
+## Common Mistakes
+
+### Using timestamp without time zone for events
+
+A plain `timestamp` has no anchor. If a server in Berlin writes `2026-03-08 09:00:00` and a server in Tokyo reads it, neither knows what instant it refers to. For anything that records when something happened, use `timestamptz`. Reserve plain `timestamp` for genuine wall-clock concepts such as "the store opens at 09:00" that are intentionally zone-independent.
+
+### Applying AT TIME ZONE twice by accident
+
+Because the operator flips the type each time, a stray second application silently reinterprets your value. This is a frequent bug in ORMs or views that already converted the column once:
+
+```sql
+-- Correct: instant -> Berlin wall clock
+SELECT occurred_at AT TIME ZONE 'Europe/Berlin' FROM events WHERE name = 'purchase';
+-- Wrong: the result above is a timestamp, so this line treats the Berlin
+-- wall-clock time as if it were UTC and produces a different instant
+SELECT (occurred_at AT TIME ZONE 'Europe/Berlin') AT TIME ZONE 'UTC' FROM events WHERE name = 'purchase';
+```
+
+Always check whether a column is already `timestamp` or still `timestamptz` before adding a conversion. `pg_typeof(expr)` tells you.
+
+### JDBC and ORM session zone surprises
+
+Many drivers issue `SET timezone` on connect using the JVM or process default zone. If the application server is in `America/Los_Angeles`, every `timestamptz` you read will be rendered in Pacific time, and every zone-less literal you write will be interpreted as Pacific time. Two fixes work well together: set the server default to UTC with `ALTER DATABASE ... SET timezone = 'UTC'`, and pin the client with a connection parameter or by starting the JVM with `-Duser.timezone=UTC`. Then do explicit `AT TIME ZONE` conversions in queries where local time is required.
+
+You can inspect what a given connection is doing by running `SHOW timezone` and `SELECT now()` from that connection. In a GUI such as Chat2DB you can open two query tabs, run `SET timezone` to different values in each, and compare the same `SELECT` side by side. Download it at https://chat2db.ai/download or use the web version at https://app.chat2db.ai.
+
+## Summary
+
+`timestamptz` stores an absolute instant in UTC and displays it through the session `TimeZone`. `AT TIME ZONE` converts a `timestamptz` to local wall-clock `timestamp`, and converts a wall-clock `timestamp` to an absolute `timestamptz`. Chain the two to move a wall-clock time between zones. Prefer IANA zone names over abbreviations, avoid POSIX-style `UTC+3`, watch for DST gaps and overlaps, and group by local day with `date_trunc` on the converted value or the PostgreSQL 16 three-argument form. Set the server default to UTC and be explicit in queries.
+
+## FAQ
+
+### Why does my timestamptz column show a different time than I inserted?
+
+Because the value is displayed in the session `TimeZone`, not in the offset you typed. The instant is stored correctly. Run `SHOW timezone` to see the display zone and use `AT TIME ZONE` to render the value in the zone you want.
+
+### What is the difference between AT TIME ZONE 'EST' and AT TIME ZONE 'America/New_York'?
+
+`'EST'` is a fixed offset of UTC-5 with no daylight saving rules. `'America/New_York'` follows the real calendar and switches between UTC-5 and UTC-4. Use the IANA name unless you specifically need a fixed offset.
+
+### How do I convert a timestamptz column to UTC for export?
+
+Use `occurred_at AT TIME ZONE 'UTC'`. The result is a plain `timestamp` showing the UTC wall-clock time, with no offset suffix, which is usually what export formats expect. Alternatively, run `SET timezone = 'UTC'` for the session and select the column directly.

@@ -1,0 +1,298 @@
+---
+title: "Stored Procedure vs Function in SQL"
+description: "The real differences between stored procedures and functions in PostgreSQL, MySQL and SQL Server: transaction control, return values and which to choose."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: September 12, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# Stored Procedure vs Function in SQL
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="September 12, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+
+"A function returns a value and a procedure does not" is the answer most interview candidates give, and it is not quite right on any major database. The distinction that actually matters in PostgreSQL - and the one that decides which you should write - is **transaction control**: a procedure can `COMMIT` and `ROLLBACK`, and a function cannot.
+
+Here is what genuinely differs, on each engine, with runnable examples.
+
+## The core difference in PostgreSQL
+
+PostgreSQL had only functions until version 11, when `CREATE PROCEDURE` arrived. The reason it was added was not naming tidiness; it was that a function always runs inside the calling transaction and therefore cannot manage transactions itself.
+
+```sql
+-- A function: called from inside a query, cannot COMMIT
+CREATE FUNCTION order_total(p_order_id bigint)
+RETURNS numeric
+LANGUAGE sql
+STABLE
+AS $$
+  SELECT coalesce(sum(quantity * unit_price), 0)
+  FROM order_items
+  WHERE order_id = p_order_id;
+$$;
+
+SELECT id, order_total(id) FROM orders LIMIT 10;
+```
+
+```sql
+-- A procedure: called with CALL, can COMMIT between steps
+CREATE PROCEDURE archive_old_orders(p_cutoff date)
+LANGUAGE plpgsql
+AS $$
+DECLARE
+  moved int;
+BEGIN
+  LOOP
+    WITH batch AS (
+      SELECT id FROM orders
+      WHERE created_at < p_cutoff
+      ORDER BY id
+      LIMIT 10000
+      FOR UPDATE SKIP LOCKED
+    ), moved_rows AS (
+      DELETE FROM orders o
+      USING batch b
+      WHERE o.id = b.id
+      RETURNING o.*
+    )
+    INSERT INTO orders_archive
+    SELECT * FROM moved_rows;
+
+    GET DIAGNOSTICS moved = ROW_COUNT;
+    EXIT WHEN moved = 0;
+
+    COMMIT;                 -- impossible inside a function
+    RAISE NOTICE 'archived % rows', moved;
+  END LOOP;
+END;
+$$;
+
+CALL archive_old_orders('2024-01-01');
+```
+
+That `COMMIT` inside the loop is the whole point. Without it, archiving ten million rows runs as one enormous transaction: the WAL grows without bound, `VACUUM` cannot clean up rows newer than the transaction's snapshot, and a failure at 95% rolls back everything. With batched commits, the job is restartable and the table stays maintainable.
+
+Attempt the same inside a function and PostgreSQL refuses:
+
+```
+ERROR:  invalid transaction termination
+CONTEXT:  PL/pgSQL function ... line 5 at COMMIT
+```
+
+There is one caveat: a procedure can only commit when it is called at the top level. `CALL` it from inside an explicit `BEGIN ... END` block that the client opened, and the `COMMIT` fails with the same error, because the procedure is no longer in charge of the transaction.
+
+## The full comparison
+
+| | Function | Procedure |
+| --- | --- | --- |
+| Invoked with | `SELECT f(...)` | `CALL p(...)` |
+| Usable in `SELECT` / `WHERE` / `JOIN` | Yes | No |
+| Returns a value | Yes (`RETURNS`) | Via `INOUT` parameters |
+| Can `COMMIT` / `ROLLBACK` | No | Yes (at top level) |
+| Can return a set of rows | Yes (`RETURNS TABLE`/`SETOF`) | No |
+| Usable in an index or constraint | Yes, if `IMMUTABLE` | No |
+| Volatility declarations | `IMMUTABLE`/`STABLE`/`VOLATILE` | Not applicable |
+
+## Function volatility: the setting that changes plans
+
+This has no procedural equivalent and is the most consequential thing you declare about a PostgreSQL function.
+
+- **`IMMUTABLE`** - same inputs always give the same result, and the function reads nothing from the database. The planner may evaluate it once at planning time and may use it in an index expression.
+- **`STABLE`** - result is constant within one statement, may read tables. Usable in index *scans* as a comparison value.
+- **`VOLATILE`** (the default) - may return anything, may have side effects. Re-evaluated for every row, and never inlined.
+
+```sql
+-- Correct: pure computation
+CREATE FUNCTION slugify(txt text) RETURNS text
+LANGUAGE sql IMMUTABLE STRICT
+AS $$ SELECT lower(regexp_replace(txt, '[^a-zA-Z0-9]+', '-', 'g')) $$;
+
+CREATE INDEX articles_slug_idx ON articles (slugify(title));  -- allowed because IMMUTABLE
+```
+
+Getting this wrong is genuinely dangerous rather than merely slow. Declaring a function `IMMUTABLE` when it reads a table lets you build an index on it - and that index becomes silently wrong as soon as the table changes, because PostgreSQL will not re-evaluate what it was told is constant. A useful rule: if the body contains `SELECT` against a table, the strongest label you may use is `STABLE`.
+
+`STRICT` (equivalently `RETURNS NULL ON NULL INPUT`) is a free optimisation for functions that should return NULL when any argument is NULL: the body is skipped entirely.
+
+## Returning sets
+
+A function that returns rows can be joined like a table, which is the capability procedures simply do not have:
+
+```sql
+CREATE FUNCTION recent_orders(p_customer_id bigint, p_days int DEFAULT 30)
+RETURNS TABLE (order_id bigint, total numeric, created_at timestamptz)
+LANGUAGE sql
+STABLE
+AS $$
+  SELECT o.id, o.total, o.created_at
+  FROM orders o
+  WHERE o.customer_id = p_customer_id
+    AND o.created_at >= now() - make_interval(days => p_days)
+  ORDER BY o.created_at DESC;
+$$;
+
+-- Use it as a table, once per customer row
+SELECT c.email, r.order_id, r.total
+FROM customers c
+CROSS JOIN LATERAL recent_orders(c.id, 7) AS r
+WHERE c.country = 'DE';
+```
+
+A simple `LANGUAGE sql` function like this one can be *inlined* by the planner: it is substituted into the calling query and optimised as a whole, so the index on `orders(customer_id, created_at)` is used normally. Write the same logic in `LANGUAGE plpgsql` and inlining does not happen - the function becomes an optimiser barrier executed as a black box. For anything that is a single query, prefer `LANGUAGE sql`.
+
+## Output parameters in procedures
+
+Procedures cannot `RETURN` a value, but `INOUT` parameters carry results back:
+
+```sql
+CREATE PROCEDURE transfer_funds(
+  p_from bigint, p_to bigint, p_amount numeric,
+  INOUT p_status text DEFAULT NULL
+)
+LANGUAGE plpgsql
+AS $$
+BEGIN
+  IF p_amount <= 0 THEN
+    p_status := 'invalid amount';
+    RETURN;
+  END IF;
+
+  UPDATE accounts SET balance = balance - p_amount
+  WHERE id = p_from AND balance >= p_amount;
+
+  IF NOT FOUND THEN
+    p_status := 'insufficient funds';
+    RETURN;
+  END IF;
+
+  UPDATE accounts SET balance = balance + p_amount WHERE id = p_to;
+  p_status := 'ok';
+END;
+$$;
+
+CALL transfer_funds(1, 2, 100.00, NULL);   -- returns a row with p_status
+```
+
+Note what this procedure does *not* do: it contains no `BEGIN`/`COMMIT`. A `CALL` from a client with autocommit on is already atomic, so both `UPDATE`s succeed or neither does. Adding explicit transaction control here would make it worse, not safer.
+
+## MySQL
+
+MySQL has had both since 5.0, and the split is closer to the textbook version:
+
+```sql
+DELIMITER $$
+
+CREATE FUNCTION order_total(p_order_id BIGINT)
+RETURNS DECIMAL(10,2)
+DETERMINISTIC READS SQL DATA
+BEGIN
+  DECLARE v_total DECIMAL(10,2);
+  SELECT COALESCE(SUM(quantity * unit_price), 0) INTO v_total
+  FROM order_items WHERE order_id = p_order_id;
+  RETURN v_total;
+END$$
+
+CREATE PROCEDURE archive_old_orders(IN p_cutoff DATE, OUT p_moved INT)
+BEGIN
+  START TRANSACTION;
+    INSERT INTO orders_archive SELECT * FROM orders WHERE created_at < p_cutoff;
+    DELETE FROM orders WHERE created_at < p_cutoff;
+    SET p_moved = ROW_COUNT();
+  COMMIT;
+END$$
+
+DELIMITER ;
+
+CALL archive_old_orders('2024-01-01', @moved);
+SELECT @moved;
+```
+
+MySQL specifics worth remembering: a procedure can return a result set simply by ending with a `SELECT`, which PostgreSQL procedures cannot do. Functions must be declared `DETERMINISTIC`, `NO SQL` or `READS SQL DATA` when binary logging is enabled, or creation fails. And functions cannot modify a table that the calling statement is already reading.
+
+## SQL Server
+
+```sql
+CREATE FUNCTION dbo.OrderTotal(@OrderId bigint)
+RETURNS decimal(10,2)
+AS
+BEGIN
+  DECLARE @Total decimal(10,2);
+  SELECT @Total = ISNULL(SUM(Quantity * UnitPrice), 0)
+  FROM dbo.OrderItems WHERE OrderId = @OrderId;
+  RETURN @Total;
+END;
+GO
+
+CREATE PROCEDURE dbo.ArchiveOldOrders @Cutoff date
+AS
+BEGIN
+  SET NOCOUNT ON;
+  BEGIN TRY
+    BEGIN TRANSACTION;
+      INSERT INTO dbo.OrdersArchive SELECT * FROM dbo.Orders WHERE CreatedAt < @Cutoff;
+      DELETE FROM dbo.Orders WHERE CreatedAt < @Cutoff;
+    COMMIT TRANSACTION;
+  END TRY
+  BEGIN CATCH
+    IF @@TRANCOUNT > 0 ROLLBACK TRANSACTION;
+    THROW;
+  END CATCH
+END;
+GO
+```
+
+SQL Server draws the hardest line of the three: functions may not modify data at all, and may not call procedures. It also distinguishes scalar functions from *inline table-valued functions*, and the difference is dramatic for performance - an inline TVF (a single `RETURN SELECT ...` with no `BEGIN`/`END`) is expanded into the calling query like a view, while a multi-statement TVF is a black box with a fixed 100-row estimate. Scalar functions were similarly opaque until SQL Server 2019 introduced scalar UDF inlining.
+
+The pattern repeats across engines: **the simplest form gets inlined and optimised; the procedural form does not.**
+
+## Choosing between them
+
+Write a **function** when:
+
+- The result is a value or a rowset you want to use inside a query
+- You need it in a `WHERE`, `JOIN`, index expression or generated column
+- The logic is one query - use `LANGUAGE sql` so it can be inlined
+- It has no side effects
+
+Write a **procedure** when:
+
+- The work is a multi-step process rather than a computation
+- You need batched `COMMIT`s over a large volume of rows
+- It performs maintenance: archiving, backfills, reindexing, ETL steps
+- There is no meaningful single return value
+
+The commit-in-a-loop case is the one that genuinely requires a procedure. If you do not need it, a function is usually the better tool, because it composes with SQL and the planner can see inside it.
+
+## Inspecting what exists
+
+```sql
+-- PostgreSQL: prokind is 'f' function, 'p' procedure, 'a' aggregate, 'w' window
+SELECT n.nspname AS schema, p.proname AS name,
+       CASE p.prokind WHEN 'f' THEN 'function' WHEN 'p' THEN 'procedure' END AS kind,
+       pg_get_function_identity_arguments(p.oid) AS args,
+       p.provolatile AS volatility
+FROM pg_proc p
+JOIN pg_namespace n ON n.oid = p.pronamespace
+WHERE n.nspname NOT IN ('pg_catalog', 'information_schema')
+ORDER BY 1, 2;
+
+-- Full source of one routine
+SELECT pg_get_functiondef('public.order_total(bigint)'::regprocedure);
+```
+
+```sql
+-- MySQL
+SELECT ROUTINE_SCHEMA, ROUTINE_NAME, ROUTINE_TYPE, IS_DETERMINISTIC
+FROM information_schema.ROUTINES
+WHERE ROUTINE_SCHEMA = DATABASE();
+```
+
+A client that lists routines with their source alongside the tables makes this easier to audit - [Chat2DB](https://chat2db.ai/download) does that for PostgreSQL, MySQL and SQL Server in one place, and the [web version](https://app.chat2db.ai) runs without an install.
+
+## Summary
+
+The textbook answer - functions return values, procedures do not - is the least useful part of the distinction. In PostgreSQL the real line is transaction control: only a procedure can `COMMIT`, and that single capability is what makes batched maintenance jobs possible. Functions earn their place by composing with SQL, and the choice inside that category matters too: declare volatility honestly, and prefer plain `LANGUAGE sql` for single-query functions so the planner can inline them instead of treating your logic as an opaque box.

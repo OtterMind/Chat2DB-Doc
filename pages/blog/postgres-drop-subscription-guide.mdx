@@ -1,0 +1,340 @@
+---
+title: "DROP SUBSCRIPTION Postgres: Safe Teardown"
+description: "How to disable, alter and drop a PostgreSQL subscription safely — including the DROP SUBSCRIPTION hang when the publisher or its slot is unreachable."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: September 16, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# DROP SUBSCRIPTION Postgres: Safe Teardown
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="September 16, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+`DROP SUBSCRIPTION app_sub;` looks like a one-line cleanup. Then it sits there for minutes, returns nothing, and you discover the subscription cannot be removed because PostgreSQL is trying to reach a publisher that was decommissioned last week.
+
+This guide is about that failure and the teardown procedure that avoids it. For setting logical replication up in the first place, see the [logical replication guide](/blog/postgres-logical-replication-guide); for what a publication contains, the [publication guide](/blog/postgres-create-publication-guide).
+
+## How a subscription is wired to a remote slot
+
+A subscription is not a local-only object. `CREATE SUBSCRIPTION` performs a remote action as a side effect:
+
+```sql
+-- On the subscriber
+CREATE SUBSCRIPTION app_sub
+    CONNECTION 'host=10.0.0.10 port=5432 dbname=appdb user=replicator password=secret'
+    PUBLICATION app_pub;
+```
+
+By default (`create_slot = true`) this opens a replication connection to the publisher and creates a logical replication slot there, named after the subscription unless you pass `slot_name`. So one `CREATE SUBSCRIPTION` produces state in three places:
+
+1. A row in `pg_subscription` on the subscriber — connection string, publication list, slot name, enabled flag.
+2. Rows in `pg_subscription_rel` on the subscriber, one per replicated table, tracking sync state.
+3. A **replication slot on the publisher**, holding WAL and pinning the catalog xmin.
+
+Item three is the whole problem. `DROP SUBSCRIPTION` tries to clean up all three, and the third one lives on a machine that may be gone, firewalled, failed over, or simply slow to answer. The subscriber has no way to delete a remote slot other than connecting and asking.
+
+You can see the wiring on the subscriber:
+
+```sql
+SELECT s.subname,
+       s.subenabled,
+       s.subslotname,
+       s.subpublications,
+       s.subsynccommit,
+       d.datname
+FROM   pg_subscription s
+JOIN   pg_database d ON d.oid = s.subdbid;
+```
+
+`pg_subscription` is a shared catalog, so this shows subscriptions from every database in the cluster — the `subdbid` join is what tells you which database each one belongs to. Note that `subconninfo` contains the password in clear text and is readable only by superusers by default, which is why the query above leaves it out.
+
+## Disabling first: what DISABLE does and does not do
+
+```sql
+ALTER SUBSCRIPTION app_sub DISABLE;
+```
+
+This stops the logical replication apply worker and any table sync workers. Changes stop being applied to the subscriber immediately. It is fully reversible:
+
+```sql
+ALTER SUBSCRIPTION app_sub ENABLE;
+```
+
+On resume, the subscriber restarts from the LSN it last confirmed, so nothing is lost — provided the publisher still has the WAL, which it does, because the slot kept it.
+
+And that is the part people get wrong. **Disabling a subscription does not release the replication slot.** The slot on the publisher goes inactive and keeps retaining WAL from the last confirmed position, forever, while also holding back vacuum of dead tuples cluster-wide. A subscription that someone disabled "temporarily" six months ago is one of the most common causes of a publisher filling its `pg_wal` partition — see the [replication slots guide](/blog/postgres-replication-slots-guide) for how that plays out.
+
+So `DISABLE` is the right first step of a teardown, and a dangerous permanent state.
+
+Verify the workers are actually gone before moving on:
+
+```sql
+SELECT subid, subname, pid, relid, received_lsn, latest_end_time
+FROM   pg_stat_subscription;
+```
+
+`pg_stat_subscription` only has rows for running workers. A `NULL` `pid` — or no row at all for the subscription — means nothing is applying. A non-null `relid` identifies a table sync worker still doing an initial copy; let it finish or accept that the copy is abandoned.
+
+On PostgreSQL 15 and later there is a second view worth checking, because it records errors that would otherwise only be in the log:
+
+```sql
+-- PostgreSQL 15+
+SELECT subname, apply_error_count, sync_error_count, stats_reset
+FROM   pg_stat_subscription_stats;
+```
+
+## The safe teardown order
+
+When the publisher is reachable and everything is healthy, this is the sequence:
+
+```sql
+-- 1. Subscriber: stop applying
+ALTER SUBSCRIPTION app_sub DISABLE;
+
+-- 2. Subscriber: confirm no workers remain
+SELECT subname, pid FROM pg_stat_subscription WHERE subname = 'app_sub';
+
+-- 3. Subscriber: drop it (also drops the remote slot)
+DROP SUBSCRIPTION app_sub;
+```
+
+```sql
+-- 4. Publisher: confirm the slot is gone
+SELECT slot_name, active, wal_status
+FROM   pg_replication_slots
+WHERE  slot_name = 'app_sub';
+
+-- 5. Publisher: drop the publication if nothing else uses it
+DROP PUBLICATION IF EXISTS app_pub;
+```
+
+Order matters in both directions. Dropping the publication first leaves the subscriber's apply worker looping on `publication "app_pub" does not exist` while its slot keeps growing. Dropping the subscriber's database first orphans the slot with no record anywhere of what created it.
+
+`DROP SUBSCRIPTION` requires ownership of the subscription. On PostgreSQL 15 and earlier, subscriptions can only be owned by superusers; PostgreSQL 16 introduced the `pg_create_subscription` predefined role so that non-superusers can own and manage them.
+
+## When DROP SUBSCRIPTION hangs
+
+Now the interesting case. The publisher is unreachable — host retired, network path removed, failover to a new primary, credentials rotated — and you run `DROP SUBSCRIPTION`. Two outcomes:
+
+The command **blocks**, sometimes for a long time, because libpq is waiting on a TCP connection that will never be answered. There is no timeout in the connection string by default, so you can wait until the OS gives up. Cancelling with Ctrl-C (or `pg_cancel_backend`) is safe here: the drop is aborted and nothing has been removed.
+
+Or the command **fails** with the message that tells you the fix:
+
+```
+ERROR:  could not connect to publisher when attempting to drop replication slot "app_sub"
+DETAIL:  The error was: could not connect to server: Connection refused
+HINT:  Use ALTER SUBSCRIPTION ... SET (slot_name = NONE) to disassociate the
+       subscription from the slot.
+```
+
+Take the hint literally. `slot_name = NONE` severs the link between the local subscription and the remote slot, so `DROP SUBSCRIPTION` becomes a purely local operation:
+
+```sql
+-- Must be disabled first
+ALTER SUBSCRIPTION app_sub DISABLE;
+
+-- Forget the remote slot
+ALTER SUBSCRIPTION app_sub SET (slot_name = NONE);
+
+-- Now this touches nothing remote and returns instantly
+DROP SUBSCRIPTION app_sub;
+```
+
+The `DISABLE` is not optional. Attempting `SET (slot_name = NONE)` on an enabled subscription is rejected, because a running apply worker would still be using the slot it was just told to forget.
+
+The cost of this escape hatch is that the slot on the publisher is now orphaned. If the publisher is genuinely gone forever, that is fine. If it is merely unreachable right now, you have created a WAL leak on a live server and you must go back and clean it up.
+
+### Cleaning up the orphaned slot on the publisher
+
+Once the publisher is reachable again, list what is left behind:
+
+```sql
+-- On the publisher
+SELECT slot_name,
+       plugin,
+       slot_type,
+       database,
+       active,
+       active_pid,
+       wal_status,
+       pg_size_pretty(
+         pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn)
+       ) AS retained_wal
+FROM   pg_replication_slots
+ORDER  BY pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn) DESC;
+```
+
+An orphan is a logical slot with `active = false` and a name matching a subscription that no longer exists. Drop it:
+
+```sql
+SELECT pg_drop_replication_slot('app_sub');
+```
+
+If it reports the slot is active for some PID, a consumer is still attached — confirm what it is with `pg_stat_replication` before terminating anything, because the obvious candidate is sometimes a healthy subscriber you forgot about. WAL is not released at the moment the slot is dropped; it goes at the next checkpoint, which you can force with `CHECKPOINT;` if the disk pressure is urgent.
+
+A useful reconciliation habit on any publisher: every logical slot should correspond to a live subscription or a known CDC consumer. Slots with `active = false` for more than a few minutes deserve an explanation.
+
+## Why DROP SUBSCRIPTION cannot run in a transaction block
+
+If your migration tool wraps statements in `BEGIN`/`COMMIT` — and most of them do — you will hit this:
+
+```
+ERROR:  DROP SUBSCRIPTION cannot run inside a transaction block
+```
+
+The reason is that dropping a replication slot on the publisher is not a transactional operation. It happens over a separate replication connection, on a different server, and cannot be rolled back. PostgreSQL refuses to let you put a non-revertible remote side effect inside a transaction that might abort, because a rollback would leave the local catalog claiming a slot that no longer exists.
+
+The restriction is conditional, which explains why it seems inconsistent: if the subscription has no associated slot (`slot_name = NONE`), there is nothing remote to do and `DROP SUBSCRIPTION` works fine inside a transaction. So the transaction-safe form of the teardown is:
+
+```sql
+-- Outside any transaction block
+ALTER SUBSCRIPTION app_sub DISABLE;
+ALTER SUBSCRIPTION app_sub SET (slot_name = NONE);
+```
+
+```sql
+-- Now this is safe inside a migration transaction
+BEGIN;
+DROP SUBSCRIPTION app_sub;
+COMMIT;
+```
+
+Use this deliberately, not as a default — you have again taken responsibility for dropping the slot on the publisher yourself.
+
+The same rule applies to `ALTER SUBSCRIPTION ... REFRESH PUBLICATION` with `copy_data = true`, and to `CREATE SUBSCRIPTION` when it creates a slot. Anything that reaches across to the publisher is barred from a transaction block.
+
+## Other ALTER SUBSCRIPTION operations you need during teardown
+
+Repointing rather than dropping is often the real goal — after a publisher failover, for instance:
+
+```sql
+-- New publisher address, same slot name on the new primary
+ALTER SUBSCRIPTION app_sub
+    CONNECTION 'host=10.0.0.20 port=5432 dbname=appdb user=replicator password=secret connect_timeout=10';
+```
+
+Adding `connect_timeout` to the connection string is a small habit with a large payoff: it turns an indefinite hang on a dead publisher into a prompt error.
+
+Changing the publication list, available since PostgreSQL 14 for the add and drop forms:
+
+```sql
+ALTER SUBSCRIPTION app_sub SET PUBLICATION app_pub_v2;
+ALTER SUBSCRIPTION app_sub ADD PUBLICATION reporting_pub;
+ALTER SUBSCRIPTION app_sub DROP PUBLICATION legacy_pub;
+
+-- Re-read table membership from the publisher
+ALTER SUBSCRIPTION app_sub REFRESH PUBLICATION;
+```
+
+Renaming the slot, which is how you attach a subscription to a slot you created by hand:
+
+```sql
+ALTER SUBSCRIPTION app_sub DISABLE;
+ALTER SUBSCRIPTION app_sub SET (slot_name = 'app_sub_new');
+ALTER SUBSCRIPTION app_sub ENABLE;
+```
+
+And a setting that prevents half of all teardowns from being needed in the first place, added in PostgreSQL 15:
+
+```sql
+-- PostgreSQL 15+
+ALTER SUBSCRIPTION app_sub SET (disable_on_error = true);
+```
+
+With this on, an apply error disables the subscription instead of retrying forever. You still have to fix the cause, but the subscriber stops hammering the publisher and the log stops filling.
+
+## Two-phase subscriptions
+
+The `two_phase` option, introduced in PostgreSQL 14, makes the subscriber apply `PREPARE TRANSACTION` at prepare time rather than waiting for the commit:
+
+```sql
+CREATE SUBSCRIPTION app_sub
+    CONNECTION '...'
+    PUBLICATION app_pub
+    WITH (two_phase = true);
+```
+
+It complicates teardown in one specific way: prepared transactions created by the apply worker on the subscriber are **not** removed by `DROP SUBSCRIPTION`. They survive as orphans, and a prepared transaction holds locks and pins the transaction horizon, blocking vacuum on the subscriber indefinitely — the same class of problem as an orphaned slot, on the other side of the link.
+
+Check before and after:
+
+```sql
+-- On the subscriber
+SELECT gid, prepared, owner, database, transaction
+FROM   pg_prepared_xacts
+ORDER  BY prepared;
+```
+
+Any entry left over from the subscription must be resolved by hand:
+
+```sql
+COMMIT PREPARED 'the_gid_from_above';
+-- or
+ROLLBACK PREPARED 'the_gid_from_above';
+```
+
+Choosing between them requires knowing whether the transaction was committed on the publisher. If the publisher is still available, look for the corresponding transaction there before deciding; if it is not, rolling back is the conservative choice, at the cost of losing that transaction on the subscriber. Resolve prepared transactions *before* dropping the subscription, while you can still correlate them with publisher state.
+
+Also note that `two_phase` can only be set at `CREATE SUBSCRIPTION` time through PostgreSQL 16; the ability to turn it off on an existing subscription with `ALTER SUBSCRIPTION` arrived in PostgreSQL 17, and requires the subscription to be disabled with no pending prepared transactions.
+
+## Verification checklist
+
+After a teardown, run through this. Each item catches a different kind of leftover.
+
+On the subscriber:
+
+```sql
+-- 1. The subscription is gone
+SELECT subname FROM pg_subscription WHERE subname = 'app_sub';   -- expect 0 rows
+
+-- 2. No per-table state remains
+SELECT srrelid::regclass, srsubstate
+FROM   pg_subscription_rel
+WHERE  srsubid NOT IN (SELECT oid FROM pg_subscription);         -- expect 0 rows
+
+-- 3. No workers running
+SELECT subname, pid FROM pg_stat_subscription;                   -- expect no app_sub row
+
+-- 4. No orphaned replication origin
+SELECT roname, roident FROM pg_replication_origin;
+
+-- 5. No orphaned prepared transactions (two_phase subscriptions)
+SELECT gid, prepared FROM pg_prepared_xacts;                     -- expect 0 rows
+```
+
+Replication origins are named `pg_` followed by the subscription OID, and `DROP SUBSCRIPTION` normally removes them. If a drop was interrupted you can be left with one, which is harmless but confusing; remove it explicitly:
+
+```sql
+SELECT pg_replication_origin_drop('pg_16401');
+```
+
+On the publisher:
+
+```sql
+-- 6. The slot is gone
+SELECT slot_name, active, wal_status
+FROM   pg_replication_slots
+WHERE  slot_name = 'app_sub';                                    -- expect 0 rows
+
+-- 7. No walsender still attached
+SELECT pid, application_name, state
+FROM   pg_stat_replication
+WHERE  application_name = 'app_sub';                             -- expect 0 rows
+
+-- 8. WAL is actually being recycled again
+SELECT pg_size_pretty(sum(size)) AS pg_wal_size FROM pg_ls_waldir();
+```
+
+Item eight is the one that tells you the cleanup achieved anything. Check it after a checkpoint has run; if `pg_wal` is still growing, another slot is holding WAL and you have more reconciling to do.
+
+Running this checklist across both ends is tedious in two terminals and trivial with both connections open side by side in a client like [Chat2DB](https://app.chat2db.ai), where you can keep the publisher and subscriber queries as saved snippets and re-run the whole set after every teardown.
+
+## Wrapping up
+
+Three rules cover almost every subscription teardown. Always `DISABLE` before you drop, so no worker is mid-transaction. Never leave a subscription disabled as a resting state, because the slot behind it keeps retaining WAL and blocking vacuum on the publisher. And when the publisher is unreachable, do not fight the hang — `ALTER SUBSCRIPTION name SET (slot_name = NONE)` converts the drop into a local operation, at the price of a slot on the publisher that is now your responsibility to remove.
+
+The single most valuable habit is treating "drop the replication slot on the publisher" as a distinct, explicitly verified step rather than something `DROP SUBSCRIPTION` will silently handle. It handles it exactly when the publisher is reachable, and those are precisely the teardowns that were never going to cause you trouble.

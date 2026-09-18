@@ -1,0 +1,291 @@
+---
+title: "Postgres generate_series: Complete Guide"
+description: "Use PostgreSQL generate_series for date ranges, calendar tables, time buckets, gap-filled reports and test data, including inclusive bounds and month steps."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: September 12, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# Postgres generate_series: Complete Guide
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="September 12, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+
+There is a category of SQL problem that looks impossible until you realise the answer is to invent rows that do not exist. A daily signups chart with no bar for the days nobody signed up. A test table that needs a million rows. A report that must show every month of the year, including the quiet ones. `generate_series` is PostgreSQL's answer to all of them.
+
+It is a set-returning function: call it in the `FROM` clause and it produces rows.
+
+## The basic shapes
+
+```sql
+-- Integers
+SELECT i FROM generate_series(1, 5) AS i;              -- 1,2,3,4,5
+SELECT i FROM generate_series(1, 10, 3) AS i;          -- 1,4,7,10
+SELECT i FROM generate_series(10, 1, -2) AS i;         -- 10,8,6,4,2
+
+-- Dates and timestamps (the third argument is an interval)
+SELECT d::date
+FROM generate_series('2026-01-01'::date, '2026-01-05'::date, interval '1 day') AS d;
+
+-- Sub-daily
+SELECT t
+FROM generate_series('2026-01-01 00:00'::timestamptz,
+                     '2026-01-01 02:00'::timestamptz,
+                     interval '15 minutes') AS t;
+```
+
+Three rules cover most of the surprises.
+
+**Both bounds are inclusive, but only if the step lands on the stop value.** The series emits `start`, `start + step`, `start + 2*step` and so on while the value is less than or equal to `stop`, then halts. So `generate_series(1, 10, 3)` ends at 10 and includes it, while `generate_series(1, 10, 4)` gives 1, 5, 9 and stops short. It never overshoots.
+
+**A step in the wrong direction returns zero rows, not an error.** `generate_series(10, 1)` yields nothing at all. A step of exactly zero does raise `ERROR: step size cannot equal zero`.
+
+**The date form returns `timestamp`, not `date`.** `generate_series(date, date, interval)` produces timestamps at midnight, so cast explicitly when you need a date column:
+
+```sql
+SELECT d::date AS day
+FROM generate_series('2026-01-01'::date, '2026-12-31'::date, interval '1 day') AS d;
+```
+
+The cast is not cosmetic. Joining an uncast timestamp series against a `date` column forces a type coercion that can prevent the planner from using an index on that column.
+
+## Month steps and the drift that does not happen
+
+Adding `interval '1 month'` to January 31 gives February 28, because PostgreSQL clamps to the end of the shorter month. If you then add another month to *that* result you get March 28, and the day has drifted permanently. Recursive CTEs written to generate month series suffer from exactly this bug.
+
+`generate_series` does not, because each value is computed as `start + n * step` from the original start rather than by repeatedly adding:
+
+```sql
+SELECT d::date
+FROM generate_series('2026-01-31'::date, '2026-06-30'::date, interval '1 month') AS d;
+```
+
+```
+ 2026-01-31
+ 2026-02-28
+ 2026-03-31
+ 2026-04-30
+ 2026-05-31
+ 2026-06-30
+```
+
+The day of month recovers after February instead of sticking at 28. That property alone is a good reason to prefer `generate_series` over hand-rolled recursion.
+
+For month *boundaries* rather than same-day-of-month values, anchor the start with `date_trunc`:
+
+```sql
+SELECT m::date AS month_start,
+       (m + interval '1 month' - interval '1 day')::date AS month_end
+FROM generate_series(date_trunc('month', '2026-01-15'::timestamp),
+                     '2026-06-30'::timestamp,
+                     interval '1 month') AS m;
+```
+
+## A calendar table
+
+Reporting systems benefit enormously from a calendar relation to join against. You can build one as a table or leave it as a view:
+
+```sql
+CREATE TABLE calendar AS
+SELECT
+  d::date                                     AS day,
+  extract(isodow FROM d)::int                 AS iso_weekday,   -- 1 = Mon .. 7 = Sun
+  extract(isodow FROM d) IN (6, 7)            AS is_weekend,
+  to_char(d, 'Dy')                            AS weekday_name,
+  date_trunc('week',  d)::date                AS week_start,
+  date_trunc('month', d)::date                AS month_start,
+  (date_trunc('month', d) + interval '1 month - 1 day')::date AS month_end,
+  extract(quarter FROM d)::int                AS quarter,
+  extract(year FROM d)::int                   AS year,
+  extract(week FROM d)::int                   AS iso_week
+FROM generate_series('2020-01-01'::date, '2030-12-31'::date, interval '1 day') AS d;
+
+ALTER TABLE calendar ADD PRIMARY KEY (day);
+```
+
+Roughly four thousand rows, and every date-dimension question - business days between two dates, the Monday of a given week, which quarter a date falls in - becomes a join instead of an expression. A materialised table also gives you somewhere to record holidays and fiscal periods, which no function can derive.
+
+## Gap filling: the main event
+
+This is the problem most people arrive with. The naive daily count:
+
+```sql
+SELECT created_at::date AS day, count(*)
+FROM orders
+WHERE created_at >= '2026-09-01' AND created_at < '2026-09-08'
+GROUP BY 1 ORDER BY 1;
+```
+
+```
+    day     | count
+------------+-------
+ 2026-09-01 |    12
+ 2026-09-02 |     7
+ 2026-09-05 |     3
+```
+
+September 3, 4, 6 and 7 are missing, because `GROUP BY` can only return groups that contain at least one row. A chart built on this draws a straight line across four days and quietly misrepresents the data.
+
+Generate the days first, then join the data onto them:
+
+```sql
+SELECT s.day,
+       count(o.id) AS orders,
+       coalesce(sum(o.total), 0) AS revenue
+FROM generate_series('2026-09-01'::date, '2026-09-07'::date, interval '1 day') AS s(day)
+LEFT JOIN orders o
+       ON o.created_at >= s.day
+      AND o.created_at <  s.day + interval '1 day'
+GROUP BY s.day
+ORDER BY s.day;
+```
+
+```
+    day     | orders | revenue
+------------+--------+---------
+ 2026-09-01 |     12 |  1840.00
+ 2026-09-02 |      7 |   903.50
+ 2026-09-03 |      0 |     0.00
+ 2026-09-04 |      0 |     0.00
+ 2026-09-05 |      3 |   275.00
+ 2026-09-06 |      0 |     0.00
+ 2026-09-07 |      0 |     0.00
+```
+
+Three details make this correct and fast.
+
+Use `count(o.id)`, not `count(*)`. With a `LEFT JOIN`, `count(*)` counts the spine row itself and returns 1 for empty days.
+
+Use a half-open range (`>= day AND < day + 1 day`), not `BETWEEN`. `BETWEEN` is inclusive on both ends, so a row at exactly midnight is counted in two buckets.
+
+Keep the comparison on the bare column. Writing `ON date_trunc('day', o.created_at) = s.day` wraps the indexed column in a function and forces a scan; comparing `o.created_at` against two boundaries lets an index on `created_at` do the work.
+
+### Carry forward instead of zero
+
+For counts, zero is the right fill. For a balance, a stock level or a gauge, "no row today" means "unchanged", and zero would be a lie. Carry the previous value forward with a window function:
+
+```sql
+WITH spine AS (
+  SELECT d::date AS day
+  FROM generate_series('2026-09-01'::date, '2026-09-07'::date, interval '1 day') AS d
+),
+daily AS (
+  SELECT recorded_on, balance FROM account_balances WHERE account_id = 7
+)
+SELECT s.day,
+       coalesce(
+         d.balance,
+         max(d.balance) FILTER (WHERE d.balance IS NOT NULL)
+           OVER (ORDER BY s.day)
+       ) AS balance
+FROM spine s
+LEFT JOIN daily d ON d.recorded_on = s.day
+ORDER BY s.day;
+```
+
+The `FILTER`ed `max()` over a running window is the standard last-known-value idiom; it is considerably faster than a correlated subquery per row.
+
+## Arbitrary-width buckets with date_bin
+
+`date_trunc` only buckets to named units - hour, day, month. For 15-minute or 10-day buckets, PostgreSQL 14 added `date_bin`:
+
+```sql
+SELECT date_bin(interval '15 minutes', created_at, '2026-09-01'::timestamptz) AS bucket,
+       count(*)
+FROM events
+WHERE created_at >= '2026-09-01' AND created_at < '2026-09-02'
+GROUP BY 1 ORDER BY 1;
+```
+
+The third argument is the origin the buckets align to. Combine it with a `generate_series` spine to keep empty buckets:
+
+```sql
+WITH spine AS (
+  SELECT b FROM generate_series('2026-09-01 00:00'::timestamptz,
+                                '2026-09-01 23:45'::timestamptz,
+                                interval '15 minutes') AS b
+),
+agg AS (
+  SELECT date_bin(interval '15 minutes', created_at, '2026-09-01'::timestamptz) AS b,
+         count(*) AS n
+  FROM events
+  WHERE created_at >= '2026-09-01' AND created_at < '2026-09-02'
+  GROUP BY 1
+)
+SELECT spine.b, coalesce(agg.n, 0) AS n
+FROM spine LEFT JOIN agg USING (b)
+ORDER BY spine.b;
+```
+
+`date_bin` does not work with months or years, because those are not fixed-width; use `date_trunc` for those.
+
+## Time zones
+
+A series of `timestamptz` values stepped by `interval '1 day'` adds exactly 24 hours each time. Across a daylight-saving transition, local midnight moves, so the buckets drift relative to the wall clock. If your report should follow local days, generate the series in local time and convert:
+
+```sql
+SELECT (d AT TIME ZONE 'Europe/Berlin') AS local_day_start_utc, d::date AS local_day
+FROM generate_series('2026-03-28'::timestamp, '2026-03-31'::timestamp, interval '1 day') AS d;
+```
+
+Here the series is plain `timestamp` - wall-clock values with no zone - and `AT TIME ZONE` converts each local midnight to the correct instant, which is 23:00 UTC before the transition and 22:00 UTC after it. Generating in UTC and converting afterwards gives you buckets that are consistently 24 hours long but not aligned to local midnight; which one is correct depends on what the report claims to show, so decide deliberately.
+
+## Generating test data
+
+`generate_series` is the fastest way to fabricate rows for a benchmark:
+
+```sql
+SELECT setseed(0.42);   -- makes random() reproducible
+
+INSERT INTO orders (customer_id, status, total, created_at)
+SELECT 1 + (random() * 9999)::int,
+       (ARRAY['pending','paid','shipped','refunded'])[1 + (i % 4)],
+       round((random() * 500 + 5)::numeric, 2),
+       now() - (random() * interval '365 days')
+FROM generate_series(1, 1000000) AS g(i);
+```
+
+Useful expressions to mix in:
+
+```sql
+'user_' || i                              -- unique predictable text
+md5(i::text)::uuid                        -- stable fake UUID
+(random() < 0.05)                         -- 5% true flag
+CASE WHEN i % 10 = 0 THEN NULL ELSE i END -- 10% NULLs, to test your queries
+(ARRAY['DE','FR','US','JP'])[1 + (i % 4)] -- cycling category
+```
+
+`setseed` first matters more than it seems: without it, two runs generate different data and your before-and-after benchmark compares two different tables.
+
+## Other set-returning functions
+
+`generate_series` has relatives worth knowing:
+
+```sql
+SELECT * FROM generate_subscripts(ARRAY['a','b','c'], 1);   -- 1,2,3
+SELECT * FROM unnest(ARRAY['a','b','c']) WITH ORDINALITY;   -- element + position
+SELECT * FROM regexp_split_to_table('a,b,c', ',');          -- rows from text
+SELECT * FROM jsonb_array_elements('[1,2,3]'::jsonb);       -- rows from JSON
+```
+
+All of them behave the same way: call them in `FROM`, optionally with `LATERAL` so they can reference columns of a preceding table:
+
+```sql
+SELECT p.id, e.tag
+FROM posts p
+CROSS JOIN LATERAL unnest(p.tags) AS e(tag);
+```
+
+## Performance notes
+
+The planner knows `generate_series` returns 1000 rows by default when it cannot tell, which can produce poor join choices for very large series. When you generate millions of rows and join them, check the plan; `EXPLAIN (ANALYZE, BUFFERS)` will show whether the estimate was close. For repeatedly used spines, materialising a calendar table with a primary key is both faster and better estimated than regenerating the series in every query.
+
+Also avoid generating far more rows than you need and filtering afterwards. `WHERE d BETWEEN ...` on a ten-year series computes all ten years first; bound the series itself instead. For building and previewing these series interactively, the [Postgres generate_series builder](https://chat2db.ai/tools/postgres-generate-series-builder) shows the row count and real last value before you run anything, and [Chat2DB](https://chat2db.ai/download) runs the resulting SQL against your database.
+
+## Summary
+
+`generate_series` invents the rows your data is missing. Remember that the stop bound is inclusive only when the step lands on it, that the date form returns `timestamp` so you should cast to `date`, and that month steps are computed from the start value so they do not drift. Use it as a spine with a `LEFT JOIN` for gap-free reports, `date_bin` for arbitrary bucket widths, and `setseed` plus a series for reproducible test data.

@@ -1,0 +1,471 @@
+---
+title: "Postgres List Schemas: psql \\dn and SQL Queries"
+description: "List schemas in PostgreSQL with psql \\dn, information_schema.schemata and pg_namespace, then manage search_path, privileges and schema sizes with runnable SQL."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: September 11, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# Postgres List Schemas: psql `\dn` and SQL Queries
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="September 11, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+
+Listing schemas is one of the first things you do when you connect to an unfamiliar PostgreSQL database. There are three ways to do it: the psql meta-command `\dn`, the SQL-standard `information_schema.schemata` view, and the PostgreSQL system catalog `pg_namespace`. Each shows slightly different information. This article covers all three, then moves on to the questions that usually follow: which schema am I in, why can I not see a table I know exists, how big is each schema, and how do I create or drop one safely.
+
+## What a Schema Is in PostgreSQL
+
+A PostgreSQL cluster contains databases. Each database contains schemas. Each schema contains tables, views, functions, types and sequences. A schema is a namespace: two tables named `orders` can coexist in the same database as long as they live in different schemas, for example `sales.orders` and `archive.orders`.
+
+Databases are isolated from each other. A single connection is bound to one database and cannot query tables in another database without an extension such as `postgres_fdw` or `dblink`. Schemas within the same database are not isolated in that way. A query can join `sales.orders` to `archive.orders` freely, subject to privileges.
+
+This is where MySQL users get confused. In MySQL, `CREATE SCHEMA` is a synonym for `CREATE DATABASE`, and `SHOW SCHEMAS` is the same as `SHOW DATABASES`. In PostgreSQL the two are distinct layers. When a MySQL guide says "switch schemas", the PostgreSQL equivalent is usually to change `search_path`, not to reconnect.
+
+Every new PostgreSQL database comes with a schema named `public`, plus the system schemas `pg_catalog`, `information_schema` and `pg_toast`. Temporary tables live in per-session schemas named `pg_temp_N`.
+
+## Set Up Sample Schemas
+
+Run this block first so the listing commands below have something to show. It creates two application schemas and a table in each.
+
+```sql
+CREATE ROLE app_owner NOLOGIN;
+CREATE ROLE reporting_user LOGIN PASSWORD 'change-me';
+
+CREATE SCHEMA sales AUTHORIZATION app_owner;
+CREATE SCHEMA archive AUTHORIZATION app_owner;
+
+CREATE TABLE sales.orders (
+    id          serial PRIMARY KEY,
+    customer    text NOT NULL,
+    amount      numeric(10,2) NOT NULL,
+    ordered_at  timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE TABLE sales.customers (
+    id    serial PRIMARY KEY,
+    name  text NOT NULL
+);
+
+CREATE TABLE archive.orders (
+    id          integer PRIMARY KEY,
+    customer    text NOT NULL,
+    amount      numeric(10,2) NOT NULL,
+    ordered_at  timestamptz NOT NULL
+);
+
+INSERT INTO sales.customers (name) VALUES ('Acme'), ('Globex');
+INSERT INTO sales.orders (customer, amount) VALUES ('Acme', 120.00), ('Globex', 75.50);
+INSERT INTO archive.orders VALUES (1, 'Initech', 300.00, '2025-01-10 09:00:00+00');
+
+COMMENT ON SCHEMA sales IS 'Live transactional data';
+COMMENT ON SCHEMA archive IS 'Orders older than one year';
+```
+
+## psql List Schemas With `\dn`
+
+In psql, the quickest command is `\dn` (describe namespaces).
+
+```text
+mydb=# \dn
+        List of schemas
+  Name   |       Owner
+---------+-------------------
+ archive | app_owner
+ public  | pg_database_owner
+ sales   | app_owner
+(3 rows)
+```
+
+Note that `\dn` hides system schemas. On PostgreSQL 15 and later, the `public` schema is owned by the pseudo-role `pg_database_owner`; on older versions it is owned by `postgres`.
+
+### `\dn+` for privileges and comments
+
+Adding `+` shows the access privilege list and the schema comment.
+
+```text
+mydb=# \dn+
+                                     List of schemas
+  Name   |       Owner       |           Access privileges            |        Description
+---------+-------------------+---------------------------------------+---------------------------
+ archive | app_owner         |                                       | Orders older than one year
+ public  | pg_database_owner | pg_database_owner=UC/pg_database_owner+| standard public schema
+         |                   | =U/pg_database_owner                  |
+ sales   | app_owner         |                                       | Live transactional data
+(3 rows)
+```
+
+An empty privileges column means only the owner has access. The `public` row shows `U` (USAGE) granted to everyone (`=U/...`) but `C` (CREATE) only to the owner, which is the PostgreSQL 15 default discussed later.
+
+### `\dnS` to include system schemas
+
+The `S` modifier includes system objects.
+
+```text
+mydb=# \dnS
+          List of schemas
+        Name        |       Owner
+--------------------+-------------------
+ archive            | app_owner
+ information_schema | postgres
+ pg_catalog         | postgres
+ pg_toast           | postgres
+ public             | pg_database_owner
+ sales              | app_owner
+(6 rows)
+```
+
+You can combine modifiers and add a pattern: `\dnS+ pg_*` lists only schemas whose names start with `pg_`, with full details.
+
+## PostgreSQL Show Schemas With information_schema
+
+`information_schema.schemata` is defined by the SQL standard, so the same query works on other databases with minor differences. This is the best choice when your code needs to be portable or when you are connecting from a tool that does not support psql meta-commands.
+
+```sql
+SELECT schema_name, schema_owner
+FROM information_schema.schemata
+ORDER BY schema_name;
+```
+
+```text
+    schema_name     |   schema_owner
+--------------------+-------------------
+ archive            | app_owner
+ information_schema | postgres
+ pg_catalog         | postgres
+ pg_toast           | postgres
+ public             | pg_database_owner
+ sales              | app_owner
+```
+
+Unlike `\dn`, this view includes system schemas. Filter them out with a `WHERE` clause:
+
+```sql
+SELECT schema_name, schema_owner
+FROM information_schema.schemata
+WHERE schema_name NOT IN ('pg_catalog', 'information_schema')
+  AND schema_name NOT LIKE 'pg_toast%'
+  AND schema_name NOT LIKE 'pg_temp%'
+ORDER BY schema_name;
+```
+
+One caveat: `information_schema.schemata` only shows schemas the current user owns or has some privilege on. If you connect as a low-privilege role and the list looks short, that is why. The catalog query in the next section does not have this restriction.
+
+## Postgres List Schemas With pg_namespace
+
+`pg_namespace` is the underlying system catalog. It exposes everything and lets you join to other catalogs for extra detail. The owner is stored as an OID, so join `pg_roles` to get the name.
+
+```sql
+SELECT n.nspname                        AS schema_name,
+       r.rolname                        AS owner,
+       obj_description(n.oid, 'pg_namespace') AS comment
+FROM pg_namespace n
+JOIN pg_roles r ON r.oid = n.nspowner
+WHERE n.nspname NOT IN ('pg_catalog', 'information_schema')
+  AND n.nspname NOT LIKE 'pg_toast%'
+  AND n.nspname NOT LIKE 'pg_temp%'
+ORDER BY n.nspname;
+```
+
+```text
+ schema_name |       owner       |          comment
+-------------+-------------------+----------------------------
+ archive     | app_owner         | Orders older than one year
+ public      | pg_database_owner | standard public schema
+ sales       | app_owner         | Live transactional data
+```
+
+This is essentially what psql runs under the hood for `\dn+`. You can confirm by starting psql with `-E` (or running `\set ECHO_HIDDEN on`), which prints the SQL behind every meta-command.
+
+## Listing Tables per Schema
+
+Once you know the schema names, the next step is usually to see what is inside. In psql:
+
+```text
+mydb=# \dt sales.*
+          List of relations
+ Schema |   Name    | Type  |   Owner
+--------+-----------+-------+----------
+ sales  | customers | table | postgres
+ sales  | orders    | table | postgres
+(2 rows)
+```
+
+`\dt *.*` lists tables in every schema, including system ones. In SQL, use `pg_tables`:
+
+```sql
+SELECT schemaname, tablename, tableowner
+FROM pg_tables
+WHERE schemaname NOT IN ('pg_catalog', 'information_schema')
+ORDER BY schemaname, tablename;
+```
+
+```text
+ schemaname | tablename | tableowner
+------------+-----------+------------
+ archive    | orders    | postgres
+ sales      | customers | postgres
+ sales      | orders    | postgres
+```
+
+To get a count per schema, which is handy for a quick overview of a large database:
+
+```sql
+SELECT schemaname, count(*) AS tables
+FROM pg_tables
+WHERE schemaname NOT IN ('pg_catalog', 'information_schema')
+GROUP BY schemaname
+ORDER BY schemaname;
+```
+
+## Which Schema Am I In?
+
+Two functions answer this. `current_schema()` returns the first existing schema in your `search_path`, which is where an unqualified `CREATE TABLE` would put a new table. `current_schemas(true)` returns the full effective search path as an array, including implicitly searched schemas when the argument is `true`.
+
+```sql
+SELECT current_schema(), current_schemas(true), current_schemas(false);
+```
+
+```text
+ current_schema |   current_schemas    | current_schemas
+----------------+----------------------+-----------------
+ public         | {pg_catalog,public}  | {public}
+```
+
+`pg_catalog` is always searched first even though it does not appear in the configured `search_path`, which is why `current_schemas(true)` includes it. Any `pg_temp` schema for the session is also searched implicitly.
+
+## Postgres search_path Explained
+
+`search_path` is a session setting that lists the schemas PostgreSQL checks, in order, when you refer to a table without a schema prefix. The default value is:
+
+```sql
+SHOW search_path;
+```
+
+```text
+   search_path
+-----------------
+ "$user", public
+```
+
+`"$user"` means "a schema with the same name as the current role, if it exists". Most databases have no such schema, so lookups fall through to `public`.
+
+With the sample data loaded, `SELECT * FROM orders` fails because `orders` is in `sales`, not `public`:
+
+```text
+ERROR:  relation "orders" does not exist
+```
+
+Change the search path for the session and the same query works:
+
+```sql
+SET search_path TO sales, public;
+SELECT id, customer, amount FROM orders;
+```
+
+```text
+ id | customer | amount
+----+----------+--------
+  1 | Acme     | 120.00
+  2 | Globex   |  75.50
+```
+
+Make it permanent for a role so every new session starts with it:
+
+```sql
+ALTER ROLE reporting_user SET search_path TO sales, public;
+```
+
+Or for every connection to a database:
+
+```sql
+ALTER DATABASE mydb SET search_path TO sales, public;
+```
+
+A note on ambiguity: both `sales` and `archive` have a table called `orders`. With `search_path = sales, public`, unqualified `orders` means `sales.orders`. If you later add `archive` to the front of the path, the same query silently returns different data. For application code, schema-qualify table names or set `search_path` explicitly at connection time rather than relying on defaults.
+
+## Schema Sizes
+
+`pg_total_relation_size` returns the on-disk size of a table including its indexes and TOAST data. Aggregate it per schema to see where the space goes.
+
+```sql
+SELECT n.nspname                                          AS schema_name,
+       count(c.oid)                                       AS tables,
+       pg_size_pretty(sum(pg_total_relation_size(c.oid))) AS total_size
+FROM pg_class c
+JOIN pg_namespace n ON n.oid = c.relnamespace
+WHERE c.relkind IN ('r', 'm', 'p')
+  AND n.nspname NOT IN ('pg_catalog', 'information_schema')
+  AND n.nspname NOT LIKE 'pg_toast%'
+GROUP BY n.nspname
+ORDER BY sum(pg_total_relation_size(c.oid)) DESC;
+```
+
+```text
+ schema_name | tables | total_size
+-------------+--------+------------
+ sales       |      2 | 80 kB
+ archive     |      1 | 24 kB
+```
+
+`relkind` values `r`, `m` and `p` are ordinary tables, materialized views and partitioned tables respectively. Indexes are already counted inside `pg_total_relation_size`, so they are excluded from the `relkind` filter to avoid double counting. Actual sizes on your system will differ from the sample output depending on page layout and version.
+
+## Why a User Cannot See a Schema's Contents
+
+A schema has two privileges: `USAGE` lets a role look up objects inside it, and `CREATE` lets a role create objects in it. Without `USAGE`, a role can see that the schema exists in `pg_namespace` but every query against a table in it fails with a permission error, even if the role has `SELECT` on the table itself.
+
+Try it with the sample role:
+
+```sql
+SET ROLE reporting_user;
+SELECT * FROM sales.orders;
+```
+
+```text
+ERROR:  permission denied for schema sales
+```
+
+Check what the role has:
+
+```sql
+SELECT has_schema_privilege('reporting_user', 'sales', 'USAGE')  AS can_use,
+       has_schema_privilege('reporting_user', 'sales', 'CREATE') AS can_create;
+```
+
+```text
+ can_use | can_create
+---------+------------
+ f       | f
+```
+
+Grant both levels, then re-check:
+
+```sql
+RESET ROLE;
+GRANT USAGE ON SCHEMA sales TO reporting_user;
+GRANT SELECT ON ALL TABLES IN SCHEMA sales TO reporting_user;
+ALTER DEFAULT PRIVILEGES IN SCHEMA sales GRANT SELECT ON TABLES TO reporting_user;
+
+SELECT has_schema_privilege('reporting_user', 'sales', 'USAGE') AS can_use;
+```
+
+```text
+ can_use
+---------
+ t
+```
+
+The `ALTER DEFAULT PRIVILEGES` line ensures tables created in `sales` in the future are also readable. Without it, each new table requires a fresh `GRANT`.
+
+To audit schema privileges across all roles, query `pg_namespace.nspacl` with `aclexplode`:
+
+```sql
+SELECT n.nspname,
+       g.rolname       AS grantee,
+       a.privilege_type
+FROM pg_namespace n
+CROSS JOIN LATERAL aclexplode(n.nspacl) a
+JOIN pg_roles g ON g.oid = a.grantee
+WHERE n.nspname = 'sales';
+```
+
+## Creating and Dropping Schemas
+
+### CREATE SCHEMA
+
+`IF NOT EXISTS` makes the statement idempotent, which matters in migration scripts that may run more than once. `AUTHORIZATION` sets the owner, who automatically gets both `USAGE` and `CREATE`.
+
+```sql
+CREATE SCHEMA IF NOT EXISTS staging AUTHORIZATION app_owner;
+```
+
+You can create objects inside the schema in the same statement:
+
+```sql
+CREATE SCHEMA IF NOT EXISTS staging_v2 AUTHORIZATION app_owner
+    CREATE TABLE imports (id serial PRIMARY KEY, payload jsonb);
+```
+
+Note that `IF NOT EXISTS` cannot be combined with schema elements in the same statement on all versions; if you hit a syntax error, split it into `CREATE SCHEMA` followed by `CREATE TABLE`.
+
+### DROP SCHEMA
+
+By default, `DROP SCHEMA` refuses to remove a schema that still contains objects:
+
+```sql
+DROP SCHEMA staging_v2;
+```
+
+```text
+ERROR:  cannot drop schema staging_v2 because other objects depend on it
+DETAIL:  table staging_v2.imports depends on schema staging_v2
+HINT:  Use DROP ... CASCADE to drop the dependent objects too.
+```
+
+`CASCADE` removes the schema and everything inside it, along with any views or foreign keys in other schemas that depend on those objects.
+
+```sql
+DROP SCHEMA IF EXISTS staging_v2 CASCADE;
+DROP SCHEMA IF EXISTS staging;
+```
+
+Warning: `DROP SCHEMA ... CASCADE` is not reversible and the dependency chain can reach into other schemas. Before running it on anything but a scratch schema, list the contents with `\dt schema.*` and, ideally, run it inside a transaction so you can inspect the `NOTICE` lines listing dropped objects and `ROLLBACK` if they surprise you.
+
+```sql
+BEGIN;
+DROP SCHEMA archive CASCADE;
+-- read the NOTICE output, then either:
+ROLLBACK;
+-- or COMMIT;
+```
+
+## The PostgreSQL 15 Change to public
+
+Before PostgreSQL 15, the `public` schema granted `CREATE` to the `PUBLIC` pseudo-role, meaning every user could create tables in it. This was a long-standing security concern because a low-privilege user could create a function or table that shadowed one in `pg_catalog` for other users' `search_path`.
+
+Since PostgreSQL 15, `public` grants only `USAGE` to everyone. `CREATE` is held by the schema owner, `pg_database_owner`, which resolves to whichever role owns the current database. If an application that worked on PostgreSQL 14 fails on 15 with:
+
+```text
+ERROR:  permission denied for schema public
+```
+
+the fix is either to grant the privilege explicitly:
+
+```sql
+GRANT CREATE ON SCHEMA public TO app_owner;
+```
+
+or, better, to give the application its own schema and set `search_path` to it, as shown earlier. Databases upgraded with `pg_upgrade` keep their old `public` privileges; only newly created databases get the new default.
+
+If you prefer a visual overview, a GUI such as Chat2DB shows every schema as a node in the connection tree with its tables, views and functions underneath, so you can expand `sales` or `archive` without typing any of the queries above. Download it at https://chat2db.ai/download or use the web version at https://app.chat2db.ai.
+
+## Clean Up the Sample Objects
+
+```sql
+DROP SCHEMA IF EXISTS sales CASCADE;
+DROP SCHEMA IF EXISTS archive CASCADE;
+DROP OWNED BY reporting_user;
+DROP ROLE reporting_user;
+DROP ROLE app_owner;
+```
+
+## Summary
+
+In psql, `\dn` lists user schemas, `\dn+` adds privileges and comments, and `\dnS` includes system schemas. In SQL, `information_schema.schemata` is portable but only shows schemas you have privileges on, while `pg_namespace` joined to `pg_roles` shows everything. Use `current_schema()` and `SHOW search_path` to understand where unqualified names resolve, `has_schema_privilege()` to diagnose permission errors, and `pg_total_relation_size` aggregated by `pg_namespace` to see which schemas use the most disk. Create schemas with `IF NOT EXISTS ... AUTHORIZATION`, treat `DROP SCHEMA ... CASCADE` with care, and remember that on PostgreSQL 15 and later `public` no longer grants `CREATE` to everyone.
+
+## FAQ
+
+### How do I list schemas in PostgreSQL without psql?
+
+Run `SELECT schema_name FROM information_schema.schemata;` or, to include schemas you have no privileges on, `SELECT nspname FROM pg_namespace;`. Both work from any SQL client or driver.
+
+### Why does `\dn` not show pg_catalog or information_schema?
+
+`\dn` hides system schemas by default. Use `\dnS` to include them, or query `pg_namespace` directly.
+
+### What is the difference between a schema and a database in PostgreSQL?
+
+A database is a top-level container that a connection is bound to; you cannot query across databases without an extension. A schema is a namespace inside a database, and a single query can join tables from several schemas. In MySQL the word schema means database, which is a common source of confusion when moving between the two systems.

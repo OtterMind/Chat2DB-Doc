@@ -1,0 +1,512 @@
+---
+title: "Sequelize ORM: A Practical Guide for Node.js"
+description: "Learn Sequelize with PostgreSQL: models, associations, eager loading, transactions and migrations, plus the N+1 and pooling traps that bite in production."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: September 14, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# Sequelize ORM: A Practical Guide for Node.js
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="September 14, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+Sequelize is the long-established ORM for Node.js, supporting PostgreSQL, MySQL, MariaDB, SQLite and SQL Server. It predates the current generation of type-first tools and carries a different philosophy: models are defined at runtime, queries are built from plain objects, and the escape hatch to raw SQL is always one call away.
+
+This guide covers using it well against PostgreSQL — including the patterns that separate a Sequelize app that scales from one that falls over under load.
+
+## Setup
+
+```bash
+npm install sequelize pg pg-hstore
+npm install --save-dev sequelize-cli
+```
+
+```javascript
+import { Sequelize } from 'sequelize';
+
+const sequelize = new Sequelize(process.env.DATABASE_URL, {
+  dialect: 'postgres',
+  logging: process.env.NODE_ENV === 'development' ? console.log : false,
+  pool: {
+    max: 10,        // must fit within the database's max_connections
+    min: 0,
+    acquire: 30000, // ms to wait for a connection before throwing
+    idle: 10000,    // ms before an idle connection is released
+  },
+  define: {
+    underscored: true,   // created_at instead of createdAt in the database
+    freezeTableName: false,
+  },
+});
+
+await sequelize.authenticate();
+```
+
+The `pool.max` setting deserves more thought than it usually gets. It is **per process**. Running eight Node instances with `max: 10` means up to 80 connections, and PostgreSQL defaults to `max_connections = 100` — of which some are reserved for superusers. Exceeding it produces `remaining connection slots are reserved` errors under load, which look like application bugs and are not.
+
+```sql
+-- What is the ceiling, and how close are you?
+SHOW max_connections;
+
+SELECT count(*), state
+FROM pg_stat_activity
+WHERE datname = current_database()
+GROUP BY state;
+```
+
+If you need more concurrency than a sensible `max_connections` allows, put PgBouncer in front rather than raising the pool. In transaction pooling mode, disable prepared statements in the driver, since they do not survive connections being swapped between transactions.
+
+## Defining models
+
+```javascript
+import { DataTypes, Model } from 'sequelize';
+
+class User extends Model {}
+
+User.init(
+  {
+    id: {
+      type: DataTypes.BIGINT,
+      primaryKey: true,
+      autoIncrement: true,
+    },
+    email: {
+      type: DataTypes.STRING(255),
+      allowNull: false,
+      unique: true,
+      validate: { isEmail: true },
+    },
+    name: {
+      type: DataTypes.STRING(100),
+      allowNull: false,
+    },
+    status: {
+      type: DataTypes.ENUM('active', 'suspended', 'deleted'),
+      allowNull: false,
+      defaultValue: 'active',
+    },
+    metadata: {
+      type: DataTypes.JSONB,
+      defaultValue: {},
+    },
+  },
+  {
+    sequelize,
+    modelName: 'User',
+    tableName: 'users',
+    timestamps: true,
+    paranoid: true,   // soft deletes via deleted_at
+    indexes: [
+      { fields: ['status'] },
+      { fields: ['created_at'] },
+    ],
+  },
+);
+```
+
+`paranoid: true` turns `destroy()` into an `UPDATE` that sets `deleted_at`, and adds `deleted_at IS NULL` to every subsequent query automatically. It is convenient, but be aware that unique constraints do not know about it — a soft-deleted user still occupies their email address unless you make the unique index partial:
+
+```sql
+CREATE UNIQUE INDEX users_email_active
+  ON users (email)
+  WHERE deleted_at IS NULL;
+```
+
+## Associations
+
+```javascript
+// One-to-many
+User.hasMany(Post, { foreignKey: 'user_id', as: 'posts' });
+Post.belongsTo(User, { foreignKey: 'user_id', as: 'author' });
+
+// Many-to-many through an explicit join model
+Post.belongsToMany(Tag, {
+  through: PostTag,
+  foreignKey: 'post_id',
+  otherKey: 'tag_id',
+  as: 'tags',
+});
+Tag.belongsToMany(Post, {
+  through: PostTag,
+  foreignKey: 'tag_id',
+  otherKey: 'post_id',
+  as: 'posts',
+});
+```
+
+Define both sides. Sequelize does not infer the inverse, and a missing side produces confusing errors when you try to eager load in that direction.
+
+Using an explicit `through` model rather than a string is worth the small extra effort: it lets you put columns on the join table (when the tag was added, who added it) and query it directly.
+
+## Querying
+
+```javascript
+import { Op } from 'sequelize';
+
+const users = await User.findAll({
+  where: {
+    status: 'active',
+    createdAt: { [Op.gte]: new Date('2026-01-01') },
+    [Op.or]: [
+      { name: { [Op.iLike]: '%smith%' } },
+      { email: { [Op.iLike]: '%smith%' } },
+    ],
+  },
+  order: [['createdAt', 'DESC']],
+  limit: 20,
+  offset: 0,
+});
+```
+
+Always import and use the `Op` symbols. The older string form (`{ gte: ... }`) was removed for a good reason: it allowed user-supplied JSON to inject operators into your queries.
+
+### Selecting only what you need
+
+```javascript
+const users = await User.findAll({
+  attributes: ['id', 'email', 'name'],
+  where: { status: 'active' },
+  raw: true,   // plain objects instead of model instances
+});
+```
+
+Two easy wins here. `attributes` stops Sequelize selecting every column including large `jsonb` blobs you are not using. `raw: true` skips building model instances, which is a meaningful saving when returning thousands of rows for a read-only endpoint.
+
+## The N+1 problem
+
+This is the single most common performance failure in Sequelize applications:
+
+```javascript
+// BAD: 1 query for posts, then 1 per post for its author
+const posts = await Post.findAll({ limit: 100 });
+for (const post of posts) {
+  const author = await post.getAuthor();   // 100 extra queries
+  console.log(author.name);
+}
+```
+
+Eager load instead:
+
+```javascript
+// GOOD: a single query with a JOIN
+const posts = await Post.findAll({
+  limit: 100,
+  include: [{ model: User, as: 'author', attributes: ['id', 'name'] }],
+});
+```
+
+### When eager loading goes wrong
+
+Including a `hasMany` association alongside `limit` produces a subtle bug:
+
+```javascript
+// The limit applies to the JOINED rows, not to posts
+const posts = await Post.findAll({
+  limit: 10,
+  include: [{ model: Comment, as: 'comments' }],
+});
+```
+
+A post with 30 comments produces 30 joined rows, so `LIMIT 10` may return a single post. Sequelize handles this if you ask it to:
+
+```javascript
+const posts = await Post.findAll({
+  limit: 10,
+  include: [{ model: Comment, as: 'comments' }],
+  distinct: true,
+  subQuery: true,   // apply the limit in a subquery against posts
+});
+```
+
+`separate: true` on the include is often better still — it runs one additional query for the children rather than a join, which avoids row multiplication entirely and is usually faster when the child count is large:
+
+```javascript
+include: [{ model: Comment, as: 'comments', separate: true, limit: 5 }]
+```
+
+### Verifying what actually ran
+
+Do not trust an ORM about the SQL it generates. Log it, then read the plan:
+
+```javascript
+const sequelize = new Sequelize(url, {
+  dialect: 'postgres',
+  benchmark: true,
+  logging: (sql, timing) => {
+    if (timing > 100) console.warn(`SLOW ${timing}ms: ${sql}`);
+  },
+});
+```
+
+And from the database side:
+
+```sql
+SELECT calls,
+       round(mean_exec_time::numeric, 2) AS avg_ms,
+       round(total_exec_time::numeric, 2) AS total_ms,
+       substring(query, 1, 100) AS query
+FROM pg_stat_statements
+ORDER BY total_exec_time DESC
+LIMIT 20;
+```
+
+Tools that show generated SQL next to its execution plan make this loop much faster. [Chat2DB](https://chat2db.ai/download) visualises PostgreSQL plans and highlights sequential scans on large tables, which is usually where an ORM-generated query goes wrong.
+
+## Transactions
+
+```javascript
+const t = await sequelize.transaction();
+try {
+  const user = await User.create({ email, name }, { transaction: t });
+  await Profile.create({ userId: user.id }, { transaction: t });
+  await t.commit();
+} catch (err) {
+  await t.rollback();
+  throw err;
+}
+```
+
+The managed form is safer, because it cannot leak a transaction if you forget a branch:
+
+```javascript
+const result = await sequelize.transaction(async (t) => {
+  const user = await User.create({ email, name }, { transaction: t });
+  await Profile.create({ userId: user.id }, { transaction: t });
+  return user;   // commits on return, rolls back on throw
+});
+```
+
+**Every query inside must receive the `transaction` option.** A query that omits it runs on a different connection, outside the transaction — so it will not see uncommitted changes, and it will not be rolled back. This is the most common transaction bug in Sequelize code.
+
+You can eliminate the risk entirely with CLS (continuation-local storage), which propagates the transaction automatically:
+
+```javascript
+import { AsyncLocalStorage } from 'node:async_hooks';
+import { Sequelize } from 'sequelize';
+
+Sequelize.useCLS(new AsyncLocalStorage());
+```
+
+### Locking
+
+```javascript
+await sequelize.transaction(async (t) => {
+  const account = await Account.findByPk(id, {
+    transaction: t,
+    lock: t.LOCK.UPDATE,       // SELECT ... FOR UPDATE
+  });
+  account.balance -= amount;
+  await account.save({ transaction: t });
+});
+```
+
+For queue-style workloads, skip rows another worker already holds rather than blocking:
+
+```javascript
+const jobs = await Job.findAll({
+  where: { status: 'pending' },
+  limit: 10,
+  transaction: t,
+  lock: t.LOCK.UPDATE,
+  skipLocked: true,
+});
+```
+
+## Migrations
+
+Use migrations. `sequelize.sync()` is for prototyping only — it cannot express a safe column rename, it will happily drop data with `force: true`, and it gives you no way to roll back.
+
+```bash
+npx sequelize-cli migration:generate --name add-status-to-users
+```
+
+```javascript
+'use strict';
+
+module.exports = {
+  async up(queryInterface, Sequelize) {
+    await queryInterface.addColumn('users', 'status', {
+      type: Sequelize.ENUM('active', 'suspended', 'deleted'),
+      allowNull: false,
+      defaultValue: 'active',
+    });
+
+    await queryInterface.addIndex('users', ['status'], {
+      name: 'users_status_idx',
+    });
+  },
+
+  async down(queryInterface) {
+    await queryInterface.removeIndex('users', 'users_status_idx');
+    await queryInterface.removeColumn('users', 'status');
+    await queryInterface.sequelize.query('DROP TYPE IF EXISTS "enum_users_status";');
+  },
+};
+```
+
+That last line in `down` matters on PostgreSQL: `removeColumn` leaves the enum type behind, and re-running the up migration then fails because the type already exists.
+
+For indexes on a table with real traffic, build them concurrently — which means the migration cannot run inside a transaction:
+
+```javascript
+module.exports = {
+  async up(queryInterface) {
+    await queryInterface.sequelize.query(
+      'CREATE INDEX CONCURRENTLY IF NOT EXISTS users_email_idx ON users (email)'
+    );
+  },
+  async down(queryInterface) {
+    await queryInterface.sequelize.query('DROP INDEX CONCURRENTLY IF EXISTS users_email_idx');
+  },
+};
+```
+
+## Raw SQL when you need it
+
+An ORM that fights you on complex queries is worse than no ORM. Sequelize gets this right — drop to SQL freely:
+
+```javascript
+import { QueryTypes } from 'sequelize';
+
+const stats = await sequelize.query(
+  `
+  SELECT u.id,
+         u.name,
+         count(p.id) AS post_count,
+         max(p.created_at) AS last_post_at
+  FROM users u
+  LEFT JOIN posts p ON p.user_id = u.id
+  WHERE u.status = :status
+  GROUP BY u.id, u.name
+  HAVING count(p.id) > :minPosts
+  ORDER BY post_count DESC
+  `,
+  {
+    replacements: { status: 'active', minPosts: 5 },
+    type: QueryTypes.SELECT,
+  },
+);
+```
+
+Use `replacements` (or `bind`) rather than string interpolation. `bind` is the stronger option because it sends values as real query parameters rather than escaping them into the SQL text:
+
+```javascript
+const rows = await sequelize.query(
+  'SELECT * FROM users WHERE email = $1',
+  { bind: [email], type: QueryTypes.SELECT },
+);
+```
+
+## Bulk operations
+
+```javascript
+// One multi-row INSERT rather than N statements
+await User.bulkCreate(users, {
+  validate: true,
+  returning: ['id'],
+});
+
+// Upsert on a unique constraint
+await User.bulkCreate(users, {
+  updateOnDuplicate: ['name', 'status'],   // ON CONFLICT DO UPDATE
+});
+
+// Update many rows in one statement
+await User.update(
+  { status: 'suspended' },
+  { where: { lastLoginAt: { [Op.lt]: cutoff } } },
+);
+```
+
+Note that `Model.update` does **not** run instance hooks by default, because it never loads the instances. If you rely on hooks for side effects, either pass `individualHooks: true` — which loads and updates rows one at a time, so use it knowingly — or move the logic into a database trigger.
+
+## Scopes and reusable query fragments
+
+Scopes let you name a query fragment once and reuse it, which keeps `where` clauses from being copy-pasted across a codebase:
+
+```javascript
+User.addScope('active', {
+  where: { status: 'active' },
+});
+
+User.addScope('withPosts', {
+  include: [{ model: Post, as: 'posts' }],
+});
+
+User.addScope('recent', (days) => ({
+  where: { createdAt: { [Op.gte]: new Date(Date.now() - days * 86400000) } },
+}), { override: false });
+
+// Compose them
+const users = await User.scope('active', { method: ['recent', 30] }).findAll();
+```
+
+A `defaultScope` applies to every query on the model, which is powerful and occasionally surprising — it is easy to forget it is there when debugging why a row is missing. Remove it explicitly when you need the unfiltered set:
+
+```javascript
+const all = await User.unscoped().findAll();
+```
+
+## Validation and hooks
+
+Sequelize validates before writing, and the errors it raises are structured enough to map onto an API response:
+
+```javascript
+import { ValidationError } from 'sequelize';
+
+try {
+  await User.create({ email: 'not-an-email', name: '' });
+} catch (err) {
+  if (err instanceof ValidationError) {
+    const details = err.errors.map((e) => ({ field: e.path, message: e.message }));
+    // -> [{ field: 'email', message: 'Validation isEmail on email failed' }]
+  }
+}
+```
+
+Hooks run around the lifecycle and are the right place for derived values:
+
+```javascript
+import argon2 from 'argon2';
+
+User.beforeSave(async (user) => {
+  if (user.changed('password')) {
+    user.password = await argon2.hash(user.password);
+  }
+});
+```
+
+Two cautions worth internalising. Application-level validation is not a constraint — it only runs when writes go through Sequelize, so anything that must always hold belongs in the database as a `CHECK`, `NOT NULL` or unique index. And hooks do not fire for bulk operations unless you ask, because those never instantiate models:
+
+```javascript
+await User.update({ status: 'suspended' }, {
+  where: { id: ids },
+  individualHooks: true,   // loads and updates row by row — know the cost
+});
+```
+
+For invariants that genuinely must never be violated, push the rule down to PostgreSQL, where nothing can bypass it:
+
+```sql
+ALTER TABLE users
+  ADD CONSTRAINT users_email_format
+  CHECK (email ~ '^[^@\s]+@[^@\s]+\.[^@\s]+$');
+```
+
+## When to reach past the ORM
+
+Sequelize is at its best for the queries that make up most of an application: fetch a row by id, list rows with a filter and a page, insert, update, delete. For those it removes boilerplate and keeps the code readable.
+
+It is at its worst when the question is genuinely analytical. Window functions, recursive CTEs, lateral joins, `DISTINCT ON`, set operations and PostgreSQL-specific features such as `jsonb` path queries or full-text ranking either have no representation in the query builder or acquire one so convoluted that the intent disappears. When you find yourself assembling nested literal objects to express something you could write in four lines of SQL, that is the signal to stop.
+
+The healthy pattern in a mature Sequelize codebase is a clear split. Models and their associations describe the schema and handle ordinary access. A small, deliberate set of raw parameterised queries handles reporting and anything performance-critical, living in its own module where the SQL is visible and reviewable rather than buried in a service method. Nothing is lost by mixing the two, and a great deal of clarity is gained.
+
+The one rule that should not bend: whichever path a query takes, look at the SQL it produces and the plan the database chooses for it. An ORM's job is to save you typing, not to relieve you of understanding what runs against your database.
+
+## Summary
+
+Sequelize is a capable, mature ORM whose sharp edges are well understood. The ones that matter in production: size `pool.max` against your database's `max_connections` multiplied by process count, pass `transaction` to every query inside a transaction or enable CLS so you cannot forget, eager load associations to avoid N+1 and use `separate: true` or `subQuery: true` when combining `include` with `limit`, and use migrations rather than `sync()`. Log generated SQL, check it against `pg_stat_statements` and `EXPLAIN`, and drop to raw parameterised SQL whenever the query builder starts producing something you would not have written by hand.

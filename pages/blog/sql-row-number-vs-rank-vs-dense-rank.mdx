@@ -1,0 +1,254 @@
+---
+title: "ROW_NUMBER vs RANK vs DENSE_RANK in SQL"
+description: "ROW_NUMBER, RANK and DENSE_RANK compared on one dataset, plus NTILE, top-N-per-group and deduplication patterns built on them."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: September 12, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# ROW_NUMBER vs RANK vs DENSE_RANK in SQL
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="September 12, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+
+Three ranking functions, nearly identical syntax, and results that only differ when there is a tie. That is why the distinction is so easy to get wrong: your query works perfectly on test data where every value is unique, and produces a wrong leaderboard the first week two customers spend exactly the same amount.
+
+The short version:
+
+- **`ROW_NUMBER()`** always gives consecutive numbers, breaking ties arbitrarily. No duplicates, no gaps.
+- **`RANK()`** gives tied rows the same number, then skips ahead. Duplicates, with gaps.
+- **`DENSE_RANK()`** gives tied rows the same number, then continues with the next integer. Duplicates, no gaps.
+
+The rest of this article shows exactly where that matters, with one dataset used throughout.
+
+## Sample data
+
+```sql
+CREATE TABLE sales (
+  rep        text NOT NULL,
+  region     text NOT NULL,
+  amount     numeric(10,2) NOT NULL,
+  closed_on  date NOT NULL
+);
+
+INSERT INTO sales VALUES
+  ('Ada',    'EMEA', 900.00, '2026-01-15'),
+  ('Grace',  'EMEA', 750.00, '2026-01-18'),
+  ('Alan',   'EMEA', 750.00, '2026-01-22'),
+  ('Edsger', 'EMEA', 500.00, '2026-02-03'),
+  ('Barbara','AMER', 820.00, '2026-01-11'),
+  ('Ken',    'AMER', 640.00, '2026-02-09'),
+  ('Donald', 'AMER', 640.00, '2026-02-14');
+```
+
+Note the two ties: Grace and Alan both at 750 in EMEA, Ken and Donald both at 640 in AMER.
+
+## The three functions side by side
+
+```sql
+SELECT rep,
+       amount,
+       ROW_NUMBER() OVER (ORDER BY amount DESC) AS row_number,
+       RANK()       OVER (ORDER BY amount DESC) AS rank,
+       DENSE_RANK() OVER (ORDER BY amount DESC) AS dense_rank
+FROM sales
+ORDER BY amount DESC, rep;
+```
+
+```
+   rep   | amount | row_number | rank | dense_rank
+---------+--------+------------+------+------------
+ Ada     | 900.00 |          1 |    1 |          1
+ Barbara | 820.00 |          2 |    2 |          2
+ Alan    | 750.00 |          3 |    3 |          3
+ Grace   | 750.00 |          4 |    3 |          3
+ Ken     | 640.00 |          5 |    5 |          4
+ Donald  | 640.00 |          6 |    5 |          4
+ Edsger  | 500.00 |          7 |    7 |          5
+```
+
+Read the tied rows carefully, because that is the whole lesson.
+
+**Alan and Grace** both sold 750. `ROW_NUMBER` gives them 3 and 4 - it *must* produce distinct numbers, so it picks one arbitrarily. `RANK` gives them both 3. `DENSE_RANK` gives them both 3 as well.
+
+**Ken and Donald**, the next group down, is where `RANK` and `DENSE_RANK` diverge. `RANK` gives them 5, because four rows are strictly ahead of them, and 4 was never assigned. `DENSE_RANK` gives them 4, because they are in the fourth distinct amount tier. `RANK` counts rows ahead of you; `DENSE_RANK` counts distinct values ahead of you.
+
+This gives you a decision rule:
+
+| You want | Use |
+| --- | --- |
+| Exactly one row per position, no duplicates ever | `ROW_NUMBER()` |
+| Olympic-style ranking: two silvers, no second silver, then fourth | `RANK()` |
+| Tier or level numbering with no holes | `DENSE_RANK()` |
+
+The "two silver medals and then fourth place" analogy is the fastest way to remember `RANK`. If two athletes tie for second, nobody gets third.
+
+## The arbitrary part of ROW_NUMBER
+
+`ROW_NUMBER` assigned 3 to Alan and 4 to Grace, but nothing in the query says it should. With a different plan - after an index is added, or once the table is big enough for a parallel scan - it could swap them. If the numbering is used for anything that must be stable, add a tiebreaker to make the ordering total:
+
+```sql
+SELECT rep, amount,
+       ROW_NUMBER() OVER (ORDER BY amount DESC, closed_on, rep) AS rn
+FROM sales;
+```
+
+A deterministic `ORDER BY` inside the window is not optional in production code; it is the difference between a pagination scheme that works and one that occasionally shows a row twice.
+
+## PARTITION BY: ranking within groups
+
+Adding `PARTITION BY` restarts the numbering for each group. This is what you want for "top performers per region":
+
+```sql
+SELECT region, rep, amount,
+       ROW_NUMBER() OVER (PARTITION BY region ORDER BY amount DESC) AS rn,
+       RANK()       OVER (PARTITION BY region ORDER BY amount DESC) AS rnk,
+       DENSE_RANK() OVER (PARTITION BY region ORDER BY amount DESC) AS drnk
+FROM sales
+ORDER BY region, amount DESC;
+```
+
+```
+ region |   rep   | amount | rn | rnk | drnk
+--------+---------+--------+----+-----+------
+ AMER   | Barbara | 820.00 |  1 |   1 |    1
+ AMER   | Donald  | 640.00 |  2 |   2 |    2
+ AMER   | Ken     | 640.00 |  3 |   2 |    2
+ EMEA   | Ada     | 900.00 |  1 |   1 |    1
+ EMEA   | Alan    | 750.00 |  2 |   2 |    2
+ EMEA   | Grace   | 750.00 |  3 |   2 |    2
+ EMEA   | Edsger  | 500.00 |  4 |   4 |    3
+```
+
+`PARTITION BY` is not the same as `GROUP BY`. `GROUP BY` collapses rows; a window function keeps every row and computes a value alongside it. That is precisely why ranking works: you get the detail *and* the position.
+
+## Top N per group
+
+This is the single most common use of these functions, and the choice between them changes the answer.
+
+```sql
+-- Exactly 2 rows per region, ties broken arbitrarily
+SELECT region, rep, amount
+FROM (
+  SELECT region, rep, amount,
+         ROW_NUMBER() OVER (PARTITION BY region ORDER BY amount DESC, rep) AS rn
+  FROM sales
+) t
+WHERE rn <= 2;
+
+-- Everyone in the top 2 positions, so ties can return 3+ rows
+SELECT region, rep, amount
+FROM (
+  SELECT region, rep, amount,
+         RANK() OVER (PARTITION BY region ORDER BY amount DESC) AS rnk
+  FROM sales
+) t
+WHERE rnk <= 2;
+
+-- Everyone in the top 2 distinct amount tiers
+SELECT region, rep, amount
+FROM (
+  SELECT region, rep, amount,
+         DENSE_RANK() OVER (PARTITION BY region ORDER BY amount DESC) AS drnk
+  FROM sales
+) t
+WHERE drnk <= 2;
+```
+
+For AMER the first query returns Barbara and one of Ken/Donald. The second returns all three, because Ken and Donald share rank 2. The third also returns all three. For a leaderboard shown to users, `RANK` or `DENSE_RANK` is almost always the fair choice; for "pick 2 rows to display in a fixed-height card", `ROW_NUMBER` is the one that guarantees the count.
+
+Note the subquery. You cannot filter on a window function in `WHERE`, because window functions are evaluated after `WHERE`:
+
+```sql
+-- ERROR:  window functions are not allowed in WHERE
+SELECT rep FROM sales WHERE ROW_NUMBER() OVER (ORDER BY amount) <= 3;
+```
+
+A subquery or CTE is the standard workaround. PostgreSQL also offers `DISTINCT ON` for the specific case of one row per group, which is shorter and often faster:
+
+```sql
+SELECT DISTINCT ON (region) region, rep, amount
+FROM sales
+ORDER BY region, amount DESC, rep;
+```
+
+## Deduplication with ROW_NUMBER
+
+The second classic use: delete duplicate rows, keeping one of each.
+
+```sql
+-- Find them first. Always look before you delete.
+WITH ranked AS (
+  SELECT ctid,
+         rep, region, amount, closed_on,
+         ROW_NUMBER() OVER (PARTITION BY rep, region, amount, closed_on
+                            ORDER BY ctid) AS rn
+  FROM sales
+)
+SELECT * FROM ranked WHERE rn > 1;
+
+-- Then delete
+WITH ranked AS (
+  SELECT ctid,
+         ROW_NUMBER() OVER (PARTITION BY rep, region, amount, closed_on
+                            ORDER BY ctid) AS rn
+  FROM sales
+)
+DELETE FROM sales
+WHERE ctid IN (SELECT ctid FROM ranked WHERE rn > 1);
+```
+
+`ROW_NUMBER` is the correct function here and the others are actively wrong: `RANK` and `DENSE_RANK` would give every duplicate the same number, so `rn > 1` would match none of them and the delete would remove nothing. The `PARTITION BY` list defines what "duplicate" means, and `ctid` (PostgreSQL's physical row identifier) works as a tiebreaker when there is no primary key. On MySQL or SQL Server, use the primary key or a rowid equivalent instead.
+
+## The rest of the family
+
+Two more functions round out the set:
+
+```sql
+SELECT rep, amount,
+       NTILE(3)       OVER (ORDER BY amount DESC) AS tercile,
+       PERCENT_RANK() OVER (ORDER BY amount DESC) AS pct_rank,
+       CUME_DIST()    OVER (ORDER BY amount DESC) AS cume_dist
+FROM sales;
+```
+
+`NTILE(n)` splits the ordered rows into `n` buckets as evenly as it can, which is how you build quartiles or deciles. It distributes any remainder into the earliest buckets, and - like `ROW_NUMBER` - it splits tied values across bucket boundaries, so two identical amounts can land in different quartiles.
+
+`PERCENT_RANK()` returns `(rank - 1) / (total_rows - 1)`, a value from 0 to 1, and `CUME_DIST()` returns the fraction of rows at or before the current one. Both are built on `RANK` semantics, so ties share a value.
+
+## Portability
+
+All three functions are part of the SQL standard and behave identically on PostgreSQL 8.4+, MySQL 8.0+, MariaDB 10.2+, SQL Server 2005+, Oracle, SQLite 3.25+, and every cloud warehouse. The syntax in this article runs unchanged on all of them.
+
+The notable exception is MySQL 5.7 and earlier, which has no window functions at all. The traditional workaround uses session variables:
+
+```sql
+-- MySQL 5.7 only; prefer upgrading
+SELECT rep, amount, @rn := @rn + 1 AS row_number
+FROM sales, (SELECT @rn := 0) init
+ORDER BY amount DESC;
+```
+
+This is fragile - the evaluation order of user variables is not guaranteed and the behaviour was deprecated in 8.0 - so treat it as a migration aid rather than a pattern.
+
+## Performance
+
+A window function requires the rows to be in the window's order, so the plan contains either a `Sort` or an `Index Scan` that already provides it. An index matching `PARTITION BY` columns followed by `ORDER BY` columns lets the planner skip the sort entirely:
+
+```sql
+CREATE INDEX sales_region_amount_idx ON sales (region, amount DESC);
+```
+
+With that index, the `PARTITION BY region ORDER BY amount DESC` query can read rows in order and compute ranks incrementally. Without it, PostgreSQL sorts the whole set first, and on a large table that sort may spill to disk - visible in `EXPLAIN (ANALYZE, BUFFERS)` as `Sort Method: external merge  Disk: ...`. Raising `work_mem` for the session is the quick fix; the index is the real one.
+
+Also avoid computing several ranking functions over *different* window definitions in one query unless you need them: each distinct `OVER (...)` clause may add another sort. Functions that share an identical window are computed in a single pass.
+
+If you would rather see the plan rendered next to the query while you experiment with index options, [Chat2DB](https://chat2db.ai/download) does that across PostgreSQL, MySQL and SQL Server, and the [web version](https://app.chat2db.ai) runs in the browser.
+
+## Summary
+
+`ROW_NUMBER` is for "give me exactly N rows" and for deduplication; it never produces ties, so always give it a deterministic `ORDER BY`. `RANK` is for competition standings where ties share a place and the next place is skipped. `DENSE_RANK` is for tier numbering with no gaps. Filter them in a subquery or CTE because window functions cannot appear in `WHERE`, and index `(partition_columns, order_columns)` so the planner can skip the sort.

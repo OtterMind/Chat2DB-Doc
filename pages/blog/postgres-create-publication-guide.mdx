@@ -1,0 +1,394 @@
+---
+title: "Postgres CREATE PUBLICATION: Full Guide"
+description: "How to create, list, alter and drop PostgreSQL publications — FOR ALL TABLES, row filters, column lists, publish options and the catalog queries to list them."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: September 16, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# Postgres CREATE PUBLICATION: Full Guide
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="September 16, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+A publication is the publisher-side half of PostgreSQL logical replication: a named, catalogued set of tables plus rules about which operations, which columns and which rows get published. Everything else — slots, subscriptions, apply workers — is plumbing around that definition.
+
+This is a reference for the publication object itself. If you are setting logical replication up for the first time, start with the [logical replication guide](/blog/postgres-logical-replication-guide) and come back here when you need to change what a live publication contains. If your problem is WAL piling up on disk, that belongs to the [replication slots guide](/blog/postgres-replication-slots-guide) instead.
+
+## What a publication is, and what it is not
+
+A publication is a catalog entry. Creating one does three things and nothing more:
+
+- Inserts a row into `pg_publication`.
+- Records the table membership in `pg_publication_rel` (and, for schema-level publications on PostgreSQL 15 and later, in `pg_publication_namespace`).
+- Tells the WAL decoder which changes to emit for consumers of this publication.
+
+What it does **not** do: it does not create a replication slot, it does not retain WAL, it does not grant anyone permission to read your data, and it does not move a single byte on its own. A publication with no subscribers is inert and costs nothing. All of the operational risk in logical replication lives in the slot and the subscription, not here.
+
+That has a practical consequence worth internalising early: you can create, alter and drop publications freely on a publisher with no subscribers. Once a subscriber is attached, the same statements become coordination problems, because the subscriber has its own copy of the table list.
+
+## Creating a publication
+
+### FOR TABLE: the explicit list
+
+The form you should reach for by default names its tables:
+
+```sql
+CREATE PUBLICATION app_pub FOR TABLE orders, customers, order_items;
+```
+
+This publishes all four operation types (`INSERT`, `UPDATE`, `DELETE`, `TRUNCATE`) for exactly those three tables. New tables added to the database later are *not* included — which is the point. An explicit list means a developer creating a scratch table tomorrow does not silently start shipping it across the network.
+
+Two modifiers matter on the table list. `ONLY` stops PostgreSQL from expanding inheritance children and partitions:
+
+```sql
+CREATE PUBLICATION parent_only_pub FOR TABLE ONLY events;
+```
+
+Without `ONLY`, naming a partitioned table pulls in all of its current and future partitions automatically, which is almost always what you want.
+
+### FOR ALL TABLES: the blunt instrument
+
+```sql
+CREATE PUBLICATION all_pub FOR ALL TABLES;
+```
+
+This publishes every table in the database, including tables created after the publication. It is the right choice for exactly one job — a full-database migration to a new major version — and a poor choice for everything else, because it is immutable in a way people find surprising: you cannot add or drop individual tables from it later. The only way to narrow it is to drop it and create a new one, which forces every subscriber to re-synchronise.
+
+Creating a `FOR ALL TABLES` publication requires superuser.
+
+### FOR TABLES IN SCHEMA: PostgreSQL 15 and later
+
+PostgreSQL 15 introduced schema-level membership, which is the middle ground most teams actually want:
+
+```sql
+-- PostgreSQL 15+
+CREATE PUBLICATION sales_pub FOR TABLES IN SCHEMA sales;
+
+-- Schemas and individual tables can be mixed in one publication
+CREATE PUBLICATION mixed_pub
+    FOR TABLES IN SCHEMA sales, reporting,
+        TABLE public.feature_flags;
+```
+
+Every current and future table in `sales` is published, without a `FOR ALL TABLES` blanket over the rest of the database. Like `FOR ALL TABLES`, this requires superuser, because it is effectively a standing grant over anything a schema owner creates later.
+
+Note that this covers tables only. Views, materialized views, foreign tables, sequences and temporary tables are never published, whether you name them individually or they happen to live in a published schema.
+
+## Controlling which operations replicate
+
+The `publish` parameter restricts the change types that get decoded. The default is all four:
+
+```sql
+CREATE PUBLICATION audit_pub FOR TABLE events
+    WITH (publish = 'insert, update, delete, truncate');
+```
+
+An append-only sink — a reporting warehouse, an audit mirror — often wants inserts only, so that a mistaken `DELETE` on the publisher does not propagate:
+
+```sql
+CREATE PUBLICATION events_insert_pub FOR TABLE events
+    WITH (publish = 'insert');
+```
+
+Be deliberate about `truncate`. `TRUNCATE` has been publishable since PostgreSQL 11 and is included by default. If you leave it on, `TRUNCATE orders` on the publisher empties the subscriber too; if you exclude it, the subscriber silently keeps rows the publisher no longer has, and the two diverge permanently. Neither behaviour is wrong, but only one of them matches what you expect, so choose it consciously.
+
+One subtlety that bites: if you omit `update` and `delete` from `publish`, tables without a primary key stop raising replica identity errors, because a table only needs a replica identity when it publishes updates or deletes. That can make an insert-only publication look like a way around the primary key requirement. It is, until someone adds `update` to the publish list months later and the apply worker starts failing.
+
+## Partitioned tables and publish_via_partition_root
+
+By default, changes to a partitioned table are published using the *leaf partition* as the relation name. The subscriber therefore needs partitions with matching names, and the partitioning scheme has to line up on both sides.
+
+`publish_via_partition_root`, available since PostgreSQL 13, changes that:
+
+```sql
+CREATE PUBLICATION orders_pub FOR TABLE orders
+    WITH (publish_via_partition_root = true);
+```
+
+With this set, changes are published as if they came from the root partitioned table. The subscriber can then be a plain non-partitioned table, or a table partitioned on a completely different key. This is the standard way to collapse a sharded or time-partitioned publisher into a single target table for reporting.
+
+Three things to remember about it:
+
+- It is a publication-level option, not a per-table one. All partitioned tables in the publication follow the same rule.
+- It also governs how `TRUNCATE` is published — truncating a leaf partition is sent as a truncate of the root.
+- Changing it on a live publication changes the relation names in the replication stream, which will break a subscriber that was built for the other convention. Treat it as a re-synchronisation event, not a tweak.
+
+## Column lists and row filters
+
+Both features arrived in PostgreSQL 15. On PostgreSQL 14 and earlier, neither syntax parses.
+
+### Row filters
+
+A row filter is a `WHERE` clause attached to a table inside a publication:
+
+```sql
+-- PostgreSQL 15+
+CREATE PUBLICATION eu_orders_pub
+    FOR TABLE orders WHERE (region = 'EU' AND status <> 'draft');
+```
+
+Only matching rows are replicated, both during the initial copy and during streaming. The rules the expression must obey are strict, and they exist because the filter is evaluated inside WAL decoding where almost no execution context is available:
+
+- Only columns of that table, no subqueries, no other tables.
+- No user-defined functions, no user-defined operators or types, and no built-in functions that are not immutable.
+- For `UPDATE` and `DELETE`, the filter may only reference columns that are part of the table's replica identity. `INSERT` can use any column.
+
+That last rule is the one people hit. `region` must be in the primary key, or you must widen the replica identity with `ALTER TABLE orders REPLICA IDENTITY FULL`, before an update-publishing table can filter on it.
+
+The update semantics are worth stating explicitly, because they are not obvious. When a row is updated, PostgreSQL evaluates the filter against both the old and the new version:
+
+- Old matches, new matches: replicated as an `UPDATE`.
+- Old matches, new does not: sent to the subscriber as a `DELETE`, so the row disappears from the replica.
+- Old does not match, new does: sent as an `INSERT`.
+
+This is what makes filters behave correctly rather than leaving orphaned rows behind, but it does mean a subscriber can see deletes for rows that were never deleted upstream.
+
+Finally, filters combine with `OR` when a subscriber subscribes to several publications containing the same table — and if any one of those publications has no filter on that table, every row is replicated. An unfiltered publication silently defeats a filtered one.
+
+### Column lists
+
+A column list restricts which columns are sent:
+
+```sql
+-- PostgreSQL 15+
+CREATE PUBLICATION safe_customers_pub
+    FOR TABLE customers (id, created_at, country, status);
+```
+
+Columns outside the list are never transmitted, which makes this the cleanest way to keep PII off a downstream analytics replica. The constraints:
+
+- The list must include every column of the replica identity, otherwise updates and deletes cannot be applied.
+- Omitted columns must be nullable or have a default on the subscriber, since the apply worker will not supply a value for them.
+- A column list cannot be used with `FOR ALL TABLES` or `FOR TABLES IN SCHEMA` — the table has to be named individually.
+- A subscriber cannot combine two publications that specify *different* column lists for the same table; PostgreSQL rejects that with an error about different column lists for the same relation.
+
+## Listing publications
+
+### From psql
+
+`\dRp` lists publications with their owner and publish flags. `\dRp+` adds the member tables, and on PostgreSQL 15 and later it also prints each table's column list and row filter:
+
+```
+\dRp
+\dRp+ app_pub
+```
+
+### From the catalogs
+
+For scripts, monitoring and anything you want to diff between environments, query the catalogs directly. The top-level list:
+
+```sql
+SELECT p.pubname,
+       r.rolname          AS owner,
+       p.puballtables,
+       p.pubinsert,
+       p.pubupdate,
+       p.pubdelete,
+       p.pubtruncate,
+       p.pubviaroot
+FROM   pg_publication p
+JOIN   pg_roles r ON r.oid = p.pubowner
+ORDER  BY p.pubname;
+```
+
+`puballtables` tells you instantly whether a publication is the immutable `FOR ALL TABLES` kind. `pubviaroot` is the `publish_via_partition_root` setting and exists from PostgreSQL 13.
+
+The membership view is `pg_publication_tables`, which resolves schema-level and all-tables publications into concrete tables for you:
+
+```sql
+-- PostgreSQL 15+: attnames and rowfilter columns are present
+SELECT pubname, schemaname, tablename, attnames, rowfilter
+FROM   pg_publication_tables
+ORDER  BY pubname, schemaname, tablename;
+```
+
+On PostgreSQL 14 and earlier the same view exists but has only `pubname`, `schemaname` and `tablename`.
+
+`pg_publication_rel` is the raw mapping, useful when you want to know whether a table was named *explicitly* rather than picked up through a schema:
+
+```sql
+SELECT p.pubname,
+       pr.prrelid::regclass AS table_name
+FROM   pg_publication_rel pr
+JOIN   pg_publication p ON p.oid = pr.prpubid
+ORDER  BY 1, 2;
+```
+
+Compare the two: a table that shows up in `pg_publication_tables` but not `pg_publication_rel` is a member via `FOR ALL TABLES` or `FOR TABLES IN SCHEMA`, and therefore cannot be dropped individually.
+
+The reverse question — "which publications carry this table?" — is the one you actually ask during an incident:
+
+```sql
+SELECT pubname, attnames, rowfilter
+FROM   pg_publication_tables
+WHERE  schemaname = 'public' AND tablename = 'orders';
+```
+
+Keeping that query one keystroke away in a client like [Chat2DB](https://app.chat2db.ai) saves a lot of guessing when a table is unexpectedly replicating, or unexpectedly not.
+
+And on PostgreSQL 15 and later, the schema memberships:
+
+```sql
+SELECT p.pubname, n.nspname AS schema_name
+FROM   pg_publication_namespace pn
+JOIN   pg_publication p ON p.oid = pn.pnpubid
+JOIN   pg_namespace   n ON n.oid = pn.pnnspid
+ORDER  BY 1, 2;
+```
+
+## Altering a publication
+
+### ADD, SET and DROP TABLE
+
+Three verbs, and the difference between them is the source of most accidents:
+
+```sql
+-- Add one table, leaving the rest of the list alone
+ALTER PUBLICATION app_pub ADD TABLE shipments;
+
+-- Remove one table
+ALTER PUBLICATION app_pub DROP TABLE order_items;
+
+-- REPLACE the entire list with exactly these tables
+ALTER PUBLICATION app_pub SET TABLE orders, customers;
+```
+
+`SET TABLE` is destructive. Running it when you meant `ADD TABLE` silently removes every table you did not list, and the subscriber will keep applying nothing for those tables without raising an error — the changes simply stop arriving. Use `ADD` and `DROP` in scripts; reserve `SET` for the case where you are genuinely declaring the full list.
+
+On PostgreSQL 15 and later the same three verbs work on schemas, and support column lists and filters on `ADD`/`SET`:
+
+```sql
+-- PostgreSQL 15+
+ALTER PUBLICATION sales_pub ADD TABLES IN SCHEMA archive;
+ALTER PUBLICATION sales_pub DROP TABLES IN SCHEMA archive;
+
+ALTER PUBLICATION app_pub SET TABLE
+    orders WHERE (region = 'EU'),
+    customers (id, created_at, country);
+```
+
+Note there is no syntax for "change the filter on this one table". You re-specify the table with `ADD`/`SET` and the new definition replaces the old one.
+
+### Changing options and ownership
+
+```sql
+-- Stop publishing deletes without touching the table list
+ALTER PUBLICATION app_pub SET (publish = 'insert, update');
+
+-- Switch a partitioned publication to root-level relation names
+ALTER PUBLICATION orders_pub SET (publish_via_partition_root = true);
+
+-- Rename
+ALTER PUBLICATION app_pub RENAME TO app_pub_v2;
+
+-- Hand it to the replication role
+ALTER PUBLICATION app_pub OWNER TO replication_admin;
+```
+
+`OWNER TO` has a requirement that catches automation: the new owner must have `CREATE` privilege on the database, and if the publication is `FOR ALL TABLES` or contains schema memberships, the new owner must be superuser. Renaming a publication breaks every subscriber pointing at the old name, so pair it with `ALTER SUBSCRIPTION ... SET PUBLICATION` on each subscriber.
+
+## Required privileges
+
+Summarised, because the rules differ by statement:
+
+| Action | Requirement |
+| --- | --- |
+| `CREATE PUBLICATION` | `CREATE` privilege on the current database |
+| `FOR ALL TABLES` / `FOR TABLES IN SCHEMA` | Superuser |
+| `ADD TABLE` / `SET TABLE` | Ownership of each table added |
+| `ALTER` / `DROP PUBLICATION` | Ownership of the publication |
+
+Separately, and easy to forget: the publication grants nothing. The role the subscription connects as still needs `SELECT` on every published table for the initial copy to succeed, plus the `REPLICATION` attribute (or membership in a role that has it) to open a replication connection.
+
+```sql
+GRANT SELECT ON orders, customers, order_items TO replicator;
+```
+
+Without that grant the subscription connects, creates its slot, and then fails the table sync with a permission denied error on the first `COPY`.
+
+## Dropping a publication
+
+```sql
+DROP PUBLICATION IF EXISTS app_pub;
+```
+
+`CASCADE` and `RESTRICT` are accepted for syntactic consistency but have no dependants to act on. Dropping a publication does **not** drop any subscription, and — importantly — does not drop the replication slot the subscription created. The subscriber keeps its slot, keeps retaining WAL on the publisher, and starts logging:
+
+```
+ERROR:  publication "app_pub" does not exist
+CONTEXT:  processing remote data for replication origin "pg_16401"
+```
+
+The apply worker then retries in a loop forever. So dropping a publication while subscribers still exist converts a clean teardown into a slow disk-space leak. Tear down the subscriber first; see the [subscription teardown guide](/blog/postgres-drop-subscription-guide) for the correct order.
+
+## What the subscriber must do after you change a publication
+
+This is the step that turns a correct `ALTER PUBLICATION` into no visible effect. The subscriber caches its own table list in `pg_subscription_rel`. After any membership change you must tell it to re-read the publication:
+
+```sql
+-- On the subscriber
+ALTER SUBSCRIPTION app_sub REFRESH PUBLICATION;
+```
+
+What refresh does and does not do:
+
+- **Added tables** are picked up and initial-copied (unless you pass `WITH (copy_data = false)`).
+- **Removed tables** are dropped from `pg_subscription_rel`; existing rows on the subscriber are left in place, now frozen.
+- **A widened row filter or column list on an already-subscribed table does not re-copy historical rows.** Refresh only synchronises table membership. Rows that were previously filtered out stay missing.
+
+For that last case the practical recipe is to force the table to look new:
+
+```sql
+-- Publisher: remove the table, then re-add it with the new filter
+ALTER PUBLICATION app_pub DROP TABLE orders;
+ALTER PUBLICATION app_pub ADD TABLE orders WHERE (region IN ('EU', 'UK'));
+```
+
+```sql
+-- Subscriber: drop the stale copy, then let the refresh re-sync it
+ALTER SUBSCRIPTION app_sub REFRESH PUBLICATION WITH (copy_data = false);
+TRUNCATE orders;
+ALTER SUBSCRIPTION app_sub REFRESH PUBLICATION WITH (copy_data = true);
+```
+
+The `TRUNCATE` matters. Without it the fresh `COPY` collides with the rows already present and the table sync worker dies on a unique constraint violation, retrying indefinitely. Also note that `REFRESH PUBLICATION` with `copy_data = true` cannot run inside a transaction block.
+
+Watch the resulting sync state:
+
+```sql
+SELECT srrelid::regclass AS table_name, srsubstate, srsublsn
+FROM   pg_subscription_rel
+ORDER  BY 1;
+```
+
+`r` means ready and streaming; `d` means the data copy is in progress; `i` means it is queued and has not started.
+
+## Common errors and what causes them
+
+**`must be superuser to create FOR ALL TABLES publication`** — exactly what it says. The same applies to `FOR TABLES IN SCHEMA`. Name the tables explicitly if you cannot get superuser.
+
+**`publication "all_pub" is defined as FOR ALL TABLES`**, with the detail that tables cannot be added to or dropped from such publications. You are trying to narrow an all-tables publication. Drop and recreate it.
+
+**`must be owner of table orders`** — `ADD TABLE` requires table ownership, not merely `SELECT`. This usually means your migration role differs from the table owner.
+
+**`cannot add relation "sales_v" to publication`**, with a detail naming the object kind. You pointed at a view, materialized view, foreign table, sequence or temporary table. Only ordinary tables and partitioned tables can be published.
+
+**`cannot update table "widgets" because it does not have a replica identity and publishes updates`** — raised on the publisher at `UPDATE` time, not at `CREATE PUBLICATION` time, which is why it surfaces hours later. Add a primary key, nominate a unique index with `ALTER TABLE ... REPLICA IDENTITY USING INDEX`, or set `REPLICA IDENTITY FULL` for small tables.
+
+**A row filter rejected because a column is not part of the replica identity** — the filter references a column outside the primary key on a table that publishes updates or deletes. Either filter on key columns only, widen the replica identity, or restrict the publication to `publish = 'insert'`.
+
+**`invalid publication WHERE expression`**, detail about mutable or user-defined functions. Replace the function call with a plain comparison, or precompute the value into a stored generated column and filter on that.
+
+**`cannot use different column lists for table ... in different publications`** — a subscription is combining publications that disagree about which columns of a table to send. Make the lists identical, or split the table across separate subscriptions.
+
+**Changes stop arriving with no error anywhere.** Almost always a `SET TABLE` that dropped a table, or an `ADD TABLE` with no matching `REFRESH PUBLICATION` on the subscriber. Compare `pg_publication_tables` on the publisher against `pg_subscription_rel` on the subscriber — that diff answers the question in one look.
+
+## Wrapping up
+
+Publications are cheap, declarative and easy to reason about as long as you keep three habits. Prefer explicit `FOR TABLE` lists over `FOR ALL TABLES`, because the blunt form cannot be narrowed later. Use `ADD` and `DROP` rather than `SET` in any automated path. And treat every publication change as a two-sided operation — the publisher statement is only half the work until the subscriber has run `REFRESH PUBLICATION`.
+
+When you are auditing what a publisher is actually shipping, opening publisher and subscriber side by side in [Chat2DB](https://chat2db.ai/download) and diffing `pg_publication_tables` against `pg_subscription_rel` is the fastest way to confirm the two ends agree.

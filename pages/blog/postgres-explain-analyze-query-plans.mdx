@@ -1,0 +1,245 @@
+---
+title: "How to Read Postgres EXPLAIN ANALYZE Plans"
+description: "Learn to read PostgreSQL EXPLAIN ANALYZE output: cost vs actual time, loops, rows misestimates, buffers, and the scan and join nodes that tell you what to fix."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: September 12, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# How to Read Postgres EXPLAIN ANALYZE Plans
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="September 12, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+
+Most advice about slow PostgreSQL queries stops at "run `EXPLAIN ANALYZE`". That is the easy part. The hard part is that the output is a tree of numbers with no obvious starting point, and the number people instinctively read - `cost` - is the one that does not matter once you have actual timings.
+
+This article is about reading the output: which numbers to look at, in which order, and what each of the common node types is telling you.
+
+## EXPLAIN vs EXPLAIN ANALYZE
+
+```sql
+-- Estimates only. Does not run the query. Safe on anything.
+EXPLAIN SELECT * FROM orders WHERE customer_id = 42;
+
+-- Actually runs the query and reports real timings and row counts.
+EXPLAIN ANALYZE SELECT * FROM orders WHERE customer_id = 42;
+```
+
+`EXPLAIN` shows what the planner *intends* to do. `EXPLAIN ANALYZE` executes the statement and reports what happened. The difference between the two is where nearly all tuning insight lives.
+
+One warning that costs people a production table: **`EXPLAIN ANALYZE` really executes the query**, including `INSERT`, `UPDATE` and `DELETE`. To inspect a write without performing it, wrap it in a transaction you roll back:
+
+```sql
+BEGIN;
+EXPLAIN ANALYZE DELETE FROM orders WHERE created_at < '2020-01-01';
+ROLLBACK;
+```
+
+The options you actually want are these:
+
+```sql
+EXPLAIN (ANALYZE, BUFFERS, VERBOSE, SETTINGS, FORMAT TEXT)
+SELECT ...;
+```
+
+`BUFFERS` reports how many 8 kB pages were read from cache and from disk, which is the most reliable measure of work done. From PostgreSQL 16 onward `BUFFERS` is included automatically with `ANALYZE`; on older versions you must ask for it, and you should. `SETTINGS` shows any non-default planner parameters in effect, which explains plans that look inexplicable on someone else's machine.
+
+## A worked example
+
+```sql
+CREATE TABLE customers (
+  id      bigserial PRIMARY KEY,
+  country text NOT NULL,
+  email   text NOT NULL
+);
+
+CREATE TABLE orders (
+  id          bigserial PRIMARY KEY,
+  customer_id bigint NOT NULL REFERENCES customers(id),
+  status      text NOT NULL,
+  total       numeric(10,2) NOT NULL,
+  created_at  timestamptz NOT NULL
+);
+
+INSERT INTO customers (country, email)
+SELECT (ARRAY['DE','FR','US','JP'])[1 + (i % 4)], 'user' || i || '@example.com'
+FROM generate_series(1, 200000) AS i;
+
+INSERT INTO orders (customer_id, status, total, created_at)
+SELECT 1 + (random() * 199999)::int,
+       (ARRAY['pending','paid','shipped'])[1 + (i % 3)],
+       round((random() * 400 + 10)::numeric, 2),
+       now() - (random() * interval '365 days')
+FROM generate_series(1, 2000000) AS i;
+
+ANALYZE customers;
+ANALYZE orders;
+```
+
+Now a query with no supporting index:
+
+```sql
+EXPLAIN (ANALYZE, BUFFERS)
+SELECT * FROM orders
+WHERE status = 'pending' AND created_at >= now() - interval '7 days';
+```
+
+```
+ Gather  (cost=1000.00..48372.10 rows=12843 width=41)
+         (actual time=0.442..283.117 rows=12781 loops=1)
+   Workers Planned: 2
+   Workers Launched: 2
+   Buffers: shared hit=1204 read=15942
+   ->  Parallel Seq Scan on orders  (cost=0.00..46087.80 rows=5351 width=41)
+                                    (actual time=0.089..271.334 rows=4260 loops=3)
+         Filter: ((status = 'pending'::text) AND (created_at >= (now() - '7 days'::interval)))
+         Rows Removed by Filter: 662407
+         Buffers: shared hit=1204 read=15942
+ Planning Time: 0.214 ms
+ Execution Time: 284.402 ms
+```
+
+### Read it from the inside out
+
+The plan is a tree. Execution starts at the most deeply indented node and results flow upward. Here the `Parallel Seq Scan` runs first, and `Gather` collects the workers' output.
+
+### The numbers, in the order you should read them
+
+**`actual time=start..end`** is milliseconds. The first number is the time to produce the *first* row, the second is the time to produce the *last* row. A large gap between them means the node streams; a large first number means the node has to finish some work before producing anything (a sort, a hash build).
+
+**`loops=N`** is the trap. The `actual time` and `rows` values are **per loop, averaged**. Here `loops=3` (the leader plus two workers), so `rows=4260` per loop means roughly 12,781 rows in total. On a nested loop with `loops=50000`, a node showing `actual time=0.012` has actually consumed 600 ms. Always multiply.
+
+**`rows` estimated vs actual** is where the real diagnosis is. The planner estimated 12,843 and got 12,781 - excellent. When these differ by an order of magnitude or more, the planner is choosing a strategy for the wrong data volume, and no amount of index tuning fixes that; you fix the estimate.
+
+**`Rows Removed by Filter: 662407`** per loop, so about two million rows were read and thrown away. That is the actual problem in this plan.
+
+**`Buffers: shared hit=1204 read=15942`** - `hit` came from PostgreSQL's cache, `read` did not. 15,942 pages is roughly 125 MB of I/O to return 12,781 rows.
+
+**`cost=...`** is a unitless estimate used to compare plans. Once you have `actual time`, ignore it. Its only use is spotting that the planner thought something was cheap when it was not.
+
+### Fix it
+
+```sql
+CREATE INDEX orders_status_created_idx ON orders (status, created_at);
+ANALYZE orders;
+```
+
+```
+ Bitmap Heap Scan on orders  (cost=289.12..31022.44 rows=12843 width=41)
+                             (actual time=2.918..14.221 rows=12781 loops=1)
+   Recheck Cond: ((status = 'pending'::text) AND (created_at >= (now() - '7 days'::interval)))
+   Heap Blocks: exact=12103
+   Buffers: shared hit=12142 read=25
+   ->  Bitmap Index Scan on orders_status_created_idx
+         (cost=0.00..285.91 rows=12843 width=0) (actual time=1.604..1.604 rows=12781 loops=1)
+         Index Cond: ((status = 'pending'::text) AND (created_at >= (now() - '7 days'::interval)))
+         Buffers: shared hit=39
+ Planning Time: 0.312 ms
+ Execution Time: 15.008 ms
+```
+
+284 ms to 15 ms, and `read` dropped from 15,942 to 25 pages. Note `Rows Removed by Filter` is gone: the condition moved into `Index Cond`, so the rows were never read in the first place. That migration - from `Filter` to `Index Cond` - is the clearest signal that an index is doing its job.
+
+## Scan nodes
+
+**`Seq Scan`** reads the whole table. Not automatically bad: for a query returning 30% of a table it is the *correct* choice, because random index lookups would be slower than a sequential read. It is bad when paired with a large `Rows Removed by Filter` and a small result.
+
+**`Index Scan`** walks the index and fetches each matching row from the table. Best for small result sets.
+
+**`Index Only Scan`** answers entirely from the index without touching the table - possible when every column the query needs is in the index. Watch the `Heap Fetches:` line underneath: a high number means the visibility map is stale and the scan is touching the heap anyway, which a `VACUUM` fixes.
+
+**`Bitmap Heap Scan`** plus **`Bitmap Index Scan`** is the middle ground: collect all matching row locations first, sort them, then read the table in physical order. PostgreSQL picks this when there are too many matches for an `Index Scan` but too few for a `Seq Scan`. If you see `Heap Blocks: lossy=...`, the bitmap exceeded `work_mem` and degraded to tracking whole pages, adding a recheck cost.
+
+**`Index Cond` vs `Filter`** is the distinction to internalise. `Index Cond` narrows the index traversal. `Filter` is applied to rows after they have been read. Moving a predicate from `Filter` to `Index Cond` is usually the entire win.
+
+## Join nodes
+
+**`Nested Loop`** runs the inner side once per outer row. Excellent when the outer side is a handful of rows and the inner side has an index; catastrophic when the outer row count was underestimated. Check `loops=` on the inner node and multiply.
+
+**`Hash Join`** builds a hash table from one side, probes with the other. The default for joining two large sets. Look for `Batches: 1`; anything higher means the hash spilled to disk because it exceeded `work_mem`.
+
+```
+   ->  Hash  (actual time=142.1..142.1 rows=200000 loops=1)
+         Buckets: 65536  Batches: 4  Memory Usage: 2048kB
+```
+
+`Batches: 4` means the join was done in four passes with temporary files. Raising `work_mem` for that session often removes it outright:
+
+```sql
+SET work_mem = '64MB';
+```
+
+**`Merge Join`** sorts both sides and walks them in step. Cheap when both inputs are already ordered by an index, expensive when it has to sort them.
+
+## Misestimated rows: the root cause behind most bad plans
+
+When a plan is wrong, it is usually because the row estimate was wrong. Common causes and fixes:
+
+**Stale statistics.** After a bulk load, the planner still believes the old distribution.
+
+```sql
+ANALYZE orders;
+```
+
+**Correlated columns.** The planner assumes independence, so it estimates `WHERE city = 'Berlin' AND country = 'DE'` as the product of two selectivities and lands far too low. Extended statistics tell it the truth:
+
+```sql
+CREATE STATISTICS orders_city_country (dependencies, ndistinct)
+  ON city, country FROM orders;
+ANALYZE orders;
+```
+
+**Not enough samples on a skewed column.** Raise the target for that column only:
+
+```sql
+ALTER TABLE orders ALTER COLUMN status SET STATISTICS 500;
+ANALYZE orders;
+```
+
+**Functions wrapped around columns.** `WHERE date(created_at) = '2026-09-12'` cannot use an index on `created_at` and gets a generic estimate. Rewrite as a range, which is both indexable and correctly estimated:
+
+```sql
+WHERE created_at >= '2026-09-12' AND created_at < '2026-09-13'
+```
+
+**Parameterised queries with a generic plan.** A prepared statement may switch to a generic plan after five executions, ignoring the actual parameter values. `EXPLAIN (ANALYZE)` on the literal version looks fine while production is slow. Check with `SET plan_cache_mode = force_custom_plan;` as a diagnostic.
+
+## A reading checklist
+
+1. Look at `Execution Time` first, then `Planning Time`. A planning time of tens of milliseconds on a simple query suggests too many partitions or indexes.
+2. Find the node with the largest `actual time`, remembering to multiply by `loops`.
+3. Compare estimated `rows` to actual `rows` at that node. A factor of 10 or more is your real problem.
+4. Look for `Rows Removed by Filter`. Large values mean work that an index could have avoided.
+5. Check `Buffers`: high `read` means I/O; high `hit` with slow time means CPU, often a bad join or an expensive function.
+6. Look for spills: `Batches:` above 1, `Sort Method: external merge`, `Heap Blocks: lossy`.
+7. Only then consider adding an index - and re-run the plan afterwards to confirm it was used.
+
+## Getting plans from production
+
+You cannot always run `EXPLAIN ANALYZE` interactively against the query that is actually slow, because you need the real parameter values and the real cache state. Two mechanisms capture plans in place:
+
+```sql
+-- auto_explain logs plans for slow statements automatically
+-- shared_preload_libraries = 'auto_explain'  (requires restart)
+SET auto_explain.log_min_duration = '500ms';
+SET auto_explain.log_analyze = on;
+SET auto_explain.log_buffers = on;
+SET auto_explain.log_nested_statements = on;
+
+-- pg_stat_statements ranks statements so you know which plan to go looking for
+SELECT queryid, calls, round(total_exec_time) AS total_ms,
+       round(mean_exec_time) AS mean_ms, rows, query
+FROM pg_stat_statements
+ORDER BY total_exec_time DESC
+LIMIT 20;
+```
+
+Use `pg_stat_statements` to pick the target - the statement consuming the most total time, not the one with the worst single run - then `auto_explain` or a manual `EXPLAIN (ANALYZE, BUFFERS)` to see why. Reading the tree is easier in a client that formats it and lets you run the before-and-after side by side; [Chat2DB](https://chat2db.ai/download) does this for PostgreSQL and MySQL, and the [web version](https://app.chat2db.ai) needs no install.
+
+## Summary
+
+Ignore `cost` once you have `ANALYZE`. Multiply `actual time` and `rows` by `loops` before believing them. The estimate-versus-actual row gap identifies the node to fix, and `Rows Removed by Filter` identifies the work to eliminate. Add `BUFFERS` to separate I/O problems from CPU problems, watch for spills to disk, and treat a bad row estimate as a statistics problem rather than an index problem - because adding an index on top of a wrong estimate usually produces a different wrong plan.

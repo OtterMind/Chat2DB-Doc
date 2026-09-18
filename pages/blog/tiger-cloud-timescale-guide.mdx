@@ -1,0 +1,207 @@
+---
+title: "Tiger Cloud and Timescale: Postgres Time Series"
+description: "Timescale is now Tiger Data and Tiger Cloud. What changed, how hypertables, compression and continuous aggregates work, and when Postgres beats a TSDB."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: September 17, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# Tiger Cloud and Timescale: Postgres Time Series
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="September 17, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+If you have gone looking for Timescale Cloud recently and landed somewhere called Tiger Cloud, nothing broke. Timescale rebranded to Tiger Data, and its managed Postgres platform is now Tiger Cloud. The extension you install is still TimescaleDB, your `create_hypertable()` calls still work, and existing connections are unaffected.
+
+This guide covers what the naming actually maps to and, more usefully, how the underlying technology works — because the reason to care is that it is all still Postgres.
+
+## What the names mean now
+
+- **Tiger Data** — the company, formerly Timescale Inc.
+- **Tiger Cloud** — the managed Postgres service, formerly Timescale Cloud.
+- **TimescaleDB** — the open-source extension. Same name, unchanged.
+- **TigerLake, Tiger MCP** and similar — newer products around the core service.
+
+The rebrand reflects a broadening of scope: the company now positions itself around Postgres for real-time analytics and AI workloads generally, not time-series alone. For an engineer, the practical impact is documentation URLs and a console logo.
+
+## The core idea: it is Postgres
+
+This is the whole argument for the approach. A hypertable is a regular Postgres table that is transparently partitioned by time. You keep joins to your transactional tables, foreign keys, `psql`, your ORM, your drivers, your extensions and your operational knowledge.
+
+```sql
+CREATE EXTENSION IF NOT EXISTS timescaledb;
+
+CREATE TABLE metrics (
+    time        timestamptz NOT NULL,
+    device_id   integer      NOT NULL,
+    location    text,
+    temperature double precision,
+    humidity    double precision
+);
+
+-- Turn it into a hypertable partitioned by time
+SELECT create_hypertable('metrics', by_range('time', INTERVAL '7 days'));
+```
+
+That is the entire conversion. Inserts and queries are ordinary SQL:
+
+```sql
+INSERT INTO metrics (time, device_id, location, temperature, humidity)
+VALUES (now(), 1, 'warehouse-a', 21.5, 45.2);
+
+SELECT device_id, avg(temperature)
+FROM metrics
+WHERE time > now() - INTERVAL '1 day'
+GROUP BY device_id;
+```
+
+Behind the scenes, rows land in chunks of roughly a week. A query with a time predicate touches only the relevant chunks — chunk exclusion — so each index stays small and hot regardless of total table size. This is the main reason a hypertable outperforms a single giant Postgres table at scale.
+
+Size your chunk interval so that **the chunks being actively written fit comfortably in about 25% of RAM**. Too large and you lose the exclusion benefit; too small and you accumulate thousands of chunks and slow down planning. Check what you have:
+
+```sql
+SELECT hypertable_name,
+       chunk_name,
+       range_start,
+       range_end,
+       pg_size_pretty(total_bytes) AS size
+FROM timescaledb_information.chunks
+WHERE hypertable_name = 'metrics'
+ORDER BY range_start DESC
+LIMIT 10;
+```
+
+## time_bucket: the function you will use constantly
+
+Postgres has `date_trunc`, which only handles standard units. `time_bucket` handles arbitrary intervals:
+
+```sql
+SELECT
+    time_bucket('15 minutes', time) AS bucket,
+    device_id,
+    avg(temperature)  AS avg_temp,
+    max(temperature)  AS max_temp,
+    count(*)          AS readings
+FROM metrics
+WHERE time > now() - INTERVAL '24 hours'
+GROUP BY bucket, device_id
+ORDER BY bucket DESC;
+```
+
+Gap filling is where it becomes genuinely valuable — charts need a point for every interval, including the ones with no data:
+
+```sql
+SELECT
+    time_bucket_gapfill('5 minutes', time) AS bucket,
+    device_id,
+    avg(temperature)                       AS avg_temp,
+    locf(avg(temperature))                 AS filled_last_value,
+    interpolate(avg(temperature))          AS interpolated
+FROM metrics
+WHERE time > now() - INTERVAL '6 hours'
+  AND time < now()
+GROUP BY bucket, device_id
+ORDER BY bucket;
+```
+
+`locf` carries the last observation forward; `interpolate` draws a line between neighbours. Both require an explicit bounded time range in the `WHERE` clause — omit the upper bound and you get an error, which is the most common complaint about this function.
+
+## Compression
+
+Columnar compression is the feature that makes Postgres viable for large time-series volumes. Older chunks are converted to a compressed columnar layout, typically shrinking dramatically depending on data shape.
+
+```sql
+ALTER TABLE metrics SET (
+    timescaledb.compress,
+    timescaledb.compress_segmentby = 'device_id',
+    timescaledb.compress_orderby   = 'time DESC'
+);
+
+SELECT add_compression_policy('metrics', INTERVAL '7 days');
+```
+
+`compress_segmentby` is the important choice: pick the column you filter on most, because compressed data is grouped by it and queries filtering on that column skip whole segments. `compress_orderby` controls ordering inside a segment; `time DESC` suits the usual "most recent first" access pattern.
+
+Verify the result rather than assuming it:
+
+```sql
+SELECT
+    pg_size_pretty(before_compression_total_bytes) AS before,
+    pg_size_pretty(after_compression_total_bytes)  AS after,
+    round(before_compression_total_bytes::numeric /
+          nullif(after_compression_total_bytes, 0), 1) AS ratio
+FROM hypertable_compression_stats('metrics');
+```
+
+Compressed chunks accept inserts, but updates and deletes on them are expensive. Design for append-only history and this is a non-issue.
+
+## Continuous aggregates
+
+A continuous aggregate is a materialized view that refreshes incrementally — only the buckets whose source data changed get recomputed. This is what turns a dashboard query from seconds into milliseconds.
+
+```sql
+CREATE MATERIALIZED VIEW metrics_hourly
+WITH (timescaledb.continuous) AS
+SELECT
+    time_bucket('1 hour', time) AS bucket,
+    device_id,
+    avg(temperature) AS avg_temp,
+    min(temperature) AS min_temp,
+    max(temperature) AS max_temp,
+    count(*)         AS readings
+FROM metrics
+GROUP BY bucket, device_id
+WITH NO DATA;
+
+SELECT add_continuous_aggregate_policy('metrics_hourly',
+    start_offset      => INTERVAL '3 days',
+    end_offset        => INTERVAL '1 hour',
+    schedule_interval => INTERVAL '30 minutes');
+```
+
+The critical behaviour: by default these views enable *real-time aggregation*, meaning a query transparently unions the materialized buckets with freshly computed results for data newer than the last refresh. You get pre-aggregated speed without stale results. Disable it if you prefer strict materialized semantics:
+
+```sql
+ALTER MATERIALIZED VIEW metrics_hourly
+SET (timescaledb.materialized_only = true);
+```
+
+You can also stack them — hourly rolled into daily — which keeps long-range dashboards cheap.
+
+## Retention
+
+Dropping a chunk is a file removal, not a `DELETE` scanning millions of rows:
+
+```sql
+SELECT add_retention_policy('metrics', INTERVAL '90 days');
+
+SELECT * FROM timescaledb_information.jobs;   -- inspect all policies
+```
+
+The idiomatic pattern is retention on the raw hypertable plus a much longer retention on the continuous aggregates: keep raw readings for 90 days, hourly rollups for two years. You lose per-reading detail on old data and keep the trends, at a fraction of the storage.
+
+## Tiger Cloud versus self-hosting
+
+TimescaleDB is open source and installs into any Postgres you run. Tiger Cloud adds managed backups and point-in-time recovery, high availability, connection pooling, automatic upgrades, and elastic storage — plus some features that are cloud-only. Self-hosting is free of licence cost but puts all of that on you, and time-series workloads are write-heavy enough that backup and vacuum strategy genuinely matters.
+
+## When to use this instead of a dedicated TSDB
+
+Choose Postgres with TimescaleDB when:
+
+- You already run Postgres and want one system rather than two.
+- Time-series data needs to join relational data — devices to customers to contracts. This is the strongest argument; dedicated TSDBs handle it badly or not at all.
+- You want full SQL, transactions and constraints on your metrics.
+- Data volume is in the low terabytes, which covers most applications.
+
+Choose something else when:
+
+- You are ingesting at a scale where a purpose-built engine's write path matters more than SQL flexibility.
+- Your workload is pure metrics with no relational component and an existing Prometheus stack already answers it.
+- You need petabyte analytical scans, where a columnar engine like ClickHouse is the better fit.
+
+The comparison people get wrong is treating raw ingest benchmarks as decisive. For most applications the binding constraint is not writes per second — it is whether you can answer a question that spans metrics and business data in one query. That is exactly what staying on Postgres buys you.
+
+Because it is ordinary Postgres, any Postgres client works. [Chat2DB](https://chat2db.ai/download) connects to Tiger Cloud and self-hosted TimescaleDB with no special configuration, so you can browse hypertables, inspect chunk sizes and run `time_bucket` queries next to your application tables; a browser version is available at [app.chat2db.ai](https://app.chat2db.ai).

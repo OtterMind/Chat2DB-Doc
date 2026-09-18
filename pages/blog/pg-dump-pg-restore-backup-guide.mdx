@@ -1,0 +1,256 @@
+---
+title: "pg_dump and pg_restore: A Practical Guide"
+description: "Back up and restore PostgreSQL with pg_dump and pg_restore: format choice, parallel jobs, globals, selective restores, version rules and common errors."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: September 12, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# pg_dump and pg_restore: A Practical Guide
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="September 12, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+
+`pg_dump` is the tool everyone uses and few read the manual for. It is easy to run and easy to misuse: the default output format cannot be restored selectively or in parallel, it does not include roles or tablespaces, and a dump taken with an older client against a newer server can fail in ways that only surface at restore time - which is to say, during an incident.
+
+This guide covers what `pg_dump` actually captures, which format to choose, how to restore quickly, and the errors that reliably appear the first time.
+
+## What pg_dump does and does not cover
+
+`pg_dump` produces a **logical** backup of a single database: the SQL needed to recreate its schema and data. It runs inside a single repeatable-read transaction, so the dump is a consistent snapshot as of its start time, and it does not block concurrent readers or writers (it does take an `ACCESS SHARE` lock on each table, which conflicts only with `ACCESS EXCLUSIVE` operations such as `ALTER TABLE`, so a migration running at the same time will wait).
+
+What it does **not** include:
+
+- Roles, users and passwords - these are cluster-wide, not per-database
+- Tablespace definitions
+- Other databases in the same cluster
+- `postgresql.conf` settings and `pg_hba.conf`
+- Replication slots and WAL
+
+That first point causes the most trouble. Restore a dump into a fresh cluster and every `GRANT` fails, because the roles it references do not exist yet. The fix is to dump the globals separately:
+
+```bash
+# Cluster-wide objects: roles, tablespaces, per-database settings
+pg_dumpall --globals-only -h db.internal -U postgres -f globals.sql
+
+# The database itself
+pg_dump -h db.internal -U postgres -d appdb -Fc -f appdb.dump
+```
+
+Restore `globals.sql` first, then the database dump. Keep both together; a database dump without its globals is only most of a backup.
+
+Note also that a logical dump is not a point-in-time recovery solution. It gives you the state at one instant, and restoring a 500 GB database from a dump can take hours. For a production system that must recover to an arbitrary second, you want physical backups with WAL archiving (`pg_basebackup`, pgBackRest or Barman) *in addition to* logical dumps, which remain the right tool for moving a database between versions or machines.
+
+## Choose the format first
+
+`pg_dump` has four output formats, and the choice determines everything you can do later.
+
+```bash
+# Plain SQL (default): a text file of SQL statements
+pg_dump -d appdb -f appdb.sql
+
+# Custom: compressed, single file, selective and parallel restore  <- use this
+pg_dump -d appdb -Fc -f appdb.dump
+
+# Directory: one file per table, supports parallel dump AND parallel restore
+pg_dump -d appdb -Fd -j 4 -f appdb_dir
+
+# Tar: like directory but in one archive, no compression of the whole archive
+pg_dump -d appdb -Ft -f appdb.tar
+```
+
+The default is plain SQL, and it is the format you least often want. It can only be replayed from start to finish with `psql`, it cannot restore a single table, and it cannot use more than one CPU. The custom format (`-Fc`) is compressed by default and carries a table of contents, which is what makes selective and parallel restores possible. Directory format (`-Fd`) is the only one that can also *dump* in parallel, so it is the right choice for large databases.
+
+A useful rule: use `-Fc` for routine backups, `-Fd -j N` when the dump itself is the bottleneck, and plain SQL only when a human needs to read the output or a tool requires it.
+
+## Common pg_dump invocations
+
+```bash
+# Schema only - useful for diffing environments
+pg_dump -d appdb --schema-only -f schema.sql
+
+# Data only, no schema
+pg_dump -d appdb --data-only -Fc -f data.dump
+
+# A single schema, or everything except one
+pg_dump -d appdb -n public -Fc -f public.dump
+pg_dump -d appdb -N audit -Fc -f no_audit.dump
+
+# Specific tables (patterns allowed; -T excludes)
+pg_dump -d appdb -t 'public.orders' -t 'public.order_items' -Fc -f orders.dump
+pg_dump -d appdb -T 'public.*_log' -Fc -f no_logs.dump
+
+# Exclude the data of a huge table but keep its structure
+pg_dump -d appdb --exclude-table-data='public.events' -Fc -f appdb.dump
+
+# Parallel dump, directory format, 4 workers
+pg_dump -d appdb -Fd -j 4 -f appdb_dir
+
+# Include DROP statements before each CREATE (for restoring over an existing DB)
+pg_dump -d appdb -Fc --clean --if-exists -f appdb.dump
+```
+
+Two flags that are worth adding by default when the dump will be restored elsewhere:
+
+```bash
+pg_dump -d appdb -Fc --no-owner --no-privileges -f appdb.dump
+```
+
+`--no-owner` skips `ALTER ... OWNER TO` statements and `--no-privileges` skips `GRANT`/`REVOKE`. Without them, restoring into a cluster whose roles differ produces a wall of errors. With them, everything ends up owned by whoever runs the restore, which is usually what you want for a development copy.
+
+Connection details follow the standard PostgreSQL environment variables, so you rarely need to repeat them:
+
+```bash
+export PGHOST=db.internal PGPORT=5432 PGUSER=postgres PGDATABASE=appdb
+export PGPASSWORD='...'   # or better, use a ~/.pgpass file with 0600 permissions
+pg_dump -Fc -f appdb.dump
+```
+
+Prefer `~/.pgpass` over `PGPASSWORD`: an environment variable is visible in the process list on some systems, and ends up in shell history.
+
+## Restoring
+
+A plain SQL dump is replayed with `psql`, everything else with `pg_restore`:
+
+```bash
+# Plain SQL
+psql -d newdb -f appdb.sql
+
+# Stop at the first error instead of ploughing on
+psql -d newdb --set ON_ERROR_STOP=on -f appdb.sql
+
+# Custom or directory format
+createdb newdb
+pg_restore -d newdb appdb.dump
+
+# Parallel restore with 4 workers - the single biggest speed-up available
+pg_restore -d newdb -j 4 appdb.dump
+```
+
+`ON_ERROR_STOP=on` matters more than it looks. Without it, `psql` reports errors and keeps going, and you end up with a database that restored "successfully" but is missing three tables.
+
+`pg_restore -j` parallelises the slow parts - data loading and index creation - and on a multi-core machine it commonly cuts restore time by more than half. It requires custom or directory format; that is the main reason not to use plain SQL.
+
+### Selective restore
+
+This is where the custom format earns its place. List the contents, filter, restore only what you need:
+
+```bash
+# What is in this dump?
+pg_restore --list appdb.dump | head -40
+
+# Restore one table's definition and data
+pg_restore -d newdb -t orders appdb.dump
+
+# Restore only the schema, or only the data
+pg_restore -d newdb --schema-only appdb.dump
+pg_restore -d newdb --data-only appdb.dump
+
+# Fine-grained: edit a list file and restore exactly those entries
+pg_restore --list appdb.dump > toc.txt
+#   delete or comment out (;) the lines you do not want
+pg_restore -d newdb --use-list=toc.txt appdb.dump
+```
+
+The `--use-list` workflow is the answer to "we need yesterday's version of these four tables and nothing else".
+
+### Restoring over an existing database
+
+```bash
+# Drop and recreate objects as it goes
+pg_restore -d appdb --clean --if-exists appdb.dump
+
+# Or let pg_restore create the database itself (connects to 'postgres' first)
+pg_restore -d postgres --create --clean appdb.dump
+```
+
+`--create` reads the database name from the dump, so the target name comes from the backup rather than the command line.
+
+## Version compatibility
+
+One rule prevents most upgrade pain: **always dump with the `pg_dump` binary of the newer version**.
+
+`pg_dump` can dump from servers older than itself, and its output is designed to be loaded into a server of its own version or newer. A PostgreSQL 17 `pg_dump` can dump a PostgreSQL 13 server and the result restores cleanly into 17. The reverse - using the 13 client against a 17 server - fails outright with `server version mismatch` or, worse, produces a dump missing newer object types.
+
+```bash
+# Wrong: old client against new server
+/usr/lib/postgresql/13/bin/pg_dump -h pg17-host -d appdb
+# pg_dump: error: server version: 17.2; pg_dump version: 13.14
+# pg_dump: error: aborting because of server version mismatch
+
+# Right: point at the newest client you have
+/usr/lib/postgresql/17/bin/pg_dump -h pg13-host -d appdb -Fc -f appdb.dump
+```
+
+On a machine with several versions installed, check what you are actually running with `pg_dump --version` and `which pg_dump`, and use the full path when in doubt. This single mismatch is the most common `pg_dump` failure reported by teams running managed Postgres, because the server is upgraded by the provider while the client on the jump box is not.
+
+## Making restores faster
+
+Beyond `-j`, the levers that matter on a large restore:
+
+```bash
+# Skip WAL for the data load when you can afford to re-run the restore on failure
+pg_restore -d newdb -j 4 --single-transaction appdb.dump
+```
+
+And on the target server, temporarily relax durability settings *on a machine that holds no other data you care about*:
+
+```sql
+ALTER SYSTEM SET maintenance_work_mem = '2GB';   -- faster index builds
+ALTER SYSTEM SET max_wal_size = '8GB';           -- fewer checkpoints
+ALTER SYSTEM SET autovacuum = off;               -- re-enable immediately after
+SELECT pg_reload_conf();
+```
+
+Reverse every one of these when the restore finishes, and run `ANALYZE` before letting traffic in - a freshly restored database has no statistics, so the first queries against it can pick catastrophically bad plans:
+
+```sql
+ANALYZE;
+```
+
+## Errors you will actually hit
+
+**`pg_dump: error: server version mismatch`** - see the version section above; use the newer client.
+
+**`ERROR: role "app_user" does not exist`** - you restored a database dump without its globals. Load `pg_dumpall --globals-only` output first, or dump with `--no-owner --no-privileges`.
+
+**`pg_restore: error: could not execute query: ERROR: relation "orders" already exists`** - the target is not empty. Use `--clean --if-exists`, or restore into a fresh database.
+
+**`ERROR: extension "postgis" is not available`** - dumps reference extensions by name and expect the binaries to be installed on the target. Install the extension packages before restoring.
+
+**Restore succeeds but the database is slow** - statistics were not rebuilt. Run `ANALYZE`.
+
+**`out of shared memory` / `You might need to increase max_locks_per_transaction`** - a `--single-transaction` restore of a database with very many tables or partitions holds a lock on each one. Either raise `max_locks_per_transaction` or drop `--single-transaction`.
+
+## A backup is only as good as its last restore test
+
+The dump that has never been restored is a hypothesis, not a backup. Automate a verification that actually loads it:
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+
+STAMP=$(date +%F)
+DUMP="/backups/appdb-${STAMP}.dump"
+
+pg_dump -h db.internal -U postgres -d appdb -Fc --no-owner -f "$DUMP"
+pg_dumpall -h db.internal -U postgres --globals-only -f "/backups/globals-${STAMP}.sql"
+
+# Verify: restore into a throwaway database and count a known table
+createdb -h localhost restore_check_$STAMP
+pg_restore -h localhost -d restore_check_$STAMP -j 4 "$DUMP"
+psql -h localhost -d restore_check_$STAMP -Atc 'SELECT count(*) FROM orders'
+dropdb -h localhost restore_check_$STAMP
+
+find /backups -name 'appdb-*.dump' -mtime +30 -delete
+```
+
+Once the copy is loaded, you still have to look at it. Connecting to the restored database and comparing row counts, schema and a few sample queries against production is the part that catches a silently partial dump - [Chat2DB](https://chat2db.ai/download) can hold both connections side by side for that comparison, and the [web version](https://app.chat2db.ai) works the same way from a browser.
+
+## Summary
+
+Use `-Fc` (or `-Fd` for very large databases) rather than the plain SQL default, because selective and parallel restores depend on it. Dump the globals separately with `pg_dumpall --globals-only`, or accept `--no-owner --no-privileges`. Always run the `pg_dump` binary from the newer of the two PostgreSQL versions involved. Restore with `-j` to use all your cores, set `ON_ERROR_STOP=on` when replaying plain SQL, and run `ANALYZE` afterwards. Then schedule a restore test, because that is the only thing that turns a file on disk into a backup.

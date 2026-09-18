@@ -1,0 +1,519 @@
+---
+title: "Postgres TO_DATE and TO_TIMESTAMP: String to Date"
+description: "Convert strings to dates in PostgreSQL with casts, TO_DATE and TO_TIMESTAMP: format patterns, time zones, strict parsing with FX, and validating bad input."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: September 11, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# Postgres TO_DATE and TO_TIMESTAMP: String to Date
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="September 11, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+
+Dates arrive as text far more often than anyone would like: CSV exports, JSON payloads, log lines, spreadsheet dumps. PostgreSQL gives you three tools to turn that text into a real `date` or `timestamp`: a plain cast, `TO_DATE`, and `TO_TIMESTAMP`. Each one is right in a different situation, and each one has a way to silently give you the wrong answer if you pick it carelessly. This guide covers when the cast is enough, how the format templates work, how time zones sneak into `TO_TIMESTAMP`, and how to load a file full of mixed-quality date strings without the whole `INSERT` failing on row 4,812.
+
+All examples run as written on PostgreSQL 13 and later unless noted. Paste them into psql or Chat2DB (https://app.chat2db.ai) and compare against the expected output.
+
+## Start with the plain cast
+
+If your input is ISO 8601, you do not need `TO_DATE` at all. The cast is shorter, faster, and stricter.
+
+```sql
+SELECT '2026-09-11'::date                       AS d,
+       '2026-09-11 15:45:00'::timestamp         AS ts,
+       '2026-09-11T15:45:00Z'::timestamptz      AS tstz,
+       CAST('2026-09-11' AS date)               AS d_standard;
+```
+
+```text
+     d      |         ts          |          tstz          | d_standard
+------------+---------------------+------------------------+------------
+ 2026-09-11 | 2026-09-11 15:45:00 | 2026-09-11 15:45:00+00 | 2026-09-11
+```
+
+The cast accepts every ISO 8601 variant (`2026-09-11`, `20260911`, `2026-09-11T15:45:00`, `2026-09-11 15:45:00.123456+02`) plus a number of English forms such as `September 11, 2026` and `11 Sep 2026`. It rejects impossible dates:
+
+```sql
+SELECT '2026-02-31'::date;
+```
+
+```text
+ERROR:  date/time field value out of range: "2026-02-31"
+```
+
+### Ambiguous input and DateStyle
+
+The problem begins with slashes. Is `03/04/2026` March 4 or April 3? The cast decides using the `DateStyle` setting, whose second half is `MDY`, `DMY`, or `YMD`.
+
+```sql
+SHOW DateStyle;
+```
+
+```text
+ DateStyle
+-----------
+ ISO, MDY
+```
+
+```sql
+SELECT '03/04/2026'::date;            -- MDY: March 4
+SET DateStyle = 'ISO, DMY';
+SELECT '03/04/2026'::date;            -- DMY: April 3
+RESET DateStyle;
+```
+
+```text
+    date
+------------
+ 2026-03-04
+
+    date
+------------
+ 2026-04-03
+```
+
+`DateStyle` is a session setting that can differ between clients, servers, and connection poolers. A query that works in your psql session can produce different dates from an application whose driver sets a different style. That is the single best reason to reach for `TO_DATE`: the format string makes the interpretation explicit and independent of session settings.
+
+## TO_DATE and TO_TIMESTAMP basics
+
+Both functions take the input text and a template describing its layout.
+
+```sql
+SELECT TO_DATE('11/09/2026', 'DD/MM/YYYY')                       AS d,
+       TO_TIMESTAMP('11/09/2026 15:45:30', 'DD/MM/YYYY HH24:MI:SS') AS ts;
+```
+
+```text
+     d      |           ts
+------------+------------------------
+ 2026-09-11 | 2026-09-11 15:45:30+00
+```
+
+Two things to notice. `TO_DATE` returns `date`. `TO_TIMESTAMP` returns `timestamp with time zone`, not plain `timestamp`, and that has consequences covered below.
+
+### Template pattern reference
+
+| Pattern | Meaning | Example input |
+|---|---|---|
+| `YYYY` | 4-digit year | `2026` |
+| `YY` | 2-digit year (nearest to 2020 rule) | `26` |
+| `MM` | Month number, 01 to 12 | `09` |
+| `DD` | Day of month, 01 to 31 | `11` |
+| `DDD` | Day of year, 001 to 366 | `254` |
+| `HH24` | Hour, 00 to 23 | `15` |
+| `HH12` or `HH` | Hour, 01 to 12 | `03` |
+| `AM` / `PM` / `A.M.` / `P.M.` | Meridiem indicator | `PM` |
+| `MI` | Minute, 00 to 59 | `45` |
+| `SS` | Second, 00 to 59 | `30` |
+| `MS` | Millisecond, 000 to 999 | `123` |
+| `US` | Microsecond, 000000 to 999999 | `123456` |
+| `SSSS` or `SSSSS` | Seconds past midnight | `56730` |
+| `Mon` | Abbreviated month name, case matched to pattern | `Sep` |
+| `Month` | Full month name, blank padded to 9 chars | `September` |
+| `Day` | Full day name, blank padded to 9 chars | `Friday` |
+| `Dy` / `DY` | Abbreviated day name | `Fri` |
+| `TZ` | Time zone abbreviation (output only) | `UTC` |
+| `TZH` | Time zone hours offset | `+02` |
+| `TZM` | Time zone minutes offset | `30` |
+| `OF` | Time zone offset from UTC | `+02:00` |
+| `Q` | Quarter | `3` |
+| `WW` | Week of year | `37` |
+| `J` | Julian day | `2461295` |
+| `FM` prefix | Fill mode: suppress padding and leading zeros | `FMDD` accepts `9` |
+| `FX` prefix | Fixed format: strict matching, no whitespace skipping | `FXYYYY-MM-DD` |
+
+Two limitations to remember. `TZ` and `tz` are output-only in `to_char`; for parsing an offset you need `TZH` and `TZM` (PostgreSQL 12 and later) or `OF`. Day-of-week patterns (`Day`, `DY`, `D`) are accepted but ignored when parsing, because a day name does not determine a date.
+
+## Worked examples for common inputs
+
+Create a table that holds the kinds of strings you meet in real files:
+
+```sql
+CREATE TABLE raw_events (
+  id        serial PRIMARY KEY,
+  label     text,
+  raw_value text
+);
+
+INSERT INTO raw_events (label, raw_value) VALUES
+  ('dmy_slash',   '11/09/2026'),
+  ('compact',     '20260911'),
+  ('us_12h',      'Sep 11 2026 3:45PM'),
+  ('iso_utc',     '2026-09-11T15:45:00Z'),
+  ('iso_offset',  '2026-09-11T15:45:00+02:00'),
+  ('epoch',       '1789141500'),
+  ('bad_day',     '2026-02-31'),
+  ('bad_month',   '2026-13-01'),
+  ('garbage',     'n/a');
+```
+
+### Day/month/year with slashes
+
+```sql
+SELECT raw_value, TO_DATE(raw_value, 'DD/MM/YYYY') AS d
+FROM raw_events WHERE label = 'dmy_slash';
+```
+
+```text
+ raw_value  |     d
+------------+------------
+ 11/09/2026 | 2026-09-11
+```
+
+If the same file used US ordering, only the template changes: `'MM/DD/YYYY'`. The value itself does not tell you which one is correct. That has to come from whoever produced the file.
+
+### Compact YYYYMMDD
+
+The cast handles this already, but the template form documents the intent:
+
+```sql
+SELECT raw_value,
+       raw_value::date               AS via_cast,
+       TO_DATE(raw_value, 'YYYYMMDD') AS via_to_date
+FROM raw_events WHERE label = 'compact';
+```
+
+```text
+ raw_value | via_cast   | via_to_date
+-----------+------------+-------------
+ 20260911  | 2026-09-11 | 2026-09-11
+```
+
+### English month, 12-hour clock
+
+```sql
+SELECT raw_value,
+       TO_TIMESTAMP(raw_value, 'Mon DD YYYY HH12:MIAM') AS ts
+FROM raw_events WHERE label = 'us_12h';
+```
+
+```text
+     raw_value      |           ts
+--------------------+------------------------
+ Sep 11 2026 3:45PM | 2026-09-11 15:45:00+00
+```
+
+Note that `HH12` accepted a single-digit `3`. Numeric fields in a template consume as many digits as available up to the field width, unless `FX` is used. `AM` and `PM` in the template are interchangeable; either accepts either value in the input.
+
+### ISO 8601 with Z or an offset
+
+For these the cast is the right tool, because it understands `Z` and `+02:00` natively:
+
+```sql
+SELECT label, raw_value, raw_value::timestamptz AS ts
+FROM raw_events WHERE label IN ('iso_utc', 'iso_offset')
+ORDER BY id;
+```
+
+```text
+   label    |         raw_value         |           ts
+------------+---------------------------+------------------------
+ iso_utc    | 2026-09-11T15:45:00Z      | 2026-09-11 15:45:00+00
+ iso_offset | 2026-09-11T15:45:00+02:00 | 2026-09-11 13:45:00+00
+```
+
+If you must use a template, `TZH:TZM` parses the offset and a literal `"Z"` in double quotes matches the trailing Z without interpreting it:
+
+```sql
+SELECT TO_TIMESTAMP('2026-09-11T15:45:00+02:00', 'YYYY-MM-DD"T"HH24:MI:SSTZH:TZM'),
+       TO_TIMESTAMP('2026-09-11T15:45:00Z',      'YYYY-MM-DD"T"HH24:MI:SS"Z"');
+```
+
+The second call ignores the Z and treats the value as local session time, which is a bug unless your session is in UTC. Prefer the cast for ISO input.
+
+### Unix epoch seconds
+
+`TO_TIMESTAMP` has a second, one-argument form that takes `double precision` seconds since 1970-01-01 UTC:
+
+```sql
+SELECT raw_value,
+       TO_TIMESTAMP(raw_value::double precision) AS ts,
+       TO_TIMESTAMP(raw_value::bigint / 1000.0)  AS if_millis
+FROM raw_events WHERE label = 'epoch';
+```
+
+```text
+ raw_value  |           ts           |          if_millis
+------------+------------------------+-----------------------------
+ 1789141500 | 2026-09-11 03:45:00+00 | 1970-01-21 16:59:01.5+00
+```
+
+If your epoch values are 13 digits long they are milliseconds; divide by 1000. Fractional seconds are preserved.
+
+## Time zones and TO_TIMESTAMP
+
+Because `TO_TIMESTAMP` returns `timestamptz`, it has to decide which zone the input was in. The rule: if the template contains `TZH`/`TZM` or `OF`, the parsed offset is used. Otherwise the input is interpreted in the session `TimeZone`.
+
+```sql
+SET TimeZone = 'Asia/Tokyo';
+SELECT TO_TIMESTAMP('2026-09-11 15:45:00', 'YYYY-MM-DD HH24:MI:SS') AS ts;
+
+SET TimeZone = 'UTC';
+SELECT TO_TIMESTAMP('2026-09-11 15:45:00', 'YYYY-MM-DD HH24:MI:SS') AS ts;
+RESET TimeZone;
+```
+
+```text
+           ts
+------------------------
+ 2026-09-11 15:45:00+09
+
+           ts
+------------------------
+ 2026-09-11 15:45:00+00
+```
+
+Same string, two different instants. If the source data is known to be UTC and you do not want to depend on session settings, say so explicitly:
+
+```sql
+SELECT TO_TIMESTAMP('2026-09-11 15:45:00', 'YYYY-MM-DD HH24:MI:SS') AT TIME ZONE 'UTC';
+```
+
+Careful: `timestamptz AT TIME ZONE 'UTC'` returns a plain `timestamp` representing wall-clock UTC. That is usually what you want for storage as `timestamp`, but if the column is `timestamptz` you should instead fix the session zone or parse with an explicit offset in the string.
+
+For a plain `timestamp` column with no zone semantics at all, the simplest correct path is `TO_TIMESTAMP(...)::timestamp` after setting `TimeZone = 'UTC'`, or a cast of ISO text directly to `timestamp`.
+
+## The lenient parsing pitfall
+
+`TO_DATE` does validate the final date. Since PostgreSQL 10 an out-of-range day is an error, not a rollover:
+
+```sql
+SELECT TO_DATE('2026-02-31', 'YYYY-MM-DD');
+```
+
+```text
+ERROR:  date/time field value out of range: "2026-02-31"
+```
+
+The lenient part is the matching of input to template. In the default (non-`FX`) mode, PostgreSQL skips whitespace, accepts fewer digits than the template width, and stops reading once the template is exhausted. Extra trailing characters are ignored. That leads to answers that are wrong but not errors:
+
+```sql
+SELECT TO_DATE('2026-9-1',      'YYYY-MM-DD')   AS short_fields,
+       TO_DATE('2026-09-11 junk','YYYY-MM-DD')  AS trailing_ignored,
+       TO_DATE('2026091',        'YYYYMMDD')     AS digits_shifted;
+```
+
+```text
+ short_fields | trailing_ignored | digits_shifted
+--------------+------------------+----------------
+ 2026-09-01   | 2026-09-11       | 2026-09-01
+```
+
+The third result is the dangerous one. `2026091` was probably a truncated `20260911`, but PostgreSQL matched `2026`, `09`, and `1` and returned a plausible date with no warning.
+
+`FX` at the start of the template turns on strict matching: separators must match exactly, numeric fields must have the full width, and leftover input is an error.
+
+```sql
+SELECT TO_DATE('2026091', 'FXYYYYMMDD');
+```
+
+```text
+ERROR:  source string too short for "DD" formatting field
+```
+
+```sql
+SELECT TO_DATE('2026-09-11 junk', 'FXYYYY-MM-DD');
+```
+
+```text
+ERROR:  trailing characters remain in input string after literal
+```
+
+For any bulk load where correctness matters more than convenience, use `FX`.
+
+## Handling bad rows in bulk loads
+
+If one string in a million is `n/a`, a single `INSERT ... SELECT TO_DATE(...)` fails and rolls back everything. The reliable pattern is: load the file into a `text` column first, then convert with a guard.
+
+### Option 1: filter with a regex before converting
+
+```sql
+SELECT id, raw_value,
+       CASE
+         WHEN raw_value ~ '^\d{4}-\d{2}-\d{2}$'
+         THEN TO_DATE(raw_value, 'FXYYYY-MM-DD')
+       END AS d
+FROM raw_events
+WHERE label IN ('bad_day', 'bad_month', 'garbage', 'compact');
+```
+
+This still fails, because `2026-02-31` and `2026-13-01` match the regex and only blow up inside `TO_DATE`. A regex proves the shape, not the value. It is good enough as a first pass but not as the only check.
+
+### Option 2: a safe conversion function
+
+Wrap the conversion in PL/pgSQL and catch the exception. The function returns `NULL` for anything that does not parse, and the caller decides what to do with the nulls.
+
+```sql
+CREATE OR REPLACE FUNCTION safe_to_date(p_text text, p_format text)
+RETURNS date
+LANGUAGE plpgsql
+IMMUTABLE
+AS $$
+BEGIN
+  RETURN TO_DATE(p_text, p_format);
+EXCEPTION
+  WHEN others THEN
+    RETURN NULL;
+END;
+$$;
+
+SELECT id, label, raw_value, safe_to_date(raw_value, 'FXYYYY-MM-DD') AS d
+FROM raw_events
+WHERE label IN ('bad_day', 'bad_month', 'garbage', 'iso_utc')
+ORDER BY id;
+```
+
+```text
+ id |   label   |      raw_value       |  d
+----+-----------+----------------------+----
+  4 | iso_utc   | 2026-09-11T15:45:00Z |
+  7 | bad_day   | 2026-02-31           |
+  8 | bad_month | 2026-13-01           |
+  9 | garbage   | n/a                  |
+```
+
+Row 4 is null because the `FX` template demands an exact match and the input has a time part. That is the correct outcome: this function is for one specific format, and a value in a different format should be flagged rather than half-parsed.
+
+Exception handling in PL/pgSQL creates a subtransaction per call, which is noticeably slower than a plain expression. It is fine for loading a file once. For a hot path, validate first and convert without the try/catch.
+
+### Option 3: pg_input_is_valid (PostgreSQL 16 and later)
+
+PostgreSQL 16 added a function that checks whether a string would be accepted by a type's input function, without raising an error:
+
+```sql
+SELECT raw_value,
+       pg_input_is_valid(raw_value, 'date')        AS is_date,
+       pg_input_is_valid(raw_value, 'timestamptz') AS is_tstz
+FROM raw_events
+ORDER BY id;
+```
+
+```text
+         raw_value         | is_date | is_tstz
+---------------------------+---------+---------
+ 11/09/2026                | t       | t
+ 20260911                  | t       | t
+ Sep 11 2026 3:45PM        | t       | t
+ 2026-09-11T15:45:00Z      | t       | t
+ 2026-09-11T15:45:00+02:00 | t       | t
+ 1789141500                | f       | f
+ 2026-02-31                | f       | f
+ 2026-13-01                | f       | f
+ n/a                       | f       | f
+```
+
+Note that `11/09/2026` reports valid because the cast accepts it under the current `DateStyle`, even though it may mean the wrong day. `pg_input_is_valid` tests the cast, not a `TO_DATE` template. Its companion `pg_input_error_info` returns the message you would have received:
+
+```sql
+SELECT * FROM pg_input_error_info('2026-13-01', 'date');
+```
+
+```text
+                      message                       | detail | hint | sql_error_code
+----------------------------------------------------+--------+------+----------------
+ date/time field value out of range: "2026-13-01"   |        |      | 22008
+```
+
+A clean load pipeline on 16+ becomes:
+
+```sql
+CREATE TABLE events (
+  id         int PRIMARY KEY,
+  event_date date NOT NULL
+);
+
+INSERT INTO events (id, event_date)
+SELECT id, raw_value::date
+FROM raw_events
+WHERE pg_input_is_valid(raw_value, 'date');
+
+-- Everything that did not make it, for manual review.
+SELECT id, label, raw_value
+FROM raw_events
+WHERE NOT pg_input_is_valid(raw_value, 'date');
+```
+
+## Converting back with TO_CHAR
+
+`TO_CHAR` uses the same template language in the other direction. This is how you produce a specific string layout for a report or an API:
+
+```sql
+SELECT TO_CHAR(DATE '2026-09-11', 'DD/MM/YYYY')                        AS dmy,
+       TO_CHAR(DATE '2026-09-11', 'FMDay, FMDD FMMonth YYYY')           AS long_form,
+       TO_CHAR(TIMESTAMPTZ '2026-09-11 15:45:00+00', 'YYYY-MM-DD"T"HH24:MI:SSOF') AS iso_like;
+```
+
+```text
+    dmy     |         long_form          |         iso_like
+------------+----------------------------+---------------------------
+ 11/09/2026 | Friday, 11 September 2026  | 2026-09-11T15:45:00+00
+```
+
+Without `FM`, `Day` and `Month` are padded with spaces to nine characters, which is why `FMDay` is used above.
+
+## Indexing converted values
+
+Once dates are real `date` values, comparisons and range scans are cheap. If you are stuck with a `text` column you cannot change, you can still index the conversion, but only if the expression is `IMMUTABLE`. `TO_DATE` is immutable. `TO_TIMESTAMP` is only `STABLE`, because its result depends on the session time zone, so it cannot be used directly in an index expression.
+
+```sql
+-- Works: TO_DATE is IMMUTABLE.
+CREATE INDEX raw_events_date_idx
+  ON raw_events (safe_to_date(raw_value, 'FXYYYY-MM-DD'));
+
+SELECT id FROM raw_events
+WHERE safe_to_date(raw_value, 'FXYYYY-MM-DD') BETWEEN DATE '2026-09-01' AND DATE '2026-09-30';
+```
+
+The `safe_to_date` function above was declared `IMMUTABLE`, which is what makes this index possible. Note that the query must use the exact same expression as the index definition for the planner to match them.
+
+```sql
+-- Fails: TO_TIMESTAMP is STABLE, not IMMUTABLE.
+CREATE INDEX bad_idx
+  ON raw_events (TO_TIMESTAMP(raw_value, 'YYYY-MM-DD HH24:MI:SS'));
+```
+
+```text
+ERROR:  functions in index expression must be marked IMMUTABLE
+```
+
+The better long-term fix is to stop storing text. Add a proper column, backfill it once, and let the application write to it directly:
+
+```sql
+ALTER TABLE raw_events ADD COLUMN event_date date;
+
+UPDATE raw_events
+SET event_date = safe_to_date(raw_value, 'FXYYYY-MM-DD')
+WHERE event_date IS NULL;
+
+CREATE INDEX raw_events_event_date_idx ON raw_events (event_date);
+```
+
+A B-tree on a 4-byte `date` is smaller and faster than any expression index over text, and every query gets the benefit without having to repeat the conversion expression.
+
+## Summary
+
+- For ISO 8601 input, cast directly: `'2026-09-11'::date`. It is strict and does not depend on a template.
+- For anything with slashes or ambiguous ordering, use `TO_DATE`/`TO_TIMESTAMP` with an explicit template so the meaning does not depend on `DateStyle`.
+- `TO_TIMESTAMP` returns `timestamptz` and reads the input in the session `TimeZone` unless the template includes `TZH`/`TZM` or `OF`.
+- Default template matching is lenient about widths and trailing characters. Prefix the template with `FX` when the data must be exact.
+- For bulk loads, import as `text`, then filter with `pg_input_is_valid` (16+) or a `safe_to_date` function that catches exceptions.
+- `TO_DATE` is `IMMUTABLE` and can be indexed; `TO_TIMESTAMP` is not. Storing a real `date` column is better than either.
+
+## FAQ
+
+### What is the difference between TO_DATE and casting with ::date in PostgreSQL?
+
+The cast uses PostgreSQL's built-in date parser, which understands ISO 8601 and several English forms and relies on `DateStyle` to resolve ambiguous slash-separated input. `TO_DATE` requires a template and follows it literally, so `DD/MM/YYYY` always means day first regardless of session settings. Use the cast for ISO input and `TO_DATE` when the layout is unusual or ambiguous.
+
+### Why does TO_TIMESTAMP return a different time than I expect?
+
+`TO_TIMESTAMP` returns `timestamp with time zone`. If the template has no `TZH`/`TZM` or `OF` field, the string is interpreted in the session's `TimeZone` setting, and the result is then displayed in that same zone. Two sessions with different `TimeZone` values get different instants from the same string. Either include the offset in the input and template, or set `TimeZone` explicitly before converting.
+
+### How do I convert a string to a date without failing on invalid values?
+
+On PostgreSQL 16 and later, filter with `WHERE pg_input_is_valid(col, 'date')` before casting. On older versions, write a small PL/pgSQL function that wraps `TO_DATE` in `BEGIN ... EXCEPTION WHEN others THEN RETURN NULL; END` and call that instead. In both cases, keep the rows that failed so you can inspect and fix them rather than silently dropping them.

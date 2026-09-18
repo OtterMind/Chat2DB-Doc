@@ -1,0 +1,183 @@
+---
+title: "MotherDuck vs DuckDB: What You Actually Get"
+description: "MotherDuck is managed DuckDB with hybrid query execution. What it adds over plain DuckDB, how dual execution works, and when local DuckDB still wins."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: September 17, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# MotherDuck vs DuckDB: What You Actually Get
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="September 17, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+DuckDB is an in-process analytical database — a library you import, with no server and no cluster. MotherDuck is a managed cloud service built around it, founded by people who previously built large-scale warehouses and concluded that most analytical workloads do not need a cluster at all.
+
+The interesting part is not "DuckDB, but hosted". It is *hybrid execution*: a single query that runs partly on your laptop and partly in the cloud, with the planner deciding which. This guide explains what that buys you and when plain DuckDB is still the better answer.
+
+## What DuckDB already does well
+
+It is worth being precise about the baseline, because DuckDB alone solves more than people expect.
+
+```python
+import duckdb
+
+con = duckdb.connect('analytics.db')
+
+# Query files directly - no load step
+con.sql("""
+    SELECT country, count(*) AS events, avg(duration_ms) AS avg_ms
+    FROM 'events/*.parquet'
+    WHERE event_date >= '2026-09-01'
+    GROUP BY country
+    ORDER BY events DESC
+""").show()
+```
+
+Columnar storage, vectorized execution, full Postgres-like SQL including window functions and correlated subqueries, direct reads of Parquet, CSV, JSON, Arrow and Pandas dataframes, and zero infrastructure. On a modern laptop it handles tens of gigabytes comfortably.
+
+Its limits are structural rather than performance-related:
+
+- **Single machine.** Bounded by local RAM, disk and cores.
+- **Single writer.** One process writes to a database file at a time. It is not a multi-user server.
+- **No sharing.** A `.duckdb` file on your machine is yours alone; collaborating means copying files.
+- **Nothing persists between environments.** Your laptop's database and your CI job's database are unrelated.
+
+MotherDuck addresses exactly those four things.
+
+## Hybrid execution
+
+The distinguishing feature. Connect local DuckDB to MotherDuck and you get one logical database spanning both:
+
+```sql
+-- Local DuckDB CLI
+ATTACH 'md:my_database';
+
+-- Cloud table joined to a local file, in one query
+SELECT
+    c.segment,
+    count(*)        AS orders,
+    sum(l.amount)   AS revenue
+FROM my_database.main.customers AS c      -- lives in the cloud
+JOIN 'local_orders.parquet'     AS l      -- lives on your disk
+  ON l.customer_id = c.id
+GROUP BY c.segment
+ORDER BY revenue DESC;
+```
+
+The planner splits the work. Filtering and aggregation over the cloud table happen in the cloud, near the storage; the local file is read locally; only the intermediate results cross the network. You are not downloading the customers table to join it.
+
+This matters because the usual failure mode of cloud warehouses is round trips — pulling data down to combine it with something local. Hybrid execution removes that step, and it means a laptop and a cloud service can genuinely cooperate on one query.
+
+You can also direct execution explicitly when you know better than the planner:
+
+```sql
+-- Force cloud execution
+SELECT count(*) FROM my_database.main.events;
+
+-- Force local execution over a cloud-stored file
+SET motherduck_execution_mode = 'local';
+```
+
+## What MotherDuck adds
+
+**Persistent storage.** Databases live in the cloud and survive your laptop. Storage is managed; you do not provision volumes.
+
+**Sharing.** A read-only snapshot of a database can be shared with a colleague in one statement:
+
+```sql
+CREATE SHARE my_share FROM my_database;
+-- The recipient attaches it:
+ATTACH 'md:_share/my_share/<share-id>';
+```
+
+This is the feature that changes team workflows most. DuckDB's story for "send my colleague this analysis" was "send them the file". Shares are versioned snapshots, so the recipient sees a consistent view without copying anything.
+
+**Serverless compute.** Cloud-side queries run on managed "ducklings" that start quickly and suspend when idle, so you are not paying for an always-on warehouse.
+
+**SQL over cloud object storage.** Query S3 data with credentials stored in the service rather than scattered across developer machines.
+
+**Multi-user access.** Several people and processes can read the same database concurrently — the single-writer limitation of a local file no longer defines the team's workflow.
+
+**AI-assisted SQL.** A `prompt_query` function generates SQL from natural language, and `pragma` helpers explain schemas. Convenient, though not why anyone chooses the product.
+
+## Where it fits against the alternatives
+
+MotherDuck is not competing with Snowflake or BigQuery for petabyte workloads, and does not claim to be. Its bet is that the median analytical dataset is much smaller than the industry's tooling assumes — that a large fraction of teams running distributed warehouses have working sets that fit comfortably on one large machine.
+
+If that describes your data, the comparison looks like this:
+
+| | Local DuckDB | MotherDuck | Cloud warehouse |
+| --- | --- | --- | --- |
+| Setup | None | Account + token | Real project |
+| Data size | Fits one machine | Fits one large node | Effectively unbounded |
+| Sharing | Copy files | Built-in shares | Native |
+| Concurrency | Single writer | Multi-user | Multi-user |
+| Cost floor | Free | Usage-based | Usually higher |
+| Ops burden | None | Minimal | Moderate |
+
+## When plain DuckDB is still right
+
+Do not add a cloud dependency you do not need. Stay local when:
+
+- **The work is genuinely solo.** Ad-hoc analysis, a notebook, a one-off investigation of a Parquet dump.
+- **Data cannot leave your environment.** Regulatory or contractual constraints settle the question.
+- **It is embedded in an application.** DuckDB inside a Python service, a CLI tool or a desktop app wants no network.
+- **It runs in CI.** Tests that spin up DuckDB in-process should not depend on an external service.
+- **Offline matters.** Local DuckDB works on a plane; MotherDuck does not.
+
+A reasonable pattern is both: local DuckDB for development and CI, MotherDuck attached when you need shared or persistent data.
+
+## Getting started
+
+```bash
+pip install duckdb
+```
+
+```python
+import duckdb
+
+con = duckdb.connect('md:my_database')   # prompts for auth, or set motherduck_token
+
+con.sql("CREATE TABLE events AS SELECT * FROM 'events/*.parquet'")
+con.sql("SELECT count(*) FROM events").show()
+```
+
+Or from the DuckDB CLI:
+
+```sql
+ATTACH 'md:';
+USE my_database;
+CREATE TABLE sales AS SELECT * FROM read_csv_auto('s3://bucket/sales/*.csv');
+```
+
+Loading an existing local database into the cloud is a single statement:
+
+```sql
+ATTACH 'local.duckdb' AS local_db;
+ATTACH 'md:cloud_db';
+CREATE TABLE cloud_db.main.events AS SELECT * FROM local_db.main.events;
+```
+
+## Cost model
+
+Billing is usage-based: compute for the time cloud queries run, plus storage for what you keep. Because ducklings suspend when idle, an intermittently used database costs close to nothing in compute — a very different shape from a warehouse billed by uptime.
+
+The main thing to watch is unintentional cloud execution. A query that appears local but touches a cloud table runs partly in the cloud; scheduled jobs hitting cloud tables every few minutes keep compute awake. Check where a query actually ran with:
+
+```sql
+EXPLAIN SELECT ...;
+```
+
+and look for which fragments are marked as remote.
+
+## The verdict
+
+MotherDuck earns its place when DuckDB's *structural* limits bite — you need persistence beyond one machine, several people on the same data, or a query spanning local and remote sources. Hybrid execution is a real architectural advantage, not a marketing line, and shares solve a collaboration problem local DuckDB simply has no answer for.
+
+It is not the right tool if you are already at the scale where a distributed warehouse is genuinely required, or if your work is solo and local — in which case DuckDB alone remains one of the best analytical tools available, and it is free.
+
+Whichever side you land on, you will want a SQL client that speaks DuckDB alongside whatever operational databases feed it. [Chat2DB](https://chat2db.ai/download) connects to DuckDB, Postgres, MySQL, ClickHouse and more from one interface, which keeps the pipeline from source to analysis in a single window; there is a browser version at [app.chat2db.ai](https://app.chat2db.ai).

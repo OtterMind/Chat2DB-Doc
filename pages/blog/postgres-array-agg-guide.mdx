@@ -1,0 +1,284 @@
+---
+title: "Postgres array_agg: Rows Into Arrays and JSON"
+description: "A practical guide to PostgreSQL array_agg: ordering, DISTINCT, FILTER, NULL handling, the multidimensional error, unnest, and when jsonb_agg is better."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: September 12, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# Postgres array_agg: Rows Into Arrays and JSON
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="September 12, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+
+The N+1 query is the most common performance bug in application code, and `array_agg` is one of the cleanest ways to remove it. Instead of fetching 50 posts and then running 50 queries to load each post's tags, you fetch 50 rows where the tags arrive as a real array. No comma-splitting, no ambiguity when a value contains the delimiter, and no second round trip.
+
+This guide covers `array_agg` properly: ordering, deduplication, filtering, the NULL rules that differ from `string_agg`, the multidimensional error everyone hits once, how to reverse it with `unnest`, and when to use `jsonb_agg` instead.
+
+## Sample data
+
+```sql
+CREATE TABLE posts (
+  id     int PRIMARY KEY,
+  title  text NOT NULL
+);
+
+CREATE TABLE tags (
+  post_id  int NOT NULL REFERENCES posts(id),
+  tag      text,
+  weight   int NOT NULL DEFAULT 1
+);
+
+INSERT INTO posts VALUES
+  (1, 'Indexing basics'),
+  (2, 'Vacuum internals'),
+  (3, 'Draft with no tags');
+
+INSERT INTO tags VALUES
+  (1, 'postgres', 5),
+  (1, 'index',    3),
+  (1, 'postgres', 1),
+  (2, 'postgres', 4),
+  (2, NULL,       2);
+```
+
+## The basic form
+
+`array_agg(expression)` collects the values of an expression within each group into an array:
+
+```sql
+SELECT p.title,
+       array_agg(t.tag) AS tags
+FROM posts p
+JOIN tags t ON t.post_id = p.id
+GROUP BY p.title;
+```
+
+```
+      title       |            tags
+------------------+-----------------------------
+ Indexing basics  | {postgres,index,postgres}
+ Vacuum internals | {postgres,NULL}
+```
+
+Two behaviours to note immediately.
+
+First, and unlike almost every other aggregate in SQL, **`array_agg` keeps NULL elements**. `string_agg` drops them; `count(col)` ignores them; `array_agg` puts a NULL into the array. That is deliberate, because an array is a faithful container and dropping elements would change its length. It also means a `LEFT JOIN` that matched nothing produces `{NULL}` - an array with one NULL element - rather than an empty array, which is a classic source of confusing application-side bugs:
+
+```sql
+SELECT p.title, array_agg(t.tag) AS tags
+FROM posts p
+LEFT JOIN tags t ON t.post_id = p.id
+GROUP BY p.title;
+-- 'Draft with no tags' gets {NULL}, not {}
+```
+
+The fix is to strip the NULLs explicitly. Either filter inside the aggregate, or use `array_remove` afterwards:
+
+```sql
+SELECT p.title,
+       coalesce(array_agg(t.tag) FILTER (WHERE t.tag IS NOT NULL), '{}') AS tags
+FROM posts p
+LEFT JOIN tags t ON t.post_id = p.id
+GROUP BY p.title;
+```
+
+`FILTER` removes the rows before aggregation, so a group with nothing left returns NULL for the whole aggregate - hence the outer `coalesce` to an empty array literal `'{}'`. This combination is the idiomatic way to write "array of children, empty when there are none".
+
+Second, the result is a genuine `text[]`, not a string that looks like one. You can index into it, check containment, and get its length:
+
+```sql
+SELECT p.title,
+       array_agg(t.tag) AS tags,
+       array_length(array_agg(t.tag), 1) AS tag_count,
+       array_agg(t.tag) @> ARRAY['index']  AS mentions_index
+FROM posts p
+JOIN tags t ON t.post_id = p.id
+GROUP BY p.title;
+```
+
+## Ordering and deduplication
+
+As with `string_agg`, the element order is whatever the plan produced unless you say otherwise, and it *will* change when the data grows enough for a different plan. Put `ORDER BY` inside the aggregate:
+
+```sql
+SELECT p.title,
+       array_agg(t.tag ORDER BY t.weight DESC, t.tag) AS tags_by_weight
+FROM posts p
+JOIN tags t ON t.post_id = p.id
+WHERE t.tag IS NOT NULL
+GROUP BY p.title;
+```
+
+Deduplicate with `DISTINCT`, remembering the same restriction that applies to every aggregate: with `DISTINCT`, the internal `ORDER BY` may only reference the aggregated expression itself.
+
+```sql
+SELECT p.title,
+       array_agg(DISTINCT t.tag ORDER BY t.tag) AS unique_tags
+FROM posts p
+JOIN tags t ON t.post_id = p.id
+WHERE t.tag IS NOT NULL
+GROUP BY p.title;
+```
+
+If you need deduplication *and* a sort by another column, aggregate the ranking column first:
+
+```sql
+SELECT title, array_agg(tag ORDER BY max_weight DESC) AS tags
+FROM (
+  SELECT p.title, t.tag, max(t.weight) AS max_weight
+  FROM posts p
+  JOIN tags t ON t.post_id = p.id
+  WHERE t.tag IS NOT NULL
+  GROUP BY p.title, t.tag
+) d
+GROUP BY title;
+```
+
+## Aggregating more than one column
+
+A common need is "the tag and its weight together". Three approaches, in increasing order of usefulness.
+
+Aggregating two separate arrays works and keeps positions aligned, as long as both aggregates carry the same `ORDER BY`:
+
+```sql
+SELECT post_id,
+       array_agg(tag    ORDER BY weight DESC) AS tags,
+       array_agg(weight ORDER BY weight DESC) AS weights
+FROM tags WHERE tag IS NOT NULL
+GROUP BY post_id;
+```
+
+Aggregating a composite type keeps the pairs together:
+
+```sql
+SELECT post_id, array_agg((tag, weight) ORDER BY weight DESC) AS tag_weights
+FROM tags WHERE tag IS NOT NULL
+GROUP BY post_id;
+-- {"(postgres,5)","(index,3)","(postgres,1)"}
+```
+
+But the version most applications actually want is JSON, because every client library already parses it:
+
+```sql
+SELECT post_id,
+       jsonb_agg(jsonb_build_object('tag', tag, 'weight', weight)
+                 ORDER BY weight DESC) AS tag_weights
+FROM tags WHERE tag IS NOT NULL
+GROUP BY post_id;
+-- [{"tag": "postgres", "weight": 5}, {"tag": "index", "weight": 3}, ...]
+```
+
+This is the single most valuable pattern in this article. One query, one round trip, structured children per parent:
+
+```sql
+SELECT p.id,
+       p.title,
+       coalesce(
+         jsonb_agg(jsonb_build_object('tag', t.tag, 'weight', t.weight)
+                   ORDER BY t.weight DESC)
+         FILTER (WHERE t.tag IS NOT NULL),
+         '[]'::jsonb
+       ) AS tags
+FROM posts p
+LEFT JOIN tags t ON t.post_id = p.id
+GROUP BY p.id, p.title
+ORDER BY p.id;
+```
+
+Every post comes back with a JSON array of its tags, and the post with no tags gets `[]` instead of `[null]`. Note `'[]'::jsonb` rather than `'{}'` - in JSON, `{}` is an empty object and `[]` is an empty array, and sending the wrong one to a client expecting a list is a runtime error waiting to happen.
+
+## The multidimensional error
+
+Try to aggregate arrays with `array_agg` and PostgreSQL stops you:
+
+```sql
+SELECT array_agg(a) FROM (VALUES (ARRAY[1,2]), (ARRAY[3])) v(a);
+-- ERROR:  cannot accumulate arrays of different dimensions
+```
+
+PostgreSQL arrays are rectangular: a two-dimensional array must have the same length in every row, so it cannot build one from a 2-element and a 1-element array. When the lengths do match, it succeeds and returns a 2-D array, which surprises people expecting a flat list.
+
+To flatten instead, aggregate the elements rather than the arrays:
+
+```sql
+-- Flatten: unnest first, then aggregate
+SELECT array_agg(DISTINCT e ORDER BY e)
+FROM (VALUES (ARRAY[1,2]), (ARRAY[3])) v(a),
+     LATERAL unnest(v.a) AS e;
+-- {1,2,3}
+```
+
+`jsonb_agg` has no such restriction, which is another reason to prefer it for ragged nested data.
+
+## Reversing it: unnest
+
+`unnest` is the inverse of `array_agg` and turns array elements back into rows. It is how you query a legacy column that stores a list, and how you join against an array parameter passed from an application:
+
+```sql
+-- One row per element, with the position
+SELECT p.id, e.tag, e.ord
+FROM posts p
+CROSS JOIN LATERAL unnest(p.tag_cache) WITH ORDINALITY AS e(tag, ord);
+
+-- Join against a parameter array instead of building an IN list in the client
+SELECT * FROM posts WHERE id = ANY($1::int[]);
+```
+
+That last line deserves emphasis. Passing an array parameter and using `= ANY($1)` is safer and faster than string-building an `IN (1,2,3)` list: it is a single prepared statement regardless of how many values you pass, so the plan cache is not flooded with one entry per list length.
+
+## Using arrays in WHERE clauses
+
+Once data is in an array column, the containment operators do the work, and a GIN index makes them fast:
+
+```sql
+CREATE TABLE articles (
+  id    int PRIMARY KEY,
+  tags  text[] NOT NULL DEFAULT '{}'
+);
+CREATE INDEX articles_tags_gin ON articles USING GIN (tags);
+
+SELECT * FROM articles WHERE tags @> ARRAY['postgres'];        -- contains all
+SELECT * FROM articles WHERE tags && ARRAY['postgres','mysql']; -- overlaps any
+SELECT * FROM articles WHERE 'postgres' = ANY(tags);            -- membership (no GIN)
+SELECT * FROM articles WHERE cardinality(tags) = 0;             -- empty
+```
+
+The first two forms use the GIN index; `= ANY(tags)` does not, so prefer `@>` when the column is indexed. Use `cardinality()` rather than `array_length(tags, 1)` to test for emptiness, because `array_length` returns NULL - not 0 - for an empty array, and `NULL = 0` is not true.
+
+Before you denormalise into an array column, though, be honest about what you lose: no foreign keys to a tags table, no per-element constraints, and an update rewrites the whole array and therefore the whole row. Arrays are excellent as a *query result* shape and only sometimes correct as a *storage* shape.
+
+## Performance notes
+
+`array_agg` builds its result in memory, one array per group. That is cheap for tens of elements per group and expensive for millions, so cap the group size when the data is unbounded:
+
+```sql
+SELECT post_id, array_agg(tag ORDER BY weight DESC) AS top_tags
+FROM (
+  SELECT post_id, tag, weight,
+         row_number() OVER (PARTITION BY post_id ORDER BY weight DESC) AS rn
+  FROM tags WHERE tag IS NOT NULL
+) t
+WHERE rn <= 20
+GROUP BY post_id;
+```
+
+When a grouped aggregate is slow, check the plan before rewriting the SQL. A `HashAggregate` over a few thousand groups is fine; a `GroupAggregate` fed by a sort of the whole table usually means an index on the grouping column would change the shape of the plan entirely. `EXPLAIN (ANALYZE, BUFFERS)` shows which one you have, along with whether the hash spilled to disk. If you would rather read plans in a UI than in text, [Chat2DB](https://chat2db.ai/download) renders them alongside the query, and the [web version](https://app.chat2db.ai) works without a local install.
+
+## Choosing between the aggregates
+
+| Goal | Use |
+| --- | --- |
+| Human-readable list in a report | `string_agg(x, ', ' ORDER BY ...)` |
+| Typed list consumed by application code | `array_agg(x ORDER BY ...)` |
+| Objects with several fields per element | `jsonb_agg(jsonb_build_object(...))` |
+| Key/value map per group | `jsonb_object_agg(k, v)` |
+| Ragged or nested structures | `jsonb_agg` (arrays cannot be ragged) |
+
+## Summary
+
+`array_agg` turns rows into a real array, which is the right shape whenever the consumer is code. Remember the three rules that separate it from `string_agg`: it preserves NULL elements, an all-NULL `LEFT JOIN` group yields `{NULL}` rather than `{}`, and it cannot accumulate arrays of differing lengths. Add `FILTER (WHERE child.id IS NOT NULL)` plus `coalesce(..., '{}')` to get clean empty arrays, put `ORDER BY` inside the call whenever order is meaningful, and switch to `jsonb_agg` as soon as an element needs more than one field.

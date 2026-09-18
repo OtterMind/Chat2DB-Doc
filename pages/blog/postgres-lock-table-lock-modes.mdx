@@ -1,0 +1,326 @@
+---
+title: "Postgres LOCK TABLE and Lock Modes Explained"
+description: "A practical guide to PostgreSQL LOCK TABLE, the eight table-level lock modes, the full conflict matrix, pg_locks queries to find blockers, and lock_timeout."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: September 11, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# Postgres LOCK TABLE and Lock Modes Explained
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="September 11, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+
+Almost every statement in PostgreSQL takes a table-level lock, even a plain `SELECT`. Most of the time these locks do not conflict and you never notice them. Then one day an `ALTER TABLE` hangs, and a few seconds later the whole application stops reading from that table. Understanding the eight lock modes, which statements acquire them, and how they conflict is the difference between a two-second migration and an outage. This article walks through the modes, the conflict matrix, the `LOCK TABLE` command, and the queries you need to find out who is blocking whom.
+
+## Sample table
+
+All examples use one small table. Run this first.
+
+```sql
+CREATE TABLE orders (
+  order_id    SERIAL PRIMARY KEY,
+  customer_id INT NOT NULL,
+  amount      NUMERIC(10,2) NOT NULL,
+  order_date  DATE NOT NULL DEFAULT CURRENT_DATE
+);
+
+INSERT INTO orders (customer_id, amount, order_date) VALUES
+  (1, 120.00, '2026-01-05'),
+  (2,  80.50, '2026-02-10'),
+  (1,  45.00, '2026-03-01');
+```
+
+## The eight table-level lock modes
+
+PostgreSQL defines eight table-level lock modes. The names are historical and do not always describe what the lock protects, so it is better to memorize them by the statements that take them. Every mode is listed from weakest to strongest.
+
+| Mode | Acquired by |
+|------|-------------|
+| ACCESS SHARE | `SELECT` and any statement that only reads the table |
+| ROW SHARE | `SELECT ... FOR UPDATE`, `FOR NO KEY UPDATE`, `FOR SHARE`, `FOR KEY SHARE` |
+| ROW EXCLUSIVE | `INSERT`, `UPDATE`, `DELETE`, `MERGE` |
+| SHARE UPDATE EXCLUSIVE | `VACUUM` (without `FULL`), `ANALYZE`, `CREATE INDEX CONCURRENTLY`, `REINDEX CONCURRENTLY`, `CREATE STATISTICS`, `COMMENT ON`, and some `ALTER TABLE` forms such as `VALIDATE CONSTRAINT`, `SET STATISTICS`, `SET (storage_parameter)`, `DETACH PARTITION CONCURRENTLY` |
+| SHARE | `CREATE INDEX` (without `CONCURRENTLY`) |
+| SHARE ROW EXCLUSIVE | `CREATE TRIGGER`, and some `ALTER TABLE` forms such as `ADD FOREIGN KEY`, `ENABLE TRIGGER`, `DISABLE TRIGGER` |
+| EXCLUSIVE | `REFRESH MATERIALIZED VIEW CONCURRENTLY` |
+| ACCESS EXCLUSIVE | `DROP TABLE`, `TRUNCATE`, `REINDEX`, `CLUSTER`, `VACUUM FULL`, `REFRESH MATERIALIZED VIEW` (without `CONCURRENTLY`), and most `ALTER TABLE` forms (`ADD COLUMN`, `DROP COLUMN`, `ALTER COLUMN TYPE`, `RENAME`, `SET SCHEMA`, and others). Also the default mode for `LOCK TABLE` |
+
+Two points are easy to miss. First, a mode does not "lock the table" in the everyday sense. It only blocks other sessions that request a conflicting mode. A `SELECT` holding ACCESS SHARE blocks nothing except ACCESS EXCLUSIVE. Second, a lock, once acquired, is held until the end of the transaction. There is no `UNLOCK TABLE`; you release locks with `COMMIT` or `ROLLBACK`.
+
+## The conflict matrix
+
+The matrix below is the heart of the topic. Read it as: the mode in the row is being requested; an X means it must wait if any other session already holds the mode in the column.
+
+| Requested / Held | ACCESS SHARE | ROW SHARE | ROW EXCL | SHARE UPD EXCL | SHARE | SHARE ROW EXCL | EXCL | ACCESS EXCL |
+|------------------|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
+| ACCESS SHARE     |     |     |     |     |     |     |     |  X  |
+| ROW SHARE        |     |     |     |     |     |     |  X  |  X  |
+| ROW EXCLUSIVE    |     |     |     |     |  X  |  X  |  X  |  X  |
+| SHARE UPDATE EXCLUSIVE |     |     |     |  X  |  X  |  X  |  X  |  X  |
+| SHARE            |     |     |  X  |  X  |     |  X  |  X  |  X  |
+| SHARE ROW EXCLUSIVE |     |     |  X  |  X  |  X  |  X  |  X  |  X  |
+| EXCLUSIVE        |     |  X  |  X  |  X  |  X  |  X  |  X  |  X  |
+| ACCESS EXCLUSIVE |  X  |  X  |  X  |  X  |  X  |  X  |  X  |  X  |
+
+Some consequences worth reading off the table:
+
+- Reads (ACCESS SHARE) and writes (ROW EXCLUSIVE) never block each other. That is MVCC doing its job.
+- `CREATE INDEX` (SHARE) does not conflict with itself, so two indexes can be built at once, but it does block `INSERT`, `UPDATE`, and `DELETE` for the duration. `CREATE INDEX CONCURRENTLY` (SHARE UPDATE EXCLUSIVE) does not block writes, which is why it exists.
+- SHARE UPDATE EXCLUSIVE conflicts with itself, so two `VACUUM` runs or two concurrent index builds on the same table will serialize.
+- ACCESS EXCLUSIVE conflicts with everything, including a plain `SELECT`. Any DDL that takes it must wait for every open transaction that has touched the table.
+
+If you do not want to look the matrix up by hand, the online checker at https://chat2db.ai/tools/postgres-lock-conflict-checker lets you pick two lock modes and tells you whether they conflict.
+
+## LOCK TABLE syntax
+
+`LOCK TABLE` acquires a table-level lock explicitly, ahead of whatever statements you are about to run.
+
+```sql
+LOCK [ TABLE ] [ ONLY ] table_name [ * ] [, ...]
+    [ IN lock_mode MODE ] [ NOWAIT ]
+```
+
+- `lock_mode` is one of the eight modes above. If omitted, the default is ACCESS EXCLUSIVE, the strongest one. Always write the mode explicitly so the intent is clear.
+- `NOWAIT` makes the command fail immediately instead of waiting if the lock cannot be granted.
+- `ONLY` locks just the named table and not its partitions or inheritance children.
+
+`LOCK TABLE` only makes sense inside a transaction, because the lock is released at transaction end. Outside one it is an error:
+
+```sql
+LOCK TABLE orders IN SHARE MODE;
+```
+
+```text
+ERROR:  LOCK TABLE can only be used in transaction blocks
+```
+
+Inside a transaction it works and the lock lives until `COMMIT` or `ROLLBACK`:
+
+```sql
+BEGIN;
+LOCK TABLE orders IN SHARE ROW EXCLUSIVE MODE;
+-- other sessions can still SELECT, but cannot INSERT, UPDATE, or DELETE
+SELECT COUNT(*) FROM orders;
+COMMIT;
+```
+
+With `NOWAIT`, a lock that cannot be granted right now produces an error instead of a wait:
+
+```text
+ERROR:  could not obtain lock on relation "orders"
+```
+
+## Two-session demonstration: a blocked ALTER TABLE
+
+The most common production incident looks like this: a long-running read is open, a migration tries to alter the table, and everything queues up behind the migration. Reproduce it with two (then three) sessions. Open them in separate connections; in a GUI such as Chat2DB each query tab is its own connection, or use two `psql` windows.
+
+### Session A: a long read
+
+```sql
+BEGIN;
+SELECT pg_backend_pid();          -- note this number, for example 4101
+SELECT COUNT(*) FROM orders;
+-- do not commit yet; the ACCESS SHARE lock is held until the transaction ends
+```
+
+### Session B: the migration
+
+```sql
+ALTER TABLE orders ADD COLUMN note TEXT;
+-- this statement hangs
+```
+
+`ADD COLUMN` needs ACCESS EXCLUSIVE, which conflicts with the ACCESS SHARE held by Session A. Session B waits.
+
+### Session C: find the blocker
+
+`pg_blocking_pids(pid)` returns the array of process IDs that are preventing the given backend from acquiring its lock. Combine it with `pg_stat_activity`:
+
+```sql
+SELECT pid,
+       state,
+       wait_event_type,
+       wait_event,
+       pg_blocking_pids(pid) AS blocked_by,
+       left(query, 50)       AS query
+FROM pg_stat_activity
+WHERE cardinality(pg_blocking_pids(pid)) > 0;
+```
+
+```text
+ pid  | state  | wait_event_type | wait_event | blocked_by |               query
+------+--------+-----------------+------------+------------+-----------------------------------
+ 4107 | active | Lock            | relation   | {4101}     | ALTER TABLE orders ADD COLUMN note
+```
+
+Now look at the locks themselves in `pg_locks`. Table-level locks have `locktype = 'relation'`, and `relation::regclass` turns the OID into a readable name:
+
+```sql
+SELECT l.pid,
+       l.locktype,
+       l.relation::regclass AS relation,
+       l.mode,
+       l.granted
+FROM pg_locks l
+WHERE l.relation = 'orders'::regclass
+ORDER BY l.granted DESC, l.pid;
+```
+
+```text
+ pid  | locktype | relation |        mode         | granted
+------+----------+----------+---------------------+---------
+ 4101 | relation | orders   | AccessShareLock     | t
+ 4107 | relation | orders   | AccessExclusiveLock | f
+```
+
+Note that `pg_locks` spells modes as one word with a `Lock` suffix (`AccessShareLock`), while `LOCK TABLE` uses spaced words (`ACCESS SHARE`). They are the same eight modes.
+
+To see who is blocking whom along with what the blocker is doing:
+
+```sql
+SELECT blocked.pid                 AS blocked_pid,
+       left(blocked.query, 40)     AS blocked_query,
+       blocker.pid                 AS blocker_pid,
+       blocker.state               AS blocker_state,
+       left(blocker.query, 40)     AS blocker_last_query,
+       now() - blocker.xact_start  AS blocker_xact_age
+FROM pg_stat_activity blocked
+JOIN pg_stat_activity blocker
+  ON blocker.pid = ANY(pg_blocking_pids(blocked.pid));
+```
+
+```text
+ blocked_pid |            blocked_query             | blocker_pid |    blocker_state    | blocker_last_query          | blocker_xact_age
+-------------+--------------------------------------+-------------+---------------------+-----------------------------+------------------
+        4107 | ALTER TABLE orders ADD COLUMN note T | 4101        | idle in transaction | SELECT COUNT(*) FROM orders | 00:02:13.48
+```
+
+A blocker in state `idle in transaction` is the classic culprit: an application opened a transaction, ran a query, and never committed. Once you have the PID you can end it with `SELECT pg_cancel_backend(4101);` (cancels the current query) or `SELECT pg_terminate_backend(4101);` (kills the connection, rolling back its transaction). Committing or rolling back Session A also releases the lock and lets Session B finish.
+
+## The lock queue effect
+
+Here is the part that turns a stuck migration into an outage. While Session B is waiting for ACCESS EXCLUSIVE, open a fourth session and run a harmless read:
+
+```sql
+-- Session D
+SELECT COUNT(*) FROM orders;
+```
+
+It hangs too. Session D only needs ACCESS SHARE, which does not conflict with Session A's ACCESS SHARE. But PostgreSQL grants locks in request order. Session B's pending ACCESS EXCLUSIVE request is ahead of Session D in the queue, and ACCESS SHARE conflicts with ACCESS EXCLUSIVE, so D waits behind B, which waits behind A. Every new query on `orders` now piles up behind a migration that cannot start. Rerun the `pg_blocking_pids` query and you will see D blocked by B, and B blocked by A.
+
+This is why a DDL statement that "should take milliseconds" can stop an application for as long as the oldest open transaction on that table lives.
+
+## lock_timeout: always set it before DDL
+
+`lock_timeout` bounds how long a statement will wait for any lock. If the wait exceeds the limit the statement is cancelled, the lock request is removed from the queue, and everyone behind it proceeds.
+
+```sql
+SET lock_timeout = '3s';
+ALTER TABLE orders ADD COLUMN note TEXT;
+```
+
+If the lock is not granted within three seconds:
+
+```text
+ERROR:  canceling statement due to lock timeout
+```
+
+Nothing was changed, and you can simply retry. The recommended pattern for production migrations:
+
+```sql
+BEGIN;
+SET LOCAL lock_timeout = '3s';
+ALTER TABLE orders ADD COLUMN note TEXT;
+COMMIT;
+```
+
+`SET LOCAL` limits the setting to this transaction. Wrap the migration in a retry loop in your deployment tool so a busy moment causes a short delay instead of a queue. Do not confuse this with `statement_timeout`, which measures total execution time including the actual work; a short `statement_timeout` would cancel a legitimately long `CREATE INDEX`, while `lock_timeout` only limits the time spent waiting to begin.
+
+## Row-level locks and how they differ
+
+Table-level locks protect the table's structure and coarse-grained access. Row-level locks protect individual rows against concurrent modification. There are four row-level modes, all acquired by `SELECT ... FOR ...` or implicitly by `UPDATE` and `DELETE`:
+
+| Row lock | Acquired by | Conflicts with |
+|----------|-------------|----------------|
+| FOR KEY SHARE | `SELECT ... FOR KEY SHARE`; taken implicitly on referenced rows when inserting a foreign key | FOR UPDATE |
+| FOR SHARE | `SELECT ... FOR SHARE` | FOR NO KEY UPDATE, FOR UPDATE |
+| FOR NO KEY UPDATE | `SELECT ... FOR NO KEY UPDATE`; `UPDATE` that does not change key columns | FOR SHARE, FOR NO KEY UPDATE, FOR UPDATE |
+| FOR UPDATE | `SELECT ... FOR UPDATE`; `DELETE`; `UPDATE` that changes a unique key column | all four |
+
+Demonstrate the difference with two sessions:
+
+```sql
+-- Session A
+BEGIN;
+SELECT * FROM orders WHERE order_id = 1 FOR UPDATE;
+```
+
+```sql
+-- Session B
+UPDATE orders SET amount = 130.00 WHERE order_id = 1;   -- waits for Session A
+UPDATE orders SET amount = 90.00  WHERE order_id = 2;   -- runs immediately (different row)
+```
+
+The key differences from table locks:
+
+- Row locks block only writers of the same row. They never block readers, because a plain `SELECT` takes no row lock at all.
+- Both sessions above hold a table-level lock too (ROW SHARE for the `FOR UPDATE`, ROW EXCLUSIVE for the `UPDATE`), and those do not conflict. The wait is purely at the row level.
+- Row locks are stored in the row header on disk, not in shared memory, so a transaction can lock millions of rows. `pg_locks` shows a row lock only while a session is waiting for it, as a row with `locktype = 'tuple'`. Granted row locks do not appear there.
+- `FOR NO KEY UPDATE` and `FOR KEY SHARE` exist so that updating a non-key column in a parent row does not block inserting a child row that references it by foreign key.
+
+## When explicit LOCK TABLE is useful
+
+Most applications never need `LOCK TABLE`; the implicit locks are enough. There are a few situations where it is the right tool.
+
+### Batch reloads
+
+You are about to delete and reinsert a large part of a table and want no writer to interleave with you, while readers keep working:
+
+```sql
+BEGIN;
+LOCK TABLE orders IN SHARE ROW EXCLUSIVE MODE;
+DELETE FROM orders WHERE order_date < DATE '2026-02-01';
+INSERT INTO orders (customer_id, amount, order_date) VALUES
+  (1, 125.00, '2026-01-05');
+COMMIT;
+```
+
+SHARE ROW EXCLUSIVE blocks other writers and other SHARE ROW EXCLUSIVE holders (so two reload jobs cannot overlap), but readers with ACCESS SHARE proceed. Taking it up front also avoids a deadlock that could occur if two sessions each locked a few rows and then tried to escalate.
+
+### A consistent read with no concurrent updates
+
+If you need to read a table several times in one transaction and be sure nobody changes it in between, `LOCK TABLE ... IN SHARE MODE` allows other readers but blocks all writers. Under `REPEATABLE READ` or `SERIALIZABLE`, issue the `LOCK TABLE` before the first query, because the snapshot is taken by the first statement and the lock cannot protect data read before it was acquired.
+
+### Avoiding serialization failures
+
+In `SERIALIZABLE` transactions, heavy read-modify-write contention on a small table can produce repeated `could not serialize access` errors. Locking the table in SHARE ROW EXCLUSIVE (or EXCLUSIVE) mode at the start of the transaction serializes those transactions explicitly and removes the retry loop. You trade concurrency for predictability, which is sometimes the right trade for a small control table.
+
+### When it is a mistake
+
+- Running `LOCK TABLE` with no `IN ... MODE`. The default is ACCESS EXCLUSIVE and blocks even reads, which is almost never what a batch job needs.
+- Locking a table in a long transaction from application code. The lock is held until commit, so every second of application logic is a second of blocked writers.
+- Using `LOCK TABLE` instead of `SELECT ... FOR UPDATE`. If you only need to protect a few rows, row locks give the same safety with far more concurrency.
+- Locking multiple tables in different orders in different code paths. That is the textbook recipe for deadlocks. Always lock in a fixed order.
+
+## Summary
+
+PostgreSQL has eight table-level lock modes, and every statement acquires one of them: `SELECT` takes ACCESS SHARE, writes take ROW EXCLUSIVE, `CREATE INDEX` takes SHARE, and most DDL takes ACCESS EXCLUSIVE, which conflicts with everything. Locks are held until the transaction ends. Because lock requests queue in order, a single ACCESS EXCLUSIVE request waiting behind a long transaction will block every new reader too, so set `lock_timeout` before running DDL in production. Use `pg_blocking_pids` with `pg_stat_activity` and `pg_locks` to identify the blocker. Row-level locks (`FOR UPDATE`, `FOR SHARE`, and their KEY variants) protect individual rows and never block plain readers. Reserve explicit `LOCK TABLE` for batch reloads and consistency requirements, always name the mode, and keep the transaction short.
+
+## FAQ
+
+### How do I see what locks are currently held in PostgreSQL?
+
+Query `pg_locks`, joining `relation::regclass` to get table names, and look at the `mode` and `granted` columns. To see who is waiting on whom, use `pg_blocking_pids(pid)` on `pg_stat_activity`; rows with a non-empty result are blocked, and the array lists the PIDs holding the conflicting locks.
+
+### Does a SELECT lock the table in Postgres?
+
+Yes, every `SELECT` takes an ACCESS SHARE lock on each table it reads, held until the transaction ends. It does not block other reads or writes, but it does block ACCESS EXCLUSIVE, which means an open transaction that ran a `SELECT` will hold up `ALTER TABLE`, `DROP TABLE`, `TRUNCATE`, and `VACUUM FULL`.
+
+### How do I release a lock in PostgreSQL?
+
+Locks cannot be released individually. They are released when the transaction that holds them ends with `COMMIT` or `ROLLBACK`. If another session is holding a lock and will not finish, you can cancel its current query with `pg_cancel_backend(pid)` or terminate the connection with `pg_terminate_backend(pid)`, which rolls back its transaction and frees the locks.

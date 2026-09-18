@@ -1,0 +1,452 @@
+---
+title: "SQL Server Profiler Is Deprecated: What to Use"
+description: "SQL Server Profiler and SQL Trace are deprecated. A hands-on guide to Extended Events, Query Store and DMVs, with runnable T-SQL and a Profiler event mapping."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: September 16, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# SQL Server Profiler Is Deprecated: What to Use
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="September 16, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+SQL Server Profiler is still in the SSMS Tools menu, it still opens, and it still captures a trace. It is also deprecated for the database engine, and has been since SQL Server 2012. Microsoft announced the deprecation of both Profiler and the underlying SQL Trace feature at that release and has been adding events exclusively to Extended Events ever since. If you are diagnosing a slow query on a modern instance with Profiler, you are using a tool that does not know about most of what the engine can tell you.
+
+This is the practical migration: what Profiler did, why it was retired, and the replacements — with complete T-SQL you can run.
+
+## What Profiler actually did
+
+Profiler is a GUI over SQL Trace. You pick events (`RPC:Completed`, `SQL:BatchCompleted`, `Deadlock graph`), pick columns (`Duration`, `CPU`, `Reads`, `TextData`), optionally add filters, and the server streams matching events to your client where they scroll past in a grid.
+
+That workflow solved real problems and solved them well:
+
+- Watching what an application actually sends, when the ORM's generated SQL is a mystery.
+- Catching a deadlock graph in the act.
+- Seeing which statement inside a stored procedure is the slow one.
+- Confirming that a query you cannot reproduce really is running, with which parameters.
+
+Nothing in that list has gone away. All of it is still doable — with different tools, better, and with much less risk to the production server.
+
+## Why it was deprecated
+
+Three reasons, in increasing order of how much they should worry you.
+
+**It is frozen.** SQL Trace events stopped being added years ago. Every engine feature since roughly SQL Server 2012 — columnstore, In-Memory OLTP, Always On availability group internals, query-store-related activity, modern wait statistics — emits Extended Events and nothing else. Profiler literally cannot see them.
+
+**It does not work everywhere.** Azure SQL Database and Azure SQL Managed Instance do not support SQL Trace against the database engine. If any part of your estate is in Azure SQL, Profiler is not an option at all and Extended Events is the only path.
+
+**The overhead problem.** This is the one that causes incidents. SQL Trace with a client-side Profiler session is a row-by-row, synchronous push to the client application. Every event is serialized and sent over the network as it happens, and the server waits on the consumer. Run an unfiltered `SQL:StmtCompleted` trace from your laptop against a busy production instance over a slow link and you can measurably slow the server down — the classic failure is a Profiler window that cannot keep up, back-pressuring the engine.
+
+Extended Events is built the other way around: events are buffered in memory, dispatched asynchronously to a target on a latency you configure, and predicates are evaluated early so events you filtered out cost almost nothing. There is still a cost — there is no free observability — but the architecture is designed for always-on production use rather than for a human staring at a grid.
+
+One thing to be clear about: **deprecated is not removed**. Profiler still ships. But deprecated features are where Microsoft stops investing, and building a monitoring practice on one is borrowing trouble.
+
+## Extended Events: the hands-on replacement
+
+Here is a session that does what most people opened Profiler for — capture completed batches and RPC calls that took longer than a second, in one database, ignoring system activity.
+
+### Create the session
+
+```sql
+CREATE EVENT SESSION [slow_queries] ON SERVER
+ADD EVENT sqlserver.rpc_completed (
+    ACTION (
+        sqlserver.client_app_name,
+        sqlserver.client_hostname,
+        sqlserver.database_name,
+        sqlserver.session_id,
+        sqlserver.username
+    )
+    WHERE (
+        duration > 1000000                    -- microseconds, so 1 second
+        AND sqlserver.database_id = 7
+        AND sqlserver.is_system = 0
+    )
+),
+ADD EVENT sqlserver.sql_batch_completed (
+    ACTION (
+        sqlserver.client_app_name,
+        sqlserver.client_hostname,
+        sqlserver.database_name,
+        sqlserver.session_id,
+        sqlserver.username
+    )
+    WHERE (
+        duration > 1000000
+        AND sqlserver.database_id = 7
+        AND sqlserver.is_system = 0
+    )
+)
+ADD TARGET package0.event_file (
+    SET filename         = N'S:\XEvents\slow_queries.xel',
+        max_file_size    = 256,               -- MB per rollover file
+        max_rollover_files = 5
+)
+WITH (
+    MAX_MEMORY              = 8MB,
+    EVENT_RETENTION_MODE    = ALLOW_SINGLE_EVENT_LOSS,
+    MAX_DISPATCH_LATENCY    = 30 SECONDS,
+    TRACK_CAUSALITY         = ON,
+    STARTUP_STATE           = OFF
+);
+```
+
+Reading that statement piece by piece:
+
+- `rpc_completed` fires for parameterized calls and stored procedure executions — the ORM and application traffic. `sql_batch_completed` fires for ad-hoc batches. Together they are the Extended Events equivalent of the two events almost every Profiler trace started with.
+- `ACTION` is the equivalent of adding columns in Profiler. Actions are collected only when the predicate passes, so they are cheap. They are also *global* — `sqlserver.client_app_name` works on any event, unlike Profiler where column availability varied per event.
+- `WHERE` is the predicate. This is the single most important line. `duration` is in **microseconds** for these events (a frequent mistake: filtering on `1000` gives you everything over a millisecond, which is everything). Put the cheapest, most selective term first — Extended Events short-circuits predicate evaluation left to right, so `sqlserver.database_id = 7` before a string comparison matters.
+- `sqlserver.is_system = 0` drops background-task noise.
+- `EVENT_RETENTION_MODE = ALLOW_SINGLE_EVENT_LOSS` tells the engine to drop an event rather than stall a worker if buffers are full. The alternative, `NO_EVENT_LOSS`, can block user sessions. Use the default unless you have a specific audit requirement.
+- `MAX_DISPATCH_LATENCY = 30 SECONDS` means events may sit in memory for up to half a minute before being written. Lower it if you are watching live; raise it to reduce I/O.
+- `TRACK_CAUSALITY = ON` stamps each event with an activity GUID and sequence number, so you can reconstruct the order of related events across sessions. Profiler had no equivalent.
+- `STARTUP_STATE = OFF` means the session does not restart with the instance. Set it `ON` for a lightweight session you want running permanently.
+
+Find the `database_id` for the filter with:
+
+```sql
+SELECT database_id, name FROM sys.databases ORDER BY name;
+```
+
+### Start, check and stop it
+
+```sql
+-- Start capturing
+ALTER EVENT SESSION [slow_queries] ON SERVER STATE = START;
+
+-- Confirm it is running and see what it has buffered
+SELECT s.name,
+       s.create_time,
+       t.target_name,
+       t.execution_count
+FROM sys.dm_xe_sessions AS s
+JOIN sys.dm_xe_session_targets AS t
+  ON t.event_session_address = s.address
+WHERE s.name = 'slow_queries';
+
+-- Stop capturing but keep the definition
+ALTER EVENT SESSION [slow_queries] ON SERVER STATE = STOP;
+
+-- Remove it entirely
+DROP EVENT SESSION [slow_queries] ON SERVER;
+```
+
+`sys.dm_xe_sessions` lists running sessions; `sys.server_event_sessions` lists defined ones whether running or not. A session that exists in the second view but not the first is stopped.
+
+### Read the file target
+
+This is the step that trips people up coming from Profiler, where results appeared in a grid automatically. An `event_file` target writes XML, and you shred it with XQuery:
+
+```sql
+SELECT CONVERT(xml, event_data) AS event_data
+INTO #raw
+FROM sys.fn_xe_file_target_read_file(
+        'S:\XEvents\slow_queries*.xel',   -- wildcard picks up rollover files
+        NULL, NULL, NULL);
+
+SELECT
+    event_name    = r.event_data.value('(event/@name)[1]', 'varchar(50)'),
+    event_time    = r.event_data.value('(event/@timestamp)[1]', 'datetime2'),
+    duration_ms   = r.event_data.value('(event/data[@name="duration"]/value)[1]', 'bigint') / 1000.0,
+    cpu_ms        = r.event_data.value('(event/data[@name="cpu_time"]/value)[1]', 'bigint') / 1000.0,
+    logical_reads = r.event_data.value('(event/data[@name="logical_reads"]/value)[1]', 'bigint'),
+    physical_reads= r.event_data.value('(event/data[@name="physical_reads"]/value)[1]', 'bigint'),
+    row_count     = r.event_data.value('(event/data[@name="row_count"]/value)[1]', 'bigint'),
+    sql_text      = COALESCE(
+                      r.event_data.value('(event/data[@name="statement"]/value)[1]', 'nvarchar(max)'),
+                      r.event_data.value('(event/data[@name="batch_text"]/value)[1]', 'nvarchar(max)')),
+    database_name = r.event_data.value('(event/action[@name="database_name"]/value)[1]', 'nvarchar(128)'),
+    client_app    = r.event_data.value('(event/action[@name="client_app_name"]/value)[1]', 'nvarchar(128)'),
+    client_host   = r.event_data.value('(event/action[@name="client_hostname"]/value)[1]', 'nvarchar(128)'),
+    login_name    = r.event_data.value('(event/action[@name="username"]/value)[1]', 'nvarchar(128)')
+FROM #raw AS r
+ORDER BY duration_ms DESC;
+
+DROP TABLE #raw;
+```
+
+Two notes on that query. Shredding into a temp table first and then extracting is materially faster than applying `.value()` calls directly to the function output, because otherwise the XML is re-parsed per column. And the `COALESCE` exists because `rpc_completed` carries the text in a field called `statement` while `sql_batch_completed` uses `batch_text` — a difference that catches everyone the first time.
+
+Once the results are in a grid, ordinary aggregation gets you what Profiler never could. This groups the same shape of statement together:
+
+```sql
+SELECT TOP (20)
+       client_app,
+       executions   = COUNT(*),
+       total_ms     = SUM(duration_ms),
+       avg_ms       = AVG(duration_ms),
+       max_ms       = MAX(duration_ms),
+       total_reads  = SUM(logical_reads)
+FROM #shredded
+GROUP BY client_app
+ORDER BY total_ms DESC;
+```
+
+Any SQL client will do for this; if you keep a set of these shredding queries around, saving them in something like [Chat2DB](https://app.chat2db.ai) so they are one click away beats rewriting the XQuery every incident.
+
+### ring_buffer versus event_file
+
+Extended Events has several targets. Two matter day to day.
+
+| Property | `package0.ring_buffer` | `package0.event_file` |
+| --- | --- | --- |
+| Storage | In memory, inside the session | On disk, `.xel` files |
+| Survives a restart | No — contents are lost | Yes |
+| Size limit | `MAX_MEMORY` / `max_events_limit`; oldest events discarded | `max_file_size` times `max_rollover_files` |
+| Reading | `sys.dm_xe_session_targets.target_data` | `sys.fn_xe_file_target_read_file` or SSMS |
+| Truncation risk | Yes — `target_data` XML is capped and can be silently truncated | No |
+| Best for | Quick ad-hoc look at recent activity | Anything you will analyse, keep, or run for hours |
+
+The truncation caveat is the reason to default to `event_file`. The `target_data` column is subject to a size limit, and a busy ring buffer returns XML that is cut off mid-document, which either fails to parse or — worse — parses into a partial result you believe.
+
+Use `ring_buffer` when you want a look at the last few minutes without touching disk:
+
+```sql
+CREATE EVENT SESSION [quick_look] ON SERVER
+ADD EVENT sqlserver.sql_batch_completed (
+    WHERE (duration > 5000000 AND sqlserver.is_system = 0)
+)
+ADD TARGET package0.ring_buffer (SET max_events_limit = 1000)
+WITH (MAX_MEMORY = 4MB, MAX_DISPATCH_LATENCY = 5 SECONDS);
+
+ALTER EVENT SESSION [quick_look] ON SERVER STATE = START;
+
+-- Then read it
+SELECT CONVERT(xml, t.target_data) AS ring_buffer_xml
+FROM sys.dm_xe_sessions AS s
+JOIN sys.dm_xe_session_targets AS t
+  ON t.event_session_address = s.address
+WHERE s.name = 'quick_look'
+  AND t.target_name = 'ring_buffer';
+```
+
+### Watch Live Data and the XEvent Profiler
+
+If what you miss about Profiler is the scrolling grid, SSMS has it. Right-click a running session under **Management → Extended Events → Sessions** and choose **Watch Live Data**. Events stream into a grid you can sort and group, and the Extended Events toolbar lets you promote any event field into a column.
+
+Even faster: **XEvent Profiler**, a node in Object Explorer directly under **Management**. It has two canned sessions:
+
+- **Standard** — roughly the equivalent of Profiler's Standard template: completed batches and RPCs, logins and logouts.
+- **TSQL** — statement text for batches and RPCs, aimed at seeing exactly what an application sends.
+
+Double-click either and a live viewer opens with no session to define. For "what is this application actually sending", this is a one-click replacement for the thing Profiler was most used for, and it uses the modern, buffered plumbing underneath.
+
+Be aware that Watch Live Data is still a client-side consumer and can drop events if it cannot keep up; it is for observation, not for capture you intend to analyse.
+
+## Query Store: the always-on alternative
+
+Extended Events is what you start when you have a question. Query Store is what answers questions about *the past*, including the ones you did not think to ask — and it is the right tool for the most common production question of all: "this was fine yesterday, what changed?"
+
+Turn it on per database:
+
+```sql
+ALTER DATABASE [YourDatabase] SET QUERY_STORE = ON
+(
+    OPERATION_MODE              = READ_WRITE,
+    DATA_FLUSH_INTERVAL_SECONDS = 900,
+    INTERVAL_LENGTH_MINUTES     = 60,
+    MAX_STORAGE_SIZE_MB         = 2048,
+    QUERY_CAPTURE_MODE          = AUTO,
+    SIZE_BASED_CLEANUP_MODE     = AUTO,
+    STALE_QUERY_THRESHOLD_DAYS  = 30
+);
+```
+
+`INTERVAL_LENGTH_MINUTES` is the aggregation bucket — 60 keeps the store small, 15 gives you finer resolution for spotting a regression inside a working day. `QUERY_CAPTURE_MODE = AUTO` skips trivial and infrequent queries so ad-hoc noise does not fill the storage budget. `SIZE_BASED_CLEANUP_MODE = AUTO` stops the store flipping to read-only when it hits `MAX_STORAGE_SIZE_MB`, which is the most common way Query Store silently stops collecting.
+
+Top consumers over the last day:
+
+```sql
+SELECT TOP (20)
+       q.query_id,
+       p.plan_id,
+       qt.query_sql_text,
+       total_executions  = SUM(rs.count_executions),
+       avg_duration_ms   = AVG(rs.avg_duration) / 1000.0,
+       avg_cpu_ms        = AVG(rs.avg_cpu_time) / 1000.0,
+       avg_logical_reads = AVG(rs.avg_logical_io_reads),
+       last_execution    = MAX(rs.last_execution_time)
+FROM sys.query_store_query          AS q
+JOIN sys.query_store_query_text     AS qt  ON qt.query_text_id = q.query_text_id
+JOIN sys.query_store_plan           AS p   ON p.query_id = q.query_id
+JOIN sys.query_store_runtime_stats  AS rs  ON rs.plan_id = p.plan_id
+JOIN sys.query_store_runtime_stats_interval AS rsi
+       ON rsi.runtime_stats_interval_id = rs.runtime_stats_interval_id
+WHERE rsi.start_time > DATEADD(hour, -24, SYSUTCDATETIME())
+GROUP BY q.query_id, p.plan_id, qt.query_sql_text
+ORDER BY SUM(rs.count_executions * rs.avg_duration) DESC;
+```
+
+Ordering by `count_executions * avg_duration` finds total time consumed, which is what you want — a query running 500,000 times at 20 ms costs far more than one running twice at a minute.
+
+The regression query is the one worth keeping. It compares a recent window against a baseline window for the same query:
+
+```sql
+WITH windowed AS (
+    SELECT q.query_id,
+           qt.query_sql_text,
+           p.plan_id,
+           bucket = CASE
+                      WHEN rsi.start_time > DATEADD(hour, -6, SYSUTCDATETIME())
+                        THEN 'recent' ELSE 'baseline'
+                    END,
+           rs.avg_duration,
+           rs.count_executions
+    FROM sys.query_store_query         AS q
+    JOIN sys.query_store_query_text    AS qt ON qt.query_text_id = q.query_text_id
+    JOIN sys.query_store_plan          AS p  ON p.query_id = q.query_id
+    JOIN sys.query_store_runtime_stats AS rs ON rs.plan_id = p.plan_id
+    JOIN sys.query_store_runtime_stats_interval AS rsi
+           ON rsi.runtime_stats_interval_id = rs.runtime_stats_interval_id
+    WHERE rsi.start_time > DATEADD(day, -7, SYSUTCDATETIME())
+)
+SELECT TOP (25)
+       query_id,
+       query_sql_text,
+       baseline_ms = AVG(CASE WHEN bucket = 'baseline' THEN avg_duration END) / 1000.0,
+       recent_ms   = AVG(CASE WHEN bucket = 'recent'   THEN avg_duration END) / 1000.0,
+       recent_execs= SUM(CASE WHEN bucket = 'recent'   THEN count_executions ELSE 0 END),
+       distinct_plans = COUNT(DISTINCT plan_id)
+FROM windowed
+GROUP BY query_id, query_sql_text
+HAVING AVG(CASE WHEN bucket = 'baseline' THEN avg_duration END) IS NOT NULL
+   AND AVG(CASE WHEN bucket = 'recent'   THEN avg_duration END) IS NOT NULL
+   AND AVG(CASE WHEN bucket = 'recent'   THEN avg_duration END)
+     > AVG(CASE WHEN bucket = 'baseline' THEN avg_duration END) * 2
+ORDER BY recent_ms - baseline_ms DESC;
+```
+
+A `distinct_plans` value above 1 for a regressed query is the classic plan-choice regression. Query Store can pin the good one:
+
+```sql
+EXEC sp_query_store_force_plan @query_id = 1234, @plan_id = 5678;
+-- and to release it later
+EXEC sp_query_store_unforce_plan @query_id = 1234, @plan_id = 5678;
+```
+
+That capability has no Profiler equivalent at all. Profiler could show you the regression; Query Store can show it *and* fix it.
+
+## DMVs for a fast answer
+
+When you need an answer in ten seconds and do not want to configure anything, the plan cache DMVs are already collecting. Top 20 statements by total CPU since the cache was last cleared:
+
+```sql
+SELECT TOP (20)
+       total_worker_ms  = qs.total_worker_time  / 1000.0,
+       avg_worker_ms    = (qs.total_worker_time / qs.execution_count) / 1000.0,
+       total_elapsed_ms = qs.total_elapsed_time / 1000.0,
+       qs.execution_count,
+       qs.total_logical_reads,
+       avg_logical_reads = qs.total_logical_reads / qs.execution_count,
+       database_name = DB_NAME(st.dbid),
+       object_name   = OBJECT_NAME(st.objectid, st.dbid),
+       statement_text = SUBSTRING(
+            st.text,
+            (qs.statement_start_offset / 2) + 1,
+            ((CASE qs.statement_end_offset
+                WHEN -1 THEN DATALENGTH(st.text)
+                ELSE qs.statement_end_offset
+              END - qs.statement_start_offset) / 2) + 1),
+       qs.creation_time,
+       qs.last_execution_time,
+       qp.query_plan
+FROM sys.dm_exec_query_stats AS qs
+CROSS APPLY sys.dm_exec_sql_text(qs.sql_handle)     AS st
+CROSS APPLY sys.dm_exec_query_plan(qs.plan_handle)  AS qp
+WHERE qs.execution_count > 0
+ORDER BY qs.total_worker_time DESC;
+```
+
+The `SUBSTRING` arithmetic extracts the individual statement from the enclosing batch: offsets in `dm_exec_query_stats` are byte offsets into an `nvarchar`, hence dividing by 2, and `-1` is the sentinel for "to the end of the batch".
+
+Two limits to keep in mind. These are **cached-plan** statistics, so a recompile, a memory-pressure eviction, a `DBCC FREEPROCCACHE` or a restart resets the counters — `creation_time` tells you how far back the numbers go. And queries that never cache a plan will not appear. Query Store has neither limitation, which is why it is the better long-term home for this question.
+
+For live activity rather than history, `sys.dm_exec_requests` joined to `sys.dm_exec_sessions` shows what is running right now, and the community script `sp_WhoIsActive` wraps that up far more readably than anything you will write under pressure.
+
+## Mapping Profiler events to Extended Events
+
+If you have existing traces or muscle memory, here are the direct equivalents.
+
+| Profiler / SQL Trace event | Extended Events event |
+| --- | --- |
+| RPC:Completed | `sqlserver.rpc_completed` |
+| RPC:Starting | `sqlserver.rpc_starting` |
+| SQL:BatchCompleted | `sqlserver.sql_batch_completed` |
+| SQL:BatchStarting | `sqlserver.sql_batch_starting` |
+| SQL:StmtCompleted | `sqlserver.sql_statement_completed` |
+| SP:StmtCompleted | `sqlserver.sp_statement_completed` |
+| SP:Completed | `sqlserver.module_end` |
+| Audit Login | `sqlserver.login` |
+| Audit Logout | `sqlserver.logout` |
+| Deadlock graph | `sqlserver.xml_deadlock_report` |
+| Lock:Deadlock | `sqlserver.lock_deadlock` |
+| Lock:Timeout | `sqlserver.lock_timeout` |
+| Blocked process report | `sqlserver.blocked_process_report` |
+| Showplan XML Statistics Profile | `sqlserver.query_post_execution_showplan` |
+| Showplan XML | `sqlserver.query_pre_execution_showplan` |
+| Exception | `sqlserver.error_reported` |
+| Attention | `sqlserver.attention` |
+| Missing Join Predicate | `sqlserver.missing_join_predicate` |
+| Sort Warnings | `sqlserver.sort_warning` |
+| Hash Warning | `sqlserver.hash_warning` |
+| Auto Stats | `sqlserver.auto_stats` |
+
+You do not have to memorize this. SQL Server ships the mapping as a catalog view:
+
+```sql
+SELECT te.trace_event_id,
+       profiler_event = te.name,
+       xe_event       = xe.xe_event_name,
+       xe_package     = xe.package_name
+FROM sys.trace_events        AS te
+LEFT JOIN sys.trace_xe_event_map AS xe
+       ON xe.trace_event_id = te.trace_event_id
+ORDER BY te.name;
+```
+
+Rows where `xe_event` is NULL are SQL Trace events with no Extended Events counterpart — usually because the underlying feature is itself gone. There is a matching `sys.trace_xe_action_map` for columns.
+
+To discover what is available beyond the mapping, search the event catalog directly:
+
+```sql
+SELECT p.name AS package_name,
+       o.name AS event_name,
+       o.description
+FROM sys.dm_xe_objects  AS o
+JOIN sys.dm_xe_packages AS p ON p.guid = o.package_guid
+WHERE o.object_type = 'event'
+  AND o.name LIKE '%deadlock%'
+ORDER BY p.name, o.name;
+```
+
+Swap the `LIKE` pattern for whatever you are hunting. A modern instance exposes well over a thousand events; SQL Trace exposed a fraction of that.
+
+Two warnings about the `query_post_execution_showplan` event in particular: it is the equivalent of Profiler's statistics-profile showplan, and it is expensive. It forces plan-level instrumentation on every query it matches. Filter it hard, run it briefly, and never leave it on.
+
+## Third-party and open-source options
+
+Extended Events, Query Store and DMVs cover the diagnostics. What they do not give you is alerting, retention, and a view across many instances. That is what the commercial tools sell. Common choices include SolarWinds SQL Sentry, Redgate SQL Monitor, Idera SQL Diagnostic Manager, Quest Spotlight, and the APM vendors — Datadog and New Relic among them — which have SQL Server integrations. Azure SQL customers get Query Performance Insight and SQL Insights in the portal without buying anything.
+
+On the free side, the community scripts are genuinely excellent and are what many DBAs reach for first: `sp_WhoIsActive` for live activity, Brent Ozar's First Responder Kit (`sp_Blitz`, `sp_BlitzFirst`, `sp_BlitzCache`, `sp_BlitzIndex`) for health checks and cache analysis, and the `dbatools` PowerShell module, which can manage Extended Events sessions across a whole estate from a script.
+
+Evaluate these against your own workload rather than a feature grid. The cheapest useful step for most teams is not buying anything — it is turning Query Store on everywhere and defining two or three standing Extended Events sessions.
+
+## Profiler is still current for Analysis Services
+
+One important exception. The deprecation applies to SQL Server Profiler **for the database engine**. Profiler remains a supported and documented tool for SQL Server Analysis Services, where it is used to trace MDX and DAX queries, processing operations and cache activity. If your work is on tabular or multidimensional models, connecting Profiler to an SSAS instance is still the normal thing to do. Extended Events is also available for Analysis Services, but Profiler has not been retired there.
+
+## Where to start
+
+If you are still running Profiler against a production database engine, a reasonable sequence:
+
+1. **Turn on Query Store** on every user database. It is the highest-value change and costs you one `ALTER DATABASE` per database.
+2. **Use XEvent Profiler** in SSMS instead of launching Profiler. Same instinct, same one-click grid, modern plumbing.
+3. **Define one standing `event_file` session** for long-running queries with a sensible duration filter, `STARTUP_STATE = ON`, and a rollover budget your disk can absorb. It costs little and is already collecting when the pager goes off.
+4. **Keep the shredding query** for the file target in your snippets, so the results are a grid in seconds rather than fifteen minutes of XQuery. A client such as [Chat2DB](https://chat2db.ai/download) is a convenient home for that library, and lets you run the same diagnostic against several instances without rebuilding it each time.
+5. **Add DMV top-N and Query Store regression queries** to the same library for the ten-second answer.
+
+Profiler was a good tool for its era, and the instincts it taught — filter aggressively, look at duration and reads together, watch what the application really sends — transfer directly. The plumbing underneath is what changed, and it changed in your favour: cheaper capture, far more events, retention that outlives the window you were staring at, and in Query Store's case, the ability to do something about what you find.
