@@ -1,0 +1,364 @@
+---
+title: "Materialized View vs Table in PostgreSQL"
+description: "Compare a Postgres materialized view with a summary table: refresh locks, indexing, staleness, pg_cron scheduling, and full SQL for both approaches."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: September 18, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# Materialized View vs Table in PostgreSQL
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="September 18, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+A Postgres materialized view and a summary table both store precomputed rows on disk, both can be indexed, and both answer the same reporting queries quickly. The difference is who is responsible for keeping the rows correct. A materialized view remembers its own query and rebuilds itself when you ask it to; a table knows nothing and relies on your application, triggers, or batch jobs to write the right data. This article compares the two mechanically, shows the full SQL for a daily sales summary implemented both ways, and gives a decision table for choosing between them.
+
+## What a Materialized View Is
+
+A materialized view is a query whose result set has been physically written to a heap, exactly like a table's data. PostgreSQL stores the query definition alongside the data, so it can re-execute it on demand. Compared with the other two relation types:
+
+- A regular view stores only the query. Every read re-executes it, so it is always current and never occupies extra storage.
+- A materialized view stores the query and a snapshot of its result. Reads hit the snapshot, which can be indexed. The snapshot is stale until refreshed.
+- A table stores only data. It has no memory of where the data came from.
+
+You cannot run `INSERT`, `UPDATE`, or `DELETE` against a materialized view. The only way to change its contents is `REFRESH MATERIALIZED VIEW`, which re-runs the stored query. Materialized views are listed in `pg_matviews` rather than `pg_views` or `pg_tables`, and in psql you list them with `\dm`.
+
+## Sample Schema
+
+Both implementations below use the same source tables:
+
+```sql
+CREATE TABLE orders (
+  order_id    bigserial PRIMARY KEY,
+  customer_id int  NOT NULL,
+  status      text NOT NULL DEFAULT 'pending',
+  ordered_at  timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE TABLE order_items (
+  order_id   bigint NOT NULL REFERENCES orders,
+  product    text   NOT NULL,
+  quantity   int    NOT NULL CHECK (quantity > 0),
+  unit_price numeric(10,2) NOT NULL,
+  PRIMARY KEY (order_id, product)
+);
+
+CREATE INDEX orders_ordered_at_idx ON orders (ordered_at);
+```
+
+## Creating a Postgres Materialized View
+
+The syntax mirrors `CREATE TABLE AS`, with an optional `WITH DATA` or `WITH NO DATA` clause at the end:
+
+```sql
+CREATE MATERIALIZED VIEW daily_sales AS
+SELECT o.ordered_at::date                 AS sale_date,
+       COUNT(DISTINCT o.order_id)         AS orders,
+       SUM(oi.quantity)                   AS units,
+       SUM(oi.quantity * oi.unit_price)   AS revenue
+FROM orders o
+JOIN order_items oi ON oi.order_id = o.order_id
+WHERE o.status = 'paid'
+GROUP BY 1
+WITH DATA;
+```
+
+`WITH DATA` is the default and runs the query immediately. `WITH NO DATA` creates the definition but leaves the view unpopulated; any `SELECT` on it fails with `ERROR:  materialized view "daily_sales" has not been populated` until the first refresh. This is useful in migrations where you want the DDL to be fast and populate later from a job.
+
+Check the definition and population status from the catalog:
+
+```sql
+SELECT matviewname, ispopulated, hasindexes
+FROM pg_matviews
+WHERE matviewname = 'daily_sales';
+```
+
+```
+ matviewname | ispopulated | hasindexes
+-------------+-------------+------------
+ daily_sales | t           | f
+```
+
+## Indexing a Materialized View
+
+Because the rows are real, you can build any index a table supports:
+
+```sql
+CREATE UNIQUE INDEX daily_sales_date_idx ON daily_sales (sale_date);
+CREATE INDEX daily_sales_revenue_idx ON daily_sales (revenue DESC);
+```
+
+The unique index is more than a performance aid: it is a hard requirement for `REFRESH ... CONCURRENTLY`. The index must be on plain columns (no expressions) and must not have a `WHERE` clause.
+
+## Refreshing
+
+### REFRESH MATERIALIZED VIEW
+
+The plain form rebuilds the whole heap under an `ACCESS EXCLUSIVE` lock:
+
+```sql
+REFRESH MATERIALIZED VIEW daily_sales;
+```
+
+While it runs, every `SELECT` against `daily_sales` waits. On a large view that can mean seconds or minutes of blocked dashboards, which is why the concurrent variant exists.
+
+### REFRESH MATERIALIZED VIEW CONCURRENTLY
+
+```sql
+REFRESH MATERIALIZED VIEW CONCURRENTLY daily_sales;
+```
+
+Concurrent refresh runs the query into a temporary table, diffs it against the current contents using the unique index, and applies only the inserts, updates, and deletes needed. Readers keep reading the old rows throughout. The tradeoffs:
+
+- It requires at least one unique index covering all rows, as described above. Without one you get `ERROR:  cannot refresh materialized view "daily_sales" concurrently` with a hint to create the index.
+- It cannot be used on an unpopulated view. The first refresh after `WITH NO DATA` must be non-concurrent.
+- It does more total work than a plain refresh, because of the diff step, so it is slower in wall-clock terms but does not block readers.
+- It takes an `EXCLUSIVE` lock, so two concurrent refreshes of the same view serialize, and it cannot run inside a transaction block.
+
+## Scheduling Refreshes
+
+A materialized view is only as useful as its refresh schedule. Two common approaches:
+
+### pg_cron
+
+If the `pg_cron` extension is installed and enabled in `shared_preload_libraries`, schedule the refresh inside the database:
+
+```sql
+CREATE EXTENSION IF NOT EXISTS pg_cron;
+
+SELECT cron.schedule(
+  'refresh-daily-sales',
+  '5 0 * * *',
+  $$REFRESH MATERIALIZED VIEW CONCURRENTLY daily_sales$$
+);
+
+-- Inspect job history
+SELECT jobid, status, start_time, end_time
+FROM cron.job_run_details
+ORDER BY start_time DESC
+LIMIT 5;
+```
+
+### System cron with psql
+
+Without an extension, a one-line crontab entry does the same job:
+
+```bash
+# /etc/cron.d/refresh-daily-sales
+5 0 * * * postgres psql -d shop -qc "REFRESH MATERIALIZED VIEW CONCURRENTLY daily_sales" >> /var/log/refresh-daily-sales.log 2>&1
+```
+
+Either way, make sure the job's failures are visible. A refresh that silently stops running is the most common way a materialized view turns into wrong data.
+
+## Daily Sales Summary: Two Implementations
+
+Now the head-to-head. The goal is a table-shaped object `daily_sales` with one row per day, queried by a dashboard.
+
+### Option A: Materialized View plus Refresh
+
+```sql
+CREATE MATERIALIZED VIEW daily_sales AS
+SELECT o.ordered_at::date               AS sale_date,
+       COUNT(DISTINCT o.order_id)       AS orders,
+       SUM(oi.quantity)                 AS units,
+       SUM(oi.quantity * oi.unit_price) AS revenue
+FROM orders o
+JOIN order_items oi ON oi.order_id = o.order_id
+WHERE o.status = 'paid'
+GROUP BY 1;
+
+CREATE UNIQUE INDEX daily_sales_date_idx ON daily_sales (sale_date);
+
+-- Nightly, or whenever freshness is needed
+REFRESH MATERIALIZED VIEW CONCURRENTLY daily_sales;
+```
+
+That is the whole implementation. Every refresh recomputes every day in history, so refresh time grows with the size of `orders`, but correctness is guaranteed because the result is always exactly what the query says.
+
+### Option B: Summary Table plus Upsert
+
+```sql
+CREATE TABLE daily_sales (
+  sale_date  date PRIMARY KEY,
+  orders     bigint NOT NULL,
+  units      bigint NOT NULL,
+  revenue    numeric(14,2) NOT NULL,
+  updated_at timestamptz NOT NULL DEFAULT now()
+);
+
+-- Recompute only the last three days and upsert them
+INSERT INTO daily_sales (sale_date, orders, units, revenue)
+SELECT o.ordered_at::date,
+       COUNT(DISTINCT o.order_id),
+       SUM(oi.quantity),
+       SUM(oi.quantity * oi.unit_price)
+FROM orders o
+JOIN order_items oi ON oi.order_id = o.order_id
+WHERE o.status = 'paid'
+  AND o.ordered_at >= CURRENT_DATE - INTERVAL '3 days'
+GROUP BY 1
+ON CONFLICT (sale_date) DO UPDATE
+SET orders     = EXCLUDED.orders,
+    units      = EXCLUDED.units,
+    revenue    = EXCLUDED.revenue,
+    updated_at = now();
+```
+
+The upsert only touches recent days, so its cost stays flat as history grows, and it never blocks readers beyond ordinary row locks. The price is that you own the logic: the three-day window is an assumption about how late orders can change status, and a backfill for older days is a separate script.
+
+If you need the summary to be current to the second rather than to the last batch, push the maintenance into a trigger on the source table:
+
+```sql
+CREATE FUNCTION bump_daily_sales() RETURNS trigger
+LANGUAGE plpgsql AS $$
+DECLARE
+  d date;
+BEGIN
+  SELECT ordered_at::date INTO d FROM orders WHERE order_id = NEW.order_id;
+  INSERT INTO daily_sales (sale_date, orders, units, revenue)
+  VALUES (d, 0, NEW.quantity, NEW.quantity * NEW.unit_price)
+  ON CONFLICT (sale_date) DO UPDATE
+  SET units   = daily_sales.units   + EXCLUDED.units,
+      revenue = daily_sales.revenue + EXCLUDED.revenue,
+      updated_at = now();
+  RETURN NEW;
+END $$;
+
+CREATE TRIGGER order_items_daily_sales
+AFTER INSERT ON order_items
+FOR EACH ROW EXECUTE FUNCTION bump_daily_sales();
+```
+
+This is deliberately incomplete: it handles inserts of line items but not deletes, quantity changes, status transitions from `pending` to `paid`, or the `orders` count. Every one of those paths needs its own trigger logic, and each one is a place where the summary can drift from the truth. That maintenance burden is the real cost of a trigger-maintained table.
+
+## When a Table Beats a Materialized View
+
+- The source data is large and the summary changes only at the edges, so incremental upserts are far cheaper than a full recompute.
+- Freshness matters more than simplicity and you can afford to write and test trigger or application logic that keeps the summary in step.
+- You need to write to the summary directly, for example to store manual adjustments or annotations next to the computed numbers.
+- You need per-row metadata such as `updated_at`, which a materialized view cannot carry without being part of the query.
+- The summary must survive schema changes to the source. A materialized view is dropped or invalidated when a referenced column changes type; a table is not.
+
+## When a Materialized View Beats a Table
+
+- The definition is the documentation. Anyone can run `\d+ daily_sales` and see exactly how the numbers are derived; a summary table's provenance lives in scripts somewhere else.
+- Correctness is trivial to reason about. Each refresh recomputes from scratch, so there is no drift, no missed edge case in trigger code, and a wrong number is fixed by one `REFRESH`.
+- A full recompute is fast enough for your data volume and refresh interval, which is true far more often than people assume for daily or hourly reporting.
+- You want to change the aggregation logic frequently. Editing a query and refreshing is faster than migrating a table and backfilling.
+
+## Cost Comparison
+
+| Concern | Materialized view | Summary table |
+| --- | --- | --- |
+| Storage | Full result set plus indexes | Full result set plus indexes, plus any extra columns |
+| Write path | `REFRESH` only; whole result recomputed | Application, batch upsert, or triggers |
+| Refresh cost | Grows with source size on every run | Grows with the changed window only |
+| Reader blocking | Plain refresh blocks; concurrent refresh does not | Row locks only |
+| Staleness | Bounded by refresh interval | Bounded by batch interval, or zero with triggers |
+| Correctness risk | Low; recomputed from definition | Depends on maintenance code |
+| Direct writes | Not allowed | Allowed |
+| Definition stored in database | Yes | No |
+
+## Checking Staleness
+
+PostgreSQL does not record when a materialized view was last refreshed. `pg_matviews` tells you whether it is populated, and `pg_stat_user_tables` shows tuple counts, but neither includes a refresh timestamp. Two practical workarounds:
+
+Wrap the refresh in a function that logs to a helper table:
+
+```sql
+CREATE TABLE matview_refresh_log (
+  matview_name text PRIMARY KEY,
+  refreshed_at timestamptz NOT NULL,
+  duration     interval NOT NULL
+);
+
+CREATE OR REPLACE FUNCTION refresh_daily_sales() RETURNS void
+LANGUAGE plpgsql AS $$
+DECLARE
+  t0 timestamptz := clock_timestamp();
+BEGIN
+  REFRESH MATERIALIZED VIEW CONCURRENTLY daily_sales;
+  INSERT INTO matview_refresh_log (matview_name, refreshed_at, duration)
+  VALUES ('daily_sales', now(), clock_timestamp() - t0)
+  ON CONFLICT (matview_name) DO UPDATE
+  SET refreshed_at = EXCLUDED.refreshed_at,
+      duration     = EXCLUDED.duration;
+END $$;
+
+-- Schedule this instead of the raw REFRESH
+SELECT cron.schedule('refresh-daily-sales', '5 0 * * *', 'SELECT refresh_daily_sales()');
+
+-- How stale is it?
+SELECT matview_name, now() - refreshed_at AS age, duration
+FROM matview_refresh_log;
+```
+
+Alternatively, if the refresh is scheduled and you only need a human-readable hint, put the schedule in a comment so it shows up in tools:
+
+```sql
+COMMENT ON MATERIALIZED VIEW daily_sales IS
+  'Refreshed nightly at 00:05 UTC by pg_cron job refresh-daily-sales';
+```
+
+Or include the refresh time in the view itself by adding `now() AS refreshed_at` to the select list. Every row will carry the same timestamp, which is redundant but costs almost nothing and is impossible to forget.
+
+## Incremental View Maintenance with pg_ivm
+
+The `pg_ivm` extension adds a third option: an incrementally maintained materialized view. Instead of refreshing, it installs triggers on the base tables and updates the view's rows as the sources change, giving table-like freshness with materialized-view-like declarativeness:
+
+```sql
+CREATE EXTENSION pg_ivm;
+
+SELECT create_immv('daily_sales_immv', $$
+  SELECT o.ordered_at::date AS sale_date,
+         COUNT(*) AS line_items,
+         SUM(oi.quantity * oi.unit_price) AS revenue
+  FROM orders o
+  JOIN order_items oi ON oi.order_id = o.order_id
+  WHERE o.status = 'paid'
+  GROUP BY 1
+$$);
+```
+
+The extension supports a subset of SQL, so check its documentation for which joins, aggregates, and clauses are allowed before designing around it. It also adds write overhead to every insert, update, and delete on the source tables, so it suits moderately written tables with expensive aggregates rather than high-throughput ingest tables.
+
+## Working with Materialized Views in Chat2DB
+
+[Chat2DB](https://chat2db.ai/download) shows materialized views as their own node in the schema tree, separate from tables and views, with the stored definition, indexes, and population status. You can run `REFRESH MATERIALIZED VIEW CONCURRENTLY` from the SQL editor and watch the row count change, which is a quick way to validate a new definition before wiring up a scheduled job.
+
+## Decision Table
+
+| Situation | Recommendation |
+| --- | --- |
+| Reporting query is slow, hourly or daily freshness is fine | Materialized view with concurrent refresh |
+| Full recompute takes longer than the acceptable refresh window | Summary table with windowed upsert |
+| Numbers must reflect writes immediately | Table with triggers, or pg_ivm if the query is supported |
+| You need to store manual adjustments alongside computed values | Table |
+| Definition changes often and correctness is the priority | Materialized view |
+| No unique key exists for the result rows | Materialized view with plain refresh, or add a surrogate key |
+| Downstream views depend on the object | Either, but note that dropping a materialized view cascades like a view |
+
+## FAQ
+
+### Can I update a Postgres materialized view directly?
+
+No. `INSERT`, `UPDATE`, and `DELETE` all fail with `ERROR:  cannot change materialized view`. Change the underlying data or the definition and run `REFRESH MATERIALIZED VIEW`.
+
+### Does a materialized view refresh automatically?
+
+Not in core PostgreSQL. You must run `REFRESH MATERIALIZED VIEW` yourself, schedule it with `pg_cron` or system cron, or use an extension such as `pg_ivm` for incremental maintenance.
+
+### Why does REFRESH CONCURRENTLY fail?
+
+The most common cause is a missing unique index. Concurrent refresh needs a unique index on plain columns with no `WHERE` clause so it can match old rows to new ones. It also fails if the view has never been populated or if you run it inside a transaction block.
+
+### Is a materialized view faster than a table?
+
+For reads they are equivalent: both are heaps with indexes, and the planner treats them the same way. The difference is entirely in how the data gets there and how much it costs to keep it correct.
+
+### How do I convert a materialized view to a table?
+
+Create a table from the view's contents with `CREATE TABLE daily_sales_tbl AS SELECT * FROM daily_sales`, add the indexes and constraints you need, then drop the materialized view and rename the table. Remember that the definition is lost once the view is dropped, so save it with `pg_get_viewdef` first.

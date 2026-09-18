@@ -1,0 +1,421 @@
+---
+title: "Postgres CREATE VIEW: Syntax, Examples, Best Use"
+description: "Learn how to create, inspect, update, secure, and drop views in PostgreSQL, with runnable SQL for joins, updatable views, check options, and recursion."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: September 18, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# Postgres CREATE VIEW: Syntax, Examples, Best Use
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="September 18, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+A Postgres view is a saved query that behaves like a table when you read from it. Nothing is copied; every `SELECT` against the view re-runs the underlying query against the real tables. That makes views the standard tool for hiding join complexity, exposing a stable interface to applications, and restricting which columns or rows a role can see. This guide walks through `CREATE VIEW` in PostgreSQL from the basic syntax to updatable views, security options, recursive views, and the dependency errors you will hit when altering or dropping them. Every example is runnable on a stock PostgreSQL 15 or later install.
+
+## What a Postgres View Is
+
+A view is a named query stored in the system catalog (`pg_class` with `relkind = 'v'`, plus the rewrite rule in `pg_rewrite`). When you query it, the planner replaces the view reference with its definition and optimizes the combined query as a whole. Three consequences follow:
+
+- A view holds no data of its own, so it is always as fresh as the tables it reads.
+- A view cannot be indexed. Indexes on the base tables are what the planner uses.
+- The view's column names and types are fixed at creation time, which matters for `CREATE OR REPLACE VIEW`.
+
+If you need stored, indexable results, that is a materialized view, which we cover briefly at the end.
+
+## Sample Schema
+
+The examples use a small e-commerce schema with customers, orders, and order line items.
+
+```sql
+CREATE TABLE customers (
+  customer_id serial PRIMARY KEY,
+  name        text NOT NULL,
+  email       text NOT NULL,
+  country     text NOT NULL,
+  created_at  timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE TABLE orders (
+  order_id    serial PRIMARY KEY,
+  customer_id int  NOT NULL REFERENCES customers,
+  status      text NOT NULL DEFAULT 'pending',
+  ordered_at  timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE TABLE order_items (
+  order_id   int  NOT NULL REFERENCES orders,
+  product    text NOT NULL,
+  quantity   int  NOT NULL CHECK (quantity > 0),
+  unit_price numeric(10,2) NOT NULL,
+  PRIMARY KEY (order_id, product)
+);
+
+INSERT INTO customers (name, email, country) VALUES
+  ('Ada',   'ada@example.com',   'DE'),
+  ('Grace', 'grace@example.com', 'US');
+
+INSERT INTO orders (customer_id, status) VALUES (1, 'paid'), (2, 'pending');
+
+INSERT INTO order_items VALUES
+  (1, 'keyboard', 1, 89.00),
+  (1, 'mouse',    2, 25.50),
+  (2, 'monitor',  1, 349.00);
+```
+
+## CREATE VIEW Syntax
+
+The minimal form is `CREATE VIEW name AS query`. A common first view filters rows:
+
+```sql
+CREATE VIEW paid_orders AS
+SELECT order_id, customer_id, ordered_at
+FROM orders
+WHERE status = 'paid';
+
+SELECT * FROM paid_orders;
+```
+
+```
+ order_id | customer_id |          ordered_at
+----------+-------------+-------------------------------
+        1 |           1 | 2026-09-18 09:12:41.201397+00
+```
+
+You can also name the columns explicitly, which is useful when the query produces expressions:
+
+```sql
+CREATE VIEW customer_summary (customer_id, display_name, country_code) AS
+SELECT customer_id, name || ' <' || email || '>', country
+FROM customers;
+```
+
+### CREATE OR REPLACE VIEW and the Column Rule
+
+`CREATE OR REPLACE VIEW` rewrites an existing view without dropping it, so grants and dependent objects survive. The catch is that the new query must produce the same columns, with the same names and types, in the same order. You may only add new columns at the end of the list.
+
+```sql
+-- OK: appends a column at the end
+CREATE OR REPLACE VIEW paid_orders AS
+SELECT order_id, customer_id, ordered_at, status
+FROM orders
+WHERE status = 'paid';
+
+-- Fails: renames the second column
+CREATE OR REPLACE VIEW paid_orders AS
+SELECT order_id, customer_id AS cust, ordered_at, status
+FROM orders
+WHERE status = 'paid';
+```
+
+```
+ERROR:  cannot change name of view column "customer_id" to "cust"
+HINT:  Use ALTER VIEW ... RENAME COLUMN ... to change name of view column instead.
+```
+
+Removing or reordering a column produces `ERROR:  cannot drop columns from view`. In those cases you must `DROP VIEW` and recreate it, which means re-applying grants and recreating anything that depends on it.
+
+## Postgres View Tables: Views Over Joins
+
+The real value of a view appears when it hides a multi-table join. Here is an order-level total that joins all three tables:
+
+```sql
+CREATE VIEW order_totals AS
+SELECT o.order_id,
+       o.ordered_at,
+       o.status,
+       c.customer_id,
+       c.name    AS customer_name,
+       c.country,
+       SUM(oi.quantity * oi.unit_price) AS order_total
+FROM orders o
+JOIN customers   c  ON c.customer_id = o.customer_id
+JOIN order_items oi ON oi.order_id   = o.order_id
+GROUP BY o.order_id, c.customer_id;
+
+SELECT order_id, customer_name, country, order_total
+FROM order_totals
+ORDER BY order_id;
+```
+
+```
+ order_id | customer_name | country | order_total
+----------+---------------+---------+-------------
+        1 | Ada           | DE      |      140.00
+        2 | Grace         | US      |      349.00
+```
+
+Grouping by `o.order_id` and `c.customer_id` is enough because both are primary keys, so PostgreSQL treats the other columns from those tables as functionally dependent.
+
+Views can be stacked. A second view that reads from `order_totals` is perfectly normal:
+
+```sql
+CREATE VIEW eu_order_totals AS
+SELECT * FROM order_totals WHERE country IN ('DE', 'FR', 'NL');
+```
+
+Keep the stack shallow. Each layer is inlined by the planner, so three or four layers of views over views are fine, but ten layers with repeated aggregates become hard to reason about and hard to tune.
+
+## Listing Views
+
+### In psql
+
+`\dv` lists views in the current search path, and `\dv+` adds size and description columns. Materialized views are listed separately with `\dm`.
+
+```
+shop=# \dv
+              List of relations
+ Schema |       Name       | Type |  Owner
+--------+------------------+------+---------
+ public | customer_summary | view | shop_app
+ public | eu_order_totals  | view | shop_app
+ public | order_totals     | view | shop_app
+ public | paid_orders      | view | shop_app
+```
+
+### From the Catalog
+
+For scripts or tools, query `information_schema.views` (portable) or `pg_views` (PostgreSQL-specific, includes the definition text):
+
+```sql
+SELECT table_schema, table_name
+FROM information_schema.views
+WHERE table_schema NOT IN ('pg_catalog', 'information_schema')
+ORDER BY 1, 2;
+
+SELECT schemaname, viewname, viewowner
+FROM pg_views
+WHERE schemaname = 'public';
+
+-- Materialized views live in a separate catalog view
+SELECT schemaname, matviewname, ispopulated FROM pg_matviews;
+```
+
+## Viewing a View's Definition
+
+In psql, `\d+ order_totals` prints the columns followed by the full view definition. From SQL, use `pg_get_viewdef`, passing `true` as the second argument for pretty-printed output:
+
+```sql
+SELECT pg_get_viewdef('order_totals', true);
+```
+
+```
+ SELECT o.order_id,
+    o.ordered_at,
+    o.status,
+    c.customer_id,
+    c.name AS customer_name,
+    c.country,
+    sum(oi.quantity::numeric * oi.unit_price) AS order_total
+   FROM orders o
+     JOIN customers c ON c.customer_id = o.customer_id
+     JOIN order_items oi ON oi.order_id = o.order_id
+  GROUP BY o.order_id, c.customer_id;
+```
+
+Notice that PostgreSQL stores the parsed query tree, not your original text. The output is regenerated, casts are made explicit, and comments are gone. If you care about preserving the original SQL, keep it in version control.
+
+## Updatable Views
+
+A simple view is automatically updatable. "Simple" means the view has exactly one table or updatable view in its `FROM` clause, no `DISTINCT`, `GROUP BY`, `HAVING`, `LIMIT`, `OFFSET`, set operations, aggregates, or window functions, and its select list contains plain column references. `paid_orders` qualifies, so this works:
+
+```sql
+UPDATE paid_orders SET status = 'shipped' WHERE order_id = 1;
+
+INSERT INTO paid_orders (customer_id, status) VALUES (1, 'pending');
+
+DELETE FROM paid_orders WHERE order_id = 1;
+```
+
+The `INSERT` above is legal even though it inserts a row the view will not show. That is usually a bug rather than a feature, which is what `WITH CHECK OPTION` is for.
+
+### WITH CHECK OPTION
+
+Adding `WITH CHECK OPTION` makes PostgreSQL reject any `INSERT` or `UPDATE` that would produce a row invisible through the view:
+
+```sql
+CREATE OR REPLACE VIEW paid_orders AS
+SELECT order_id, customer_id, ordered_at, status
+FROM orders
+WHERE status = 'paid'
+WITH CHECK OPTION;
+
+INSERT INTO paid_orders (customer_id, status) VALUES (1, 'pending');
+```
+
+```
+ERROR:  new row violates check option for view "paid_orders"
+DETAIL:  Failing row contains (4, 1, pending, 2026-09-18 09:20:03.55+00).
+```
+
+The option has two flavors. `WITH LOCAL CHECK OPTION` checks only the conditions defined on this view. `WITH CASCADED CHECK OPTION` (the default when you write just `WITH CHECK OPTION`) also checks the conditions of every underlying view. Use `LOCAL` only when you deliberately want a lower view's filter to be bypassable, which is rare.
+
+### INSTEAD OF Triggers for Complex Views
+
+A join view such as `order_totals` is not updatable because PostgreSQL cannot know which base table should receive the change. You can define that yourself with an `INSTEAD OF` trigger:
+
+```sql
+CREATE FUNCTION order_totals_update() RETURNS trigger
+LANGUAGE plpgsql AS $$
+BEGIN
+  UPDATE orders SET status = NEW.status WHERE order_id = OLD.order_id;
+  RETURN NEW;
+END $$;
+
+CREATE TRIGGER order_totals_upd
+INSTEAD OF UPDATE ON order_totals
+FOR EACH ROW EXECUTE FUNCTION order_totals_update();
+
+UPDATE order_totals SET status = 'refunded' WHERE order_id = 2;
+```
+
+The trigger fires once per row and is responsible for the whole write. You can add `INSTEAD OF INSERT` and `INSTEAD OF DELETE` triggers in the same way.
+
+## Views and Security
+
+### Hiding Columns and Granting Access
+
+The most common security use is to expose a subset of columns and grant access to the view but not the table:
+
+```sql
+CREATE VIEW customers_public AS
+SELECT customer_id, name, country FROM customers;
+
+REVOKE ALL ON customers FROM analyst;
+GRANT SELECT ON customers_public TO analyst;
+```
+
+By default a view runs with the privileges of its owner, so `analyst` can read `customers_public` even though it has no rights on `customers`. The view owner must have the necessary privileges on the underlying tables.
+
+### security_barrier
+
+When a view filters rows for security, the planner's freedom to push a user-supplied function below the view's `WHERE` clause becomes a leak: a cheap function with a `RAISE NOTICE` could be evaluated on rows the user should never see. Mark such views as a barrier:
+
+```sql
+CREATE VIEW my_orders WITH (security_barrier = true) AS
+SELECT * FROM orders WHERE customer_id = current_setting('app.customer_id')::int;
+```
+
+The planner then evaluates the view's own conditions first and only applies outer conditions marked `LEAKPROOF` before them. This costs some optimization opportunities, so use it only where the row filter is a security boundary.
+
+### security_invoker in PostgreSQL 15 and Later
+
+`security_invoker = true` flips the privilege model: the view is checked against the permissions of the user running the query, not the view owner. This is what you want when row-level security policies on the base tables should apply to the querying user:
+
+```sql
+CREATE VIEW orders_rls WITH (security_invoker = true) AS
+SELECT order_id, customer_id, status FROM orders;
+```
+
+You can set both options on one view. Combined with `GRANT`, this gives three distinct patterns: owner-privilege views for controlled data exposure, invoker-privilege views for RLS pass-through, and barrier views for safe row filtering.
+
+## Temporary and Recursive Views
+
+`CREATE TEMP VIEW` creates a view that lives in the session's temporary schema and disappears when the session ends. It is handy for ad hoc analysis scripts:
+
+```sql
+CREATE TEMP VIEW today_orders AS
+SELECT * FROM orders WHERE ordered_at >= CURRENT_DATE;
+```
+
+A view whose base table is temporary is automatically temporary too.
+
+`CREATE RECURSIVE VIEW` is shorthand for a view over a recursive common table expression. Given a self-referencing `categories` table:
+
+```sql
+CREATE TABLE categories (
+  category_id serial PRIMARY KEY,
+  parent_id   int REFERENCES categories,
+  name        text NOT NULL
+);
+
+CREATE RECURSIVE VIEW category_tree (category_id, parent_id, name, depth) AS
+  SELECT category_id, parent_id, name, 0
+  FROM categories
+  WHERE parent_id IS NULL
+  UNION ALL
+  SELECT c.category_id, c.parent_id, c.name, t.depth + 1
+  FROM categories c
+  JOIN category_tree t ON c.parent_id = t.category_id;
+```
+
+The column list is mandatory here. PostgreSQL rewrites this into `CREATE VIEW category_tree AS WITH RECURSIVE category_tree(...) AS (...) SELECT ... FROM category_tree`.
+
+## Performance: Views Are Inlined
+
+Because the planner merges the view definition into the calling query, a view is neither faster nor slower than writing the query by hand. `EXPLAIN` on a query against `order_totals` shows the same join and aggregate nodes you would get from the raw SQL:
+
+```sql
+EXPLAIN SELECT order_total FROM order_totals WHERE order_id = 1;
+```
+
+Two practical implications:
+
+- Predicates on the outer query are pushed into the view where legal, so `WHERE order_id = 1` can use the primary key index on `orders` even though the view aggregates.
+- A view that does heavy aggregation over millions of rows re-runs that aggregation on every call. If the result only needs to be fresh every few minutes, a materialized view with `REFRESH MATERIALIZED VIEW CONCURRENTLY` and an index will usually be the better tool.
+
+## ALTER VIEW, RENAME, and DROP VIEW
+
+`ALTER VIEW` handles metadata changes without touching the query:
+
+```sql
+ALTER VIEW paid_orders RENAME TO orders_paid;
+ALTER VIEW orders_paid RENAME COLUMN customer_id TO cust_id;
+ALTER VIEW orders_paid OWNER TO shop_admin;
+ALTER VIEW orders_paid SET SCHEMA reporting;
+ALTER VIEW orders_paid SET (security_invoker = true);
+```
+
+Dropping a view that other views depend on fails by default:
+
+```sql
+DROP VIEW order_totals;
+```
+
+```
+ERROR:  cannot drop view order_totals because other objects depend on it
+DETAIL:  view eu_order_totals depends on view order_totals
+HINT:  Use DROP ... CASCADE to drop the dependent objects too.
+```
+
+You get the same error when you try to `DROP TABLE` or `ALTER TABLE ... DROP COLUMN` on a base table used by a view, and when you `ALTER COLUMN ... TYPE` a column the view references. The options are to drop the dependents first, or use `DROP VIEW order_totals CASCADE`, which removes every dependent view in one statement and prints a `NOTICE` for each. In migrations, prefer explicit drops so that the list of affected objects is visible in code review.
+
+To find dependents before dropping, query `pg_depend`:
+
+```sql
+SELECT DISTINCT dependent.relname
+FROM pg_depend d
+JOIN pg_rewrite r        ON r.oid = d.objid
+JOIN pg_class dependent  ON dependent.oid = r.ev_class
+WHERE d.refobjid = 'order_totals'::regclass
+  AND dependent.oid <> 'order_totals'::regclass;
+```
+
+## Managing Views in Chat2DB
+
+If you prefer a GUI, [Chat2DB](https://chat2db.ai/download) lists views under each schema in the object tree next to tables, materialized views, and functions. Opening a view shows its columns and the reconstructed definition, and you can edit the SQL and apply it as a `CREATE OR REPLACE VIEW`, which is handy for spotting the column-order rule before a migration fails.
+
+## FAQ
+
+### Does a Postgres view store data?
+
+No. A view stores only the query. Each `SELECT` on the view executes that query against the current contents of the base tables. Only materialized views store rows.
+
+### Can I create an index on a view?
+
+Not on a regular view. Create indexes on the underlying tables; the planner uses them after inlining the view. Materialized views can be indexed because they hold real data.
+
+### How do I see which tables a view uses?
+
+Use `\d+ view_name` in psql, `pg_get_viewdef('view_name', true)`, or query `information_schema.view_table_usage` for a table-by-table list.
+
+### Why does CREATE OR REPLACE VIEW say it cannot drop columns?
+
+The replacement query must keep every existing column with the same name and type in the same position. You can append columns but not remove, rename, or reorder them. Use `ALTER VIEW ... RENAME COLUMN` for renames, or drop and recreate the view for structural changes.
+
+### What is the difference between a view and a materialized view?
+
+A view is re-executed on every read and is always current. A materialized view stores the query result on disk, can be indexed, and returns stale data until you run `REFRESH MATERIALIZED VIEW`.

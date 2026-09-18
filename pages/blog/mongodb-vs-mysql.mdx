@@ -1,0 +1,338 @@
+---
+title: "MongoDB vs MySQL: Differences and When to Use Each"
+description: "MongoDB vs MySQL compared on data model, schema flexibility, query language, transactions, indexing, sharding, JSON columns, tooling and use cases."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: September 18, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# MongoDB vs MySQL: Differences and When to Use Each
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="September 18, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+MongoDB and MySQL are both free to start with, both run everywhere, and both back a huge share of the web. Beyond that they diverge sharply: MySQL is a relational database that stores rows in tables with a fixed schema and joins them with SQL, while MongoDB is a document database that stores JSON-like documents in collections and queries them with an operator-based language. Choosing between them is mostly a question of how your data is shaped, how it will change, and how you need to scale. This article compares the two with the same example modeled both ways.
+
+## Data model: documents vs tables
+
+Consider an e-commerce order with a customer, shipping address, and several line items.
+
+### The MongoDB document
+
+In MongoDB the whole order is one document in the `orders` collection. Related data that is always read together is embedded rather than referenced.
+
+```json
+{
+  "_id": "ord_1001",
+  "customer": { "id": "cus_42", "email": "ana@example.com" },
+  "shipping": { "street": "12 Rue Lepic", "city": "Paris", "country": "FR" },
+  "status": "paid",
+  "items": [
+    { "sku": "sku-1", "name": "Keyboard", "qty": 1, "price": 89.00 },
+    { "sku": "sku-7", "name": "USB-C cable", "qty": 2, "price": 9.50 }
+  ],
+  "total": 108.00,
+  "createdAt": { "$date": "2026-09-18T09:12:00Z" }
+}
+```
+
+One read returns everything needed to render the order page. The trade-off is that the customer's email is copied into each order; if it changes, you decide whether to update historical orders or accept that they reflect the email at the time of purchase (often the desired behavior).
+
+### The MySQL tables
+
+In MySQL the same order is normalized into three tables linked by foreign keys.
+
+```sql
+CREATE TABLE customers (
+  id         BIGINT AUTO_INCREMENT PRIMARY KEY,
+  email      VARCHAR(255) NOT NULL UNIQUE
+) ENGINE=InnoDB;
+
+CREATE TABLE orders (
+  id           BIGINT AUTO_INCREMENT PRIMARY KEY,
+  customer_id  BIGINT NOT NULL,
+  status       ENUM('pending','paid','shipped','cancelled') NOT NULL,
+  ship_street  VARCHAR(255),
+  ship_city    VARCHAR(100),
+  ship_country CHAR(2),
+  total        DECIMAL(12,2) NOT NULL,
+  created_at   DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  CONSTRAINT fk_orders_customer FOREIGN KEY (customer_id) REFERENCES customers(id)
+) ENGINE=InnoDB;
+
+CREATE TABLE order_items (
+  id        BIGINT AUTO_INCREMENT PRIMARY KEY,
+  order_id  BIGINT NOT NULL,
+  sku       VARCHAR(64) NOT NULL,
+  name      VARCHAR(255) NOT NULL,
+  qty       INT NOT NULL CHECK (qty > 0),
+  price     DECIMAL(10,2) NOT NULL,
+  CONSTRAINT fk_items_order FOREIGN KEY (order_id) REFERENCES orders(id) ON DELETE CASCADE
+) ENGINE=InnoDB;
+```
+
+Each fact lives in one place. Rendering the order page requires a join, but updating a customer email is a single-row update, and the database enforces that every order points to a real customer and every item to a real order.
+
+## Schema flexibility vs constraints
+
+MongoDB collections do not require a schema. Two documents in `orders` can have different fields, which is convenient during rapid iteration and for genuinely heterogeneous data such as product attributes that vary by category. When you want guarantees, you add JSON Schema validation at the collection level:
+
+```javascript
+db.createCollection("orders", {
+  validator: {
+    $jsonSchema: {
+      bsonType: "object",
+      required: ["customer", "items", "total", "status"],
+      properties: {
+        total:  { bsonType: "decimal" },
+        status: { enum: ["pending", "paid", "shipped", "cancelled"] },
+        items:  { bsonType: "array", minItems: 1 }
+      }
+    }
+  },
+  validationLevel: "strict"
+})
+```
+
+MySQL requires the schema up front, and changing it is a DDL operation. InnoDB supports many `ALTER TABLE` operations online (`ALGORITHM=INPLACE` or `INSTANT` for adding columns in MySQL 8), so schema changes are less painful than they once were, but they are still deliberate events managed through migrations. Foreign keys, `CHECK` constraints, `NOT NULL`, `UNIQUE`, and `ENUM` types enforce integrity in the database rather than in application code.
+
+The practical rule: if you can draw a stable entity-relationship diagram for your domain, MySQL's constraints will save you from a class of bugs. If the shape of records legitimately varies or evolves weekly, MongoDB's flexibility reduces migration overhead.
+
+## Query language side by side
+
+Below are the same three questions answered in both systems.
+
+### Find paid orders for a customer, newest first
+
+```javascript
+// MongoDB
+db.orders.find(
+  { "customer.id": "cus_42", status: "paid" },
+  { _id: 1, total: 1, createdAt: 1 }
+).sort({ createdAt: -1 }).limit(20)
+```
+
+```sql
+-- MySQL
+SELECT id, total, created_at
+FROM orders
+WHERE customer_id = 42 AND status = 'paid'
+ORDER BY created_at DESC
+LIMIT 20;
+```
+
+### Revenue per country for the last 30 days
+
+```javascript
+// MongoDB aggregation pipeline
+db.orders.aggregate([
+  { $match: { status: "paid", createdAt: { $gte: new Date(Date.now() - 30*24*3600*1000) } } },
+  { $group: { _id: "$shipping.country", revenue: { $sum: "$total" }, orders: { $sum: 1 } } },
+  { $sort: { revenue: -1 } }
+])
+```
+
+```sql
+-- MySQL
+SELECT ship_country, SUM(total) AS revenue, COUNT(*) AS orders
+FROM orders
+WHERE status = 'paid' AND created_at >= NOW() - INTERVAL 30 DAY
+GROUP BY ship_country
+ORDER BY revenue DESC;
+```
+
+### Top-selling SKUs by quantity
+
+This is where embedding shows its cost. In MongoDB you must unwind the array before grouping; in MySQL the items are already rows.
+
+```javascript
+// MongoDB
+db.orders.aggregate([
+  { $match: { status: "paid" } },
+  { $unwind: "$items" },
+  { $group: { _id: "$items.sku", qty: { $sum: "$items.qty" } } },
+  { $sort: { qty: -1 } },
+  { $limit: 10 }
+])
+```
+
+```sql
+-- MySQL
+SELECT oi.sku, SUM(oi.qty) AS qty
+FROM order_items oi
+JOIN orders o ON o.id = oi.order_id
+WHERE o.status = 'paid'
+GROUP BY oi.sku
+ORDER BY qty DESC
+LIMIT 10;
+```
+
+MongoDB does have `$lookup` for left-outer joins across collections, but it is designed for occasional use. If most of your queries need multi-collection joins, that is a signal the data is relational.
+
+## Transactions
+
+MySQL with the InnoDB engine has been fully ACID for decades: multi-statement transactions, row-level locking, configurable isolation levels (REPEATABLE READ by default), and crash recovery through the redo log.
+
+```sql
+START TRANSACTION;
+INSERT INTO orders (customer_id, status, total) VALUES (42, 'paid', 108.00);
+SET @order_id = LAST_INSERT_ID();
+INSERT INTO order_items (order_id, sku, name, qty, price)
+VALUES (@order_id, 'sku-1', 'Keyboard', 1, 89.00),
+       (@order_id, 'sku-7', 'USB-C cable', 2, 9.50);
+UPDATE inventory SET on_hand = on_hand - 1 WHERE sku = 'sku-1';
+UPDATE inventory SET on_hand = on_hand - 2 WHERE sku = 'sku-7';
+COMMIT;
+```
+
+MongoDB has always been atomic at the single-document level, which is why embedding is encouraged: writing the order and its items as one document is one atomic operation. Since version 4.0 (replica sets) and 4.2 (sharded clusters), MongoDB also supports multi-document ACID transactions:
+
+```javascript
+const session = client.startSession();
+try {
+  session.startTransaction();
+  await orders.insertOne(orderDoc, { session });
+  await inventory.updateOne({ sku: "sku-1" }, { $inc: { onHand: -1 } }, { session });
+  await inventory.updateOne({ sku: "sku-7" }, { $inc: { onHand: -2 } }, { session });
+  await session.commitTransaction();
+} catch (e) {
+  await session.abortTransaction();
+  throw e;
+} finally {
+  await session.endSession();
+}
+```
+
+They work, but they carry more overhead than InnoDB transactions and MongoDB's own guidance is to model data so that most writes stay within a single document. If your workload is transaction-heavy across many entities (ledgers, inventory, bookings), MySQL is the more natural fit.
+
+## Indexing
+
+Both systems use B-tree indexes as the workhorse and both support compound indexes, unique indexes, and partial or filtered indexes. Differences show up in the specialized types.
+
+**MongoDB** offers single-field, compound, multikey (automatically used when indexing an array field), text, 2dsphere geospatial, hashed (for sharding), wildcard (for unpredictable field names), and TTL indexes that expire documents automatically.
+
+```javascript
+db.orders.createIndex({ "customer.id": 1, createdAt: -1 })
+db.orders.createIndex({ "items.sku": 1 })                       // multikey
+db.products.createIndex({ name: "text", description: "text" })  // full text
+db.stores.createIndex({ location: "2dsphere" })                 // geospatial
+db.sessions.createIndex({ lastSeen: 1 }, { expireAfterSeconds: 86400 }) // TTL
+```
+
+**MySQL** InnoDB offers B-tree (clustered primary key plus secondary indexes), FULLTEXT with natural-language and boolean modes, SPATIAL indexes on geometry columns, functional indexes since 8.0.13, invisible indexes for safe removal testing, and descending indexes.
+
+```sql
+CREATE INDEX idx_orders_customer_created ON orders (customer_id, created_at DESC);
+CREATE INDEX idx_items_sku ON order_items (sku);
+CREATE FULLTEXT INDEX ft_products ON products (name, description);
+CREATE SPATIAL INDEX sp_stores ON stores (location);
+CREATE INDEX idx_email_lower ON customers ((LOWER(email)));  -- functional index
+```
+
+Use `explain()` in MongoDB and `EXPLAIN` / `EXPLAIN ANALYZE` in MySQL to confirm the planner uses the index you expect.
+
+## Scaling
+
+**MongoDB** was designed for horizontal scale. Replica sets provide redundancy and automatic failover; sharding distributes a collection across multiple replica sets by a shard key, and the `mongos` router hides the topology from the application. Choosing a good shard key (high cardinality, even write distribution, matches common query patterns) is the critical design decision, and it is hard to change later.
+
+```javascript
+sh.enableSharding("shop")
+sh.shardCollection("shop.orders", { "customer.id": "hashed" })
+```
+
+**MySQL** scales reads by adding replicas through binary-log replication (asynchronous, semi-synchronous, or Group Replication). Writes go to a single primary. To route traffic you typically add ProxySQL or MySQL Router. Writes beyond a single primary require application-level sharding or a layer such as Vitess (which powers YouTube-scale MySQL deployments) or PlanetScale. These approaches are proven but they are add-ons rather than core features, and cross-shard joins and transactions become the application's problem.
+
+```sql
+-- Read-only replica for reporting
+CHANGE REPLICATION SOURCE TO
+  SOURCE_HOST = 'db-primary', SOURCE_USER = 'repl', SOURCE_PASSWORD = 'secret',
+  SOURCE_AUTO_POSITION = 1;
+START REPLICA;
+```
+
+For most applications a single well-tuned MySQL primary with replicas goes a very long way. MongoDB's built-in sharding matters when you know write volume or dataset size will exceed one machine.
+
+## MySQL JSON columns as a middle ground
+
+If you like relational integrity for core entities but need flexible attributes on some of them, MySQL's native `JSON` type covers a lot of ground. Values are validated and stored in an efficient binary format, and you can index specific paths through generated columns.
+
+```sql
+ALTER TABLE products ADD COLUMN attributes JSON;
+
+INSERT INTO products (sku, name, attributes)
+VALUES ('sku-1', 'Keyboard', '{"layout": "ISO", "switch": "brown", "wireless": true}');
+
+-- Query a path
+SELECT sku, JSON_EXTRACT(attributes, '$.switch') AS switch_type
+FROM products
+WHERE attributes->>'$.wireless' = 'true';
+
+-- Index a path via a generated column
+ALTER TABLE products
+  ADD COLUMN switch_type VARCHAR(32)
+    GENERATED ALWAYS AS (attributes->>'$.switch') STORED,
+  ADD INDEX idx_switch (switch_type);
+
+-- MySQL 8.0.17+: multi-valued index on a JSON array
+ALTER TABLE products ADD INDEX idx_tags ((CAST(attributes->'$.tags' AS CHAR(64) ARRAY)));
+SELECT sku FROM products WHERE 'mechanical' MEMBER OF (attributes->'$.tags');
+```
+
+This does not turn MySQL into MongoDB (no aggregation pipeline over nested arrays, no wildcard indexes), but it removes the most common reason teams reach for a document store: a handful of variable fields on an otherwise relational table.
+
+## Performance characteristics
+
+Rather than quoting benchmark numbers that depend entirely on hardware and workload, here is how the two behave qualitatively:
+
+- **Reads of a whole aggregate** (an order with all its items) are cheaper in MongoDB because the document is contiguous; MySQL needs a join, though with proper indexes the join is fast.
+- **Updates to shared facts** (a customer's address referenced by many orders) are cheaper in MySQL, where one row changes, than in MongoDB, where you either accept duplication or update many documents.
+- **Analytical queries** across entities (top SKUs, revenue by region) are typically simpler and often faster in MySQL because the data is already in flat rows; MongoDB needs `$unwind` and `$group` stages.
+- **Write throughput at large scale** favors MongoDB when sharding spreads writes across nodes; a single MySQL primary is the ceiling until you add Vitess or application sharding.
+- **Memory behavior**: both depend heavily on keeping the working set in RAM (InnoDB buffer pool vs WiredTiger cache). Neither is magically faster once data spills to disk.
+
+## Tooling
+
+MongoDB ships **mongosh** (the shell) and **MongoDB Compass**, a GUI for browsing documents, building aggregations visually, and inspecting index usage. MySQL ships the `mysql` command-line client and **MySQL Workbench** for modeling, querying, and administration.
+
+If your stack uses both, which is common (MySQL for orders and billing, MongoDB for catalog or event data), [Chat2DB](https://chat2db.ai/download) connects to MySQL and MongoDB in one client, so you can browse tables and collections side by side, run SQL against MySQL and queries against MongoDB, and use the AI assistant to draft either. The web version at [app.chat2db.ai](https://app.chat2db.ai) needs no installation.
+
+## Use-case decision matrix
+
+| Requirement | Prefer MySQL | Prefer MongoDB |
+| --- | --- | --- |
+| Data is naturally tabular with clear relationships | Yes | |
+| Records vary in shape or evolve quickly | | Yes |
+| Multi-entity transactions are frequent (payments, ledgers, inventory) | Yes | |
+| Aggregates are read whole and rarely joined (profiles, catalogs, events) | | Yes |
+| Heavy reporting and ad-hoc analytics in SQL | Yes | |
+| Dataset or write volume will exceed one server soon | | Yes (built-in sharding) |
+| Team already fluent in SQL and ORMs | Yes | |
+| Geospatial or time-series event streams with TTL | | Yes |
+| Need a mostly relational schema with a few flexible fields | Yes (JSON columns) | |
+
+Many production systems use both. The mistake to avoid is picking MongoDB to skip schema design for data that is fundamentally relational, or forcing highly variable documents into dozens of nullable MySQL columns.
+
+## FAQ
+
+### Is MongoDB faster than MySQL?
+
+For reading and writing self-contained documents, MongoDB is often faster because no joins are needed. For queries that combine many entities or aggregate across them, MySQL with proper indexes is usually faster and simpler. Benchmark your actual access patterns.
+
+### Does MongoDB support joins?
+
+Yes, through the `$lookup` aggregation stage, which performs a left outer join to another collection in the same database. It is useful for occasional joins but not intended as the primary access pattern.
+
+### Can MySQL store JSON documents?
+
+Yes. MySQL 5.7 and later have a native `JSON` column type with functions such as `JSON_EXTRACT`, `JSON_SET`, and `JSON_TABLE`, and you can index JSON paths through generated columns or multi-valued indexes.
+
+### Does MongoDB support ACID transactions?
+
+Single-document operations have always been atomic. Multi-document ACID transactions are supported on replica sets since MongoDB 4.0 and on sharded clusters since 4.2.
+
+### Which is easier to scale?
+
+MongoDB includes replica sets and sharding in the core product. MySQL scales reads easily with replicas; scaling writes requires Vitess, a managed service, or application-level sharding.

@@ -1,0 +1,351 @@
+---
+title: "Best Open Source Vector Databases in 2026"
+description: "Vector database comparison of eight open source options in 2026: pgvector, Milvus, Qdrant, Weaviate, Chroma, LanceDB, Vespa and OpenSearch, with code samples."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: September 18, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# Best Open Source Vector Databases in 2026
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="September 18, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+A vector database stores embeddings, the dense floating-point arrays that models produce for text, images, audio or code, and answers one question quickly: which stored vectors are closest to this query vector? Exact nearest-neighbour search over millions of 1536-dimensional vectors is too slow for interactive use, so every serious engine uses approximate nearest neighbour (ANN) indexes. The two families you will meet everywhere are HNSW (a layered proximity graph that trades memory for very fast, high-recall search) and IVF (inverted file: cluster the vectors, then search only the nearest clusters, often combined with product quantization to shrink memory).
+
+The catch is that "an open source vector database" now means anything from a Postgres extension to a distributed system with a dozen microservices. This vector database comparison covers the eight most popular open source options in 2026, what each one is actually good at, and how to pick.
+
+## How to evaluate a vector database
+
+Before the list, here are the criteria used for each entry:
+
+- **Index types.** HNSW is the default for quality; IVF and quantized variants (IVF_PQ, scalar and binary quantization) matter once you exceed what fits in RAM. DiskANN-style indexes matter for very large corpora on SSD.
+- **Metadata filtering.** Nearly every real query is "similar to X *where* tenant = Y and created after Z". Pre-filtering (filter before ANN) preserves recall; post-filtering can silently return fewer results than you asked for.
+- **Hybrid search.** Combining vector similarity with BM25 or full-text scoring, usually fused with reciprocal rank fusion (RRF). Pure vector search misses exact identifiers, product codes and rare terms.
+- **Scaling model.** Single node, replicas, or sharded clusters. Most teams under a few tens of millions of vectors never need sharding.
+- **Operational burden.** How many processes, how much external infrastructure (etcd, object storage, message queues), backups, upgrades.
+- **License.** Apache 2.0, MIT, BSD, PostgreSQL License, or a source-available license with restrictions.
+
+## 1. pgvector on PostgreSQL
+
+- **License:** PostgreSQL License (permissive)
+- **Language / architecture:** C extension inside PostgreSQL; vectors are a column type in ordinary tables
+- **Index types:** HNSW, IVFFlat; halfvec (16-bit), sparsevec and bit types with binary quantization
+- **Filtering / hybrid:** Full SQL `WHERE` clauses, joins, and `tsvector` full-text search in the same query
+- **Best for:** Teams that already run Postgres and want embeddings next to their relational data without a second system
+
+pgvector wins the top spot not because it is the fastest ANN engine but because it removes an entire category of problems. Your embeddings live in the same transaction, backup, replication and permission model as the rows they describe. Filtering is just SQL, joins are just joins, and hybrid search is a `UNION` or a CTE.
+
+```sql
+CREATE EXTENSION IF NOT EXISTS vector;
+
+CREATE TABLE documents (
+  id         bigserial PRIMARY KEY,
+  tenant_id  int       NOT NULL,
+  title      text      NOT NULL,
+  body       text      NOT NULL,
+  embedding  vector(1536) NOT NULL,
+  created_at timestamptz DEFAULT now()
+);
+
+-- HNSW index using cosine distance
+CREATE INDEX documents_embedding_hnsw
+  ON documents USING hnsw (embedding vector_cosine_ops)
+  WITH (m = 16, ef_construction = 128);
+
+-- Full-text index for the keyword half of hybrid search
+CREATE INDEX documents_body_fts
+  ON documents USING gin (to_tsvector('english', body));
+
+-- Filtered nearest-neighbour query
+SET hnsw.ef_search = 100;
+
+SELECT id, title, embedding <=> '[0.012, -0.034, ...]'::vector AS distance
+FROM documents
+WHERE tenant_id = 42
+  AND created_at > now() - interval '90 days'
+ORDER BY embedding <=> '[0.012, -0.034, ...]'::vector
+LIMIT 10;
+```
+
+A hybrid query fuses the two rankings with RRF, all inside Postgres:
+
+```sql
+WITH vec AS (
+  SELECT id, row_number() OVER (ORDER BY embedding <=> $1) AS r
+  FROM documents WHERE tenant_id = 42
+  ORDER BY embedding <=> $1 LIMIT 40
+),
+kw AS (
+  SELECT id, row_number() OVER
+    (ORDER BY ts_rank_cd(to_tsvector('english', body), plainto_tsquery($2)) DESC) AS r
+  FROM documents
+  WHERE tenant_id = 42
+    AND to_tsvector('english', body) @@ plainto_tsquery($2)
+  LIMIT 40
+)
+SELECT COALESCE(vec.id, kw.id) AS id,
+       COALESCE(1.0 / (60 + vec.r), 0) + COALESCE(1.0 / (60 + kw.r), 0) AS score
+FROM vec FULL OUTER JOIN kw USING (id)
+ORDER BY score DESC
+LIMIT 10;
+```
+
+The practical downside of pgvector is that it is a Postgres extension, so a vector column type is not something most generic GUI tools know how to display or query comfortably. [Chat2DB](https://chat2db.ai/download) handles this well: you can run the queries above against Postgres, see `vector` columns rendered in the result grid, check `EXPLAIN` output to confirm the HNSW index is being used, and build the hybrid CTE with the AI SQL assistant. The [web version](https://app.chat2db.ai) works without installing anything. Managed cloud: any Postgres provider that ships the extension (most do).
+
+## 2. Milvus
+
+- **License:** Apache 2.0
+- **Language / architecture:** Go and C++ (Knowhere index engine); cloud-native, disaggregated storage and compute, depends on etcd and object storage (MinIO or S3) in cluster mode
+- **Index types:** HNSW, IVF_FLAT, IVF_SQ8, IVF_PQ, DiskANN, GPU indexes (CAGRA), scalar/binary quantization
+- **Filtering / hybrid:** Boolean scalar filtering with pre-filtering; sparse vectors and BM25 for hybrid search with rank fusion
+- **Best for:** Billion-scale collections, GPU acceleration, teams that need a dedicated distributed vector platform
+
+Milvus is the heavyweight of the group. Milvus Lite (an embedded Python build) and Milvus Standalone (a single Docker container) keep small deployments simple, while the distributed mode separates query nodes, data nodes and index nodes so they scale independently.
+
+```python
+from pymilvus import MilvusClient
+
+client = MilvusClient("http://localhost:19530")
+client.create_collection(
+    collection_name="docs",
+    dimension=1536,
+    metric_type="COSINE",
+)
+client.insert("docs", [{"id": 1, "vector": emb, "tenant_id": 42, "title": "..."}])
+
+res = client.search(
+    collection_name="docs",
+    data=[query_emb],
+    limit=10,
+    filter="tenant_id == 42",
+    output_fields=["title"],
+)
+```
+
+Managed cloud: Zilliz Cloud.
+
+## 3. Qdrant
+
+- **License:** Apache 2.0
+- **Language / architecture:** Rust; single binary, optional sharded cluster with Raft consensus
+- **Index types:** HNSW with scalar, product and binary quantization; on-disk vectors and payload indexes
+- **Filtering / hybrid:** Rich payload filtering integrated into the HNSW graph traversal (filterable HNSW); sparse vectors and server-side fusion via the Query API
+- **Best for:** Heavy metadata filtering, memory-constrained deployments, teams that want one binary and a clean REST/gRPC API
+
+Qdrant's distinguishing feature is how it handles filters. Instead of choosing between pre- and post-filtering, it builds additional graph links so that filtered searches stay fast without losing recall, and it falls back to a payload index scan when the filter is very selective.
+
+```python
+from qdrant_client import QdrantClient, models
+
+client = QdrantClient(url="http://localhost:6333")
+client.create_collection(
+    "docs",
+    vectors_config=models.VectorParams(size=1536, distance=models.Distance.COSINE),
+    quantization_config=models.ScalarQuantization(
+        scalar=models.ScalarQuantizationConfig(type=models.ScalarType.INT8, always_ram=True)
+    ),
+)
+
+hits = client.query_points(
+    "docs",
+    query=query_emb,
+    query_filter=models.Filter(
+        must=[models.FieldCondition(key="tenant_id", match=models.MatchValue(value=42))]
+    ),
+    limit=10,
+).points
+```
+
+Managed cloud: Qdrant Cloud (also a hybrid-cloud operator).
+
+## 4. Weaviate
+
+- **License:** BSD-3-Clause
+- **Language / architecture:** Go; modular server with pluggable vectorizer and reranker modules, horizontal sharding and replication
+- **Index types:** HNSW (with PQ, SQ and BQ compression), flat index, dynamic index that switches from flat to HNSW as a collection grows
+- **Filtering / hybrid:** Pre-filtering with inverted indexes; built-in BM25 and hybrid search with an `alpha` weighting parameter
+- **Best for:** Teams that want the database to call the embedding model for them, and multi-tenant SaaS with many small isolated collections
+
+Weaviate's modules can generate embeddings on insert and on query (OpenAI, Cohere, local transformers, and others), which shortens the pipeline for prototypes. Its native multi-tenancy creates an isolated shard per tenant, which is a good fit for B2B products.
+
+```python
+import weaviate
+from weaviate.classes.query import Filter
+
+client = weaviate.connect_to_local()
+docs = client.collections.get("Docs")
+
+res = docs.query.hybrid(
+    query="postgres connection pooling",
+    alpha=0.6,                 # 1.0 = pure vector, 0.0 = pure BM25
+    limit=10,
+    filters=Filter.by_property("tenant_id").equal(42),
+)
+```
+
+Managed cloud: Weaviate Cloud.
+
+## 5. Chroma
+
+- **License:** Apache 2.0
+- **Language / architecture:** Rust core (rewritten from Python) with a Python and JavaScript client; embedded or client-server mode
+- **Index types:** HNSW; newer versions add SPANN-style on-disk indexing in the distributed build
+- **Filtering / hybrid:** Metadata `where` filters and document `where_document` text matching; full-text search via the built-in FTS index
+- **Best for:** Local development, notebooks, small RAG applications, anything where "pip install and go" matters more than scale
+
+Chroma is deliberately minimal. The API is a handful of calls, embeddings can be generated by a pluggable embedding function, and the whole thing runs in-process.
+
+```python
+import chromadb
+
+client = chromadb.PersistentClient(path="./chroma")
+col = client.get_or_create_collection("docs", metadata={"hnsw:space": "cosine"})
+col.add(ids=["1"], embeddings=[emb], documents=["..."], metadatas=[{"tenant_id": 42}])
+
+res = col.query(query_embeddings=[query_emb], n_results=10, where={"tenant_id": 42})
+```
+
+Managed cloud: Chroma Cloud.
+
+## 6. LanceDB
+
+- **License:** Apache 2.0
+- **Language / architecture:** Rust, built on the Lance columnar format; embedded (no server) with optional object-storage-backed tables
+- **Index types:** IVF_PQ, IVF_HNSW_SQ, IVF_HNSW_PQ; disk-based by design
+- **Filtering / hybrid:** SQL-style filter strings pushed down to the columnar scan; full-text search (Tantivy-based) and hybrid queries with rerankers
+- **Best for:** Multimodal datasets, data lakes on S3, analytics workloads that want vectors next to Arrow/Parquet-style columns
+
+LanceDB is closer to DuckDB than to Milvus: it is a library, the data lives in versioned files, and you can query the same files from Python, Rust, Node or directly with Arrow tooling. Because the index is disk-native, you can search collections much larger than RAM on a single machine.
+
+```python
+import lancedb
+
+db = lancedb.connect("s3://my-bucket/lancedb")
+tbl = db.create_table("docs", data=rows)   # rows: list of dicts with a "vector" field
+tbl.create_index(metric="cosine", num_partitions=256, num_sub_vectors=96)
+
+res = (tbl.search(query_emb)
+          .where("tenant_id = 42 AND created_at > date '2026-06-01'")
+          .limit(10)
+          .to_pandas())
+```
+
+Managed cloud: LanceDB Cloud.
+
+## 7. Vespa
+
+- **License:** Apache 2.0
+- **Language / architecture:** Java and C++; a full search and ranking engine with content and container clusters
+- **Index types:** HNSW, plus exact and paged (disk) tensor attributes; supports multi-vector documents natively
+- **Filtering / hybrid:** Complete query language (YQL) with BM25, vector distance, and multi-phase ranking expressions that can run ONNX models in the ranking pipeline
+- **Best for:** Search teams that need full control over ranking (learned rankers, ColBERT-style late interaction), very large real-time corpora
+
+Vespa is the most capable and the most demanding option here. It is not "a vector database" so much as a search platform that happens to do vectors extremely well. Schemas, ranking profiles and deployment are configured in application packages; the schema below would live in `schemas/doc.sd`.
+
+```yaml
+schema doc {
+  document doc {
+    field body type string { indexing: index | summary }
+    field tenant_id type int { indexing: attribute }
+    field embedding type tensor<float>(x[1536]) {
+      indexing: attribute | index
+      attribute { distance-metric: angular }
+      index { hnsw { max-links-per-node: 16 } }
+    }
+  }
+  rank-profile hybrid {
+    inputs { query(q) tensor<float>(x[1536]) }
+    first-phase { expression: bm25(body) + closeness(field, embedding) }
+  }
+}
+```
+
+Managed cloud: Vespa Cloud.
+
+## 8. Elasticsearch and OpenSearch k-NN
+
+- **License:** Elasticsearch: AGPL-3.0 / SSPL / Elastic License (triple-licensed since 2024); OpenSearch: Apache 2.0
+- **Language / architecture:** Java on Lucene; sharded and replicated clusters
+- **Index types:** HNSW via Lucene (both); OpenSearch additionally offers FAISS and NMSLIB engines with IVF and PQ, and disk-based binary quantized indexes
+- **Filtering / hybrid:** Mature boolean filters with efficient pre-filtering; hybrid search via `rank` / RRF retrievers (Elasticsearch) or the neural search and hybrid query plugins (OpenSearch)
+- **Best for:** Organizations already running Elastic or OpenSearch for logs or text search who want to add vectors without another cluster
+
+If you already operate one of these clusters, adding a `dense_vector` or `knn_vector` field is the cheapest path to production vector search you will find.
+
+```bash
+curl -X PUT "localhost:9200/docs" -H 'Content-Type: application/json' -d '{
+  "mappings": {
+    "properties": {
+      "body":      { "type": "text" },
+      "tenant_id": { "type": "integer" },
+      "embedding": { "type": "dense_vector", "dims": 1536,
+                     "index": true, "similarity": "cosine" }
+    }
+  }
+}'
+
+curl -X POST "localhost:9200/docs/_search" -H 'Content-Type: application/json' -d '{
+  "knn": {
+    "field": "embedding", "query_vector": [0.012, -0.034],
+    "k": 10, "num_candidates": 100,
+    "filter": { "term": { "tenant_id": 42 } }
+  }
+}'
+```
+
+Managed cloud: Elastic Cloud, Amazon OpenSearch Service.
+
+## Comparison table
+
+| Database | License | Index types | Hybrid search | Managed cloud |
+|---|---|---|---|---|
+| pgvector (PostgreSQL) | PostgreSQL License | HNSW, IVFFlat, binary quantization | Yes, via tsvector + SQL fusion | Any managed Postgres |
+| Milvus | Apache 2.0 | HNSW, IVF family, DiskANN, GPU | Yes, sparse + dense with fusion | Zilliz Cloud |
+| Qdrant | Apache 2.0 | Filterable HNSW, SQ/PQ/BQ | Yes, sparse vectors + Query API fusion | Qdrant Cloud |
+| Weaviate | BSD-3 | HNSW (PQ/SQ/BQ), flat, dynamic | Yes, built-in BM25 with alpha | Weaviate Cloud |
+| Chroma | Apache 2.0 | HNSW, SPANN (distributed) | Partial, FTS + metadata filters | Chroma Cloud |
+| LanceDB | Apache 2.0 | IVF_PQ, IVF_HNSW_SQ/PQ (disk) | Yes, FTS + rerankers | LanceDB Cloud |
+| Vespa | Apache 2.0 | HNSW, paged tensors, multi-vector | Yes, full ranking expressions | Vespa Cloud |
+| Elasticsearch / OpenSearch | AGPL/SSPL/ELv2 / Apache 2.0 | Lucene HNSW; FAISS IVF/PQ (OpenSearch) | Yes, RRF retrievers / hybrid query | Elastic Cloud, AWS OpenSearch |
+
+## How to choose
+
+**You already run Postgres and have under, say, a few tens of millions of vectors.** Use pgvector. The integration and operational savings outweigh raw ANN throughput for the majority of applications, and HNSW in pgvector is fast enough for interactive latency at that scale.
+
+**You need heavy filtering with high recall.** Qdrant's filterable HNSW is designed for exactly this. Weaviate and Milvus also pre-filter correctly; be careful with any engine that post-filters.
+
+**You are past a hundred million vectors or need GPU indexing.** Milvus is built for that scale; Vespa if your problem is really a ranking problem.
+
+**Your data lives in object storage and you also do analytics.** LanceDB fits naturally alongside Parquet and Arrow tooling.
+
+**You want zero infrastructure for a prototype.** Chroma or LanceDB in embedded mode, or Milvus Lite.
+
+**You already run Elastic or OpenSearch.** Add a vector field and stop reading.
+
+Whatever you pick, measure recall (compare ANN results against brute-force on a sample) as well as latency. An index that returns results in two milliseconds but misses a third of the true neighbours is not fast, it is wrong.
+
+## FAQ
+
+### What is the most popular vector database?
+
+Popularity depends on what you count. Among purpose-built engines, Milvus, Qdrant, Weaviate and Chroma are the names that come up most often in open source RAG projects. Measured by installed base, pgvector almost certainly leads, because it rides on every existing PostgreSQL deployment and is offered by every major managed Postgres provider.
+
+### Is pgvector good enough for production?
+
+Yes for most workloads. HNSW indexes, halfvec storage and binary quantization cover the common needs. The limits show up when a single Postgres node cannot hold the index in memory, or when you need sharding across many nodes; at that point a dedicated engine or a Postgres sharding layer becomes necessary.
+
+### HNSW or IVF, which index should I use?
+
+Default to HNSW. It gives higher recall at a given latency and does not need a training step. Choose IVF (usually IVF_PQ) when memory is the constraint, since the quantized index can be an order of magnitude smaller, at the cost of some recall and a rebuild when the data distribution shifts.
+
+### Do I need hybrid search?
+
+If users search for exact terms (SKUs, error codes, names, function identifiers), yes. Embeddings are poor at exact-match semantics. Fusing BM25 and vector rankings with RRF is a cheap, robust improvement and every engine on this list supports it in some form.
+
+### Can I run these without Docker or Kubernetes?
+
+pgvector (needs only Postgres), Chroma, LanceDB and Qdrant (single binary) all run without containers. Milvus Lite embeds in Python. Vespa and the Elastic/OpenSearch clusters are best run in containers or on managed services.

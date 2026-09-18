@@ -1,0 +1,282 @@
+---
+title: "MySQL EXPLAIN ANALYZE: Read Real Query Plans"
+description: "How to use EXPLAIN ANALYZE in MySQL 8.0 to see actual times and row counts, read the TREE output node by node, spot bad plans and fix them with indexes."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: September 18, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# MySQL EXPLAIN ANALYZE: Read Real Query Plans
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="September 18, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+Plain `EXPLAIN` tells you what the MySQL optimizer *intends* to do. `EXPLAIN ANALYZE` tells you what it *actually did*: it runs the query, instruments every step of the plan, and reports real timings and real row counts next to the optimizer's estimates. That difference is where most slow-query investigations are won or lost, because the majority of bad plans come from the optimizer being wrong about how many rows a step will produce. This guide walks through the output line by line on a realistic example, explains each node type, and shows how to turn what you see into a fix.
+
+## EXPLAIN vs EXPLAIN ANALYZE
+
+`EXPLAIN ANALYZE` was added in MySQL 8.0.18 and always uses the `TREE` output format. Three things distinguish it from ordinary `EXPLAIN`:
+
+1. **It executes the query.** All of it, including any side effects. Result rows are discarded, but the work is done.
+2. **It reports actual numbers.** Each plan node shows the time to the first row, the time to the last row, the number of rows produced, and the number of times the node was executed (loops).
+3. **It uses the iterator executor.** The tree you see is the real chain of iterators MySQL 8 runs, not the older tabular "select_type / type / Extra" summary, so hash joins, sorts and temporary tables are shown as explicit nodes.
+
+Ordinary `EXPLAIN` remains useful because it is free: it never runs the query, so you can safely explain a statement that takes ten minutes. Use it first; use `EXPLAIN ANALYZE` when you need to know where the estimate went wrong.
+
+## A realistic example
+
+Two tables, a filter, a join, and a sort. This is the shape of most reporting queries.
+
+```sql
+CREATE TABLE customers (
+  id         INT AUTO_INCREMENT PRIMARY KEY,
+  country    CHAR(2)      NOT NULL,
+  email      VARCHAR(255) NOT NULL,
+  created_at DATETIME     NOT NULL
+) ENGINE=InnoDB;
+
+CREATE TABLE orders (
+  id          BIGINT AUTO_INCREMENT PRIMARY KEY,
+  customer_id INT           NOT NULL,
+  status      VARCHAR(16)   NOT NULL,
+  amount      DECIMAL(10,2) NOT NULL,
+  ordered_at  DATETIME      NOT NULL,
+  CONSTRAINT fk_orders_customer FOREIGN KEY (customer_id) REFERENCES customers(id)
+) ENGINE=InnoDB;
+```
+
+Assume a few hundred thousand customers and a few million orders, and that the only indexes are the primary keys plus the index InnoDB creates automatically for the foreign key on `orders.customer_id`. The query:
+
+```sql
+EXPLAIN ANALYZE
+SELECT c.email, o.id, o.amount
+FROM customers c
+JOIN orders o ON o.customer_id = c.id
+WHERE c.country = 'DE'
+  AND o.status = 'shipped'
+  AND o.ordered_at >= '2026-09-01'
+ORDER BY o.ordered_at DESC
+LIMIT 50;
+```
+
+A typical output (the numbers are illustrative; yours will differ):
+
+```text
+-> Limit: 50 row(s)  (actual time=1842.311..1842.320 rows=50 loops=1)
+    -> Sort: o.ordered_at DESC, limit input to 50 row(s) per chunk  (actual time=1842.309..1842.315 rows=50 loops=1)
+        -> Stream results  (cost=482911.40 rows=123544) (actual time=0.412..1791.207 rows=61892 loops=1)
+            -> Nested loop inner join  (cost=482911.40 rows=123544) (actual time=0.401..1770.114 rows=61892 loops=1)
+                -> Filter: (c.country = 'DE')  (cost=31280.55 rows=30412) (actual time=0.093..208.331 rows=41077 loops=1)
+                    -> Table scan on c  (cost=31280.55 rows=304120) (actual time=0.081..151.902 rows=304120 loops=1)
+                -> Filter: ((o.status = 'shipped') and (o.ordered_at >= TIMESTAMP'2026-09-01 00:00:00'))  (cost=10.43 rows=4.06) (actual time=0.031..0.037 rows=1.51 loops=41077)
+                    -> Index lookup on o using fk_orders_customer (customer_id=c.id)  (cost=10.43 rows=12.19) (actual time=0.028..0.034 rows=12.08 loops=41077)
+```
+
+## Reading the tree
+
+The tree is read **inside out and bottom up**. The deepest, most indented nodes run first and feed rows to their parent. Each line has up to two parenthesised groups:
+
+- `(cost=... rows=...)` is the optimizer's **estimate**: a unitless cost figure and the number of rows it expected the node to produce *per execution*.
+- `(actual time=A..B rows=N loops=L)` is what **happened**: A is milliseconds to the first row, B is milliseconds to the last row, N is the average rows produced per execution, and L is how many times the node ran.
+
+Two details trip people up. First, `actual time` is *per loop*, so for a node with `loops=41077` you multiply by the loop count to get the total. Second, `rows` is also per loop and is shown as an average, which is why you see fractional values like `rows=1.51`.
+
+### Walking the example bottom up
+
+**Index lookup on o using fk_orders_customer.** For each customer row, MySQL probes the foreign key index for that customer's orders. It ran 41,077 times, returning about 12 orders each time. The estimate of 12.19 rows was excellent.
+
+**Filter on status and ordered_at.** Those 12 orders per customer are then filtered in memory down to about 1.5. The filter runs *after* the index lookup because the index only covers `customer_id`; status and date are not in it, so every candidate order row has to be fetched and checked.
+
+**Table scan on c and Filter on country.** MySQL read all 304,120 customers and kept 41,077 German ones. The estimate was 30,412, roughly 10 percent, which is the optimizer's default guess for an equality predicate on a column with no index and no histogram. The actual selectivity was about 13.5 percent, close enough. But a full table scan to find 13 percent of a table is expensive and, more importantly, it makes the customers table the *driving* side of the join.
+
+**Nested loop inner join.** Total estimate 123,544 rows, actual 61,892. The join itself took about 1.77 seconds, almost all of which is the 41,077 index probes plus the row fetches underneath them.
+
+**Stream results, Sort, Limit.** All 61,892 joined rows flowed into a sort. Because there is a `LIMIT`, MySQL uses a priority-queue sort that only keeps the top 50, which is why the sort node itself adds almost nothing. The cost was already paid producing 61,892 rows to sort.
+
+### Node types you will meet
+
+| Node | Meaning |
+|---|---|
+| `Table scan on t` | Full scan, every row read. Fine for tiny tables, a red flag on large ones. |
+| `Index scan on t using idx` | Full scan, but walking an index instead of the clustered table. Often a covering-index read. |
+| `Index lookup on t using idx (col=...)` | Point lookup on an equality; the classic good join access. |
+| `Index range scan on t using idx over (...)` | Range predicate resolved by the index, such as a date window. |
+| `Covering index lookup / range scan` | Same as above, but every needed column was in the index, so no row fetch was needed. |
+| `Single-row index lookup` | Lookup on a primary key or unique index; at most one row. |
+| `Nested loop inner join` / `left join` | For each outer row, execute the inner subtree. Cheap when the inner side is an index lookup. |
+| `Hash join` | Build a hash table from one side, probe with the other. Chosen when there is no usable index on the join column. |
+| `Filter: (...)` | A predicate applied to rows *after* they were fetched. Rows filtered here were read for nothing. |
+| `Sort: col` | A filesort. `limit input to N row(s) per chunk` means a bounded priority-queue sort. |
+| `Aggregate` / `Group aggregate` | Aggregation; the grouped form relies on input already sorted by the group key. |
+| `Temporary table with deduplication` | Implicit temp table, typically for `DISTINCT`, `GROUP BY` without a usable index, or `UNION`. |
+| `Materialize` | A subquery, CTE or derived table written out and then scanned, sometimes repeatedly. |
+| `Stream results` | Rows passed through without buffering; harmless. |
+
+## Spotting problems
+
+### Estimated vs actual rows gap
+
+The single most useful thing in the output. When `rows=` in the estimate and `rows=` in the actual differ by an order of magnitude, the optimizer chose the plan on false premises, and everything above that node is suspect. Common causes are stale statistics, correlated predicates the optimizer treats as independent, and skewed data with no histogram. In the example above the estimates were good, so the plan was reasonable *given the indexes available*. The problem was the indexes.
+
+### Table scan on a large table
+
+`Table scan on c` with `rows=304120` on the outer side of a nested loop is the first thing to fix. A scan on the inner side of a nested loop is worse still: it would run once per outer row.
+
+### Filter directly above an index lookup
+
+`Filter` sitting on top of `Index lookup` means the index found candidates but could not apply all predicates. Look at the ratio: 12.08 rows in, 1.51 rows out means 87 percent of the fetched rows were discarded. Adding the filtered columns to the index removes that waste.
+
+### Sort and temporary table nodes
+
+A `Sort` over a large input is a filesort. A `Temporary table` node means MySQL materialized an intermediate result, which costs memory or disk. Both often disappear when an index provides the required order.
+
+### Hash join
+
+A `Hash join` node is not inherently bad; it is MySQL's best choice when no index exists on the join key and both sides are large. But if you expected an index lookup and see a hash join, either the index is missing or the join condition is not sargable (a function wrapped around the column, or a type mismatch between the two sides).
+
+## Fixing the example
+
+The join is driven by customers filtered on `country`, and the orders side needs `status` and `ordered_at` alongside `customer_id`. Two indexes address both problems:
+
+```sql
+CREATE INDEX idx_customers_country ON customers (country, id);
+
+CREATE INDEX idx_orders_cust_status_date
+  ON orders (customer_id, status, ordered_at);
+```
+
+Running `EXPLAIN ANALYZE` again:
+
+```text
+-> Limit: 50 row(s)  (actual time=312.884..312.892 rows=50 loops=1)
+    -> Sort: o.ordered_at DESC, limit input to 50 row(s) per chunk  (actual time=312.882..312.888 rows=50 loops=1)
+        -> Stream results  (cost=61203.71 rows=59811) (actual time=0.118..298.402 rows=61892 loops=1)
+            -> Nested loop inner join  (cost=61203.71 rows=59811) (actual time=0.109..281.774 rows=61892 loops=1)
+                -> Covering index lookup on c using idx_customers_country (country='DE')  (cost=4143.90 rows=41077) (actual time=0.044..19.315 rows=41077 loops=1)
+                -> Index range scan on o using idx_orders_cust_status_date over (customer_id=c.id AND status='shipped' AND '2026-09-01 00:00:00' <= ordered_at)  (cost=1.09 rows=1.46) (actual time=0.005..0.006 rows=1.51 loops=41077)
+```
+
+The `Filter` nodes are gone, the customers side became a covering index lookup, and the inner side is now a range scan that returns exactly the rows needed. The total dropped from about 1.8 seconds to about 0.3 seconds, and the remaining cost is the fact that the query legitimately touches 61,892 rows before the sort.
+
+If that is still too slow, the next step is a rewrite. Because the `LIMIT` is on `ordered_at`, an index that leads with the sort column lets MySQL stop early:
+
+```sql
+CREATE INDEX idx_orders_status_date ON orders (status, ordered_at, customer_id);
+
+SELECT c.email, o.id, o.amount
+FROM orders o
+JOIN customers c ON c.id = o.customer_id AND c.country = 'DE'
+WHERE o.status = 'shipped'
+  AND o.ordered_at >= '2026-09-01'
+ORDER BY o.ordered_at DESC
+LIMIT 50;
+```
+
+Now the plan walks `idx_orders_status_date` backwards, probes customers by primary key for each candidate, and stops after 50 matches. Whether this wins depends on how common German customers are among shipped orders; `EXPLAIN ANALYZE` will tell you rather than making you guess.
+
+## EXPLAIN ANALYZE with UPDATE, DELETE and INSERT
+
+Because `EXPLAIN ANALYZE` executes the statement, running it on a data-modifying query modifies data. MySQL 8.0.19 and later allow it for `UPDATE`, `DELETE` and `INSERT ... SELECT`. Always wrap it in a transaction you roll back:
+
+```sql
+START TRANSACTION;
+
+EXPLAIN ANALYZE
+DELETE FROM orders
+WHERE status = 'cancelled' AND ordered_at < '2025-01-01';
+
+ROLLBACK;
+```
+
+The plan and the timings are real, and the rows come back. Do not do this on a replica with `super_read_only` expecting it to fail safely; check the transaction wrapping instead. Also be aware that a long-running `EXPLAIN ANALYZE` on an `UPDATE` holds row locks for the duration, just like the real statement.
+
+## FORMAT=JSON vs TREE
+
+`EXPLAIN ANALYZE` only produces `TREE`. Plain `EXPLAIN` supports three formats:
+
+```sql
+EXPLAIN FORMAT=TREE SELECT ...;   -- same shape as EXPLAIN ANALYZE, estimates only
+EXPLAIN FORMAT=JSON SELECT ...;   -- full detail: used columns, attached conditions, cost breakdown
+EXPLAIN SELECT ...;               -- classic tabular output
+```
+
+`FORMAT=JSON` is the one to reach for when TREE is not enough: it shows `used_key_parts`, `attached_condition`, per-table `read_cost` and `eval_cost`, and whether a `using_filesort` or `using_temporary_table` step is planned. Starting with MySQL 8.3 you can set `explain_json_format_version = 2` to get JSON that mirrors the iterator tree rather than the legacy join-order structure, which makes it much easier to correlate with `EXPLAIN ANALYZE` output.
+
+## Optimizer hints
+
+When the optimizer will not pick the plan you know is right, hints force the issue without changing semantics:
+
+```sql
+SELECT /*+ JOIN_ORDER(o, c) INDEX(o idx_orders_status_date) NO_HASH_JOIN(o, c) */
+       c.email, o.id, o.amount
+FROM orders o
+JOIN customers c ON c.id = o.customer_id
+WHERE c.country = 'DE' AND o.status = 'shipped'
+ORDER BY o.ordered_at DESC
+LIMIT 50;
+```
+
+Hints are a last resort. They freeze a plan that may stop being optimal as data changes, so prefer fixing statistics and indexes, and if you must hint, leave a comment explaining why and re-check the plan with `EXPLAIN ANALYZE` after major data growth.
+
+## Refreshing statistics with ANALYZE TABLE
+
+When the estimate-versus-actual gap is large and the indexes look right, the statistics are usually stale. InnoDB samples a small number of index pages to estimate cardinality, and it does not always resample after large bulk loads or deletes.
+
+```sql
+ANALYZE TABLE orders, customers;
+
+-- Build a histogram for a skewed non-indexed column
+ANALYZE TABLE orders UPDATE HISTOGRAM ON status WITH 32 BUCKETS;
+
+-- Increase sampling accuracy for a specific table
+ALTER TABLE orders STATS_SAMPLE_PAGES = 200;
+```
+
+Histograms are especially valuable for columns like `status` or `country` where a handful of values dominate. Without one, the optimizer assumes uniform distribution and the row estimate for `status = 'shipped'` can be wrong by a large factor in either direction.
+
+## Going deeper with the optimizer trace
+
+If you need to know *why* the optimizer rejected a plan, the optimizer trace records every alternative it considered and the cost it assigned:
+
+```sql
+SET optimizer_trace = 'enabled=on';
+SET optimizer_trace_max_mem_size = 1048576;
+
+SELECT c.email, o.id FROM customers c JOIN orders o ON o.customer_id = c.id
+WHERE c.country = 'DE' LIMIT 10;
+
+SELECT TRACE FROM information_schema.OPTIMIZER_TRACE\G
+
+SET optimizer_trace = 'enabled=off';
+```
+
+Search the JSON for `considered_execution_plans`, `rows_estimation` and `chosen`. The trace is verbose but it is the only way to see, for instance, that a range scan was skipped because the optimizer estimated it would return more rows than a table scan would cost.
+
+## Running EXPLAIN ANALYZE from a GUI
+
+Nothing here requires a specific client; `mysql` on the command line works fine. That said, the TREE output is much easier to read with monospaced alignment and the ability to compare two runs side by side. [Chat2DB](https://chat2db.ai/download) runs `EXPLAIN ANALYZE` directly from the editor and renders the plan, so you can keep the before-and-after outputs open in two tabs while iterating on indexes. It is also convenient for the transaction-wrapped `UPDATE` and `DELETE` pattern, since the editor keeps the session open between the `START TRANSACTION` and the `ROLLBACK`.
+
+## FAQ
+
+### Does EXPLAIN ANALYZE really execute the query?
+
+Yes, completely. It is safe for `SELECT` in the sense that results are discarded, but it still consumes CPU, I/O, buffer pool and locks. For `UPDATE`, `DELETE` and `INSERT ... SELECT`, wrap it in a transaction and roll back.
+
+### Why do actual rows show as a decimal like 1.51?
+
+Because `rows` and `actual time` are averages per loop. A node with `loops=41077` and `rows=1.51` produced about 62,000 rows in total.
+
+### Which MySQL version do I need?
+
+`EXPLAIN ANALYZE` requires MySQL 8.0.18 or later. Support for data-modifying statements arrived in 8.0.19, and the iterator-shaped JSON format in 8.3. MariaDB has a different but related feature called `ANALYZE FORMAT=JSON`.
+
+### Can I cancel a long-running EXPLAIN ANALYZE?
+
+Yes. Use `KILL QUERY connection_id` from another session, exactly as you would for the underlying query.
+
+### Is a hash join always worse than a nested loop?
+
+No. For joining two large unindexed sets, a hash join is usually far better than a nested loop with a table scan on the inner side. It is only a problem when an index lookup was available and the optimizer did not use it, which usually points to a missing index or a non-sargable join condition.

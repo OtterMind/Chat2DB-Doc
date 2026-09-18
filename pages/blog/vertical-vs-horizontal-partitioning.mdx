@@ -1,0 +1,285 @@
+---
+title: "Vertical vs Horizontal Partitioning in Databases"
+description: "Horizontal vs vertical partitioning explained with PostgreSQL and MySQL examples: range, list and hash partitions, pruning, column splits, and when to use each."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: September 18, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# Vertical vs Horizontal Partitioning in Databases
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="September 18, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+Database partitioning splits one logical table into smaller physical pieces so that queries, maintenance and storage can operate on less data at a time. There are two fundamentally different ways to cut a table. Horizontal partitioning divides it by *rows*: every partition has the same columns but holds a different subset of records. Vertical partitioning divides it by *columns*: every piece holds all the rows but only some of the fields. They solve different problems, they are frequently combined, and each has traps that only show up in production. This guide covers both with working PostgreSQL and MySQL examples.
+
+## The two cuts, described
+
+Picture a spreadsheet of orders with columns `id`, `customer_id`, `status`, `amount`, `ordered_at`, `shipping_address` and `notes`, and ten million rows.
+
+**Horizontal partitioning** draws lines *across* the sheet. Rows from 2024 go in one file, 2025 in another, 2026 in a third. Each file has all seven columns. A query for last month's orders only opens one file.
+
+**Vertical partitioning** draws a line *down* the sheet. The narrow, frequently read columns (`id`, `customer_id`, `status`, `amount`, `ordered_at`) stay in one table; the wide, rarely read columns (`shipping_address`, `notes`) move to a second table keyed by the same `id`. A query that lists orders by status touches only the narrow table, so far more rows fit in each page and in cache.
+
+Both cuts keep the *logical* table intact from the application's point of view, either because the database routes queries automatically (horizontal) or because a join or a view reassembles the pieces (vertical).
+
+## Horizontal partitioning
+
+Horizontal partitioning is what most people mean when they say "partitioning" without qualification. Modern relational databases implement it declaratively: you define a parent table, state how rows are routed, and create child partitions.
+
+### Three routing strategies
+
+- **Range.** Rows are assigned by a continuous key: dates, sequence numbers, IDs. Ideal for time-series and append-mostly data, and for dropping old data by dropping a partition.
+- **List.** Rows are assigned by explicit values: country codes, tenant IDs, regions. Ideal when a small set of discrete values dominate access patterns and you want to isolate them.
+- **Hash.** Rows are assigned by a hash of the key modulo the partition count. Spreads writes evenly when no natural range or list exists, at the cost of no pruning for range predicates.
+
+### PostgreSQL declarative partitioning
+
+```sql
+CREATE TABLE orders (
+  id          bigint GENERATED ALWAYS AS IDENTITY,
+  customer_id int           NOT NULL,
+  status      text          NOT NULL,
+  amount      numeric(10,2) NOT NULL,
+  ordered_at  timestamptz   NOT NULL,
+  PRIMARY KEY (id, ordered_at)          -- partition key must be part of the PK
+) PARTITION BY RANGE (ordered_at);
+
+CREATE TABLE orders_2025 PARTITION OF orders
+  FOR VALUES FROM ('2025-01-01') TO ('2026-01-01');
+
+CREATE TABLE orders_2026_h1 PARTITION OF orders
+  FOR VALUES FROM ('2026-01-01') TO ('2026-07-01');
+
+CREATE TABLE orders_2026_h2 PARTITION OF orders
+  FOR VALUES FROM ('2026-07-01') TO ('2027-01-01');
+
+CREATE TABLE orders_default PARTITION OF orders DEFAULT;
+
+-- Indexes created on the parent are propagated to every partition
+CREATE INDEX ON orders (customer_id, ordered_at);
+```
+
+Inserts go to the parent and PostgreSQL routes each row to the matching child. Rows that match no partition land in `orders_default`; without a default partition, such an insert fails, which is often what you want so that a missing future partition is noticed immediately.
+
+Sub-partitioning is possible by declaring a partition as itself partitioned, for example hash-partitioning each yearly range by `customer_id`. Keep it to two levels; deeper trees make planning slow.
+
+### Seeing partition pruning with EXPLAIN
+
+The payoff is that the planner skips partitions whose bounds cannot match the query predicate:
+
+```sql
+EXPLAIN (COSTS OFF)
+SELECT count(*) FROM orders
+WHERE ordered_at >= '2026-08-01' AND ordered_at < '2026-09-01';
+```
+
+```text
+Aggregate
+  ->  Seq Scan on orders_2026_h2 orders
+        Filter: ((ordered_at >= '2026-08-01 00:00:00+00'::timestamptz)
+             AND (ordered_at < '2026-09-01 00:00:00+00'::timestamptz))
+```
+
+Only `orders_2026_h2` appears. Change the predicate to `customer_id = 42` with no date and every partition is scanned, because the partition key is not constrained. Pruning also works at execution time for parameters and join keys (`enable_partition_pruning`, on by default), which `EXPLAIN ANALYZE` shows as `Subplans Removed: N`.
+
+Dropping old data becomes a metadata operation:
+
+```sql
+ALTER TABLE orders DETACH PARTITION orders_2025 CONCURRENTLY;
+DROP TABLE orders_2025;
+```
+
+Compare that with `DELETE FROM orders WHERE ordered_at < '2026-01-01'`, which would generate millions of dead tuples and a long vacuum.
+
+### MySQL partitioning
+
+MySQL supports `RANGE`, `LIST`, `HASH` and `KEY` partitioning (plus `COLUMNS` variants that accept non-integer types). The partitions are managed by the storage engine rather than as separate tables:
+
+```sql
+CREATE TABLE orders (
+  id          BIGINT        NOT NULL AUTO_INCREMENT,
+  customer_id INT           NOT NULL,
+  status      VARCHAR(16)   NOT NULL,
+  amount      DECIMAL(10,2) NOT NULL,
+  ordered_at  DATETIME      NOT NULL,
+  PRIMARY KEY (id, ordered_at)
+) ENGINE=InnoDB
+PARTITION BY RANGE COLUMNS (ordered_at) (
+  PARTITION p2025   VALUES LESS THAN ('2026-01-01'),
+  PARTITION p2026h1 VALUES LESS THAN ('2026-07-01'),
+  PARTITION p2026h2 VALUES LESS THAN ('2027-01-01'),
+  PARTITION pmax    VALUES LESS THAN (MAXVALUE)
+);
+
+-- Check pruning: the partitions column lists what will be read
+EXPLAIN SELECT count(*) FROM orders
+WHERE ordered_at >= '2026-08-01' AND ordered_at < '2026-09-01';
+
+-- Drop a partition's data instantly
+ALTER TABLE orders DROP PARTITION p2025;
+
+-- Add a partition ahead of the MAXVALUE catch-all
+ALTER TABLE orders REORGANIZE PARTITION pmax INTO (
+  PARTITION p2027 VALUES LESS THAN ('2028-01-01'),
+  PARTITION pmax  VALUES LESS THAN (MAXVALUE)
+);
+```
+
+The MySQL rule that surprises people most: every unique key on a partitioned table, including the primary key, must include every column of the partitioning expression. That is why `ordered_at` is in the primary key above. MySQL also does not support foreign keys on partitioned InnoDB tables, in either direction.
+
+## Vertical partitioning
+
+Vertical partitioning is a schema design decision rather than a database feature. You identify columns with different access patterns or sizes and move them into a separate table with a one-to-one relationship.
+
+### When a wide table hurts
+
+Consider a `users` table that has grown to sixty columns: identity and authentication fields that every request reads, plus a biography, avatar bytes, a JSON blob of notification preferences, and a large `settings` document. Every login query pulls the whole row into the buffer cache, so a page that could hold two hundred narrow user rows holds twenty wide ones, and the table's cache footprint is ten times larger than the hot data actually needs.
+
+The fix is to split the table into a hot part and a cold part.
+
+### PostgreSQL example: users and user_profiles
+
+```sql
+-- Hot columns: read on every request
+CREATE TABLE users (
+  id            bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  email         text        NOT NULL UNIQUE,
+  password_hash text        NOT NULL,
+  status        text        NOT NULL DEFAULT 'active',
+  last_login_at timestamptz,
+  created_at    timestamptz NOT NULL DEFAULT now()
+);
+
+-- Cold columns: read on the profile page only
+CREATE TABLE user_profiles (
+  user_id       bigint PRIMARY KEY
+                REFERENCES users(id) ON DELETE CASCADE,
+  display_name  text,
+  bio           text,
+  avatar        bytea,
+  preferences   jsonb NOT NULL DEFAULT '{}'::jsonb,
+  settings      jsonb NOT NULL DEFAULT '{}'::jsonb,
+  updated_at    timestamptz NOT NULL DEFAULT now()
+);
+
+-- A view reunites the pieces for code that expects the old shape
+CREATE VIEW users_full AS
+SELECT u.id, u.email, u.status, u.last_login_at, u.created_at,
+       p.display_name, p.bio, p.avatar, p.preferences, p.settings
+FROM users u
+LEFT JOIN user_profiles p ON p.user_id = u.id;
+```
+
+Making `user_id` both the primary key and the foreign key enforces the one-to-one relationship: a user can have at most one profile row, and deleting the user removes it. The `LEFT JOIN` in the view means users without a profile still appear.
+
+Migrating an existing wide table is a two-step copy:
+
+```sql
+INSERT INTO user_profiles (user_id, display_name, bio, avatar, preferences, settings)
+SELECT id, display_name, bio, avatar, preferences, settings FROM users_old;
+
+INSERT INTO users (email, password_hash, status, last_login_at, created_at)
+OVERRIDING SYSTEM VALUE
+SELECT email, password_hash, status, last_login_at, created_at FROM users_old;
+```
+
+In practice you would preserve the original IDs with `OVERRIDING SYSTEM VALUE` and `id` in the column list, run the copy inside a transaction, and swap the view in for the old table name so the application keeps working.
+
+### TOAST: vertical partitioning you already have
+
+PostgreSQL performs an implicit vertical split on its own. Any row wider than roughly 2 KB triggers TOAST (The Oversized-Attribute Storage Technique): large `text`, `bytea` and `jsonb` values are compressed and, if still large, moved out of line into a separate TOAST table, leaving a small pointer in the main heap. A query that does not reference the toasted column never reads the TOAST table.
+
+This means a single big `jsonb` column costs less than it looks *as long as* you do not select it. It does not help when the width comes from many medium-sized columns, none of which is individually large enough to be toasted, which is exactly the sixty-column `users` case above. Explicit vertical partitioning is still the answer there.
+
+## Choosing between them
+
+| Situation | Reach for |
+|---|---|
+| Table grows without bound over time; old data expires | Horizontal (range on time) |
+| Multi-tenant table where tenants are queried in isolation | Horizontal (list or hash on tenant) |
+| Uniform write load with no natural key | Horizontal (hash) |
+| Some columns read constantly, others rarely | Vertical (hot/cold split) |
+| A few huge columns dominate row size | Vertical, or rely on TOAST in Postgres |
+| Columns with different security or update frequency | Vertical (separate table, separate grants) |
+| Bulk deletes or archival are slow | Horizontal (drop partition) |
+
+### Combining both
+
+The two are orthogonal and often used together. A large `events` table might be split vertically into `events` (id, type, actor, timestamp) and `event_payloads` (id, payload jsonb), and then *each* of those tables partitioned horizontally by month. The narrow table stays fast for counts and timelines, the wide table only gets read when someone opens a specific event, and both can age out by dropping partitions.
+
+### Partitioning versus sharding
+
+Partitioning keeps all pieces inside one database instance under one query planner and one transaction manager. Sharding distributes the pieces across separate servers, which adds capacity but removes single-node transactions, cross-shard joins and simple backups. Horizontal partitioning is frequently a precursor to sharding, because the same key that routes rows to partitions can later route them to shards. If you are not out of capacity on one server, partition first.
+
+## Pitfalls
+
+### Cross-partition queries
+
+Any query that does not constrain the partition key touches every partition. With hundreds of partitions this is slower than an unpartitioned table, because each partition is planned and opened separately. Keep partition counts in the tens or low hundreds, and make sure your dominant query patterns include the key.
+
+### Unique constraints must include the partition key
+
+Both PostgreSQL and MySQL require it, because uniqueness is enforced per partition. That means `email UNIQUE` on a table range-partitioned by `created_at` is impossible; you need `(email, created_at)`, which does not enforce global email uniqueness at all. Common workarounds are a separate unpartitioned lookup table with the unique constraint, or enforcing uniqueness in the application layer.
+
+### Foreign keys
+
+PostgreSQL supports foreign keys both to and from partitioned tables since version 12. MySQL does not support them on partitioned tables. If referential integrity matters and you are on MySQL, that alone may rule out partitioning the table.
+
+### Joins after a vertical split
+
+Every query that needs columns from both halves now pays for a join. If the "cold" columns turn out to be read more often than expected, the split makes things worse. Measure column access before splitting, using `pg_stat_statements` or the slow query log to see which columns real queries reference, and be prepared to move a column back.
+
+### Partition maintenance
+
+Range partitions on time need someone to create next month's partition before rows arrive. Automate it with `pg_partman` in PostgreSQL or a scheduled `ALTER TABLE ... REORGANIZE PARTITION` in MySQL, and keep a default or `MAXVALUE` partition as a safety net that you monitor for unexpected rows.
+
+## Inspecting partitions
+
+To see how a partitioned table is laid out in PostgreSQL:
+
+```sql
+SELECT inhrelid::regclass AS partition,
+       pg_get_expr(c.relpartbound, c.oid) AS bounds,
+       pg_size_pretty(pg_total_relation_size(inhrelid)) AS size
+FROM pg_inherits i
+JOIN pg_class c ON c.oid = i.inhrelid
+WHERE inhparent = 'orders'::regclass
+ORDER BY 1;
+```
+
+And in MySQL:
+
+```sql
+SELECT partition_name, partition_description, table_rows,
+       ROUND(data_length / 1024 / 1024, 1) AS data_mb
+FROM information_schema.PARTITIONS
+WHERE table_schema = DATABASE() AND table_name = 'orders';
+```
+
+[Chat2DB](https://chat2db.ai/download) shows partitions under each table in the object tree for both PostgreSQL and MySQL, displays the generated DDL including the `PARTITION BY` clause and child bounds, and lets you run the `EXPLAIN` checks above to confirm pruning is happening. The [web version](https://app.chat2db.ai) is enough for a quick look at a schema you do not manage day to day.
+
+## FAQ
+
+### Is vertical partitioning the same as normalization?
+
+No, although they look similar. Normalization removes redundancy by splitting on functional dependencies. Vertical partitioning splits a table that is already normalized, purely for performance or storage reasons, keeping a one-to-one relationship between the pieces.
+
+### Does horizontal partitioning make every query faster?
+
+No. It makes queries that filter on the partition key faster, makes bulk deletes and archival much faster, and can make queries that do not use the key slower. Partition for a specific access pattern, not as a default.
+
+### How many partitions is too many?
+
+There is no fixed limit, but planning time grows with partition count, and thousands of partitions can make even simple queries noticeably slower to plan. Monthly partitions over a few years, or a few dozen hash partitions, is a comfortable range for most workloads.
+
+### Can I partition an existing table without downtime?
+
+In PostgreSQL, create the new partitioned table, then `ATTACH PARTITION` the old table as one partition (with a `CHECK` constraint matching its bounds so the attach skips a full scan), and add new partitions for future data. In MySQL, `ALTER TABLE ... PARTITION BY` rebuilds the table, so use an online schema change tool such as `gh-ost` or `pt-online-schema-change`.
+
+### Should I split large JSON columns into their own table in PostgreSQL?
+
+Often TOAST already handles it, since large `jsonb` values are stored out of line automatically. Split explicitly when the column is updated at a very different rate from the rest of the row, when you want separate access permissions, or when many medium-sized columns together make the row wide.

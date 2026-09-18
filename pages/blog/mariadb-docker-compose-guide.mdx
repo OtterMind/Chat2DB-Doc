@@ -1,0 +1,355 @@
+---
+title: "MariaDB Docker Compose: Setup Guide with Examples"
+description: "Run MariaDB in Docker with docker run, a full docker-compose.yml, healthchecks, init scripts, custom my.cnf, a Dockerfile, backups, upgrades and error fixes."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: September 18, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# MariaDB Docker Compose: Setup Guide with Examples
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="September 18, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+Running MariaDB in Docker is the fastest way to get a consistent database for local development, CI pipelines, and small self-hosted deployments. The official `mariadb` image handles initialization, user creation, and upgrades through environment variables, and Docker Compose lets you describe the database, its volume, its healthcheck, and companion services such as Adminer in a single file. This guide goes from a one-line `docker run` to a production-style Compose stack, a custom Dockerfile, backups, upgrades, and the errors you are most likely to hit.
+
+## Quick start with docker run
+
+The shortest way to get a MariaDB server:
+
+```bash
+docker run -d --name mariadb \
+  -e MARIADB_ROOT_PASSWORD=rootpass \
+  -e MARIADB_DATABASE=appdb \
+  -e MARIADB_USER=appuser \
+  -e MARIADB_PASSWORD=apppass \
+  -p 3306:3306 \
+  mariadb:11.4
+```
+
+Check that it came up:
+
+```bash
+docker logs mariadb 2>&1 | tail -n 3
+# ... [Note] mariadbd: ready for connections.
+# Version: '11.4.x-MariaDB-ubu2404'  socket: '/run/mysqld/mysqld.sock'  port: 3306
+```
+
+### Environment variables the image understands
+
+- `MARIADB_ROOT_PASSWORD`: password for `root`. Required unless one of the alternatives below is set.
+- `MARIADB_RANDOM_ROOT_PASSWORD=yes`: generate a random root password and print it in the container log as `GENERATED ROOT PASSWORD: ...`. Good for throwaway containers.
+- `MARIADB_ALLOW_EMPTY_ROOT_PASSWORD=yes`: no root password at all. Only for isolated test environments.
+- `MARIADB_DATABASE`: create this database on first start.
+- `MARIADB_USER` and `MARIADB_PASSWORD`: create this user and grant it all privileges on `MARIADB_DATABASE`. Both must be set together.
+- `MARIADB_ROOT_HOST`: host pattern for the root account, default `%`. Set to `localhost` to block remote root logins.
+- `MARIADB_AUTO_UPGRADE=1`: run `mariadb-upgrade` on startup if the data directory was created by an older version.
+- `MARIADB_INITDB_SKIP_TZINFO=1`: skip loading time zone tables, which shaves a little off first start.
+
+Important: these variables are read only when the data directory is empty. Changing `MARIADB_ROOT_PASSWORD` on an existing volume does nothing; the password stored in the data directory wins.
+
+## A complete docker-compose.yml
+
+Here is a Compose file suitable for development and small deployments. It uses a named volume for persistence, a healthcheck so dependent services wait for MariaDB to be ready, an init-script directory, and a custom configuration directory.
+
+```yaml
+services:
+  mariadb:
+    image: mariadb:11.4
+    container_name: mariadb
+    restart: unless-stopped
+    environment:
+      MARIADB_ROOT_PASSWORD: ${MARIADB_ROOT_PASSWORD:-rootpass}
+      MARIADB_DATABASE: appdb
+      MARIADB_USER: appuser
+      MARIADB_PASSWORD: ${MARIADB_PASSWORD:-apppass}
+      MARIADB_AUTO_UPGRADE: "1"
+    ports:
+      - "3306:3306"
+    volumes:
+      - mariadb_data:/var/lib/mysql
+      - ./initdb:/docker-entrypoint-initdb.d:ro
+      - ./conf.d:/etc/mysql/conf.d:ro
+    healthcheck:
+      test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+  adminer:
+    image: adminer:latest
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    depends_on:
+      mariadb:
+        condition: service_healthy
+
+volumes:
+  mariadb_data:
+```
+
+Start it with:
+
+```bash
+docker compose up -d
+docker compose ps
+# NAME       IMAGE          STATUS                    PORTS
+# adminer    adminer        Up 20 seconds             0.0.0.0:8080->8080/tcp
+# mariadb    mariadb:11.4   Up 30 seconds (healthy)   0.0.0.0:3306->3306/tcp
+```
+
+If you would rather not write this by hand, the free [Docker Compose generator for MySQL and MariaDB](https://chat2db.ai/tools/docker-compose-mysql-mariadb-generator) produces an equivalent file from a short form, including the healthcheck and volume definitions.
+
+### The healthcheck
+
+`healthcheck.sh` ships inside the official image. `--connect` verifies that a TCP connection can be made and `--innodb_initialized` verifies that the InnoDB engine has finished recovery. Together they make `condition: service_healthy` meaningful: your application container will not start until MariaDB can actually accept queries, which avoids a whole class of "connection refused on first boot" errors. The `start_period` gives the first initialization (which creates system tables and runs init scripts) time to finish before failed checks count against `retries`.
+
+### Init scripts in /docker-entrypoint-initdb.d
+
+On the first start with an empty data directory, the entrypoint executes every `.sql`, `.sql.gz`, `.sql.xz`, `.sql.zst`, and `.sh` file found in `/docker-entrypoint-initdb.d`, in alphabetical order, after the database and user from the environment variables have been created. Number the files to control order:
+
+```bash
+mkdir -p initdb conf.d
+cat > initdb/01-schema.sql <<'SQL'
+USE appdb;
+CREATE TABLE IF NOT EXISTS users (
+  id         BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+  email      VARCHAR(255) NOT NULL UNIQUE,
+  created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+SQL
+
+cat > initdb/02-seed.sql <<'SQL'
+USE appdb;
+INSERT INTO users (email) VALUES ('ana@example.com'), ('bo@example.com');
+SQL
+```
+
+Shell scripts (`.sh`) are sourced if they are not executable and executed if they are; they can call `mariadb` directly using the `$MARIADB_ROOT_PASSWORD` variable. Init scripts never run again once the volume contains data. To re-run them, remove the volume (`docker compose down -v`) and start fresh.
+
+### Custom my.cnf via /etc/mysql/conf.d
+
+Any `.cnf` file mounted into `/etc/mysql/conf.d/` is included by the main configuration. Use it for tuning without rebuilding the image:
+
+```bash
+cat > conf.d/custom.cnf <<'CNF'
+[mariadb]
+character-set-server        = utf8mb4
+collation-server            = utf8mb4_unicode_ci
+innodb_buffer_pool_size     = 512M
+innodb_log_file_size        = 128M
+max_connections             = 200
+slow_query_log              = 1
+slow_query_log_file         = /var/lib/mysql/slow.log
+long_query_time             = 1
+CNF
+docker compose restart mariadb
+```
+
+Confirm the settings took effect:
+
+```bash
+docker compose exec mariadb mariadb -uroot -p"$MARIADB_ROOT_PASSWORD" \
+  -e "SHOW VARIABLES LIKE 'innodb_buffer_pool_size'; SHOW VARIABLES LIKE 'character_set_server';"
+```
+
+For simple one-off flags you can also pass them as the container command instead of a file, for example `command: --max-connections=200 --character-set-server=utf8mb4`.
+
+## Adding phpMyAdmin instead of Adminer
+
+Adminer is a single-file tool and needs no configuration. If your team prefers phpMyAdmin, swap the service:
+
+```yaml
+  phpmyadmin:
+    image: phpmyadmin:latest
+    restart: unless-stopped
+    environment:
+      PMA_HOST: mariadb
+      PMA_PORT: 3306
+      UPLOAD_LIMIT: 64M
+    ports:
+      - "8081:80"
+    depends_on:
+      mariadb:
+        condition: service_healthy
+```
+
+Open `http://localhost:8081`, log in with `appuser` / `apppass`, and the `appdb` database is ready. Note `PMA_HOST: mariadb`: inside the Compose network, containers reach each other by service name.
+
+## Connecting to the container
+
+### From the host
+
+The `mariadb` client on your machine connects to the published port. Use `127.0.0.1` rather than `localhost`, because `localhost` makes the client look for a Unix socket that does not exist on the host:
+
+```bash
+mariadb -h 127.0.0.1 -P 3306 -u appuser -papppass appdb
+```
+
+If you do not have the client installed, run it from the container:
+
+```bash
+docker compose exec mariadb mariadb -uappuser -papppass appdb -e "SELECT COUNT(*) FROM users;"
+```
+
+Any GUI works the same way. [Chat2DB](https://chat2db.ai/download) connects with host `127.0.0.1`, port `3306`, and the user from your Compose file, and gives you a table browser, query editor, and AI SQL assistant on top of the container.
+
+### From another container
+
+Application containers in the same Compose project use the service name as hostname and the internal port, not the published one. A typical connection string:
+
+```yaml
+  app:
+    image: your/app:latest
+    environment:
+      DATABASE_URL: "mysql://appuser:apppass@mariadb:3306/appdb"
+    depends_on:
+      mariadb:
+        condition: service_healthy
+```
+
+You can drop the `ports:` block from the `mariadb` service entirely if nothing on the host needs to reach it; the app container will still connect.
+
+## A Dockerfile that extends the MariaDB image
+
+When you want configuration and schema baked into an image (for CI or for shipping a preconfigured database to another team), extend the official image:
+
+```dockerfile
+FROM mariadb:11.4
+
+# Custom server configuration
+COPY conf.d/custom.cnf /etc/mysql/conf.d/custom.cnf
+
+# Schema and seed data executed on first start
+COPY initdb/01-schema.sql /docker-entrypoint-initdb.d/01-schema.sql
+COPY initdb/02-seed.sql   /docker-entrypoint-initdb.d/02-seed.sql
+
+# Optional: bake in non-secret defaults; override secrets at runtime
+ENV MARIADB_DATABASE=appdb \
+    MARIADB_USER=appuser
+
+EXPOSE 3306
+```
+
+Build and run it:
+
+```bash
+docker build -t myorg/mariadb-app:11.4 .
+docker run -d --name mariadb-app \
+  -e MARIADB_ROOT_PASSWORD=rootpass -e MARIADB_PASSWORD=apppass \
+  -p 3306:3306 myorg/mariadb-app:11.4
+```
+
+In Compose, replace `image: mariadb:11.4` with `build: .` and the rest of the file stays the same. Never put real passwords in the Dockerfile; keep them in environment variables or Docker secrets (`MARIADB_ROOT_PASSWORD_FILE` and `MARIADB_PASSWORD_FILE` are supported for reading from files).
+
+## Backup and restore with mariadb-dump
+
+Logical backups run inside the container and stream to the host:
+
+```bash
+# Backup one database
+docker compose exec -T mariadb \
+  mariadb-dump -uroot -p"$MARIADB_ROOT_PASSWORD" --single-transaction --routines --triggers appdb \
+  > backup-$(date +%F).sql
+
+# Backup everything, compressed
+docker compose exec -T mariadb \
+  mariadb-dump -uroot -p"$MARIADB_ROOT_PASSWORD" --all-databases --single-transaction \
+  | gzip > all-$(date +%F).sql.gz
+```
+
+`--single-transaction` takes a consistent InnoDB snapshot without locking tables. The `-T` flag disables TTY allocation so the output is a clean stream.
+
+Restore by piping back in:
+
+```bash
+docker compose exec -T mariadb mariadb -uroot -p"$MARIADB_ROOT_PASSWORD" appdb < backup-2026-09-18.sql
+gunzip -c all-2026-09-18.sql.gz | docker compose exec -T mariadb mariadb -uroot -p"$MARIADB_ROOT_PASSWORD"
+```
+
+For large datasets, physical backups with `mariadb-backup` are faster to restore. It is included in the official image:
+
+```bash
+docker compose exec mariadb mariadb-backup --backup --target-dir=/backup -uroot -p"$MARIADB_ROOT_PASSWORD"
+```
+
+Mount a host directory at `/backup` so the files persist. Schedule either approach with cron on the host or a small sidecar container.
+
+## Upgrading major versions
+
+Point releases (11.4.2 to 11.4.3) just need a new image tag and a restart. Major upgrades (10.11 to 11.4) require the system tables to be updated. Set `MARIADB_AUTO_UPGRADE=1` in the environment, change the tag, and recreate:
+
+```bash
+# 1. Take a backup first
+docker compose exec -T mariadb mariadb-dump -uroot -p"$MARIADB_ROOT_PASSWORD" --all-databases > pre-upgrade.sql
+
+# 2. Edit docker-compose.yml: image: mariadb:11.4 -> image: mariadb:11.8
+# 3. Recreate the container
+docker compose up -d mariadb
+docker compose logs mariadb | grep -i upgrade
+# ... Upgrading MariaDB ... mariadb-upgrade completed
+```
+
+The entrypoint compares the version recorded in the data directory with the running binary and runs `mariadb-upgrade` only when they differ. Skipping more than one major series at a time is supported by MariaDB but always test on a copy of the volume first. Never downgrade a data directory; restore from the dump instead.
+
+## Common errors and fixes
+
+### Access denied for user 'root'@'localhost'
+
+Almost always because the volume already existed when you set or changed `MARIADB_ROOT_PASSWORD`. Either use the password that was in effect at first initialization, or reset it:
+
+```bash
+docker compose down -v   # destroys data; only if you can recreate it
+docker compose up -d
+```
+
+To reset without losing data, start the container with `--skip-grant-tables` as a temporary command, connect, run `ALTER USER 'root'@'%' IDENTIFIED BY 'newpass';` followed by `FLUSH PRIVILEGES;`, then remove the flag and restart.
+
+### unknown variable 'some_option=...'
+
+The option in your `.cnf` file or `command:` is not valid for this MariaDB version, or it was placed under the wrong section. Check the name against the MariaDB documentation for your version, put server options under `[mariadb]` or `[mysqld]`, and remember that MySQL-only variables (for example `default_authentication_plugin`) do not exist in MariaDB. The container will crash-loop until the option is removed.
+
+### Volume permission problems
+
+When bind-mounting a host directory instead of a named volume (`./data:/var/lib/mysql`), the container's `mysql` user (UID 999) must be able to write to it. Symptoms are `Can't create/write to file` or `Permission denied` in the logs. Fix with:
+
+```bash
+sudo chown -R 999:999 ./data
+```
+
+Or run the container with `user: "1000:1000"` matching your host user. Named volumes avoid this entirely, which is why they are the default recommendation.
+
+### Port 3306 already in use
+
+A MariaDB or MySQL server is already running on the host, or another container publishes the same port. Either stop it or change the host side of the mapping to something like `"3307:3306"` and connect on 3307. The container-side port and the service-name connections from other containers are unaffected.
+
+### Container keeps restarting during first init
+
+Usually an error in an init script. Run `docker compose logs mariadb` and look for the SQL error just before the exit; a syntax error or a missing `USE appdb;` line are the common causes. Fix the script, `docker compose down -v`, and start again.
+
+## FAQ
+
+### Which MariaDB image tag should I use?
+
+Pin to a specific long-term-support series such as `mariadb:11.4` or `mariadb:10.11` rather than `latest`, so an unexpected major upgrade never runs on a routine `docker compose pull`.
+
+### Where is the data stored?
+
+In the volume mounted at `/var/lib/mysql`. With the named volume above, `docker volume inspect mariadb_data` shows the host path. Removing the container does not remove the volume; `docker compose down -v` does.
+
+### Can I run two MariaDB containers on the same host?
+
+Yes. Give each a different container name, volume name, and host port (`3306:3306` and `3307:3306`). Inside separate Compose projects they are isolated networks by default.
+
+### Is the MySQL image interchangeable with MariaDB?
+
+Mostly for basic use, but the environment variables differ (`MYSQL_*` versus `MARIADB_*`; the MariaDB image accepts both), the healthcheck script is MariaDB-specific, and the on-disk data directories are not compatible between the two servers.
+
+### How do I run a query without entering the shell?
+
+Use `docker compose exec mariadb mariadb -uappuser -papppass appdb -e "SELECT 1;"`, or connect a desktop client such as Chat2DB to the published port.
