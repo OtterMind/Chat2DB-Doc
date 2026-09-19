@@ -1,0 +1,578 @@
+---
+title: "PostgreSQL Exporter with Prometheus and Grafana"
+description: "Set up postgres_exporter with Prometheus and Grafana: a pg_monitor role, Docker Compose, scrape config, key metrics, PromQL queries and alerting rules."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: September 19, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# PostgreSQL Exporter with Prometheus and Grafana
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="September 19, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+PostgreSQL exposes a huge amount of runtime information through its statistics views (`pg_stat_database`, `pg_stat_activity`, `pg_stat_replication` and friends), but Prometheus cannot read SQL. The bridge between the two is `postgres_exporter`, the PostgreSQL exporter maintained by the prometheus-community organization. It connects to your database, runs a set of catalog queries on every scrape, and serves the results as Prometheus metrics on port 9187. Grafana then turns those metrics into dashboards, and Prometheus (or Alertmanager) turns them into alerts.
+
+This guide walks through a complete, working setup: a least-privilege monitoring role, running the exporter with Docker and Docker Compose next to Prometheus and Grafana, the scrape configuration, the metrics that actually matter, PromQL queries for cache hit ratio and connection saturation, alerting rules, collector flags, the state of custom queries, multi-target scraping, and security hardening.
+
+## How postgres_exporter works
+
+The exporter is a single Go binary. When Prometheus scrapes `http://exporter:9187/metrics`, the exporter:
+
+1. Opens (or reuses) a connection to PostgreSQL using the connection string you gave it.
+2. Runs the queries belonging to each enabled collector, such as the `database` collector (database sizes) or the `stat_database` collector (rows from `pg_stat_database`).
+3. Converts each row into one or more metric samples with labels like `datname`, `state` or `mode`.
+4. Returns everything in the Prometheus text format, together with `pg_up`, which tells you whether the exporter could reach the database at all.
+
+Because the queries run on every scrape, the scrape interval directly controls how often your database is queried. The default collectors are lightweight catalog reads, so a 15 to 30 second interval is normal. The expensive ones, such as `pg_stat_statements`, are disabled by default for good reason.
+
+One exporter normally monitors one PostgreSQL instance. You deploy it next to the database (as a sidecar, a second container, or a systemd service on the same host), or you run one central exporter in multi-target mode, which is covered later.
+
+## Step 1: Create a least-privilege monitoring role
+
+Never point the exporter at the `postgres` superuser. Since PostgreSQL 10 there is a built-in role, `pg_monitor`, that bundles `pg_read_all_settings`, `pg_read_all_stats` and `pg_stat_scan_tables`. That is exactly what a monitoring agent needs and nothing more: it can read statistics and settings, but it cannot read or modify your application tables.
+
+Connect as a superuser and run:
+
+```sql
+CREATE ROLE postgres_exporter WITH LOGIN PASSWORD 'change-me-long-random';
+
+-- Allow connecting to the database the exporter will use
+GRANT CONNECT ON DATABASE postgres TO postgres_exporter;
+
+-- Read access to all statistics views and settings
+GRANT pg_monitor TO postgres_exporter;
+
+-- Keep lookups predictable
+ALTER ROLE postgres_exporter SET search_path TO postgres_exporter, pg_catalog;
+
+-- Optional: stop a runaway monitoring query from hurting the server
+ALTER ROLE postgres_exporter SET statement_timeout = '10s';
+ALTER ROLE postgres_exporter CONNECTION LIMIT 5;
+```
+
+A few notes on these statements:
+
+- The exporter connects to one database (often `postgres`). Cluster-wide views like `pg_stat_database`, `pg_stat_activity` and `pg_stat_replication` show data for all databases from any database, so you do not need to grant `CONNECT` everywhere.
+- `pg_monitor` includes `pg_read_all_stats`, which lets the role see the query text of every session in `pg_stat_activity`. Query text may contain literal values, so treat the exporter credentials as sensitive.
+- If you run managed PostgreSQL (Amazon RDS, Cloud SQL, Azure), `pg_monitor` is generally available, but the superuser equivalent is restricted; the grants above work without superuser on the monitoring role.
+
+Next, make sure the new role can actually log in. Add a line to `pg_hba.conf` if the exporter connects over the network:
+
+```text
+# TYPE  DATABASE   USER               ADDRESS          METHOD
+host    postgres   postgres_exporter  10.0.0.0/8       scram-sha-256
+```
+
+Reload the configuration and test the login:
+
+```bash
+psql -h db.internal -U postgres_exporter -d postgres -c "SELECT count(*) FROM pg_stat_activity;"
+```
+
+If that returns a number, the exporter will be able to connect too.
+
+## Step 2: Configure the connection
+
+The exporter reads its PostgreSQL connection from environment variables. There are two styles.
+
+### A single DATA_SOURCE_NAME
+
+`DATA_SOURCE_NAME` takes a full libpq connection URI (or key-value string):
+
+```bash
+export DATA_SOURCE_NAME="postgresql://postgres_exporter:change-me-long-random@db.internal:5432/postgres?sslmode=require"
+```
+
+This is the simplest option, but the password lives inside the URI, where it can leak into process listings, logs and `docker inspect` output.
+
+### Split URI, user and password
+
+The split form keeps the credential separate from the address:
+
+```bash
+export DATA_SOURCE_URI="db.internal:5432/postgres?sslmode=require"
+export DATA_SOURCE_USER="postgres_exporter"
+export DATA_SOURCE_PASS="change-me-long-random"
+```
+
+Both the user and the password also have file-based variants, `DATA_SOURCE_USER_FILE` and `DATA_SOURCE_PASS_FILE`, which read the value from a file. Those pair nicely with Docker secrets and Kubernetes secret volumes, and they are the recommended option for production.
+
+Special characters in passwords (such as `@`, `/` or `#`) must be percent-encoded when they appear inside a URI; with `DATA_SOURCE_PASS` or `DATA_SOURCE_PASS_FILE` that is not necessary.
+
+## Step 3: Run the exporter with Docker
+
+The official image is published at `quay.io/prometheuscommunity/postgres-exporter` (it is also mirrored on Docker Hub as `prometheuscommunity/postgres-exporter`). A quick standalone run:
+
+```bash
+docker run -d --name postgres-exporter \
+  -p 9187:9187 \
+  -e DATA_SOURCE_URI="db.internal:5432/postgres?sslmode=require" \
+  -e DATA_SOURCE_USER="postgres_exporter" \
+  -e DATA_SOURCE_PASS="change-me-long-random" \
+  quay.io/prometheuscommunity/postgres-exporter
+```
+
+Verify it before wiring up Prometheus:
+
+```bash
+curl -s http://localhost:9187/metrics | grep -E '^pg_up'
+# pg_up 1
+
+curl -s http://localhost:9187/metrics | grep -c '^pg_'
+# a few hundred lines on a typical instance
+```
+
+If `pg_up` is `0`, the exporter is running but cannot reach PostgreSQL. `docker logs postgres-exporter` will show the actual connection error (wrong password, `pg_hba.conf` rejection, TLS mismatch and so on).
+
+If PostgreSQL runs on the Docker host itself, `localhost` inside the container refers to the container, not the host. Use `--network host` on Linux, or `host.docker.internal` on Docker Desktop.
+
+## Step 4: A full stack with Docker Compose
+
+The following Compose file starts PostgreSQL, the exporter, Prometheus and Grafana on one network. It is a good local lab and a reasonable template for a single-host deployment.
+
+```yaml
+# docker-compose.yml
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_PASSWORD: postgres
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./init/01-monitoring.sql:/docker-entrypoint-initdb.d/01-monitoring.sql:ro
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      retries: 10
+
+  postgres-exporter:
+    image: quay.io/prometheuscommunity/postgres-exporter:latest  # pin a release tag in production
+    environment:
+      DATA_SOURCE_URI: "postgres:5432/postgres?sslmode=disable"
+      DATA_SOURCE_USER: "postgres_exporter"
+      DATA_SOURCE_PASS_FILE: "/run/secrets/pg_exporter_password"
+    secrets:
+      - pg_exporter_password
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      - "9187:9187"
+
+  prometheus:
+    image: prom/prometheus:latest
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./prometheus/rules:/etc/prometheus/rules:ro
+      - promdata:/prometheus
+    ports:
+      - "9090:9090"
+
+  grafana:
+    image: grafana/grafana:latest
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: admin-change-me
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - grafanadata:/var/lib/grafana
+    ports:
+      - "3000:3000"
+
+secrets:
+  pg_exporter_password:
+    file: ./secrets/pg_exporter_password.txt
+
+volumes:
+  pgdata:
+  promdata:
+  grafanadata:
+```
+
+The init script creates the monitoring role on first start of the PostgreSQL container:
+
+```sql
+-- init/01-monitoring.sql
+CREATE ROLE postgres_exporter WITH LOGIN PASSWORD 'exporter-lab-password';
+GRANT pg_monitor TO postgres_exporter;
+```
+
+Put the same password (without a trailing newline is safest) in the secret file and start everything:
+
+```bash
+mkdir -p secrets prometheus/rules grafana/provisioning/datasources init
+printf '%s' 'exporter-lab-password' > secrets/pg_exporter_password.txt
+docker compose up -d
+docker compose ps
+```
+
+Scripts in `docker-entrypoint-initdb.d` only run when the data volume is empty. If you already started the stack once, either create the role manually with `psql` or remove the `pgdata` volume.
+
+## Step 5: Configure Prometheus to scrape the exporter
+
+A minimal `prometheus.yml` that scrapes the exporter every 15 seconds and loads alerting rules:
+
+```yaml
+# prometheus/prometheus.yml
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+rule_files:
+  - /etc/prometheus/rules/*.yml
+
+scrape_configs:
+  - job_name: postgres
+    static_configs:
+      - targets: ["postgres-exporter:9187"]
+        labels:
+          cluster: orders-db
+          role: primary
+```
+
+Static labels such as `cluster` and `role` pay off later: dashboards and alerts can filter on them, and alert messages become self-explanatory. After reloading Prometheus, open `http://localhost:9090/targets` and confirm the `postgres` job is `UP`. Note that a target being `UP` only means Prometheus reached the exporter; the database itself is healthy only when `pg_up` is `1`.
+
+## Step 6: The metrics that matter
+
+A fresh exporter emits hundreds of series. These are the ones worth learning first. Metric names below come from the default collectors; if you are on an old exporter release, some names may differ slightly, so check your own `/metrics` output.
+
+### Availability
+
+- `pg_up`: `1` if the last scrape connected to PostgreSQL successfully, `0` otherwise. This is your primary liveness signal.
+- `pg_postmaster_start_time_seconds`: Unix timestamp of the server start. A value that jumps forward means the server restarted.
+
+### Throughput and errors from pg_stat_database
+
+The `stat_database` collector turns each column of `pg_stat_database` into a metric labelled by `datname`:
+
+- `pg_stat_database_xact_commit` and `pg_stat_database_xact_rollback`: cumulative committed and rolled-back transactions. Use `rate()` to get transactions per second.
+- `pg_stat_database_blks_hit` and `pg_stat_database_blks_read`: blocks found in shared buffers versus blocks read from the OS (page cache or disk). Together they give the buffer cache hit ratio.
+- `pg_stat_database_deadlocks`: cumulative deadlocks detected.
+- `pg_stat_database_numbackends`: current number of backends connected to each database.
+- `pg_stat_database_temp_bytes`: bytes written to temporary files, a strong hint that `work_mem` is too small for some queries.
+- `pg_stat_database_tup_fetched`, `pg_stat_database_tup_inserted`, `pg_stat_database_tup_updated`, `pg_stat_database_tup_deleted`: row-level activity.
+
+These values are counters that only grow (until someone calls `pg_stat_reset()`), so always wrap them in `rate()` or `increase()`.
+
+### Connections from pg_stat_activity
+
+`pg_stat_activity_count` counts sessions, with labels such as `datname` and `state` (`active`, `idle`, `idle in transaction` and so on). Compare it to `pg_settings_max_connections`, which the exporter publishes from `pg_settings`. Sessions stuck in `idle in transaction` deserve special attention because they hold locks and block vacuum.
+
+### Replication
+
+On a standby, `pg_replication_lag_seconds` reports how far replay is behind, computed from the timestamp of the last replayed transaction. Be aware of a classic false positive: if the primary receives no writes, there is nothing to replay and this value keeps growing even though the replica is fully caught up. Alert on it together with write activity on the primary, or use byte-based lag from `pg_stat_replication` on the primary. `pg_replication_is_replica` tells you whether an instance is currently a standby, which is useful for spotting unexpected failovers.
+
+### Size, locks and vacuum
+
+- `pg_database_size_bytes`: size of each database, labelled by `datname`. Great for growth charts and "disk full in N days" predictions.
+- `pg_locks_count`: number of locks, labelled by `datname` and `mode`.
+- The `stat_user_tables` collector exposes per-table statistics like dead tuples and last autovacuum time. It can produce many series on databases with thousands of tables.
+
+## Step 7: PromQL queries you will actually use
+
+Paste these into the Prometheus expression browser or a Grafana panel.
+
+Transactions per second per database:
+
+```promql
+sum by (datname) (
+  rate(pg_stat_database_xact_commit[5m]) + rate(pg_stat_database_xact_rollback[5m])
+)
+```
+
+Rollback ratio (a rising value usually means application errors or serialization failures):
+
+```promql
+sum by (datname) (rate(pg_stat_database_xact_rollback[5m]))
+/
+sum by (datname) (rate(pg_stat_database_xact_commit[5m]) + rate(pg_stat_database_xact_rollback[5m]))
+```
+
+Buffer cache hit ratio per database:
+
+```promql
+sum by (datname) (rate(pg_stat_database_blks_hit[5m]))
+/
+(
+  sum by (datname) (rate(pg_stat_database_blks_hit[5m]))
+  + sum by (datname) (rate(pg_stat_database_blks_read[5m]))
+)
+```
+
+For an OLTP workload whose working set fits in memory, this is typically very close to 1. There is no universal threshold; watch for drops relative to your own baseline, which usually coincide with a new query pattern, a large report, or a working set that has outgrown `shared_buffers`. Remember that a `blks_read` can still be served from the OS page cache, so a lower ratio is not automatically a disk problem.
+
+Connection saturation per instance, as a fraction of `max_connections`:
+
+```promql
+sum by (instance) (pg_stat_activity_count)
+/
+max by (instance) (pg_settings_max_connections)
+```
+
+Sessions idle in a transaction:
+
+```promql
+sum by (instance, datname) (pg_stat_activity_count{state="idle in transaction"})
+```
+
+Deadlocks in the last 10 minutes:
+
+```promql
+sum by (datname) (increase(pg_stat_database_deadlocks[10m]))
+```
+
+Database size growth over the last day, and a four-day projection:
+
+```promql
+delta(pg_database_size_bytes[1d])
+predict_linear(pg_database_size_bytes[1d], 4 * 24 * 3600)
+```
+
+Temporary file volume per database:
+
+```promql
+sum by (datname) (rate(pg_stat_database_temp_bytes[5m]))
+```
+
+## Step 8: Alerting rules
+
+Save the following as `prometheus/rules/postgres.yml`. The thresholds are starting points; tune them to your workload.
+
+```yaml
+groups:
+  - name: postgresql
+    rules:
+      - alert: PostgreSQLDown
+        expr: pg_up == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "PostgreSQL is unreachable on {{ $labels.instance }}"
+          description: "postgres_exporter cannot connect to the database for more than 1 minute."
+
+      - alert: PostgreSQLExporterDown
+        expr: up{job="postgres"} == 0
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "postgres_exporter target {{ $labels.instance }} is down"
+
+      - alert: PostgreSQLTooManyConnections
+        expr: |
+          sum by (instance) (pg_stat_activity_count)
+            / max by (instance) (pg_settings_max_connections) > 0.8
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "More than 80% of max_connections in use on {{ $labels.instance }}"
+          description: "Current usage is {{ $value | humanizePercentage }}."
+
+      - alert: PostgreSQLHighReplicationLag
+        expr: pg_replication_is_replica == 1 and pg_replication_lag_seconds > 300
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Replica {{ $labels.instance }} is more than 5 minutes behind"
+
+      - alert: PostgreSQLDeadlocks
+        expr: increase(pg_stat_database_deadlocks[10m]) > 0
+        labels:
+          severity: info
+        annotations:
+          summary: "Deadlocks detected in database {{ $labels.datname }} on {{ $labels.instance }}"
+
+      - alert: PostgreSQLRestarted
+        expr: time() - pg_postmaster_start_time_seconds < 300
+        labels:
+          severity: info
+        annotations:
+          summary: "PostgreSQL on {{ $labels.instance }} restarted in the last 5 minutes"
+```
+
+Validate the file before reloading Prometheus:
+
+```bash
+docker compose exec prometheus promtool check rules /etc/prometheus/rules/postgres.yml
+```
+
+Two design choices are worth explaining. First, there are separate alerts for `pg_up == 0` (the database is unreachable from the exporter) and `up == 0` (Prometheus cannot reach the exporter). They point at different problems and different on-call actions. Second, the replication lag alert is limited to instances that report themselves as replicas, so it does not fire on the primary. If your primary can be idle for long periods, add a condition on write rate or switch to byte-based lag to avoid the false positive described above.
+
+To route these alerts to Slack, PagerDuty or email, add an `alerting` block that points Prometheus at Alertmanager; the rule files stay the same.
+
+## Enabling and disabling collectors
+
+The exporter organizes its queries into collectors, each toggled by a command-line flag in the form `--collector.NAME` to enable and `--no-collector.NAME` to disable. Some examples:
+
+- `--collector.stat_statements` enables per-query statistics from the `pg_stat_statements` extension. It is off by default.
+- `--no-collector.stat_user_tables` and `--no-collector.statio_user_tables` turn off per-table metrics, which is useful on databases with a very large number of tables, where they would create a lot of series.
+- `--collector.long_running_transactions` adds metrics about the oldest open transactions, when your exporter version includes it.
+
+Run the binary with `--help` to see the exact list for your version, since collectors are added between releases:
+
+```bash
+docker run --rm quay.io/prometheuscommunity/postgres-exporter --help 2>&1 | grep collector
+```
+
+In Compose, pass flags through `command`:
+
+```yaml
+  postgres-exporter:
+    image: quay.io/prometheuscommunity/postgres-exporter:latest
+    command:
+      - "--collector.stat_statements"
+      - "--no-collector.stat_user_tables"
+```
+
+### Turning on pg_stat_statements
+
+The `stat_statements` collector only works if the extension is loaded and created. In `postgresql.conf` (this requires a restart):
+
+```text
+shared_preload_libraries = 'pg_stat_statements'
+```
+
+Then, in the database the exporter connects to:
+
+```sql
+CREATE EXTENSION IF NOT EXISTS pg_stat_statements;
+```
+
+`pg_monitor` already allows reading all rows of the view. Keep in mind that per-query metrics carry a `queryid` label, and every distinct query shape becomes new series. On busy systems with many ad-hoc queries this can increase Prometheus memory use noticeably, so enable it deliberately and keep an eye on series counts.
+
+## Custom queries: queries.yaml is deprecated
+
+Older tutorials show a `queries.yaml` file passed via `--extend.query-path` (or the `PG_EXPORTER_EXTEND_QUERY_PATH` variable) to add arbitrary SQL-based metrics. That mechanism still exists in many releases, but the project has marked it as deprecated in favor of built-in collectors, and it may be removed in a future version. Some of the default metrics that used to be defined through this mechanism have also moved into collectors, which is one reason metric names differ between old and new releases.
+
+For new deployments the practical guidance is:
+
+- Check whether a built-in collector already covers what you need before writing SQL.
+- If you have a legacy `queries.yaml`, keep it working, but plan a migration path and test it on every exporter upgrade.
+- For business metrics (orders per minute, queue depth in an application table), a general-purpose SQL exporter such as `sql_exporter` is a better fit than bending the PostgreSQL exporter into a generic query runner.
+
+Whatever tool runs custom SQL, give it its own read-only role with `SELECT` only on the specific tables it needs, and keep each query cheap: it will run on every scrape.
+
+## Importing a Grafana dashboard
+
+First, provision Prometheus as a data source so Grafana is ready on startup:
+
+```yaml
+# grafana/provisioning/datasources/prometheus.yml
+apiVersion: 1
+datasources:
+  - name: Prometheus
+    type: prometheus
+    access: proxy
+    url: http://prometheus:9090
+    isDefault: true
+```
+
+Then import a community dashboard:
+
+1. Open Grafana at `http://localhost:3000` and log in.
+2. Go to **Dashboards**, then **New**, then **Import**.
+3. Enter a dashboard ID from grafana.com, or upload a JSON file. A long-standing community dashboard for this exporter is "PostgreSQL Database" (ID 9628 at the time of writing).
+4. Select the Prometheus data source and click **Import**.
+
+Community dashboards are written against a particular exporter version. If some panels show "No data", open the panel query, compare the metric names with your `/metrics` output and adjust them. It is also worth building one small dashboard of your own with the PromQL queries from this article: TPS, rollback ratio, cache hit ratio, connection saturation, replication lag and database size cover most day-to-day questions.
+
+## Monitoring many PostgreSQL instances
+
+### One exporter per instance
+
+The simplest pattern is one exporter per database server, each as a separate Prometheus target. It isolates failures and makes `instance` labels obvious. Kubernetes users typically run the exporter as a sidecar container in the database pod and discover it with a ServiceMonitor or pod annotations.
+
+### Multi-target mode with the probe endpoint
+
+Newer releases of the exporter also support a multi-target pattern, similar to the blackbox exporter. A single exporter process serves a `/probe` endpoint, and Prometheus passes the database to scrape as a `target` parameter. Credentials are kept in the exporter's configuration file as named auth modules instead of being sent by Prometheus:
+
+```yaml
+# postgres_exporter.yml (passed with --config.file)
+auth_modules:
+  prod_monitor:
+    type: userpass
+    userpass:
+      username: postgres_exporter
+      password: change-me-long-random
+    options:
+      sslmode: require
+```
+
+```yaml
+# prometheus.yml
+scrape_configs:
+  - job_name: postgres-multi
+    metrics_path: /probe
+    params:
+      auth_module: [prod_monitor]
+    static_configs:
+      - targets:
+          - db1.internal:5432/postgres
+          - db2.internal:5432/postgres
+    relabel_configs:
+      - source_labels: [__address__]
+        target_label: __param_target
+      - source_labels: [__param_target]
+        target_label: instance
+      - target_label: __address__
+        replacement: postgres-exporter:9187
+```
+
+The relabeling moves each listed database into the `target` query parameter, keeps it as the `instance` label, and then sends the actual HTTP request to the exporter. Replace `static_configs` with any Prometheus service discovery mechanism (file-based, Consul, EC2, Kubernetes) to pick up new databases automatically. Check the README of the exporter version you run for the exact configuration syntax, since this feature is younger than the rest of the project.
+
+### Auto-discovering databases inside one server
+
+Older versions offered a flag to discover all databases on a server and scrape each one. It has been deprecated alongside the custom queries feature. Most important metrics (`pg_stat_database_*`, `pg_database_size_bytes`, `pg_stat_activity_count`) are already cluster-wide and labelled by `datname`, so a single connection covers every database for those. Per-table metrics are the exception: they only cover the database the exporter is connected to, so if you need them for several databases, add one target per database using the multi-target configuration above.
+
+## Security checklist
+
+- Use a dedicated role with `pg_monitor`, never a superuser, and limit its connections and statement timeout.
+- Pass the password through `DATA_SOURCE_PASS_FILE` or a secret store instead of embedding it in `DATA_SOURCE_NAME`.
+- Use `sslmode=require` (or `verify-full` with a CA bundle) when the exporter talks to PostgreSQL over any network you do not fully control.
+- Do not publish port 9187 to the internet. Metrics reveal database names, user names, server settings and, with `stat_statements`, query shapes. Bind it to a private network or firewall it to your Prometheus servers.
+- The exporter supports the standard Prometheus exporter-toolkit web configuration (`--web.config.file`) for TLS and basic authentication on the metrics endpoint. Use it if Prometheus scrapes across untrusted networks.
+- Restrict `pg_hba.conf` so the monitoring role can only log in from exporter hosts.
+- Pin the image to a release tag and read the changelog before upgrading, because metric names occasionally change and can silently break dashboards and alerts.
+
+## Troubleshooting common problems
+
+- `pg_up` is `0` and logs show `password authentication failed`: the password in the secret file probably has a trailing newline, or `pg_hba.conf` uses a method the role's stored password does not match (for example `scram-sha-256` while the password was stored as MD5).
+- Many metrics are missing but `pg_up` is `1`: the role lacks `pg_monitor`, so queries on restricted views return no rows or fail. Check the exporter logs for `permission denied`.
+- `pg_stat_statements` metrics are absent: the collector is not enabled, the library is not in `shared_preload_libraries`, or the extension was created in a different database than the one the exporter connects to.
+- Prometheus memory grows after enabling collectors: look at the series count with `count by (__name__) ({job="postgres"})` sorted by value, and disable the per-table or per-statement collectors you do not need.
+
+When an alert fires, the next step is usually looking at the actual sessions and queries. A SQL client such as [Chat2DB](https://chat2db.ai/download) makes that quick: connect with an admin role, query `pg_stat_activity` filtered by `state` and `wait_event_type`, and inspect the offending statements while the dashboard tells you when the problem started.
+
+## FAQ
+
+### What port does postgres_exporter use?
+
+It listens on port 9187 by default and serves metrics at `/metrics`. You can change both with `--web.listen-address` and `--web.telemetry-path`.
+
+### What permissions does the PostgreSQL exporter need?
+
+On PostgreSQL 10 and later, a login role with `GRANT pg_monitor` and `CONNECT` on the database it connects to is enough. Superuser is not required and should not be used.
+
+### How do I calculate the cache hit ratio from exporter metrics?
+
+Divide `rate(pg_stat_database_blks_hit[5m])` by the sum of the `blks_hit` and `blks_read` rates, grouped by `datname`. Compare the result to your own baseline rather than a fixed threshold.
+
+### Why does replication lag keep growing on an idle cluster?
+
+The time-based lag is calculated from the timestamp of the last replayed transaction. With no writes on the primary there is nothing new to replay, so the value grows even though the replica is in sync. Use byte-based lag or combine the alert with a write activity condition.
+
+### Is queries.yaml still supported?
+
+The `--extend.query-path` feature is deprecated. It may still work in your version, but new metrics should come from built-in collectors, and custom business metrics are better served by a dedicated SQL exporter.
+
+### Can one exporter monitor several PostgreSQL servers?
+
+Yes, with the multi-target `/probe` endpoint and auth modules defined in the exporter's config file. Running one exporter per instance is still the simplest option and isolates failures better.

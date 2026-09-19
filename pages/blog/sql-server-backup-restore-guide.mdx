@@ -1,0 +1,598 @@
+---
+title: "SQL Server Backup and Restore Database Guide"
+description: "Learn to back up and restore a SQL Server database with T-SQL: recovery models, full, differential and log backups, point-in-time restore and error fixes."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: September 19, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# SQL Server Backup and Restore Database Guide
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="September 19, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+A SQL Server backup is only worth something if you can restore it, quickly, to the exact point you need, on a server that may not be the one that took it. That sounds obvious, yet most restore incidents fail for boring reasons: the database was in the wrong recovery model, the log chain was broken by an ad-hoc backup, the file paths on the target server do not exist, or someone is still connected to the database you are trying to overwrite.
+
+This guide walks through backing up and restoring a database in SQL Server entirely with T-SQL, because T-SQL works the same in SSMS, `sqlcmd`, Azure Data Studio, any other client, a SQL Server Agent job, and SQL Server on Linux or in Docker. It covers recovery models, full, differential and transaction log backups, the options you should almost always use, inspecting backup files before you restore them, restore sequences, point-in-time recovery, tail-log backups, restoring under a new name, querying backup history in `msdb`, and the errors you are most likely to meet.
+
+All examples use a database called `SalesDb`. Replace paths and names with your own.
+
+## Recovery models decide what you can restore
+
+Before writing a single `BACKUP` statement, check the recovery model. It controls how the transaction log is managed and therefore which restore options exist.
+
+```sql
+SELECT name,
+       recovery_model_desc,
+       log_reuse_wait_desc,
+       state_desc
+FROM sys.databases
+ORDER BY name;
+```
+
+### SIMPLE
+
+The log is truncated automatically at checkpoints, so it stays small, but you cannot take log backups. Your recovery point is your last full or differential backup. If you back up every night at 01:00 and the disk dies at 17:00, you lose 16 hours of work. Trying to back up the log fails with Msg 4208, "The statement BACKUP LOG is not allowed while the recovery model is SIMPLE."
+
+SIMPLE is appropriate for development databases, staging copies and data you can rebuild from another source.
+
+### FULL
+
+Every change is fully logged and the log is only truncated by a log backup. That gives you point-in-time restore down to a specific second, at the cost of having to schedule log backups. If you switch to FULL and never back up the log, the log file grows until the disk fills, and `log_reuse_wait_desc` shows `LOG_BACKUP`.
+
+### BULK_LOGGED
+
+Like FULL, except bulk operations such as `BULK INSERT`, `SELECT INTO` and index rebuilds are minimally logged. Log backups still work, but you cannot stop at a point in time inside a log backup that contains a minimally logged operation; you can only restore that backup to its end. Use it temporarily around large loads, then switch back.
+
+### Switching models
+
+```sql
+ALTER DATABASE SalesDb SET RECOVERY FULL;
+
+-- The log chain starts only after the next full backup
+BACKUP DATABASE SalesDb
+TO DISK = N'D:\Backup\SalesDb_full.bak'
+WITH COMPRESSION, CHECKSUM, INIT, STATS = 10;
+```
+
+After moving from SIMPLE to FULL, the database behaves as if it were still in SIMPLE until a full backup exists. Until then, `BACKUP LOG` fails with Msg 4214, "BACKUP LOG cannot be performed because there is no current database backup." Always take a full backup immediately after the switch.
+
+## Taking backups with T-SQL
+
+### Full backup
+
+A full backup contains all data pages plus enough of the log to make the copy consistent.
+
+```sql
+BACKUP DATABASE SalesDb
+TO DISK = N'D:\Backup\SalesDb_full_20260919.bak'
+WITH
+    NAME        = N'SalesDb full 2026-09-19',
+    COMPRESSION,
+    CHECKSUM,
+    INIT,
+    STATS       = 10;
+```
+
+What each option does:
+
+- `COMPRESSION` usually shrinks the file substantially and makes the backup faster, because less data is written. The CPU cost is modest on modern hardware. You can make it the server default with `EXEC sp_configure 'backup compression default', 1; RECONFIGURE;`.
+- `CHECKSUM` verifies page checksums as pages are read and writes a checksum for the whole backup. If a damaged page is found the backup fails, which is exactly what you want to hear about now rather than during a restore.
+- `INIT` overwrites existing backup sets in the file instead of appending. Without it (the default `NOINIT`) every run appends another backup set to the same file, which silently grows and makes restores confusing.
+- `FORMAT` goes further and writes a new media header, which also implies `INIT`. Use it when reusing a file or device that may belong to a different media set.
+- `STATS = 10` prints progress every 10 percent, handy for large databases in `sqlcmd` or the messages tab.
+
+To speed up very large backups, stripe across several files; all stripes are required to restore:
+
+```sql
+BACKUP DATABASE SalesDb
+TO  DISK = N'D:\Backup\SalesDb_full_1.bak',
+    DISK = N'E:\Backup\SalesDb_full_2.bak',
+    DISK = N'F:\Backup\SalesDb_full_3.bak'
+WITH COMPRESSION, CHECKSUM, FORMAT, STATS = 5;
+```
+
+### Differential backup
+
+A differential contains every extent changed since the last full backup (the differential base). Each differential is cumulative, so to restore you need only the full backup and the latest differential, not every differential in between.
+
+```sql
+BACKUP DATABASE SalesDb
+TO DISK = N'D:\Backup\SalesDb_diff_20260919_1200.bak'
+WITH DIFFERENTIAL, COMPRESSION, CHECKSUM, INIT, STATS = 10;
+```
+
+Differentials grow over the week as more extents change. When a differential approaches the size of a full backup, it is time for a new full.
+
+### Transaction log backup
+
+Log backups capture every log record since the previous log backup and truncate the inactive portion of the log. They form a chain: each one must be restored in order.
+
+```sql
+BACKUP LOG SalesDb
+TO DISK = N'D:\Backup\SalesDb_log_20260919_1215.trn'
+WITH COMPRESSION, CHECKSUM, INIT;
+```
+
+Your log backup frequency is your data loss window. Every 15 minutes is a common starting point for production databases; busy OLTP systems often go to every 5 minutes.
+
+### COPY_ONLY backups for ad-hoc copies
+
+A developer asks for "a quick backup of production to restore on test". If you take a normal full backup, it becomes the new differential base, and tonight's differential will be relative to a file that may be deleted from someone's laptop next week. Use `COPY_ONLY`:
+
+```sql
+BACKUP DATABASE SalesDb
+TO DISK = N'D:\Backup\SalesDb_copy_for_test.bak'
+WITH COPY_ONLY, COMPRESSION, CHECKSUM, INIT, STATS = 10;
+```
+
+`COPY_ONLY` on a full backup leaves the differential base alone. `COPY_ONLY` on a log backup does not truncate the log, so it does not break the log chain your scheduled job depends on.
+
+### Encrypted backups
+
+Backup encryption protects the file itself if it is copied off the server. It needs a database master key and a certificate in `master`:
+
+```sql
+USE master;
+GO
+CREATE MASTER KEY ENCRYPTION BY PASSWORD = N'Use-A-Long-Random-Passphrase-1!';
+GO
+CREATE CERTIFICATE BackupCert
+    WITH SUBJECT = N'SQL Server backup encryption';
+GO
+-- Back up the certificate immediately. Without it the backups cannot be restored.
+BACKUP CERTIFICATE BackupCert
+TO FILE = N'D:\Keys\BackupCert.cer'
+WITH PRIVATE KEY (
+    FILE = N'D:\Keys\BackupCert.pvk',
+    ENCRYPTION BY PASSWORD = N'Another-Long-Passphrase-2!'
+);
+GO
+
+BACKUP DATABASE SalesDb
+TO DISK = N'D:\Backup\SalesDb_full_encrypted.bak'
+WITH COMPRESSION,
+     CHECKSUM,
+     INIT,
+     ENCRYPTION (ALGORITHM = AES_256, SERVER CERTIFICATE = BackupCert),
+     STATS = 10;
+```
+
+To restore on a different server, create the certificate there first from the saved files:
+
+```sql
+USE master;
+CREATE MASTER KEY ENCRYPTION BY PASSWORD = N'Target-Server-Passphrase-3!';
+CREATE CERTIFICATE BackupCert
+FROM FILE = N'D:\Keys\BackupCert.cer'
+WITH PRIVATE KEY (
+    FILE = N'D:\Keys\BackupCert.pvk',
+    DECRYPTION BY PASSWORD = N'Another-Long-Passphrase-2!'
+);
+```
+
+Store the certificate files and passwords somewhere other than the backup share. Losing the certificate means losing every backup encrypted with it.
+
+### Backing up to Azure Blob Storage
+
+From SQL Server 2016 onward you can write backups straight to Azure Blob Storage using a shared access signature. The credential name must be the container URL:
+
+```sql
+CREATE CREDENTIAL [https://contosobackups.blob.core.windows.net/sql]
+WITH IDENTITY = 'SHARED ACCESS SIGNATURE',
+     SECRET   = 'sv=2022-11-02&ss=b&srt=co&sp=rwdl&se=2027-01-01...';  -- SAS token without the leading ?
+
+BACKUP DATABASE SalesDb
+TO URL = N'https://contosobackups.blob.core.windows.net/sql/SalesDb_full_20260919.bak'
+WITH COMPRESSION, CHECKSUM, FORMAT, STATS = 10;
+```
+
+`RESTORE ... FROM URL` works the same way. SQL Server 2022 also supports S3-compatible object storage with `s3://` URLs. For large databases, stripe across several URLs just as you would across disks.
+
+## Inspecting a backup file before you restore
+
+Never restore a file you have not looked at. Three commands tell you what is inside and whether it is readable.
+
+### RESTORE HEADERONLY
+
+Lists every backup set in the file, one row each:
+
+```sql
+RESTORE HEADERONLY
+FROM DISK = N'D:\Backup\SalesDb_full_20260919.bak';
+```
+
+Key columns: `Position` (which backup set, used with `FILE = n`), `BackupType` (1 = full database, 2 = transaction log, 5 = differential database), `DatabaseName`, `BackupStartDate`, `FirstLSN`, `LastLSN`, `IsCopyOnly`, `Compressed`, and `SoftwareVersionMajor`, which tells you the SQL Server version that took the backup. You cannot restore a backup onto an older major version than the one that created it.
+
+If the file contains several backup sets because someone used `NOINIT`, pick one explicitly:
+
+```sql
+RESTORE DATABASE SalesDb
+FROM DISK = N'D:\Backup\SalesDb.bak'
+WITH FILE = 3, NORECOVERY;
+```
+
+### RESTORE FILELISTONLY
+
+Shows the logical and physical file names inside the backup, which you need for `WITH MOVE`:
+
+```sql
+RESTORE FILELISTONLY
+FROM DISK = N'D:\Backup\SalesDb_full_20260919.bak';
+```
+
+Typical output:
+
+```text
+LogicalName   PhysicalName                          Type  FileGroupName  Size
+SalesDb       C:\SQLData\SalesDb.mdf                D     PRIMARY        10737418240
+SalesDb_log   C:\SQLLogs\SalesDb_log.ldf            L     NULL           2147483648
+```
+
+### RESTORE VERIFYONLY
+
+Checks that the backup set is complete and readable, and with `CHECKSUM` re-validates the page checksums:
+
+```sql
+RESTORE VERIFYONLY
+FROM DISK = N'D:\Backup\SalesDb_full_20260919.bak'
+WITH CHECKSUM;
+```
+
+`VERIFYONLY` does not prove the database inside is structurally sound. The only real proof is to restore the backup somewhere and run `DBCC CHECKDB` against it, which we cover below.
+
+## Restoring a database in SQL Server
+
+### The simplest restore
+
+Restoring a single full backup over an existing database of the same name:
+
+```sql
+USE master;
+GO
+RESTORE DATABASE SalesDb
+FROM DISK = N'D:\Backup\SalesDb_full_20260919.bak'
+WITH REPLACE, RECOVERY, STATS = 10;
+```
+
+`REPLACE` tells SQL Server to overwrite the existing database even if the backup came from a different database, and to skip the tail-log check. It is powerful and dangerous; read the tail-log section before using it on production.
+
+`RECOVERY` (the default) rolls back uncommitted transactions and brings the database online. After that, no further backups can be applied.
+
+### NORECOVERY and the restore sequence
+
+When you need to apply more than one backup, every restore except the last uses `NORECOVERY`, which leaves the database in the `RESTORING` state, ready to accept the next file. The order is always full, then the latest differential (if any), then every log backup taken after that differential, in sequence.
+
+```sql
+USE master;
+GO
+-- 1. Full backup (Sunday)
+RESTORE DATABASE SalesDb
+FROM DISK = N'D:\Backup\SalesDb_full_20260913.bak'
+WITH NORECOVERY, REPLACE, STATS = 10;
+
+-- 2. Most recent differential (Friday midnight)
+RESTORE DATABASE SalesDb
+FROM DISK = N'D:\Backup\SalesDb_diff_20260919_0000.bak'
+WITH NORECOVERY, STATS = 10;
+
+-- 3. Every log backup after the differential, in order
+RESTORE LOG SalesDb FROM DISK = N'D:\Backup\SalesDb_log_20260919_0015.trn' WITH NORECOVERY;
+RESTORE LOG SalesDb FROM DISK = N'D:\Backup\SalesDb_log_20260919_0030.trn' WITH NORECOVERY;
+RESTORE LOG SalesDb FROM DISK = N'D:\Backup\SalesDb_log_20260919_0045.trn' WITH NORECOVERY;
+
+-- 4. Bring it online
+RESTORE DATABASE SalesDb WITH RECOVERY;
+```
+
+If you accidentally recover too early, you cannot apply more logs; you have to start again from the full backup. That is why it is common to use `NORECOVERY` for every file and run a separate `RESTORE DATABASE ... WITH RECOVERY` at the end.
+
+If there is no differential, apply all log backups taken since the full backup. A missing log file breaks the chain: SQL Server will refuse the next log because its `FirstLSN` does not match the previous `LastLSN`.
+
+### Point-in-time restore with STOPAT
+
+Someone ran `DELETE FROM dbo.Orders` without a `WHERE` clause at 14:31. In the FULL recovery model you can restore to 14:30:
+
+```sql
+USE master;
+GO
+RESTORE DATABASE SalesDb_Recover
+FROM DISK = N'D:\Backup\SalesDb_full_20260913.bak'
+WITH MOVE N'SalesDb'     TO N'D:\SQLData\SalesDb_Recover.mdf',
+     MOVE N'SalesDb_log' TO N'L:\SQLLogs\SalesDb_Recover_log.ldf',
+     NORECOVERY, STATS = 10;
+
+RESTORE DATABASE SalesDb_Recover
+FROM DISK = N'D:\Backup\SalesDb_diff_20260919_1200.bak'
+WITH NORECOVERY;
+
+RESTORE LOG SalesDb_Recover
+FROM DISK = N'D:\Backup\SalesDb_log_20260919_1415.trn'
+WITH NORECOVERY, STOPAT = '2026-09-19T14:30:00';
+
+RESTORE LOG SalesDb_Recover
+FROM DISK = N'D:\Backup\SalesDb_log_20260919_1430.trn'
+WITH NORECOVERY, STOPAT = '2026-09-19T14:30:00';
+
+RESTORE LOG SalesDb_Recover
+FROM DISK = N'D:\Backup\SalesDb_log_20260919_1445.trn'
+WITH RECOVERY, STOPAT = '2026-09-19T14:30:00';
+```
+
+Putting the same `STOPAT` on each log restore is safe: if a log backup ends before the target time, SQL Server applies it fully and leaves the database restoring so you can apply the next one. Restoring into a separate database, as here, is usually smarter than overwriting production: you copy the deleted rows back with an `INSERT ... SELECT` and leave the rest of today's work untouched.
+
+### Tail-log backups
+
+If the database is still accessible (or its log file survives) when disaster strikes, the log records written since the last log backup exist only in the live log. Capture them before restoring, otherwise they are gone:
+
+```sql
+BACKUP LOG SalesDb
+TO DISK = N'D:\Backup\SalesDb_tail.trn'
+WITH NORECOVERY, CHECKSUM, INIT;
+```
+
+`NORECOVERY` here puts the database into the `RESTORING` state so nobody can write more changes after the tail is captured. If the data files are damaged, add `NO_TRUNCATE` (and possibly `CONTINUE_AFTER_ERROR`) so SQL Server backs up the log without needing the data files. Then run your restore sequence and apply the tail log last, with `RECOVERY`.
+
+When you restore over a FULL-recovery database without a tail-log backup and without `REPLACE`, SQL Server stops you with Msg 3159: "The tail of the log for the database has not been backed up." That error is a safety net, not an obstacle. Only add `REPLACE` when you are sure the unbacked-up log is not needed.
+
+### Restoring to a new database name
+
+To create a copy next to the original, for testing or data recovery, change the name and move the files so they do not collide with the originals. Get the logical names from `RESTORE FILELISTONLY` first.
+
+```sql
+RESTORE DATABASE SalesDb_Test
+FROM DISK = N'D:\Backup\SalesDb_full_20260919.bak'
+WITH MOVE N'SalesDb'     TO N'D:\SQLData\SalesDb_Test.mdf',
+     MOVE N'SalesDb_log' TO N'L:\SQLLogs\SalesDb_Test_log.ldf',
+     RECOVERY, STATS = 10;
+```
+
+Optionally rename the logical files so future restores are less confusing:
+
+```sql
+ALTER DATABASE SalesDb_Test MODIFY FILE (NAME = N'SalesDb',     NEWNAME = N'SalesDb_Test');
+ALTER DATABASE SalesDb_Test MODIFY FILE (NAME = N'SalesDb_log', NEWNAME = N'SalesDb_Test_log');
+```
+
+### Fixing orphaned users after a cross-server restore
+
+Database users are linked to server logins by SID. When you restore onto another instance, a SQL-authentication login with the same name usually has a different SID, so the user is orphaned. Find and fix them:
+
+```sql
+USE SalesDb_Test;
+SELECT dp.name AS orphaned_user
+FROM sys.database_principals AS dp
+LEFT JOIN sys.server_principals AS sp ON sp.sid = dp.sid
+WHERE dp.type = 'S'
+  AND dp.authentication_type_desc = 'INSTANCE'
+  AND sp.sid IS NULL;
+
+ALTER USER app_user WITH LOGIN = app_user;
+```
+
+### Proving the backup works
+
+A test restore followed by an integrity check is the only verification that counts:
+
+```sql
+RESTORE DATABASE SalesDb_Verify
+FROM DISK = N'D:\Backup\SalesDb_full_20260919.bak'
+WITH MOVE N'SalesDb'     TO N'D:\Verify\SalesDb_Verify.mdf',
+     MOVE N'SalesDb_log' TO N'D:\Verify\SalesDb_Verify_log.ldf',
+     RECOVERY, STATS = 10;
+
+DBCC CHECKDB (SalesDb_Verify) WITH NO_INFOMSGS, ALL_ERRORMSGS;
+
+DROP DATABASE SalesDb_Verify;
+```
+
+Run it on a separate server where possible, so the check also proves you can restore away from the original machine.
+
+## Backups and restores with sqlcmd
+
+Everything above runs unchanged from the command line, which is how you script backups on servers without a GUI.
+
+```bash
+# Windows authentication
+sqlcmd -S SQL01 -E -Q "BACKUP DATABASE SalesDb TO DISK = N'D:\Backup\SalesDb_full.bak' WITH COMPRESSION, CHECKSUM, INIT, STATS = 10"
+
+# SQL authentication, trusting a self-signed certificate (-C)
+sqlcmd -S sql01.example.com -U backup_operator -P "$SQLPWD" -C -b \
+  -Q "RESTORE VERIFYONLY FROM DISK = N'D:\Backup\SalesDb_full.bak' WITH CHECKSUM"
+
+# Run a whole restore script and stop on the first error
+sqlcmd -S SQL01 -E -b -i restore_salesdb.sql -o restore_salesdb.log
+```
+
+`-b` makes `sqlcmd` return a non-zero exit code on error, which your scheduler or CI pipeline needs to detect failures.
+
+## SQL Server on Linux and in Docker
+
+The T-SQL is identical on Linux; only the paths change. Data files live under `/var/opt/mssql/data` by default, and the files you back up to or restore from must be readable and writable by the `mssql` user.
+
+```bash
+sudo mkdir -p /var/opt/mssql/backup
+sudo chown mssql:mssql /var/opt/mssql/backup
+sudo /opt/mssql/bin/mssql-conf set filelocation.defaultbackupdir /var/opt/mssql/backup
+sudo systemctl restart mssql-server
+```
+
+```sql
+BACKUP DATABASE SalesDb
+TO DISK = N'/var/opt/mssql/backup/SalesDb_full.bak'
+WITH COMPRESSION, CHECKSUM, INIT, STATS = 10;
+
+RESTORE DATABASE SalesDb
+FROM DISK = N'/var/opt/mssql/backup/SalesDb_full.bak'
+WITH MOVE N'SalesDb'     TO N'/var/opt/mssql/data/SalesDb.mdf',
+     MOVE N'SalesDb_log' TO N'/var/opt/mssql/data/SalesDb_log.ldf',
+     REPLACE, RECOVERY, STATS = 10;
+```
+
+A backup taken on Windows restores on Linux without conversion, but the Windows paths recorded in the backup do not exist, so `WITH MOVE` is mandatory.
+
+In Docker, copy the file into the container, fix ownership, and run `sqlcmd` inside it. Recent images ship `sqlcmd` in `/opt/mssql-tools18/bin`; older ones use `/opt/mssql-tools/bin`.
+
+```bash
+docker exec -u root mssql mkdir -p /var/opt/mssql/backup
+docker cp ./SalesDb_full.bak mssql:/var/opt/mssql/backup/
+docker exec -u root mssql chown mssql /var/opt/mssql/backup/SalesDb_full.bak
+
+docker exec -it mssql /opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P "$SA_PASSWORD" -C \
+  -Q "RESTORE FILELISTONLY FROM DISK = N'/var/opt/mssql/backup/SalesDb_full.bak'"
+```
+
+Mount a volume at `/var/opt/mssql` if you want databases and backups to survive the container being recreated.
+
+## Querying backup history in msdb
+
+Every backup and restore is recorded in `msdb`. This is the fastest way to answer "when was this database last backed up, and where is the file?"
+
+```sql
+SELECT TOP 50
+    bs.database_name,
+    CASE bs.type WHEN 'D' THEN 'Full'
+                 WHEN 'I' THEN 'Differential'
+                 WHEN 'L' THEN 'Log'
+                 ELSE bs.type END                          AS backup_type,
+    bs.backup_start_date,
+    bs.backup_finish_date,
+    DATEDIFF(second, bs.backup_start_date, bs.backup_finish_date) AS duration_s,
+    CAST(bs.backup_size / 1048576.0 AS decimal(12,1))            AS size_mb,
+    CAST(bs.compressed_backup_size / 1048576.0 AS decimal(12,1)) AS compressed_mb,
+    bs.is_copy_only,
+    bs.has_backup_checksums,
+    bs.first_lsn,
+    bs.last_lsn,
+    bmf.physical_device_name
+FROM msdb.dbo.backupset AS bs
+JOIN msdb.dbo.backupmediafamily AS bmf
+  ON bmf.media_set_id = bs.media_set_id
+WHERE bs.database_name = N'SalesDb'
+ORDER BY bs.backup_finish_date DESC;
+```
+
+And a daily sanity check across the instance, flagging databases with no recent full backup or FULL-recovery databases with no recent log backup:
+
+```sql
+SELECT
+    d.name,
+    d.recovery_model_desc,
+    MAX(CASE WHEN b.type = 'D' THEN b.backup_finish_date END) AS last_full,
+    MAX(CASE WHEN b.type = 'I' THEN b.backup_finish_date END) AS last_diff,
+    MAX(CASE WHEN b.type = 'L' THEN b.backup_finish_date END) AS last_log
+FROM sys.databases AS d
+LEFT JOIN msdb.dbo.backupset AS b
+  ON b.database_name = d.name
+ AND b.is_copy_only = 0
+WHERE d.name <> N'tempdb'
+GROUP BY d.name, d.recovery_model_desc
+ORDER BY last_full;
+```
+
+Restores are logged in `msdb.dbo.restorehistory`, which is useful when you need to know who refreshed a test database and from which backup:
+
+```sql
+SELECT rh.destination_database_name, rh.restore_date, rh.user_name,
+       rh.restore_type, bs.database_name AS source_database,
+       bs.backup_finish_date AS source_backup_time
+FROM msdb.dbo.restorehistory AS rh
+JOIN msdb.dbo.backupset AS bs ON bs.backup_set_id = rh.backup_set_id
+ORDER BY rh.restore_date DESC;
+```
+
+History accumulates forever unless you prune it, so schedule `EXEC msdb.dbo.sp_delete_backuphistory @oldest_date = '2026-03-01';` (with a rolling date) on busy instances.
+
+If you keep these queries saved in a SQL client, checking backup status becomes a one-click job. In [Chat2DB](https://chat2db.ai/download), for instance, you can save the history query as a snippet, run it across several SQL Server connections, and ask the AI assistant to adapt the restore script to a new database name or file layout.
+
+## Common backup and restore errors
+
+### Msg 3154: backup set holds a backup of a database other than the existing database
+
+```text
+Msg 3154, Level 16
+The backup set holds a backup of a database other than the existing 'SalesDb_Test' database.
+```
+
+You are restoring a backup of one database over a different existing database. Either restore to a new, non-existent name with `WITH MOVE`, or, if you really intend to overwrite, add `REPLACE`.
+
+### Msg 3201: cannot open backup device
+
+```text
+Msg 3201, Level 16
+Cannot open backup device 'D:\Backup\SalesDb_full.bak'. Operating system error 5(Access is denied.).
+```
+
+The file is opened by the SQL Server service account, not by you. Grant that account (for example `NT SERVICE\MSSQLSERVER`) read/write permissions on the folder or share. Operating system error 2 or 3 instead means the file or path does not exist on the server, which often happens because a path is valid on your workstation but not on the database server. Use UNC paths for network shares; mapped drive letters are not visible to the service. On Linux, check that the `mssql` user owns or can read the file.
+
+### Msg 3101: exclusive access could not be obtained
+
+```text
+Msg 3101, Level 16
+Exclusive access could not be obtained because the database is in use.
+```
+
+Restoring over a database requires that no sessions are using it, including your own query window if its current database is the target. Switch to `master` and kick everyone out:
+
+```sql
+USE master;
+GO
+ALTER DATABASE SalesDb SET SINGLE_USER WITH ROLLBACK IMMEDIATE;
+GO
+RESTORE DATABASE SalesDb
+FROM DISK = N'D:\Backup\SalesDb_full_20260919.bak'
+WITH REPLACE, RECOVERY, STATS = 10;
+GO
+ALTER DATABASE SalesDb SET MULTI_USER;
+```
+
+`ROLLBACK IMMEDIATE` rolls back open transactions from other sessions. Run the `ALTER` and `RESTORE` in the same batch or session so an application does not grab the single available connection in between.
+
+### Msg 3159: tail of the log has not been backed up
+
+Covered above: take a tail-log backup with `NORECOVERY`, or add `REPLACE` if you knowingly want to discard the log.
+
+### Msg 4214 and 4208: log backups refused
+
+4214 means no full backup exists since the database was created or switched to FULL; take one. 4208 means the database is in SIMPLE recovery; switch to FULL if you need point-in-time recovery.
+
+### Backup from a newer version
+
+A backup taken on SQL Server 2022 cannot be restored on SQL Server 2019 or older. Check `SoftwareVersionMajor` in `RESTORE HEADERONLY` before you start. To move data to an older version, script the schema and copy the data instead.
+
+## A sensible default strategy
+
+For a typical production database in FULL recovery:
+
+1. Full backup weekly or nightly, depending on size.
+2. Differential daily if full backups are weekly.
+3. Log backups every 5 to 15 minutes.
+4. `COMPRESSION` and `CHECKSUM` on every backup, and encryption for anything leaving the server.
+5. Copy backups off the server to a share or object storage with a retention policy.
+6. A scheduled test restore plus `DBCC CHECKDB` at least weekly.
+7. A daily `msdb` query or alert that flags any database whose last backup is too old.
+
+## FAQ
+
+### How do I restore a SQL Server database from a .bak file?
+
+Run `RESTORE FILELISTONLY` to get the logical file names, then `RESTORE DATABASE name FROM DISK = N'path.bak' WITH MOVE ..., RECOVERY`. Add `REPLACE` only when overwriting an existing database on purpose.
+
+### What is the difference between a full, differential and log backup?
+
+A full backup copies the whole database. A differential copies extents changed since the last full backup. A log backup copies log records since the previous log backup and is what enables point-in-time restore.
+
+### Can I restore to a specific time?
+
+Yes, if the database is in FULL recovery and you have an unbroken chain of log backups covering that time. Restore the full and differential with `NORECOVERY`, then the logs with `STOPAT`.
+
+### Does COPY_ONLY affect my backup schedule?
+
+No. That is its purpose. A copy-only full backup does not reset the differential base and a copy-only log backup does not truncate the log.
+
+### Is RESTORE VERIFYONLY enough to trust a backup?
+
+It confirms the file is complete and readable, and with `CHECKSUM` that the pages were not damaged. It does not check logical consistency; only a real restore followed by `DBCC CHECKDB` does.

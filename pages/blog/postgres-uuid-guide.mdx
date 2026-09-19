@@ -1,0 +1,444 @@
+---
+title: "Postgres UUID: Types, Generation and Indexing"
+description: "A practical guide to the Postgres UUID type: gen_random_uuid(), uuid-ossp, uuidv7() in PostgreSQL 18, UUID primary keys, casting errors and index tradeoffs."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: September 19, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# Postgres UUID: Types, Generation and Indexing
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="September 19, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+PostgreSQL has had a native `uuid` data type for a long time, but the way you generate UUIDs has changed several times. Older tutorials tell you to install the `uuid-ossp` extension, slightly newer ones point at `pgcrypto`, PostgreSQL 13 made `gen_random_uuid()` a built-in function, and PostgreSQL 18 added `uuidv7()` for time-ordered identifiers. This guide walks through all of it in one place: how the Postgres UUID type stores data, which functions generate which versions, how to use a UUID as a primary key, what it costs compared with `bigint`, how to cast text safely, and how to index and sort UUID columns without surprises.
+
+## The PostgreSQL uuid type
+
+### Storage and size
+
+The `uuid` type stores a 128-bit value as exactly 16 bytes. It is a fixed-length binary type, not a string, so it is far more compact than storing the same identifier in a `text` or `varchar(36)` column, which needs the 36 characters of the canonical form plus a length header. You can confirm the difference directly:
+
+```sql
+SELECT pg_column_size('a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11'::uuid) AS as_uuid,
+       pg_column_size('a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11'::text) AS as_text;
+```
+
+```text
+ as_uuid | as_text
+---------+---------
+      16 |      40
+```
+
+The text value is reported as 40 bytes here because a standalone datum carries a 4-byte length header; inside a table row a short string uses a 1-byte header, so it ends up at 37 bytes. Either way you pay more than double the space, and every index on that column pays it again. Comparisons on the `uuid` type are also cheaper, because PostgreSQL compares 16 raw bytes instead of running collation-aware string comparison.
+
+### Accepted input formats
+
+PostgreSQL is lenient about how a UUID is written on input. All of these literals are accepted and produce the same value:
+
+```sql
+SELECT 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11'::uuid;
+SELECT 'A0EEBC99-9C0B-4EF8-BB6D-6BB9BD380A11'::uuid;      -- upper case
+SELECT '{a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11}'::uuid;    -- braces
+SELECT 'a0eebc999c0b4ef8bb6d6bb9bd380a11'::uuid;          -- no hyphens
+SELECT 'a0ee-bc99-9c0b-4ef8-bb6d-6bb9-bd38-0a11'::uuid;   -- hyphen after any group of four
+```
+
+Output is always the canonical form: lower-case hexadecimal in groups of 8, 4, 4, 4 and 12 digits separated by hyphens. That means you never need to normalize case in application code before comparing values; once a string is cast to `uuid`, `A0EE...` and `a0ee...` are the same value.
+
+### Versions in one paragraph
+
+A UUID carries its version number in the first hex digit of the third group. Version 4 values look like `xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx` and are almost entirely random. Version 1 embeds a timestamp and a node identifier (historically the MAC address). Versions 3 and 5 are deterministic hashes of a namespace plus a name (MD5 and SHA-1 respectively). Version 7, standardized in RFC 9562, puts a Unix timestamp in milliseconds in the most significant 48 bits and fills the rest with random data, which makes values roughly sortable by creation time. The `uuid` column type does not care which version you store; the version only matters for how the value was generated and how it behaves in an index.
+
+## Generating UUIDs in PostgreSQL
+
+### gen_random_uuid(), built in since PostgreSQL 13
+
+For random version 4 UUIDs you do not need any extension on PostgreSQL 13 or later:
+
+```sql
+SELECT gen_random_uuid();
+```
+
+```text
+           gen_random_uuid
+--------------------------------------
+ b3f1c2a4-5d6e-4f70-8a9b-0c1d2e3f4a5b
+```
+
+Before version 13 the same function existed only in the `pgcrypto` extension, which is why many older migration scripts start with `CREATE EXTENSION pgcrypto;`. On a modern server that line is harmless but no longer required for UUID generation. If you still support PostgreSQL 12 or older, keep the extension; otherwise you can drop the dependency.
+
+Generating many values at once is a common need for test data:
+
+```sql
+SELECT gen_random_uuid() AS id
+FROM generate_series(1, 5);
+```
+
+Each row gets a different value, because the function is volatile and is evaluated once per row.
+
+### uuidv4() and uuidv7() in PostgreSQL 18
+
+PostgreSQL 18 added two new generator functions. `uuidv4()` is simply another name for `gen_random_uuid()`, provided so that the function names line up with the UUID version they produce. The more interesting one is `uuidv7()`:
+
+```sql
+SELECT uuidv7();
+```
+
+```text
+                uuidv7
+--------------------------------------
+ 01a0b8bc-482b-7d19-86b6-fff1ee6ea009
+```
+
+The first 12 hex digits encode the number of milliseconds since the Unix epoch, and the third group starts with `7`. PostgreSQL also uses extra bits for sub-millisecond precision so that values generated by the same session are monotonically increasing, even when many are created within one millisecond.
+
+`uuidv7()` accepts an optional `interval` argument that shifts the embedded timestamp. This is useful for backfilling historical rows or for tests that need identifiers from the past:
+
+```sql
+SELECT uuidv7(interval '-1 day');   -- timestamp portion is one day earlier
+SELECT uuidv7(interval '2 hours');  -- timestamp portion is two hours later
+```
+
+If you run PostgreSQL 17 or older, `uuidv7()` does not exist. You can generate v7 values in the application (most languages have a library for RFC 9562 UUIDs) and insert them into a normal `uuid` column; the type itself has always been able to store them.
+
+### The uuid-ossp extension
+
+The `uuid-ossp` contrib module is the traditional way to generate UUIDs in PostgreSQL. It ships with the standard server packages, but it has to be enabled per database. The hyphen in the name means you must double-quote it:
+
+```sql
+CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
+```
+
+Once installed, it provides these functions:
+
+| Function | What it produces |
+| --- | --- |
+| `uuid_generate_v1()` | Version 1: timestamp plus the server's MAC address |
+| `uuid_generate_v1mc()` | Version 1 with a random multicast MAC instead of the real one |
+| `uuid_generate_v3(namespace, name)` | Version 3: MD5 hash of namespace and name |
+| `uuid_generate_v4()` | Version 4: random |
+| `uuid_generate_v5(namespace, name)` | Version 5: SHA-1 hash of namespace and name |
+| `uuid_nil()` | The all-zero UUID |
+| `uuid_ns_dns()`, `uuid_ns_url()`, `uuid_ns_oid()`, `uuid_ns_x500()` | Standard namespace constants for v3 and v5 |
+
+The PostgreSQL documentation itself recommends `gen_random_uuid()` over `uuid_generate_v4()` if random UUIDs are all you need, since the core function requires no extension. So when do you still need `uuid-ossp`?
+
+- **Deterministic IDs (v3/v5).** If you want the same input to always map to the same UUID, for example to derive a stable ID from an external URL or an email address, `uuid_generate_v5()` does exactly that.
+- **Legacy schemas.** Existing column defaults such as `DEFAULT uuid_generate_v4()` depend on the extension. Dropping it would break those defaults, so keep it until you have altered the columns.
+- **Version 1 values.** Rarely needed today, and `uuid_generate_v1()` leaks the server's MAC address and creation time, which is why `uuid_generate_v1mc()` exists.
+
+Here is a v5 example. The output depends only on the inputs, so running it twice, or on another server, yields the same value:
+
+```sql
+SELECT uuid_generate_v5(uuid_ns_url(), 'https://example.com/products/42') AS product_uuid;
+
+-- Deterministic: this is always true
+SELECT uuid_generate_v5(uuid_ns_url(), 'https://example.com/products/42')
+     = uuid_generate_v5(uuid_ns_url(), 'https://example.com/products/42') AS same;
+```
+
+You can also define your own namespace, which is just any UUID you choose once and keep constant:
+
+```sql
+SELECT uuid_generate_v5('6f1c2d3e-4b5a-4c6d-8e7f-9a0b1c2d3e4f'::uuid, 'customer:10017');
+```
+
+If the extension is missing, calling one of these functions fails with `ERROR: function uuid_generate_v4() does not exist`. The fix is either `CREATE EXTENSION "uuid-ossp";` in that database, or switching the call to `gen_random_uuid()`. On managed services such as Amazon RDS, Cloud SQL or Azure Database for PostgreSQL, `uuid-ossp` is normally on the allow list, but you still need a role with permission to create extensions.
+
+### Which generator should you pick?
+
+- PostgreSQL 18 or later and the UUID is a primary key or heavily indexed: `uuidv7()`.
+- Random, unguessable token that should not reveal when it was created: `gen_random_uuid()` (or `uuidv4()`).
+- Stable ID derived from a natural key: `uuid_generate_v5()` from `uuid-ossp`.
+- PostgreSQL 12 or older: `gen_random_uuid()` from `pgcrypto`, or `uuid_generate_v4()` from `uuid-ossp`.
+
+## Using a UUID as a primary key
+
+### Table definition with DEFAULT
+
+The usual pattern is to let the database fill in the key when the application does not supply one:
+
+```sql
+CREATE TABLE orders (
+    id          uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    customer_id bigint      NOT NULL,
+    total_cents integer     NOT NULL,
+    created_at  timestamptz NOT NULL DEFAULT now()
+);
+
+INSERT INTO orders (customer_id, total_cents)
+VALUES (10017, 4599)
+RETURNING id;
+```
+
+On PostgreSQL 18 you can swap the default for a time-ordered generator:
+
+```sql
+CREATE TABLE events (
+    id      uuid PRIMARY KEY DEFAULT uuidv7(),
+    kind    text  NOT NULL,
+    payload jsonb NOT NULL
+);
+```
+
+`RETURNING id` is the idiomatic way to get the generated key back in the same round trip, which removes any need to generate the value client-side just to know it.
+
+### Adding a UUID column to an existing table
+
+A common migration is adding a public, non-guessable identifier next to an existing integer key:
+
+```sql
+ALTER TABLE customers
+    ADD COLUMN public_id uuid NOT NULL DEFAULT gen_random_uuid();
+
+CREATE UNIQUE INDEX CONCURRENTLY customers_public_id_key
+    ON customers (public_id);
+```
+
+Be aware that `gen_random_uuid()` is a volatile function. Since PostgreSQL 11, adding a column with a constant default is a quick catalog-only change, but a volatile default forces PostgreSQL to rewrite the entire table so that every existing row gets its own value. On a large table that rewrite holds an `ACCESS EXCLUSIVE` lock for its whole duration. For big tables it is safer to add the column as nullable, backfill in batches, then add the default and the `NOT NULL` constraint:
+
+```sql
+ALTER TABLE customers ADD COLUMN public_id uuid;
+ALTER TABLE customers ALTER COLUMN public_id SET DEFAULT gen_random_uuid();
+
+-- Backfill in batches; repeat until 0 rows are updated
+UPDATE customers
+SET public_id = gen_random_uuid()
+WHERE id IN (
+    SELECT id FROM customers
+    WHERE public_id IS NULL
+    LIMIT 10000
+);
+
+ALTER TABLE customers ALTER COLUMN public_id SET NOT NULL;
+```
+
+Setting the default before the backfill ensures new rows inserted during the migration are covered too. Note that `SET NOT NULL` scans the table to validate the constraint; on very large tables you can first add a `CHECK (public_id IS NOT NULL) NOT VALID` constraint, validate it separately, and PostgreSQL 12 and later will use that validated constraint to skip the scan.
+
+## UUID vs bigint identity keys
+
+### Size
+
+A `bigint` is 8 bytes, a `uuid` is 16. The difference looks small per row, but it repeats in the primary key index, in every foreign key column that references the table, and in every index on those foreign keys. A schema with a handful of large child tables pointing at a UUID-keyed parent carries that extra 8 bytes many times over.
+
+### Index locality
+
+This is the bigger issue. A B-tree index keeps keys in sorted order. With an identity column, each new key is larger than every existing key, so inserts always land in the right-most leaf page, which stays hot in shared buffers. With random v4 UUIDs, each insert lands on an effectively random leaf page. Once the index is larger than memory, inserts start reading pages from disk, pages split in the middle and end up partly empty, and the index grows larger than the same data would need with sequential keys.
+
+UUIDv7 fixes most of this. Because the high bits are a timestamp, new values sort after older ones, and inserts go to the right-hand edge of the index just like a sequence. You keep the benefits of UUIDs (globally unique, can be generated anywhere, safe to merge across databases) with index behavior close to that of `bigint`.
+
+### WAL volume
+
+With `full_page_writes` enabled (the default), the first time a page is modified after a checkpoint PostgreSQL writes the entire page image into the WAL. Sequential keys modify the same few index pages over and over, so relatively few full-page images are written. Random keys touch a different page on almost every insert, so a much larger share of index changes produce full-page images. The result is more WAL, which means more disk I/O, larger backups and more data to ship to replicas. Time-ordered UUIDs behave much more like sequential keys here.
+
+### When bigint is still the better choice
+
+- Single database, IDs never leave your system, and you want the smallest and fastest keys: `bigint GENERATED ALWAYS AS IDENTITY`.
+- You need IDs generated offline or in several services before they reach the database: UUID.
+- You expose IDs in URLs and do not want them to be enumerable: UUID (v4 if creation time must stay private, since v7 reveals it).
+
+A frequent compromise is an identity column as the internal primary key plus a UUID `public_id` column with a unique index for anything exposed externally.
+
+```sql
+CREATE TABLE invoices (
+    id         bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    public_id  uuid   NOT NULL DEFAULT gen_random_uuid() UNIQUE,
+    amount     numeric(12,2) NOT NULL
+);
+```
+
+## Casting text to uuid
+
+### Explicit casts
+
+You can convert between `text` and `uuid` with either the `::` shorthand or standard `CAST` syntax:
+
+```sql
+SELECT '01a0b8bc-482b-7d19-86b6-fff1ee6ea009'::uuid;
+SELECT CAST('01a0b8bc-482b-7d19-86b6-fff1ee6ea009' AS uuid);
+SELECT gen_random_uuid()::text;
+```
+
+A string literal compared with a `uuid` column is resolved automatically, so `WHERE id = '01a0b8bc-...'` works without a cast. The problem appears when the other side already has type `text`, for example a column or a parameter explicitly typed as text:
+
+```sql
+SELECT * FROM orders o JOIN legacy_orders l ON o.id = l.order_ref;
+-- ERROR:  operator does not exist: uuid = text
+```
+
+The fix is to cast one side. Cast the text side to `uuid` so that an index on `orders.id` can still be used:
+
+```sql
+SELECT * FROM orders o JOIN legacy_orders l ON o.id = l.order_ref::uuid;
+```
+
+### invalid input syntax for type uuid
+
+When a string is not a valid UUID, the cast fails and aborts the whole statement:
+
+```sql
+SELECT 'not-a-uuid'::uuid;
+-- ERROR:  invalid input syntax for type uuid: "not-a-uuid"
+```
+
+Typical causes are empty strings from a CSV import, IDs with trailing spaces or quotes, 35 or 37 character values caused by truncation or concatenation, and placeholder values like `0` or `null` stored as text. An empty string is not treated as `NULL`; `''::uuid` raises the same error.
+
+On PostgreSQL 16 and later you can test values without raising errors using `pg_input_is_valid()`:
+
+```sql
+SELECT order_ref
+FROM legacy_orders
+WHERE NOT pg_input_is_valid(order_ref, 'uuid');
+```
+
+On older versions, a regular expression finds values in the canonical format:
+
+```sql
+SELECT order_ref
+FROM legacy_orders
+WHERE order_ref !~* '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$';
+```
+
+That regex is stricter than PostgreSQL's parser (it rejects braces and missing hyphens, which the cast would accept), so treat its results as candidates for review, not proof of invalidity.
+
+### Converting a text column to uuid
+
+Once the data is clean, convert the column in place with a `USING` clause:
+
+```sql
+UPDATE legacy_orders SET order_ref = NULL WHERE btrim(order_ref) = '';
+
+ALTER TABLE legacy_orders
+    ALTER COLUMN order_ref TYPE uuid USING order_ref::uuid;
+```
+
+This rewrites the table and rebuilds its indexes, so plan it like any other heavy migration. If any row still fails to cast, the whole `ALTER TABLE` is rolled back and you get the `invalid input syntax for type uuid` error naming the offending value.
+
+## Inspecting UUIDs: version and timestamp
+
+PostgreSQL 17 added two helper functions, and PostgreSQL 18 extended them to cover version 7:
+
+- `uuid_extract_version(uuid)` returns the version number for RFC 9562 variant UUIDs, and `NULL` for other variants.
+- `uuid_extract_timestamp(uuid)` returns a `timestamptz` for version 1 UUIDs and, starting with PostgreSQL 18, version 7 UUIDs. For other versions it returns `NULL`.
+
+```sql
+SET TIME ZONE 'UTC';
+
+SELECT uuid_extract_version(gen_random_uuid())                        AS v4,
+       uuid_extract_version('01a0b8bc-482b-7d19-86b6-fff1ee6ea009')   AS v7,
+       uuid_extract_timestamp('01a0b8bc-482b-7d19-86b6-fff1ee6ea009') AS created;
+```
+
+```text
+ v4 | v7 |          created
+----+----+----------------------------
+  4 |  7 | 2026-09-19 08:15:42.123+00
+```
+
+This is handy for debugging ("when was this row created?") even if the table has no `created_at` column, and for sanity checks during a migration, for example confirming that every value in a column is really version 7:
+
+```sql
+SELECT uuid_extract_version(id) AS version, count(*)
+FROM events
+GROUP BY 1;
+```
+
+Remember the flip side: anyone who sees a v7 UUID can derive when it was generated. If that is sensitive, for example with password reset tokens or IDs that reveal signup dates, use a random v4 value instead.
+
+## Indexing and sorting UUID columns
+
+### B-tree and hash indexes
+
+A `PRIMARY KEY` or `UNIQUE` constraint on a `uuid` column creates a B-tree index automatically. Additional indexes work as usual:
+
+```sql
+CREATE INDEX events_kind_id_idx ON events (kind, id);
+```
+
+The `uuid` type also supports hash indexes, which only help equality lookups and cannot enforce uniqueness. For almost all workloads the B-tree is the right choice because it supports equality, range scans, ordering and constraints.
+
+### How ORDER BY works on uuid
+
+UUIDs sort by comparing their 16 bytes from left to right. For random v4 values that order is meaningless; it is stable, but it has nothing to do with insertion time. For v7 values, the leading bytes are the timestamp, so `ORDER BY id` returns rows in approximately creation order, with ties within the same millisecond broken by the remaining bits:
+
+```sql
+SELECT id, uuid_extract_timestamp(id) AS created
+FROM events
+ORDER BY id DESC
+LIMIT 20;
+```
+
+That makes v7 keys work well for keyset pagination, where you fetch the next page with a `WHERE id < last_seen_id` condition instead of a large `OFFSET`:
+
+```sql
+SELECT id, kind
+FROM events
+WHERE id < '01a0b8bc-482c-763f-b892-ba5e37f4cabc'
+ORDER BY id DESC
+LIMIT 50;
+```
+
+With v4 keys, keyset pagination still works mechanically, but the pages are in random order, so you would paginate on `(created_at, id)` instead.
+
+### Range queries by time on v7 keys
+
+Because v7 values are ordered by time, you can turn a timestamp into the smallest possible v7-shaped UUID for that millisecond and use it as a boundary. A condition like `WHERE uuid_extract_timestamp(id) >= ...` would work, but it cannot use the plain index on `id`. Comparing `id` against boundary values can:
+
+```sql
+CREATE FUNCTION uuid7_lower_bound(ts timestamptz)
+RETURNS uuid
+LANGUAGE sql STABLE
+AS $$
+    SELECT (lpad(to_hex((extract(epoch FROM ts) * 1000)::bigint), 12, '0')
+            || '00000000000000000000')::uuid
+$$;
+
+SELECT count(*)
+FROM events
+WHERE id >= uuid7_lower_bound('2026-09-01 00:00+00')
+  AND id <  uuid7_lower_bound('2026-09-02 00:00+00');
+```
+
+The function builds 12 hex digits of milliseconds since the epoch and pads the remaining 20 digits with zeros; the cast accepts the 32-digit form without hyphens. Every v7 UUID generated at or after the given millisecond sorts at or above that boundary, so the query becomes a simple range scan on the primary key. Run `EXPLAIN` to confirm you get an index scan on `events_pkey`. This trick is only valid for v7 values; mixing v4 and v7 keys in one column would make such ranges meaningless.
+
+When you are exploring UUID-keyed tables, a client that shows execution plans and lets you edit rows without hand-typing 36-character literals saves time; [Chat2DB](https://chat2db.ai/download) can generate these queries from a plain-language prompt and run `EXPLAIN` on them against your PostgreSQL connection.
+
+## Common mistakes
+
+- **Storing UUIDs as `varchar(36)`.** Over twice the size, slower comparisons, and no validation. Use the `uuid` type.
+- **Forgetting the quotes around the extension name.** `CREATE EXTENSION uuid-ossp;` is a syntax error because of the hyphen; write `"uuid-ossp"`.
+- **Generating v4 keys for huge, insert-heavy tables.** Index bloat and WAL growth follow. Use v7 on PostgreSQL 18, or generate v7 in the application on older releases.
+- **Comparing `uuid` with `text` parameters.** Cast the text side so the index on the uuid column remains usable.
+- **Assuming v7 values are strictly ordered across sessions.** Monotonicity is guaranteed within one session; values generated at the same millisecond by different sessions or different application servers are ordered by their random bits, not by the exact moment of creation.
+
+## FAQ
+
+### How do I generate a UUID in PostgreSQL?
+
+On PostgreSQL 13 or later run `SELECT gen_random_uuid();`, no extension needed. On PostgreSQL 18 you can also use `uuidv4()` or the time-ordered `uuidv7()`. On older versions enable `pgcrypto` or `uuid-ossp` first.
+
+### Do I still need the uuid-ossp extension?
+
+Only if you need deterministic v3 or v5 UUIDs, version 1 UUIDs, or you have existing column defaults that call `uuid_generate_v4()`. For random UUIDs the built-in `gen_random_uuid()` is the recommended option.
+
+### What is the difference between uuid and text for storing UUIDs?
+
+The `uuid` type uses 16 bytes, validates input, and compares values as raw bytes. A text column uses about 37 bytes per value in a row, accepts any string, and compares with collation rules. Indexes on `uuid` are smaller and faster.
+
+### Is UUIDv7 better than UUIDv4 for a primary key?
+
+For index performance, yes: v7 values are time-ordered, so inserts append to the end of the B-tree instead of scattering across it. Choose v4 when the ID must not reveal its creation time.
+
+### How do I fix "invalid input syntax for type uuid"?
+
+Find the offending values with `pg_input_is_valid(value, 'uuid')` on PostgreSQL 16 and later, or with a regular expression on older versions. Convert empty strings to `NULL`, trim whitespace, then cast again.
+
+### Can I get the creation time from a UUID?
+
+Yes, for version 1 and version 7 values. `uuid_extract_timestamp()` returns a `timestamptz`; it handles v1 since PostgreSQL 17 and v7 since PostgreSQL 18. For v4 values it returns `NULL` because they contain no timestamp.
+
+For the full reference, see the PostgreSQL documentation for the [UUID type](https://www.postgresql.org/docs/current/datatype-uuid.html), [UUID functions](https://www.postgresql.org/docs/current/functions-uuid.html) and the [uuid-ossp module](https://www.postgresql.org/docs/current/uuid-ossp.html).

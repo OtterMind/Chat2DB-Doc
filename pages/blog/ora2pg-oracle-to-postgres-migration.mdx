@@ -1,0 +1,522 @@
+---
+title: "Ora2Pg Tutorial: Oracle to PostgreSQL Migration"
+description: "Hands-on ora2pg tutorial for Oracle to PostgreSQL migration: install, ora2pg.conf, cost assessment, schema and data export, PL/SQL fixes and validation."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: September 19, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# Ora2Pg Tutorial: Oracle to PostgreSQL Migration
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="September 19, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+Ora2Pg is the most widely used open source tool for moving an Oracle database to PostgreSQL. It connects to Oracle, reads the data dictionary, and writes PostgreSQL-compatible DDL, converted PL/pgSQL code and data load files, or streams data straight into a running PostgreSQL server. This tutorial walks through a complete Oracle to PostgreSQL migration with ora2pg: installing it with the Oracle client libraries, creating a migration project, configuring `ora2pg.conf`, running the migration assessment report, exporting schema objects and data, fixing the PL/SQL constructs that do not translate cleanly, and validating the result.
+
+## What ora2pg is
+
+Ora2Pg is a free Perl program written and maintained by Gilles Darold and released under the GPL. It uses the Perl DBI layer with the `DBD::Oracle` driver to read an Oracle schema, and optionally `DBD::Pg` to write directly into PostgreSQL. It can also connect to MySQL and MariaDB, but Oracle is its main purpose.
+
+The tool does three jobs:
+
+1. **Assessment.** It inventories every object in a schema and estimates how much manual work the migration will take.
+2. **Schema conversion.** It exports tables, constraints, indexes, sequences, views, materialized views, triggers, functions, procedures, packages, types, partitions, grants and more, converting Oracle types and PL/SQL syntax along the way.
+3. **Data migration.** It extracts rows from Oracle and writes them as `COPY` or `INSERT` statements to files, or loads them directly into PostgreSQL, optionally in parallel.
+
+Everything is driven by one configuration file, `ora2pg.conf`, plus a handful of command-line options. The official documentation lives at [ora2pg.darold.net](https://ora2pg.darold.net/documentation.html) and the source code at [github.com/darold/ora2pg](https://github.com/darold/ora2pg).
+
+## Installing ora2pg
+
+### Prerequisites
+
+You need a Linux (or other Unix-like) host that can reach both databases, with:
+
+- Perl 5.10 or later, plus the `DBI` module.
+- An Oracle client. The Oracle Instant Client is the easiest option: install the **Basic** package, the **SDK** package (headers needed to compile `DBD::Oracle`) and, for convenience, `SQL*Plus` to test connectivity.
+- The `DBD::Oracle` Perl module, compiled against that client.
+- Optionally `DBD::Pg` if you want ora2pg to load data directly into PostgreSQL, and `Compress::Zlib` if you want compressed output files.
+
+### Oracle Instant Client and DBD::Oracle
+
+After installing the Instant Client RPM or ZIP files, point the environment at them. Paths vary by client version; adjust to match your installation:
+
+```bash
+export ORACLE_HOME=/usr/lib/oracle/21/client64
+export LD_LIBRARY_PATH=$ORACLE_HOME/lib
+export PATH=$ORACLE_HOME/bin:$PATH
+
+# Quick connectivity check with SQL*Plus
+sqlplus hr/secret@//oradb.example.com:1521/ORCLPDB1
+```
+
+Then build `DBD::Oracle` from CPAN with the same environment variables set, so that its `Makefile.PL` can find the client libraries and headers:
+
+```bash
+sudo -E perl -MCPAN -e 'install DBI'
+sudo -E perl -MCPAN -e 'install DBD::Oracle'
+
+# Optional, for direct loading into PostgreSQL
+sudo -E perl -MCPAN -e 'install DBD::Pg'
+```
+
+`sudo -E` preserves `ORACLE_HOME` and `LD_LIBRARY_PATH`; without it the build usually fails with a message that it cannot find the Oracle libraries. If you prefer `cpanm`, `cpanm DBD::Oracle` works the same way.
+
+### Installing ora2pg itself
+
+Ora2Pg is packaged by several Linux distributions and is also available from the PostgreSQL community yum repository, but the distribution package may lag behind the latest release. Installing from the source release is straightforward:
+
+```bash
+tar xjf ora2pg-x.y.tar.bz2      # or clone https://github.com/darold/ora2pg
+cd ora2pg-x.y
+perl Makefile.PL
+make && sudo make install
+```
+
+This installs the `ora2pg` script, the Perl modules and a sample configuration file at `/etc/ora2pg/ora2pg.conf.dist`. Confirm the installation:
+
+```bash
+ora2pg --version
+```
+
+If `DBD::Oracle` is not loadable you will find out as soon as ora2pg tries to connect, so the next step is to point it at a real database.
+
+## Creating a migration project
+
+Ora2Pg can generate a project skeleton that keeps configuration, generated DDL, source code and data exports in a predictable layout. This is much easier to manage than a single huge SQL file:
+
+```bash
+ora2pg --project_base /srv/migration --init_project hr_migration
+```
+
+The command creates a directory tree similar to this:
+
+```text
+/srv/migration/hr_migration/
+├── config/
+│   └── ora2pg.conf
+├── data/
+├── export_schema.sh
+├── import_all.sh
+├── reports/
+├── schema/
+│   ├── functions/
+│   ├── packages/
+│   ├── procedures/
+│   ├── sequences/
+│   ├── tables/
+│   ├── triggers/
+│   ├── types/
+│   └── views/
+└── sources/
+```
+
+`schema/` receives the converted PostgreSQL code, `sources/` receives the original Oracle code for comparison, `data/` is for data files, and `reports/` is for assessment output. The two generated shell scripts automate the export and the import; both are covered below.
+
+## Configuring ora2pg.conf
+
+Open `config/ora2pg.conf`. It is long and heavily commented, but a first migration only needs a handful of directives.
+
+### Connection settings
+
+```text
+ORACLE_HOME     /usr/lib/oracle/21/client64
+ORACLE_DSN      dbi:Oracle:host=oradb.example.com;sid=ORCL;port=1521
+ORACLE_USER     system
+ORACLE_PWD      secret
+```
+
+`ORACLE_DSN` uses DBD::Oracle's DSN syntax. For a pluggable database you usually connect with a service name instead of a SID: `dbi:Oracle:host=oradb.example.com;service_name=ORCLPDB1;port=1521`. The Oracle user needs to be able to read the data dictionary for the schema being exported. A DBA account is simplest; if you must use the schema owner itself, set `USER_GRANTS 1` so ora2pg queries the `ALL_*` views instead of the `DBA_*` views, at the cost of some features such as exporting grants.
+
+### Schema selection
+
+```text
+SCHEMA          HR
+EXPORT_SCHEMA   1
+PG_SCHEMA       hr
+```
+
+`SCHEMA` is the Oracle schema to export. Oracle stores unquoted names in upper case, so write it in upper case. `EXPORT_SCHEMA 1` makes ora2pg create the schema in PostgreSQL and set the `search_path`, instead of putting everything into `public`. `PG_SCHEMA` lets you choose a different target schema name.
+
+By default ora2pg lowercases identifiers, which is what you want in PostgreSQL because unquoted identifiers are folded to lower case. Leave `PRESERVE_CASE` at `0` unless you have a strong reason; setting it to `1` produces quoted mixed-case identifiers that every query will then have to quote as well.
+
+### Target version and export type
+
+```text
+PG_VERSION      16
+TYPE            TABLE
+OUTPUT_DIR      /srv/migration/hr_migration/schema/tables
+OUTPUT          table.sql
+```
+
+`PG_VERSION` tells ora2pg which PostgreSQL features it may use, for example native partitioning, identity columns or `CREATE PROCEDURE` (available since PostgreSQL 11). Set it to the major version you are migrating to. `TYPE` selects what is exported; you will usually override it on the command line with `-t` rather than editing the file for each object type.
+
+### Type mapping directives
+
+```text
+PG_NUMERIC_TYPE   0
+PG_INTEGER_TYPE   1
+DEFAULT_NUMERIC   bigint
+DATA_TYPE         VARCHAR2:varchar,NVARCHAR2:varchar,DATE:timestamp(0),LONG:text,LONG RAW:bytea,CLOB:text,NCLOB:text,BLOB:bytea,RAW:bytea
+MODIFY_TYPE       EMPLOYEES:SALARY:numeric(10,2),ORDERS:STATUS:varchar(20)
+```
+
+`DATA_TYPE` overrides ora2pg's default mapping for Oracle types, as a comma-separated list of `ORACLE_TYPE:pg_type` pairs. `MODIFY_TYPE` overrides the type of specific columns using `TABLE:COLUMN:type`. `PG_INTEGER_TYPE` converts `NUMBER(p)` with no scale into `smallint`, `integer` or `bigint` depending on precision, and `DEFAULT_NUMERIC` sets what a bare `NUMBER` becomes. `PG_NUMERIC_TYPE` controls whether `NUMBER(p,s)` becomes a floating-point type or stays exact; for money and anything else where rounding matters, set it to `0` so the column is exported as `numeric(p,s)`.
+
+### Data export settings
+
+```text
+PG_DSN            dbi:Pg:dbname=hr;host=pg.example.com;port=5432
+PG_USER           hr_owner
+PG_PWD            secret
+DATA_LIMIT        10000
+NLS_LANG          AMERICAN_AMERICA.AL32UTF8
+CLIENT_ENCODING   UTF8
+```
+
+`PG_DSN`, `PG_USER` and `PG_PWD` are needed only for direct loading and for the `TEST` actions. `DATA_LIMIT` is the number of rows fetched and written per batch. `NLS_LANG` and `CLIENT_ENCODING` keep character data intact; mismatches here are the most common cause of garbled accented characters after migration.
+
+### Test the connection
+
+Before anything else, ask ora2pg for the Oracle version. It is the cheapest action that proves the whole chain (Perl, DBD::Oracle, Instant Client, network, credentials) works:
+
+```bash
+cd /srv/migration/hr_migration
+ora2pg -t SHOW_VERSION -c config/ora2pg.conf
+```
+
+Other quick inventory actions are `SHOW_SCHEMA` (list schemas), `SHOW_TABLE` (list tables with row counts from statistics), `SHOW_COLUMN` (columns and their proposed PostgreSQL types) and `SHOW_ENCODING` (the Oracle and client character sets).
+
+## Assessing the migration with SHOW_REPORT
+
+Before exporting anything, run the migration assessment. It counts every object type, flags constructs that need manual work, and with `--estimate_cost` assigns a cost to each object:
+
+```bash
+ora2pg -t SHOW_REPORT --estimate_cost -c config/ora2pg.conf > reports/report.txt
+
+# Same report as HTML, easier to share with the team
+ora2pg -t SHOW_REPORT --estimate_cost --dump_as_html -c config/ora2pg.conf > reports/report.html
+```
+
+The report lists, per object type, how many objects exist, how many are invalid in Oracle, and comments such as which constructs will need rewriting. The cost is expressed in cost units, and each unit represents a fixed amount of work for a PostgreSQL expert, five minutes by default. Change that assumption with `--cost_unit_value` (or the `COST_UNIT_VALUE` directive) if your team is less familiar with PostgreSQL.
+
+The summary line gives a migration level such as `B-5`:
+
+- The letter is the migration level: **A** means the migration can mostly be run automatically, **B** means code rewriting is needed with an estimated effort of up to five person-days, and **C** means code rewriting beyond five person-days.
+- The number is the technical difficulty from **1** (trivial: no stored code or triggers) to **5** (difficult: stored functions or triggers that require manual rewriting).
+
+Treat the estimate as a planning aid rather than a quote: it counts patterns, it does not understand business logic. The most valuable part of the report is often the per-object detail showing which packages and procedures contain the heaviest Oracle-specific code.
+
+## Exporting the schema
+
+### Using export_schema.sh
+
+The generated `export_schema.sh` runs ora2pg once per object type with the right output directory, and also exports the original Oracle source into `sources/`. For most projects it is the simplest way to produce the full schema:
+
+```bash
+./export_schema.sh
+```
+
+Read the script before running it; it is plain shell and easy to adapt, for example to remove object types you do not need.
+
+### Exporting object types individually
+
+You can also run each type by hand, which is useful while iterating on configuration:
+
+```bash
+ora2pg -t TABLE     -o table.sql     -b schema/tables     -c config/ora2pg.conf
+ora2pg -t SEQUENCE  -o sequence.sql  -b schema/sequences  -c config/ora2pg.conf
+ora2pg -t VIEW      -o view.sql      -b schema/views      -c config/ora2pg.conf
+ora2pg -t TRIGGER   -o trigger.sql   -b schema/triggers   -c config/ora2pg.conf
+ora2pg -t FUNCTION  -o function.sql  -b schema/functions  -c config/ora2pg.conf
+ora2pg -t PROCEDURE -o procedure.sql -b schema/procedures -c config/ora2pg.conf
+ora2pg -t PACKAGE   -o package.sql   -b schema/packages   -c config/ora2pg.conf
+ora2pg -t TYPE      -o type.sql      -b schema/types      -c config/ora2pg.conf
+```
+
+`-t` sets the export type, `-o` the output file name and `-b` the output directory. Other types you may need include `GRANT`, `PARTITION`, `MVIEW`, `SYNONYM`, `DBLINK` and `TABLESPACE`.
+
+To restrict an export to certain objects, use `-a` (allow) or `-e` (exclude) with a comma-separated list; the same filters exist in the config file as `ALLOW` and `EXCLUDE`:
+
+```bash
+ora2pg -t TABLE -a 'EMPLOYEES,DEPARTMENTS' -o table.sql -b schema/tables -c config/ora2pg.conf
+```
+
+### What the TABLE export produces
+
+A table such as this Oracle definition:
+
+```sql
+CREATE TABLE HR.EMPLOYEES (
+    EMPLOYEE_ID  NUMBER(6)      NOT NULL,
+    FIRST_NAME   VARCHAR2(20),
+    LAST_NAME    VARCHAR2(25)   NOT NULL,
+    HIRE_DATE    DATE           NOT NULL,
+    SALARY       NUMBER(8,2),
+    RESUME       CLOB,
+    PHOTO        BLOB,
+    CONSTRAINT EMP_EMP_ID_PK PRIMARY KEY (EMPLOYEE_ID)
+);
+```
+
+comes out roughly like this, with `PG_NUMERIC_TYPE 0`:
+
+```sql
+CREATE TABLE employees (
+    employee_id integer NOT NULL,
+    first_name  varchar(20),
+    last_name   varchar(25) NOT NULL,
+    hire_date   timestamp(0) NOT NULL,
+    salary      numeric(8,2),
+    resume      text,
+    photo       bytea
+);
+ALTER TABLE employees ADD PRIMARY KEY (employee_id);
+```
+
+With the `FILE_PER_INDEX`, `FILE_PER_CONSTRAINT` and `FILE_PER_FKEYS` directives set to `1`, indexes, constraints and foreign keys are written to separate files, so you can create them after the data load, which is much faster than loading into indexed tables.
+
+### How packages are converted
+
+PostgreSQL has no packages. Ora2Pg exports each package as a schema named after the package, and each package function or procedure as a routine inside that schema, so a call to `payroll.calc_bonus(...)` keeps the same shape. Package-level variables and initialization blocks have no direct equivalent and are flagged in the assessment report; they usually need a manual redesign, for example using a session-scoped setting via `set_config()` and `current_setting()`, or a temporary table.
+
+## Common Oracle to PostgreSQL type mappings
+
+| Oracle | PostgreSQL (typical) | Notes |
+| --- | --- | --- |
+| `NUMBER(p)` with p up to 4 | `smallint` | With `PG_INTEGER_TYPE 1` |
+| `NUMBER(p)` with p from 5 to 9 | `integer` | With `PG_INTEGER_TYPE 1` |
+| `NUMBER(p)` with p from 10 to 18 | `bigint` | With `PG_INTEGER_TYPE 1` |
+| `NUMBER(p,s)` | `numeric(p,s)` | With `PG_NUMERIC_TYPE 0`; keep exact for money |
+| `NUMBER` | `DEFAULT_NUMERIC` value | `bigint` unless changed; use `numeric` if values have decimals |
+| `VARCHAR2(n)`, `NVARCHAR2(n)` | `varchar(n)` | Oracle `n` may be bytes, PostgreSQL counts characters |
+| `CHAR(n)` | `char(n)` | |
+| `DATE` | `timestamp(0)` | Oracle `DATE` includes a time of day |
+| `TIMESTAMP` | `timestamp` | |
+| `TIMESTAMP WITH TIME ZONE` | `timestamptz` | |
+| `CLOB`, `NCLOB`, `LONG` | `text` | |
+| `BLOB`, `RAW`, `LONG RAW` | `bytea` | Some versions map `RAW(16)` to `uuid`; check `SHOW_COLUMN` |
+| `BINARY_DOUBLE` | `double precision` | |
+| `XMLTYPE` | `xml` | |
+
+The two mappings that cause the most trouble later are `DATE` and bare `NUMBER`. Mapping Oracle `DATE` to PostgreSQL `date` silently drops the time portion, so keep the `timestamp` mapping unless you have verified that every value is at midnight. A bare `NUMBER` column can contain decimals; if it does and it is mapped to `bigint`, the data load will fail or round values, so check such columns with `SHOW_COLUMN` and override them with `MODIFY_TYPE`.
+
+## Exporting and loading data
+
+### Writing data files with COPY or INSERT
+
+With `PG_DSN` unset, ora2pg writes the data to files:
+
+```bash
+ora2pg -t COPY   -o data.sql -b data -c config/ora2pg.conf
+ora2pg -t INSERT -o data.sql -b data -c config/ora2pg.conf
+```
+
+`COPY` produces PostgreSQL `COPY ... FROM STDIN` blocks and is much faster to load than `INSERT`. Use `INSERT` only when the target cannot process `COPY`, for example some managed services where you load through a restricted client.
+
+### Loading directly into PostgreSQL
+
+When `PG_DSN`, `PG_USER` and `PG_PWD` are set, the `COPY` and `INSERT` actions send rows straight to PostgreSQL instead of writing files. Create the tables first, then load:
+
+```bash
+psql -h pg.example.com -U hr_owner -d hr -f schema/tables/table.sql
+ora2pg -t COPY -c config/ora2pg.conf -j 4 -J 2 -P 2
+```
+
+- `-j` sets the number of parallel processes used to write data to PostgreSQL.
+- `-J` sets the number of parallel connections used to extract data from a single table in Oracle; it needs a numeric column to split on, which ora2pg takes from the primary key or which you define in the config.
+- `-P` sets how many tables are exported in parallel.
+
+Start with small values and increase them while watching CPU on both servers and the network. Useful companion directives are `TRUNCATE_TABLE 1` (empty the target tables before loading, handy for re-runs), `DROP_FKEY 1` (drop and recreate foreign keys around the load) and `DISABLE_TRIGGERS 1` (avoid firing triggers during the load). Large `LOB` columns may need `LONGREADLEN` raised and a smaller `DATA_LIMIT` to keep memory use under control.
+
+### Using import_all.sh
+
+The generated `import_all.sh` creates the owner and database if needed, imports the schema files in a sensible order, loads data, and creates indexes and constraints after the data. A typical invocation looks like this:
+
+```bash
+./import_all.sh -d hr -o hr_owner -h pg.example.com -U postgres
+```
+
+Here `-d` is the target database, `-o` the owner of the objects, `-h` the host and `-U` the connecting superuser. The script asks for confirmation before each step, which makes it convenient for a first dry run. Check the usage text at the top of the script for the other options available in your version.
+
+## PL/SQL to PL/pgSQL gotchas
+
+Ora2Pg rewrites a large share of PL/SQL syntax automatically, but some differences are semantic rather than syntactic and always deserve a manual review. You can convert a single piece of PL/SQL without connecting to Oracle by passing it as an input file:
+
+```bash
+ora2pg -i sources/procedures/raise_salary.sql -t PROCEDURE -c config/ora2pg.conf
+```
+
+### NVL and NVL2
+
+`NVL(a, b)` becomes `COALESCE(a, b)`. Unlike `NVL`, `COALESCE` requires both arguments to have compatible types, so `NVL(numeric_col, '0')` style mixing may need an explicit cast. `NVL2(x, a, b)` becomes a `CASE WHEN x IS NOT NULL THEN a ELSE b END`.
+
+```sql
+-- Oracle
+SELECT NVL(commission_pct, 0) FROM employees;
+-- PostgreSQL
+SELECT COALESCE(commission_pct, 0) FROM employees;
+```
+
+### SYSDATE and SYSTIMESTAMP
+
+PostgreSQL has no `SYSDATE`. The closest replacements are `LOCALTIMESTAMP` (current date and time without time zone, matching an Oracle `DATE` column mapped to `timestamp`) and `now()` or `current_timestamp` (with time zone). Note that in PostgreSQL these return the start time of the current transaction, not the moment of the call; use `clock_timestamp()` if a long-running procedure needs the actual wall-clock time at each call.
+
+```sql
+-- Oracle
+UPDATE orders SET shipped_at = SYSDATE WHERE order_id = 42;
+-- PostgreSQL
+UPDATE orders SET shipped_at = LOCALTIMESTAMP WHERE order_id = 42;
+```
+
+Date arithmetic also differs. In Oracle `SYSDATE + 1` adds a day; in PostgreSQL add an interval, as in `LOCALTIMESTAMP + interval '1 day'`.
+
+### DECODE
+
+`DECODE` becomes a `CASE` expression. One subtle difference: `DECODE` treats two `NULL` values as equal, while a simple `CASE x WHEN NULL` never matches. If the original code decodes `NULL`, use `IS NULL` explicitly:
+
+```sql
+-- Oracle
+SELECT DECODE(status, 'A', 'Active', 'I', 'Inactive', NULL, 'Unknown', 'Other') FROM accounts;
+-- PostgreSQL
+SELECT CASE
+         WHEN status = 'A' THEN 'Active'
+         WHEN status = 'I' THEN 'Inactive'
+         WHEN status IS NULL THEN 'Unknown'
+         ELSE 'Other'
+       END
+FROM accounts;
+```
+
+### ROWNUM
+
+Simple `ROWNUM` limits map to `LIMIT`. Be careful with the classic Oracle pitfall, where `ROWNUM` is applied before `ORDER BY` in the same query block; PostgreSQL's `LIMIT` is applied after sorting, which is usually what the original author intended but can change results:
+
+```sql
+-- Oracle, top 10 earners (needs the subquery because of ROWNUM semantics)
+SELECT * FROM (SELECT * FROM employees ORDER BY salary DESC) WHERE ROWNUM <= 10;
+-- PostgreSQL
+SELECT * FROM employees ORDER BY salary DESC LIMIT 10;
+```
+
+When `ROWNUM` is used as a row number in the select list, replace it with `row_number() OVER ()` or a window function with an explicit `ORDER BY`.
+
+### Oracle (+) outer joins
+
+The old Oracle outer join syntax has to become ANSI `LEFT JOIN` or `RIGHT JOIN`. Recent ora2pg versions attempt this rewrite, but complex queries with several `(+)` markers, or with `(+)` in filter conditions, should be checked by hand because moving a filter from `ON` to `WHERE` changes the result:
+
+```sql
+-- Oracle
+SELECT e.last_name, d.department_name
+FROM employees e, departments d
+WHERE e.department_id = d.department_id(+)
+  AND d.location_id(+) = 1700;
+
+-- PostgreSQL
+SELECT e.last_name, d.department_name
+FROM employees e
+LEFT JOIN departments d
+       ON e.department_id = d.department_id
+      AND d.location_id = 1700;
+```
+
+### Empty string is NULL in Oracle, not in PostgreSQL
+
+This is the most dangerous difference because nothing fails; results just change. In Oracle `''` is `NULL`, so `WHERE middle_name IS NULL` finds rows where an empty string was inserted. In PostgreSQL an empty string is a real value. After migration, code that inserts `''` and later tests `IS NULL` quietly stops matching, and `'abc' || NULL` returns `NULL` in PostgreSQL where Oracle returned `'abc'`.
+
+Mitigations:
+
+- Clean the data during or after the load, for example `UPDATE employees SET middle_name = NULL WHERE middle_name = '';`.
+- Use `concat()` or `concat_ws()` instead of `||` where operands may be `NULL`, since those functions ignore `NULL` arguments.
+- Consider ora2pg's `NULL_EQUAL_EMPTY` directive, which makes the converted code use `coalesce()` in `NULL` tests to mimic Oracle behavior. It helps with a straight port, but it makes the code harder to read and to index, so many teams prefer to fix the data and the application once.
+
+### Sequences, dual and other small differences
+
+- `emp_seq.NEXTVAL` becomes `nextval('emp_seq')`; ora2pg handles this automatically.
+- `SELECT sysdate FROM dual` style queries: PostgreSQL allows a `SELECT` without any `FROM` clause, so simply drop `FROM dual`.
+- `SUBSTR` exists in PostgreSQL, but Oracle's negative start positions (counting from the end) do not behave the same way; use `right()` instead.
+- `TO_DATE('2026-09-19', 'YYYY-MM-DD')` exists in PostgreSQL but returns a `date`; use `to_timestamp()` when you need the time part.
+- Autonomous transactions (`PRAGMA AUTONOMOUS_TRANSACTION`) have no native equivalent and usually need `dblink` or a design change.
+- Exceptions: `WHEN NO_DATA_FOUND` exists in PL/pgSQL, but a `SELECT INTO` only raises it when you write `SELECT INTO STRICT`. Ora2Pg adds `STRICT` in many cases; verify it where the exception handler matters.
+
+## Validating the migration
+
+### Comparing objects and row counts with ora2pg
+
+Once `PG_DSN` is configured, ora2pg can compare Oracle and PostgreSQL for you:
+
+```bash
+# Compare object counts: tables, indexes, constraints, sequences, triggers, functions...
+ora2pg -t TEST -c config/ora2pg.conf > reports/test.txt
+
+# Compare actual row counts table by table
+ora2pg -t TEST_COUNT -c config/ora2pg.conf > reports/test_count.txt
+
+# Compare the number of rows returned by each view
+ora2pg -t TEST_VIEW -c config/ora2pg.conf > reports/test_view.txt
+```
+
+Adding `--count_rows` to `TEST` makes it perform real `count(*)` queries instead of relying on Oracle statistics, which may be stale. Any line marked as a difference in these reports is a lead to investigate, typically a failed batch in the data load, an object that did not compile in PostgreSQL, or a table filtered out by `ALLOW` or `EXCLUDE`.
+
+### Checking sequences and data by hand
+
+After a data load, sequences must be moved past the highest existing key, otherwise the first insert fails with a duplicate key error. Ora2Pg's `SEQUENCE_VALUES` export type produces the `setval()` statements for you; you can also fix a sequence manually:
+
+```sql
+SELECT setval('hr.employees_seq', (SELECT max(employee_id) FROM hr.employees));
+```
+
+Row counts do not prove the content is identical. Spot-check aggregates that are sensitive to type conversion problems on both sides:
+
+```sql
+-- Run the equivalent query on Oracle and on PostgreSQL and compare
+SELECT count(*), sum(salary), min(hire_date), max(hire_date),
+       count(DISTINCT department_id)
+FROM hr.employees;
+```
+
+Differences in `sum()` point at precision loss from `NUMBER` mappings; differences in `min()` or `max()` of dates point at time-zone or `DATE` mapping issues. Also check character data with accented characters to confirm the encoding settings were right. Having both connections open side by side in one client makes these comparisons faster; [Chat2DB](https://chat2db.ai/download) supports Oracle and PostgreSQL connections in the same workspace, so you can run the same check query against both and compare the result grids.
+
+### Testing the application
+
+Finally, run the application's test suite against PostgreSQL, and replay a sample of real production queries. Pay special attention to reports and batch jobs that rely on empty strings, `ROWNUM` ordering, implicit type conversions (Oracle compares a `VARCHAR2` to a number silently; PostgreSQL raises an error), and transaction behavior: in PostgreSQL an error inside a transaction aborts the whole transaction until rollback, while Oracle rolls back only the failed statement.
+
+## A practical migration checklist
+
+1. Install Instant Client, `DBD::Oracle` and ora2pg; confirm with `SHOW_VERSION`.
+2. Create a project with `--init_project` and set connection, schema and `PG_VERSION`.
+3. Run `SHOW_REPORT --estimate_cost` and review the objects flagged for manual work.
+4. Review `SHOW_COLUMN` output and fix mappings with `DATA_TYPE` and `MODIFY_TYPE`.
+5. Export the schema with `export_schema.sh`, create tables in a test PostgreSQL database.
+6. Load data with `COPY`, directly or from files; then create indexes and constraints.
+7. Rewrite the procedural code the report flagged; test each function individually.
+8. Validate with `TEST`, `TEST_COUNT`, `TEST_VIEW` and aggregate spot checks; reset sequences.
+9. Repeat the whole run on a fresh copy until it is predictable, then schedule the cutover.
+
+## FAQ
+
+### What is ora2pg used for?
+
+Ora2Pg converts an Oracle database to PostgreSQL. It assesses the migration effort, exports schema objects as PostgreSQL DDL, converts PL/SQL to PL/pgSQL, and moves data using `COPY` or `INSERT`, either to files or directly into a PostgreSQL server.
+
+### Does ora2pg need an Oracle client installed?
+
+Yes. It connects through the `DBD::Oracle` Perl driver, which must be compiled against Oracle client libraries. The Oracle Instant Client Basic and SDK packages are enough.
+
+### Can ora2pg convert packages and stored procedures automatically?
+
+It converts a large portion of PL/SQL syntax automatically and turns packages into schemas containing the package routines. Package variables, autonomous transactions, dynamic SQL and some built-in packages still require manual work, which the `SHOW_REPORT` assessment points out.
+
+### How long does an Oracle to PostgreSQL migration with ora2pg take?
+
+It depends mostly on the amount of stored code. Run `ora2pg -t SHOW_REPORT --estimate_cost` for an estimate in person-days and a migration level such as `A-2` or `C-5`; data volume mainly affects the load window, not the conversion effort.
+
+### How do I check that all data was migrated?
+
+Use `ora2pg -t TEST_COUNT` to compare row counts per table, `ora2pg -t TEST` to compare object counts, and run aggregate queries such as sums and min/max dates on both databases to catch conversion problems that row counts alone would miss.
+
+### Is ora2pg free for commercial use?
+
+Ora2Pg is open source under the GPL, so you can use it to migrate commercial databases without licensing fees. Review the license terms if you plan to redistribute a modified version.
