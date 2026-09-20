@@ -1,0 +1,197 @@
+---
+title: "AWS RDS Pricing Explained: Every Cost Dimension"
+description: "Understand AWS RDS pricing: instance hours, storage and IOPS, Multi-AZ, backups, data transfer, licensing and the Aurora model — plus how to cut each line item."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: September 20, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# AWS RDS Pricing Explained: Every Cost Dimension
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="September 20, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+An RDS bill that surprises you is almost never surprising because of the instance. It is surprising because of the five other things you are being charged for and had not thought about: provisioned IOPS, a Multi-AZ standby that silently doubles compute, backup storage beyond the free allowance, cross-AZ data transfer, and — on commercial engines — licensing folded into the hourly rate.
+
+This article walks through every dimension of AWS RDS pricing, explains how Aurora differs, and gives a concrete lever for reducing each line. It deliberately quotes no dollar figures: AWS changes rates, they differ by Region, and a stale number is worse than no number. Use the [AWS Pricing Calculator](https://calculator.aws/) and the RDS pricing page for the arithmetic; use this article to know what to put into them.
+
+## The six dimensions
+
+Every RDS bill is some combination of:
+
+1. **Instance hours** — compute, by instance class and engine.
+2. **Storage** — provisioned GB, by storage type.
+3. **Provisioned IOPS and throughput** — only on io1/io2 and, above a threshold, gp3.
+4. **Backup and snapshot storage** — beyond the free allowance.
+5. **Data transfer** — cross-AZ, cross-Region and internet egress.
+6. **Extras** — Multi-AZ, read replicas, Performance Insights retention, Extended Support, licensing.
+
+Most cost-reduction work is identifying which of these dominates *your* bill. Cost Explorer grouped by usage type tells you in about two minutes, and it is worth doing before you optimise anything:
+
+```bash
+aws ce get-cost-and-usage \
+  --time-period Start=2026-08-01,End=2026-09-01 \
+  --granularity MONTHLY \
+  --metrics UnblendedCost \
+  --group-by Type=DIMENSION,Key=USAGE_TYPE \
+  --filter '{"Dimensions":{"Key":"SERVICE","Values":["Amazon Relational Database Service"]}}'
+```
+
+## 1. Instance hours
+
+You pay per second (with a 10-minute minimum) for a running instance, at a rate set by instance class and engine. A `db.r6g.xlarge` costs the same whether it is at 5% CPU or 95%.
+
+Three levers here, in order of effect.
+
+**Right-size using real metrics, not the size you picked a year ago.** The signal is CPU utilisation and, more importantly, freeable memory:
+
+```bash
+aws cloudwatch get-metric-statistics \
+  --namespace AWS/RDS --metric-name CPUUtilization \
+  --dimensions Name=DBInstanceIdentifier,Value=prod-postgres \
+  --start-time 2026-08-20T00:00:00Z --end-time 2026-09-20T00:00:00Z \
+  --period 3600 --statistics Average Maximum
+```
+
+An instance whose maximum CPU over a month is under 40% is oversized. Be more careful with memory: dropping to a class with less RAM shrinks `shared_buffers` and can turn a cached workload into an I/O-bound one, moving cost from the compute line to the IOPS line rather than removing it.
+
+**Use Graviton.** ARM-based instance classes (r6g, r7g, m6g, m7g) are consistently cheaper per hour than their x86 equivalents and generally perform at least as well for PostgreSQL and MySQL. Switching is a modify operation with a reboot, available through a blue/green deployment for minimal downtime. For most workloads this is the single highest-return change on the list.
+
+**Commit to Reserved Instances for the steady baseline.** One- or three-year commitments, with the larger discount for three years and for all-upfront payment. The practical approach is to reserve your genuine floor — the capacity you will run regardless — and leave headroom on demand. Note that RDS Reserved Instances are not Savings Plans: they are tied to instance family, Region and engine, so they are less flexible than the EC2 equivalent and need more thought before purchase.
+
+**Turn off what is not running.** Non-production instances can be stopped, and a stopped RDS instance incurs no instance hours (storage and backups still bill). RDS auto-restarts stopped instances after seven days, so schedule the stop/start rather than doing it once:
+
+```bash
+aws rds stop-db-instance --db-instance-identifier dev-postgres
+aws rds start-db-instance --db-instance-identifier dev-postgres
+```
+
+A scheduled stop overnight and at weekends removes roughly two-thirds of non-production compute cost.
+
+## 2. Storage
+
+You pay for provisioned storage, not used storage. An instance with 1 TB allocated and 200 GB in use bills for 1 TB.
+
+The storage types:
+
+- **gp3** — general purpose SSD, the sensible default. Includes a baseline of IOPS and throughput; you pay extra only if you provision beyond it.
+- **gp2** — the older generation, where IOPS scale with allocated size. This is why people used to over-allocate storage to buy IOPS. On gp3 that is unnecessary, and migrating gp2 to gp3 is usually a straight saving.
+- **io1 / io2 Block Express** — provisioned IOPS, priced separately per IOPS. Only worth it for sustained, latency-sensitive high-I/O workloads.
+- **Magnetic** — legacy, ignore.
+
+Two things to know. **Storage autoscaling** raises your allocation automatically when free space runs low, which prevents outages — and you cannot shrink it again. RDS does not support reducing allocated storage; the only route back is a dump and restore into a new, smaller instance. Set a sensible `MaxAllocatedStorage` ceiling so autoscaling cannot quietly triple your storage line:
+
+```bash
+aws rds modify-db-instance \
+  --db-instance-identifier prod-postgres \
+  --max-allocated-storage 2000 \
+  --apply-immediately
+```
+
+And **reclaim space inside the database** before concluding you need more. Bloat from dead tuples is frequently the real cause of growth:
+
+```sql
+-- PostgreSQL: biggest tables and their bloat-prone dead tuple counts
+SELECT relname,
+       pg_size_pretty(pg_total_relation_size(relid)) AS total_size,
+       n_live_tup,
+       n_dead_tup,
+       round(100.0 * n_dead_tup / nullif(n_live_tup + n_dead_tup, 0), 1) AS dead_pct,
+       last_autovacuum
+FROM   pg_stat_user_tables
+ORDER  BY pg_total_relation_size(relid) DESC
+LIMIT  20;
+```
+
+A table that is 40% dead tuples is storage you are paying for and not using. Investigating this kind of thing across several instances is much faster from a client that keeps multiple connections open at once — [Chat2DB](https://chat2db.ai/download) connects to your RDS PostgreSQL, MySQL and SQL Server instances side by side, so you can run the same size-and-bloat audit across a fleet without reconnecting each time.
+
+## 3. Provisioned IOPS and throughput
+
+On io1/io2 you pay per provisioned IOPS, separately from storage. On gp3 you pay only for IOPS and throughput above the included baseline.
+
+The mistake to avoid is provisioning IOPS to mask a query problem. Before buying I/O, check whether you are simply missing an index. `ReadIOPS` high with a poor buffer cache hit ratio is a query problem, not a storage problem:
+
+```sql
+-- PostgreSQL cache hit ratio; below ~95% on an OLTP workload warrants investigation
+SELECT round(100.0 * sum(heap_blks_hit) /
+             nullif(sum(heap_blks_hit) + sum(heap_blks_read), 0), 2) AS cache_hit_pct
+FROM   pg_statio_user_tables;
+```
+
+Adding the right index or increasing instance memory is almost always cheaper than provisioning IOPS permanently.
+
+## 4. Backups and snapshots
+
+RDS gives you backup storage equal to your total provisioned database storage at no charge. Beyond that, you pay per GB-month. The usual causes of overrun:
+
+- **A long backup retention window** on a large, frequently-changing database. Retention beyond what your compliance policy requires is pure cost.
+- **Manual snapshots that nobody deletes.** Automated backups expire; manual snapshots live forever until removed. Audit them:
+
+```bash
+aws rds describe-db-snapshots --snapshot-type manual \
+  --query 'DBSnapshots[].{id:DBSnapshotIdentifier,created:SnapshotCreateTime,gb:AllocatedStorage}' \
+  --output table
+```
+
+- **Cross-Region snapshot copies**, which bill both the transfer and the destination storage.
+
+## 5. Data transfer
+
+The line most often forgotten. Data transferred *in* is free. After that:
+
+- **Same-AZ, same-VPC traffic** to your application is free.
+- **Cross-AZ traffic is charged**, and this includes Multi-AZ synchronous replication as well as an application in AZ-a talking to a database in AZ-b. Co-locate your application with the writer where latency and cost matter.
+- **Cross-Region replication** is charged per GB.
+- **Internet egress** is charged. If anything is querying RDS from outside AWS at volume, this can become the largest line on the bill.
+
+## 6. Multi-AZ, replicas and other extras
+
+**Multi-AZ** deployments roughly double instance and storage cost, because you are running a standby. That is the correct spend for production, and the wrong spend for development — check that nobody enabled it on a sandbox. The newer Multi-AZ DB *cluster* option adds two readable standbys and costs accordingly, but gives you read capacity for the money.
+
+**Read replicas** cost a full instance each, plus cross-AZ or cross-Region transfer for the replication stream. They are the right answer for read scaling and the wrong answer for a reporting query that runs twice a day.
+
+**Performance Insights** is free for the default short retention window and charged for long-term retention. Enable it everywhere at the free tier; extend retention only where you actually investigate history.
+
+**Extended Support** is a significant and often unexpected charge: when a major engine version reaches end of standard support, AWS bills you per vCPU-hour to keep running it, and the rate increases in later years. Staying on a supported major version is a cost decision as much as a security one. Check what you are running:
+
+```bash
+aws rds describe-db-instances \
+  --query 'DBInstances[].{id:DBInstanceIdentifier,engine:Engine,version:EngineVersion}' \
+  --output table
+```
+
+**Licensing** applies to commercial engines. SQL Server and Oracle license-included rates vary enormously by edition — Express, Web, Standard, Enterprise — and the edition is frequently the dominant term in the whole bill. This is the strongest financial argument for migrating SQL Server or Oracle workloads to PostgreSQL, where the licence cost is zero.
+
+## How Aurora differs
+
+Aurora prices on a different basis and the comparison is not apples to apples:
+
+- **Storage is billed on what you use**, growing automatically in 10 GB increments, with no provisioning and no over-allocation.
+- **I/O**: Aurora Standard bills per I/O request, which for I/O-heavy workloads can exceed the compute cost. Aurora I/O-Optimized removes per-request I/O charges in exchange for higher compute and storage rates. AWS suggests a rough crossover around the point where I/O is a substantial fraction of your Aurora spend — measure yours rather than guessing.
+- **Aurora Serverless v2** bills per ACU-second, so cost tracks your traffic shape. It is more expensive per unit of steady capacity and cheaper for variable load.
+- **Replicas** share the storage layer, so an Aurora read replica costs compute only, not a second copy of the data. This makes Aurora replicas notably cheaper than RDS replicas.
+
+For a steady-load database with modest I/O, RDS with a Reserved Instance is often cheaper. For variable load, heavy read scaling or demanding availability requirements, Aurora usually wins.
+
+## A review checklist
+
+Run through this quarterly:
+
+- [ ] Any instance below 40% peak CPU over a month — resize.
+- [ ] Any x86 instance class — evaluate Graviton.
+- [ ] Any non-production instance running outside business hours — schedule stop/start.
+- [ ] Any gp2 volume — migrate to gp3.
+- [ ] Storage autoscaling without a `MaxAllocatedStorage` ceiling — set one.
+- [ ] Manual snapshots older than your retention policy — delete.
+- [ ] Multi-AZ enabled on non-production — disable.
+- [ ] Read replicas with near-zero connections — remove.
+- [ ] Engines on a version incurring Extended Support — plan the upgrade.
+- [ ] Steady baseline capacity not covered by Reserved Instances — commit.
+- [ ] Commercial-engine licensing — evaluate migration to PostgreSQL.
+
+## Summary
+
+RDS pricing is six dimensions: instance hours, provisioned storage, provisioned IOPS, backup storage, data transfer, and extras such as Multi-AZ, replicas, Extended Support and licensing. Find which dominates your bill with Cost Explorer grouped by usage type before changing anything. The reliable wins, roughly in order, are Graviton instance classes, right-sizing from real CloudWatch data, stopping non-production instances out of hours, gp2 to gp3, deleting orphaned manual snapshots, and Reserved Instances on your genuine baseline. Aurora prices differently — used storage, per-I/O or I/O-Optimized, cheap replicas — so compare on your own workload rather than on list rates, and always confirm current prices on the AWS pricing page.

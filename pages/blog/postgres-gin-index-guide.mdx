@@ -1,0 +1,244 @@
+---
+title: "Postgres GIN Index: When and How to Use It"
+description: "A practical guide to the Postgres GIN index: how it differs from B-tree and GiST, operator classes for jsonb, arrays and full-text search, plus fastupdate."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: September 20, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# Postgres GIN Index: When and How to Use It
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="September 20, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+A B-tree index answers questions about whole values: is this column equal to, less than or between some value. A GIN index answers a different question entirely — does this column *contain* something. That one word covers a surprising amount of real work: does this `jsonb` document have this key, does this array include this tag, does this document match these search words, does this string contain this substring. Every one of those is a case where a B-tree index is useless and a Postgres GIN index makes the query fast.
+
+GIN stands for Generalized Inverted Index, and the "inverted" part is the whole idea. Instead of storing one index entry per row, GIN breaks each value into many keys and stores, for each key, the list of rows that contain it. It is the same structure a search engine uses. This guide covers when a GIN index is the right choice, which operator class to pick, how to read the query plans, and the tuning knobs — `fastupdate`, `gin_pending_list_limit` and `work_mem` — that decide whether your writes stay fast.
+
+## How GIN differs from B-tree and GiST
+
+### The inverted structure
+
+Consider a `tags text[]` column with three rows:
+
+```sql
+CREATE TABLE articles (
+  id      bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  title   text NOT NULL,
+  tags    text[] NOT NULL DEFAULT '{}',
+  body    text NOT NULL,
+  meta    jsonb NOT NULL DEFAULT '{}'
+);
+
+INSERT INTO articles (title, tags, body) VALUES
+  ('Indexing basics',   '{postgres,index}',      'B-tree indexes ...'),
+  ('JSONB in practice', '{postgres,jsonb,json}', 'Storing documents ...'),
+  ('Array columns',     '{postgres,array}',      'Arrays are ...');
+```
+
+A B-tree on `tags` would store three entries, one per array value as a whole — useful only if you search for the exact array `{postgres,index}`, which nobody does. A GIN index instead stores one entry per distinct element, each pointing at a posting list of row IDs:
+
+```text
+array   -> {3}
+index   -> {1}
+json    -> {2}
+jsonb   -> {2}
+postgres-> {1,2,3}
+```
+
+Now `WHERE tags @> ARRAY['jsonb']` is a single key lookup that returns row 2 immediately.
+
+### Choosing between GIN and GiST
+
+Both GIN and GiST handle composite values, but they trade off differently:
+
+| | GIN | GiST |
+| --- | --- | --- |
+| Lookup speed | Faster for containment queries | Slower, lossy, needs recheck |
+| Build and update cost | Slower to build, heavier writes | Cheaper to update |
+| Index size | Usually larger | Usually smaller |
+| Distance / nearest-neighbour | Not supported | Supported (`<->` ordering) |
+| Best for | Static or read-heavy data | Write-heavy data, ranges, geometry |
+
+The rule of thumb: if the column is read far more than it is written and your queries are containment or full-text searches, use GIN. If the table is write-heavy, or you need ordering by distance (KNN), use GiST. For `tsvector` columns in particular, GIN is the standard choice because search latency matters much more than index build time.
+
+## GIN operator classes you will actually use
+
+A GIN index is only as useful as its operator class, which defines how a value is split into keys and which operators the index can serve. These are the ones worth knowing.
+
+### jsonb_ops and jsonb_path_ops
+
+The default for `jsonb` is `jsonb_ops`. It indexes every key *and* every value, so it supports the existence operators `?`, `?|` and `?&` as well as containment `@>`:
+
+```sql
+CREATE INDEX idx_articles_meta ON articles USING gin (meta);
+
+-- containment: does the document contain this fragment?
+SELECT id, title FROM articles WHERE meta @> '{"status": "published"}';
+
+-- key existence: does the document have this top-level key?
+SELECT id, title FROM articles WHERE meta ? 'author_id';
+```
+
+`jsonb_path_ops` indexes only hashes of complete key-to-value paths. It produces a much smaller index and faster containment lookups, but it supports *only* `@>` (plus `@?` and `@@` for jsonpath). If you never use the `?` existence operators, it is usually the better choice:
+
+```sql
+CREATE INDEX idx_articles_meta_path
+  ON articles USING gin (meta jsonb_path_ops);
+```
+
+A common mistake is indexing a whole large `jsonb` column when you only query one field. If you always filter on `meta->>'status'`, a plain B-tree expression index is smaller and faster:
+
+```sql
+CREATE INDEX idx_articles_status ON articles ((meta->>'status'));
+```
+
+Use GIN when the set of keys you filter on is open-ended; use an expression B-tree when it is fixed.
+
+### tsvector for full-text search
+
+Full-text search is the original use case for GIN. Index a generated column so the `tsvector` is stored once rather than recomputed per query:
+
+```sql
+ALTER TABLE articles
+  ADD COLUMN search_vector tsvector
+  GENERATED ALWAYS AS (
+    setweight(to_tsvector('english', coalesce(title, '')), 'A') ||
+    setweight(to_tsvector('english', coalesce(body,  '')), 'B')
+  ) STORED;
+
+CREATE INDEX idx_articles_search ON articles USING gin (search_vector);
+
+SELECT id, title, ts_rank(search_vector, query) AS rank
+FROM   articles, websearch_to_tsquery('english', 'jsonb indexing') AS query
+WHERE  search_vector @@ query
+ORDER  BY rank DESC
+LIMIT  20;
+```
+
+The `GENERATED ALWAYS AS ... STORED` form matters: if you write `to_tsvector('english', body)` directly in the `WHERE` clause, you need an expression index that exactly matches the expression, and any mismatch in the text search configuration name silently disables the index.
+
+### pg_trgm for LIKE and similarity
+
+`LIKE '%foo%'` cannot use a B-tree because the pattern is unanchored. The `pg_trgm` extension splits strings into three-character trigrams, which GIN can index:
+
+```sql
+CREATE EXTENSION IF NOT EXISTS pg_trgm;
+
+CREATE INDEX idx_articles_title_trgm
+  ON articles USING gin (title gin_trgm_ops);
+
+-- now both of these can use the index
+SELECT id, title FROM articles WHERE title ILIKE '%index%';
+SELECT id, title FROM articles WHERE title % 'indexng';   -- fuzzy match
+```
+
+Trigram indexes are the standard answer to "our search box is slow". Note that patterns shorter than three characters cannot produce a trigram, so `ILIKE '%ab%'` still falls back to a sequential scan.
+
+### Arrays and the intarray contrib
+
+For array columns the default `array_ops` supports `@>` (contains), `<@` (is contained by), `&&` (overlaps) and `=`:
+
+```sql
+CREATE INDEX idx_articles_tags ON articles USING gin (tags);
+
+SELECT id, title FROM articles WHERE tags @> ARRAY['postgres','jsonb'];
+SELECT id, title FROM articles WHERE tags && ARRAY['json','array'];
+```
+
+Note the direction carefully: `tags @> ARRAY['a','b']` means the row's tags contain *both* a and b, while `&&` means they share *at least one* element. Getting these backwards is one of the most common array query bugs.
+
+## Reading the plan
+
+Always confirm the index is actually used rather than assuming. Load enough rows first — on a three-row table PostgreSQL will always pick a sequential scan because it is cheaper:
+
+```sql
+INSERT INTO articles (title, tags, body, meta)
+SELECT 'Article ' || i,
+       ARRAY['postgres', 'tag' || (i % 500)],
+       'Body text number ' || i,
+       jsonb_build_object('status', CASE WHEN i % 4 = 0 THEN 'draft' ELSE 'published' END)
+FROM generate_series(1, 200000) AS i;
+
+ANALYZE articles;
+
+EXPLAIN (ANALYZE, BUFFERS)
+SELECT id FROM articles WHERE tags @> ARRAY['tag42'];
+```
+
+```text
+Bitmap Heap Scan on articles  (cost=12.30..1502.11 rows=400 width=8) (actual time=0.112..0.401 rows=400 loops=1)
+  Recheck Cond: (tags @> '{tag42}'::text[])
+  Heap Blocks: exact=389
+  Buffers: shared hit=396
+  ->  Bitmap Index Scan on idx_articles_tags  (cost=0.00..12.20 rows=400 width=0) (actual time=0.061..0.061 rows=400 loops=1)
+        Index Cond: (tags @> '{tag42}'::text[])
+```
+
+Two things to notice. First, GIN always produces a **Bitmap Index Scan**, never a plain Index Scan — GIN stores no ordering information and cannot return rows in index order, which is also why a GIN index can never satisfy an `ORDER BY`. Second, the `Recheck Cond` line is normal: the bitmap may be lossy when it grows beyond `work_mem`, in which case PostgreSQL falls back to page-level granularity and rechecks each row. If you see `Heap Blocks: lossy=...` with a large count, raising `work_mem` for that query will cut the recheck cost significantly.
+
+If you want to compare plans across several index strategies without juggling terminal sessions, Chat2DB ([chat2db.ai/download](https://chat2db.ai/download)) shows `EXPLAIN` output next to the query and keeps each variation in its own tab, which makes A/B testing operator classes much less tedious.
+
+## Tuning writes: fastupdate and the pending list
+
+GIN's weakness is write cost. Inserting one row with ten tags means touching ten posting lists. To avoid that on every insert, GIN has `fastupdate`, enabled by default: new entries go into an unsorted **pending list** and are merged into the main index later, during `VACUUM` or when the list exceeds `gin_pending_list_limit` (4 MB by default).
+
+This is a genuine trade-off. Writes get much cheaper, but queries must scan the pending list linearly on top of the main index, so a large pending list makes reads slower and latency spiky — the unlucky transaction that triggers the merge pays for all of it.
+
+```sql
+-- inspect and change per index
+SELECT relname, reloptions FROM pg_class WHERE relname = 'idx_articles_tags';
+
+-- smaller pending list: steadier read latency, more frequent merges
+ALTER INDEX idx_articles_tags SET (fastupdate = on, gin_pending_list_limit = '1MB');
+
+-- read-heavy table with rare bulk loads: turn it off entirely
+ALTER INDEX idx_articles_search SET (fastupdate = off);
+
+-- force a merge now rather than waiting for autovacuum
+SELECT gin_clean_pending_list('idx_articles_tags');
+```
+
+Turn `fastupdate` off when queries hit the index constantly and writes arrive in occasional batches. Keep it on, with a modest limit, for steady high-volume inserts.
+
+Two more practical notes. Bulk loading is dramatically faster if you create the GIN index *after* the data is loaded rather than before, and raising `maintenance_work_mem` before a `CREATE INDEX` on a large table can cut build time by more than half:
+
+```sql
+SET maintenance_work_mem = '2GB';
+CREATE INDEX CONCURRENTLY idx_articles_search ON articles USING gin (search_vector);
+RESET maintenance_work_mem;
+```
+
+Use `CONCURRENTLY` on production tables so the build does not hold a write lock — it takes longer and requires two table scans, but it does not block your application.
+
+## Checking size and usage
+
+GIN indexes can grow large. Check what you are paying for, and whether anything uses it:
+
+```sql
+SELECT i.indexrelname AS index_name,
+       pg_size_pretty(pg_relation_size(i.indexrelid)) AS size,
+       i.idx_scan AS scans
+FROM   pg_stat_user_indexes i
+JOIN   pg_index x ON x.indexrelid = i.indexrelid
+JOIN   pg_am a ON a.oid = (SELECT relam FROM pg_class WHERE oid = i.indexrelid)
+WHERE  a.amname = 'gin'
+ORDER  BY pg_relation_size(i.indexrelid) DESC;
+```
+
+An index with `scans = 0` after a full business cycle is pure write overhead — drop it. Conversely, an index far larger than its table usually means `jsonb_ops` on documents with many keys, where switching to `jsonb_path_ops` often halves the size.
+
+## Common mistakes
+
+- **Expecting GIN to help `ORDER BY` or range queries.** It cannot. Keep a B-tree for sorting and range filters, and let the planner combine both with a BitmapAnd.
+- **Indexing the wrong side of a containment operator.** `WHERE ARRAY['a'] <@ tags` is indexable; `WHERE 'a' = ANY(tags)` is not, even though the two look equivalent. Rewrite `= ANY` as `@>`.
+- **Mismatched text search configuration.** `to_tsvector('english', body)` in the index and `to_tsvector(body)` in the query are different expressions; the second uses `default_text_search_config` and will not match the index.
+- **Forgetting the recheck cost.** A GIN lookup that matches a large fraction of the table still has to visit those heap rows. If a query returns 40% of the table, a sequential scan genuinely is faster and the planner is right to choose it.
+- **Leaving a bloated pending list.** If read latency is erratic on a write-heavy GIN index, check `fastupdate` before blaming the query.
+
+## Summary
+
+Reach for a Postgres GIN index whenever your predicate asks whether a value *contains* something rather than what it equals: `jsonb` containment and key existence, array overlap and containment, `tsvector` full-text matching, and unanchored `LIKE`/`ILIKE` through `pg_trgm`. Pick `jsonb_path_ops` over the default when you only need `@>`, store `tsvector` in a generated column, and confirm with `EXPLAIN (ANALYZE, BUFFERS)` that you get a Bitmap Index Scan with few lossy heap blocks. Then tune the write path: `fastupdate` on with a small `gin_pending_list_limit` for steady inserts, off for read-dominated tables, and always build large indexes `CONCURRENTLY` with a generous `maintenance_work_mem`. Get those choices right and GIN turns queries that used to scan the whole table into millisecond lookups.

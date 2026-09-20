@@ -1,0 +1,333 @@
+---
+title: "dbt Sources and Source Freshness: Complete Guide"
+description: "Define dbt sources in YAML, configure source freshness with warn_after and error_after, run dbt source freshness in CI, and use build --select source_status."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: September 20, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# dbt Sources and Source Freshness: Complete Guide
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="September 20, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+Most dbt failures that reach a business user are not dbt failures. The models ran perfectly, every test passed, and the dashboard is still wrong — because the ingestion pipeline stopped loading at 3 a.m. and dbt cheerfully transformed yesterday's data into today's report. dbt cannot fix a broken pipeline, but it can refuse to pretend nothing happened, and that is what source freshness is for.
+
+Sources are how you declare the raw tables your project reads. Freshness checks are how you assert that those tables are actually being kept up to date. Together they turn silent staleness into a loud, early failure. This guide covers defining sources properly, configuring freshness thresholds that people will not learn to ignore, and wiring the results into your scheduled runs.
+
+## Why declare sources at all
+
+You can reference a raw table directly:
+
+```sql
+select * from analytics.raw_shop.orders
+```
+
+It works, and it costs you four things: the table does not appear in your lineage graph, you cannot test it, you cannot check its freshness, and changing the schema name means editing every model that hard-codes it. Declaring a source fixes all four.
+
+```yaml
+# models/staging/_sources.yml
+version: 2
+
+sources:
+  - name: shop
+    description: Raw tables loaded from the e-commerce platform by Fivetran.
+    database: analytics
+    schema: raw_shop
+    tables:
+      - name: orders
+      - name: customers
+      - name: order_items
+```
+
+```sql
+-- models/staging/stg_orders.sql
+select
+    id          as order_id,
+    customer_id,
+    lower(trim(status)) as order_status,
+    total::numeric(12,2) as order_total,
+    created_at
+from {{ source('shop', 'orders') }}
+```
+
+`{{ source('shop', 'orders') }}` compiles to `analytics.raw_shop.orders`, registers the dependency in the DAG, and makes the table selectable:
+
+```bash
+dbt run --select source:shop+          # every model downstream of this source
+dbt run --select source:shop.orders+   # downstream of one table
+```
+
+### Handling naming you do not control
+
+Raw tables rarely follow your conventions. The `identifier` property separates the name you use from the name that exists:
+
+```yaml
+    tables:
+      - name: orders
+        identifier: ORDERS_V2_FINAL      # the real, unfortunate table name
+      - name: customers
+        identifier: CUST_MASTER
+```
+
+Now the ugly name appears in exactly one place. When the vendor ships `ORDERS_V3`, you change one line.
+
+### Environment-specific schemas
+
+Use a var so dev and prod can read different raw schemas:
+
+```yaml
+sources:
+  - name: shop
+    database: "{{ var('raw_database', 'analytics') }}"
+    schema: "{{ var('raw_schema', 'raw_shop') }}"
+```
+
+```bash
+dbt run --vars '{raw_schema: raw_shop_sandbox}'
+```
+
+## Testing sources
+
+Sources take the same tests as models, and running them is the cheapest data quality win available — you catch bad data before it propagates through twenty models:
+
+```yaml
+    tables:
+      - name: orders
+        columns:
+          - name: id
+            description: Primary key from the source system.
+            data_tests:
+              - unique
+              - not_null
+          - name: status
+            data_tests:
+              - accepted_values:
+                  values: ['pending', 'completed', 'cancelled', 'refunded']
+          - name: customer_id
+            data_tests:
+              - relationships:
+                  to: source('shop', 'customers')
+                  field: id
+```
+
+```bash
+dbt test --select source:shop
+```
+
+Note `data_tests:` rather than `tests:` — dbt 1.8 renamed the property to distinguish data tests from unit tests. The old key still works but should not be used in new code.
+
+A useful CI pattern is to run source tests first and abort if they fail, so that a bad load never becomes a bad build:
+
+```bash
+dbt test --select "source:*" && dbt build
+```
+
+## Source freshness
+
+Freshness answers one question: how long ago was the newest row in this table loaded? You configure it with a `freshness` block and a `loaded_at_field`.
+
+```yaml
+sources:
+  - name: shop
+    database: analytics
+    schema: raw_shop
+
+    # project-level default, inherited by every table below
+    freshness:
+      warn_after:  { count: 12, period: hour }
+      error_after: { count: 24, period: hour }
+    loaded_at_field: _fivetran_synced
+
+    tables:
+      - name: orders
+        # hourly pipeline: much tighter thresholds
+        freshness:
+          warn_after:  { count: 1, period: hour }
+          error_after: { count: 3, period: hour }
+
+      - name: customers
+        # inherits the 12h/24h default
+
+      - name: exchange_rates
+        # daily reference data
+        freshness:
+          warn_after:  { count: 36, period: hour }
+          error_after: { count: 48, period: hour }
+
+      - name: country_codes
+        # static lookup — never checked
+        freshness: null
+```
+
+Run it:
+
+```bash
+dbt source freshness
+```
+
+```text
+1 of 4 START freshness of shop.orders ......................... [RUN]
+1 of 4 PASS freshness of shop.orders ......................... [PASS in 0.61s]
+2 of 4 WARN freshness of shop.customers ...................... [WARN in 0.44s]
+3 of 4 ERROR STALE freshness of shop.order_items ............. [ERROR STALE in 0.52s]
+```
+
+The three key points:
+
+- **`loaded_at_field` must be a warehouse-load timestamp, not a business timestamp.** `_fivetran_synced`, `_airbyte_extracted_at` or an ingestion `inserted_at` column all work. Using `order_created_at` means a genuinely quiet Sunday looks identical to a broken pipeline.
+- **`period`** is `minute`, `hour` or `day`. **`count`** is an integer.
+- **`freshness: null`** disables the check for a table that inherits a source-level default. Use it for static lookups so they do not generate permanent warnings.
+
+### Table metadata instead of a column
+
+If a source table has no load timestamp column, some adapters (Snowflake, BigQuery, Databricks and others) can use the warehouse's own table metadata instead. Simply omit `loaded_at_field`:
+
+```yaml
+      - name: legacy_orders
+        freshness:
+          warn_after: { count: 6, period: hour }
+        # no loaded_at_field — dbt uses table metadata
+```
+
+This avoids scanning the table at all, which makes the check nearly free. Be aware it reflects when the *table* was last modified, which on some platforms includes changes that did not add rows.
+
+### Filtering expensive checks
+
+On a very large table, `select max(_fivetran_synced)` can be slow. Add a filter to restrict the scan to a recent partition:
+
+```yaml
+      - name: events
+        freshness:
+          warn_after:  { count: 1, period: hour }
+          error_after: { count: 6, period: hour }
+          filter: _partition_date >= date_sub(current_date, interval 3 day)
+        loaded_at_field: _loaded_at
+```
+
+The filter is injected into the `WHERE` clause of the freshness query, so it must be a condition the warehouse can use to prune. Without it, a freshness check on an event table can cost more than the models it protects.
+
+## Setting thresholds people will trust
+
+The most common mistake is copying one threshold everywhere. A pipeline that loads hourly and one that loads weekly need completely different numbers, and a warning that fires every day is a warning everyone filters into a folder.
+
+A workable method:
+
+1. **Measure the real interval** before guessing. Look at the actual gap between loads over the last month:
+
+```sql
+select date_trunc('hour', _fivetran_synced) as load_hour,
+       count(*)                             as rows_loaded
+from   analytics.raw_shop.orders
+where  _fivetran_synced >= current_date - 30
+group  by 1
+order  by 1 desc;
+```
+
+2. **Set `warn_after` at roughly twice the normal interval.** An hourly pipeline warns at two to three hours, not at one — pipelines are allowed the occasional retry.
+3. **Set `error_after` at the point where the business is genuinely affected.** If the morning report reads this table at 8 a.m., error when data is old enough to break that report.
+4. **Account for weekends and holidays.** A table loaded only on business days needs thresholds that survive Sunday, or a filter that excludes weekends.
+5. **Review after a month.** Any check that has warned more than a couple of times without a real incident has the wrong threshold. Fix it or delete it.
+
+Inspecting load patterns and validating a `loaded_at_field` means running ad-hoc queries against raw schemas, often across several source databases at once. [Chat2DB](https://chat2db.ai/download) connects to Snowflake, BigQuery, PostgreSQL, MySQL and 20+ other engines in one workspace, which makes it straightforward to check load cadence in the warehouse and compare it against the operational database the data came from.
+
+## Using freshness results in a run
+
+The real payoff is `source_status`, which lets a scheduled run build only what has new data. The pattern needs two pieces: results from a previous run stored as artifacts, and the `--select` selector.
+
+```bash
+# scheduled run
+dbt source freshness                                       # writes target/sources.json
+
+dbt build --select "source_status:fresher+" \
+          --state ./previous_artifacts
+```
+
+`source_status:fresher+` selects every model downstream of a source whose `max_loaded_at` has advanced since the stored `sources.json`. On a project where only two of fifteen sources update hourly, this turns a full rebuild into a small one and cuts warehouse spend noticeably.
+
+There is also a build-time guard:
+
+```bash
+dbt build --select "source_status:stale+"    # find what is affected by staleness
+```
+
+### Controlling exit codes
+
+By default `dbt source freshness` exits non-zero when any source errors, which fails your scheduler — usually what you want. When you would rather record the result and continue:
+
+```bash
+dbt source freshness || true
+# ... then inspect target/sources.json yourself
+```
+
+The `sources.json` artifact contains `max_loaded_at`, `snapshotted_at`, the computed age and the status for every table, which is what feeds dbt's documentation site and any custom alerting you build.
+
+## Alerting on stale sources
+
+A freshness check that nobody sees is a freshness check that does not exist. The `target/sources.json` artifact is structured JSON, so turning it into an alert is a short script rather than a product purchase:
+
+```python
+import json, sys
+
+with open("target/sources.json") as fh:
+    artifact = json.load(fh)
+
+stale = [
+    r for r in artifact["results"]
+    if r["status"] in ("warn", "error", "runtime error")
+]
+
+for r in stale:
+    name = ".".join(r["unique_id"].split(".")[-2:])
+    age_hours = round(r.get("max_loaded_at_time_ago_in_s", 0) / 3600, 1)
+    print(f"{r['status'].upper()}: {name} is {age_hours}h old")
+
+sys.exit(1 if any(r["status"] != "warn" for r in stale) else 0)
+```
+
+Two conventions make alerts useful rather than annoying. Route warnings to a channel the data team reads and errors to whatever pages someone, so the severity you configured in YAML maps to a real escalation path. And include the owner from the source's `meta` block in the message — an alert naming the team that owns the pipeline gets fixed considerably faster than one that just names a table.
+
+It is also worth recording freshness results over time rather than only reacting to the current state. Loading `sources.json` into a small table after every scheduled run gives you a history you can query, which is how you discover that a pipeline has been drifting from 20 minutes to 90 minutes over six weeks — a problem no single threshold breach would have revealed.
+
+## Snapshotting freshness without a full run
+
+`dbt source freshness` can be run on its own schedule, independently of your transformation run. This is often the better design: check freshness every 15 minutes so you find a broken pipeline quickly, and run the models hourly. Because the freshness query is a single `max()` per table, it is cheap enough to run frequently, especially with the metadata-based option or a partition filter.
+
+```bash
+# fast, frequent: catch breakage early
+dbt source freshness --select "source:shop"
+
+# slower, scheduled: the actual transformation
+dbt build --select "source_status:fresher+" --state ./prod_artifacts
+```
+
+Keep the two in separate jobs so that a stale source produces a clear "ingestion is broken" alert rather than a confusing failed model build several steps downstream.
+
+## Documenting and surfacing it
+
+Freshness results appear in `dbt docs`, giving stakeholders a visible answer to "is this dashboard current":
+
+```bash
+dbt source freshness
+dbt docs generate
+dbt docs serve
+```
+
+Describing sources properly matters more than it seems, because the source page is where an analyst lands when they want to know what a raw table contains and how often it arrives:
+
+```yaml
+  - name: shop
+    description: |
+      Raw e-commerce tables replicated by Fivetran every 15 minutes.
+      Owner: Data Platform. Escalation: #data-platform-oncall.
+    meta:
+      owner: data-platform
+      sla: 1 hour
+```
+
+## Summary
+
+Declare every raw table as a dbt source so it appears in lineage, can be tested, and can be checked for freshness. Use `identifier` to isolate names you do not control, and vars for environment-specific schemas. Configure `freshness` with a genuine warehouse-load timestamp in `loaded_at_field`, set source-level defaults and override them per table, and use `freshness: null` for static lookups. Choose thresholds from measured load intervals rather than a single copied value, add a `filter` on large tables to keep the check cheap, and run `dbt source freshness` before your build. Then let `source_status:fresher+` rebuild only what changed — you get earlier detection of broken pipelines and a smaller warehouse bill from the same configuration.

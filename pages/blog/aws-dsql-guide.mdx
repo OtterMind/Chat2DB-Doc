@@ -1,0 +1,161 @@
+---
+title: "Aurora DSQL Explained: AWS Distributed SQL"
+description: "What Aurora DSQL is, how its optimistic concurrency and active-active multi-Region design work, the PostgreSQL features it omits, and when to choose it."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: September 20, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# Aurora DSQL Explained: AWS Distributed SQL
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="September 20, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+Amazon Aurora DSQL is AWS's distributed SQL database: serverless, PostgreSQL-compatible, and designed to run active-active across multiple Regions with strong consistency. It is a genuinely different product from Aurora PostgreSQL despite the shared name, and treating it as "Aurora but more distributed" is the fastest way to be disappointed by it.
+
+The short version: DSQL gives you multi-Region writes with strong consistency and no infrastructure to manage, and in exchange it asks you to give up a meaningful chunk of PostgreSQL. Whether that trade is good depends entirely on your application. This article explains the architecture, the concurrency model that shapes how you write code against it, the compatibility gaps, and the decision criteria.
+
+## What problem it solves
+
+Traditional relational databases scale writes by having one writer. Aurora PostgreSQL has a single writer instance with read replicas; Aurora Global Database extends that across Regions but keeps one Region authoritative for writes, with the others read-only and asynchronously replicated. If your Region fails you promote another, which takes time and risks losing recently committed data.
+
+The alternatives have historically been unappealing: shard the application yourself, accept eventual consistency with a multi-master setup and all the conflict resolution that entails, or move to a distributed SQL system outside AWS.
+
+Aurora DSQL's proposition is that every regional endpoint in a multi-Region cluster accepts writes, all of them are strongly consistent, and there is no failover step because there is no primary. Combined with a serverless model where capacity scales automatically and you pay for what you use, it targets applications that need both global write availability and transactional correctness.
+
+## How the architecture works
+
+Three design choices define DSQL.
+
+**Compute and storage are fully separated, and so is the transaction log.** Query processing, the commit/journal layer and storage each scale independently. Because compute nodes hold no durable state, DSQL can add or remove them freely, and a failed node costs nothing but the in-flight work.
+
+**Transactions are ordered by a shared time source.** AWS uses a hardware-backed time reference (the same Amazon Time Sync infrastructure that provides microsecond-accurate clocks to EC2) to assign transaction timestamps consistently across Regions. Accurate distributed time is what allows a strongly consistent ordering without a coordinator having to round-trip on every operation — the same insight behind Google Spanner's TrueTime.
+
+**Concurrency control is optimistic, not lock-based.** This is the change that most affects how you write application code, so it deserves its own section.
+
+## Optimistic concurrency control
+
+A conventional PostgreSQL transaction takes locks as it goes. `SELECT ... FOR UPDATE` blocks other writers; two transactions updating the same row serialise, with the second waiting for the first.
+
+Aurora DSQL takes no locks. Every transaction reads a consistent snapshot, buffers its changes locally, and at `COMMIT` time the system checks whether anything it read was modified by a concurrently committed transaction. If so, your commit is rejected and you must retry.
+
+The practical consequence: **`COMMIT` can fail, and your application must handle that.** In conventional PostgreSQL a `COMMIT` failing is an exceptional event; under OCC on a contended row it is routine. Every write path needs retry logic:
+
+```python
+import psycopg
+import time
+
+def run_with_retry(conn_str, fn, max_attempts=5):
+    for attempt in range(max_attempts):
+        try:
+            with psycopg.connect(conn_str) as conn:
+                with conn.cursor() as cur:
+                    result = fn(cur)
+                conn.commit()
+                return result
+        except psycopg.errors.SerializationFailure:
+            if attempt == max_attempts - 1:
+                raise
+            # exponential backoff with jitter
+            time.sleep((2 ** attempt) * 0.05)
+```
+
+Three rules follow from this model:
+
+1. **Keep transactions short and narrow.** The longer a transaction runs and the more rows it touches, the larger its conflict window. A transaction that reads ten thousand rows and then writes one is far more likely to be rejected than one that reads and writes the same row.
+2. **Avoid hot rows.** A single counter row updated by every request is the worst case for OCC — under load, most transactions will conflict and retry, and throughput collapses. Shard counters across multiple rows and aggregate on read, or move the counter out of the database entirely.
+3. **Make retries safe.** Any operation that might run twice needs to be idempotent, or guarded by a unique key that makes the second attempt a no-op.
+
+DSQL also enforces hard limits on transaction size and duration — a cap on how many rows a single transaction may modify and how long it may remain open. Both are published in the AWS documentation and have been raised over time, so check the current values rather than designing against a number from an article. The design intent is clear either way: DSQL is built for many small transactions, not for bulk operations.
+
+## PostgreSQL compatibility: what is missing
+
+DSQL speaks the PostgreSQL wire protocol, so `psql`, `psycopg`, JDBC drivers and standard GUI clients connect to it normally. Your ORM will connect. That does not mean your schema will migrate cleanly.
+
+Features that have been unavailable or restricted include foreign key constraints, triggers, views, sequences in their familiar blocking form, temporary tables, most extensions, and several DDL operations such as altering a primary key after table creation. AWS has been adding capabilities steadily since launch, so the accurate statement is: **the unsupported list is real, it is shorter than it was, and you must check the current documentation against your own schema before committing.**
+
+Two of these deserve comment because they change how you design.
+
+**No foreign keys** means referential integrity moves into your application. This is a familiar trade from the distributed-database world — enforcing a constraint across a distributed dataset requires coordination that undermines the scaling properties — but it is a genuine loss, and one that tends to be discovered late, in the form of orphaned rows.
+
+**Sequence behaviour differs.** A classic PostgreSQL `SERIAL`/`IDENTITY` column requires a coordinated counter, which is exactly what a distributed system wants to avoid. Design around it by generating identifiers client-side:
+
+```sql
+CREATE TABLE orders (
+    order_id    uuid PRIMARY KEY,           -- generated by the application
+    customer_id uuid NOT NULL,
+    status      text NOT NULL,
+    total       numeric(12,2) NOT NULL,
+    created_at  timestamptz NOT NULL DEFAULT now()
+);
+```
+
+Prefer a time-ordered UUID (UUIDv7) over a random UUIDv4 so that inserts cluster rather than scattering across the key space. Alternatively, DSQL offers a built-in function for generating sortable unique identifiers — again, check the current documentation for the exact name and semantics in your Region.
+
+## Connecting to Aurora DSQL
+
+Authentication is IAM-based: you generate a short-lived token rather than storing a password.
+
+```bash
+# generate an auth token (valid for a limited window)
+export PGPASSWORD=$(aws dsql generate-db-connect-admin-auth-token \
+  --region us-east-1 \
+  --expires-in 3600 \
+  --hostname "$DSQL_ENDPOINT")
+
+psql --host "$DSQL_ENDPOINT" \
+     --username admin \
+     --dbname postgres \
+     --set=sslmode=require
+```
+
+Because the token expires, long-lived connection pools need to refresh credentials rather than holding one password forever — check whether your pooler supports a credential callback before assuming this works out of the box.
+
+Any PostgreSQL-compatible client will then work for exploration. [Chat2DB](https://chat2db.ai/download) connects over the standard PostgreSQL protocol alongside your existing Aurora PostgreSQL, RDS and other databases, which is convenient when you are comparing a DSQL schema against the conventional PostgreSQL schema you are migrating from — you can run the same query against both and see where behaviour diverges. There is also a browser version at [app.chat2db.ai](https://app.chat2db.ai) if you would rather not install a client for a short evaluation.
+
+## Aurora DSQL versus Aurora PostgreSQL
+
+| | Aurora PostgreSQL | Aurora DSQL |
+| --- | --- | --- |
+| Writers | One per cluster (or per Region, async) | Every Region endpoint, strongly consistent |
+| Concurrency | Lock-based MVCC | Optimistic, commit may be rejected |
+| PostgreSQL compatibility | Near-complete, extensions supported | Subset, limited extensions |
+| Capacity management | Instance classes or ACU range | Fully automatic |
+| Failover | Promotion, measurable RTO | No primary to fail over |
+| Best for | General-purpose OLTP | Globally distributed, high-availability OLTP |
+| Migration effort from Postgres | Low | Schema and application changes required |
+
+Note also that Aurora DSQL is an OLTP system. It is not a replacement for Redshift or for a data warehouse, and long analytical scans are exactly the shape of transaction its limits discourage.
+
+## When to choose it
+
+**Good fits:**
+
+- Applications that must accept writes in several Regions with strong consistency, where an asynchronous global database plus failover is not acceptable.
+- Workloads made of many small, short transactions — order placement, session state, ledger entries with sharded keys, inventory with well-distributed items.
+- Teams that want zero database operations: no patching, no instance sizing, no failover runbooks.
+- Greenfield services, where designing around the constraints costs nothing because there is nothing to migrate.
+
+**Poor fits:**
+
+- Existing PostgreSQL applications that lean on foreign keys, triggers, views, extensions like PostGIS or pgvector, or long-running transactions. The migration is a rewrite, not a lift.
+- Analytical or batch workloads, ETL jobs, and anything that modifies large numbers of rows in one transaction.
+- Designs with inherently hot rows that cannot be sharded.
+- Single-Region applications with no global write requirement — you would be paying the compatibility cost for a benefit you do not need. Aurora Serverless v2 is the better answer here.
+
+## Getting started sensibly
+
+If DSQL looks like a fit, evaluate it in this order:
+
+1. **Audit your schema against the unsupported feature list** in the current AWS documentation. This alone decides most cases.
+2. **Identify your hottest rows.** If a handful of rows absorb most writes, model how you would shard them before going further.
+3. **Prototype the write path with retry logic** and measure the rejection rate under realistic concurrency. A retry rate above a few percent means your transaction design needs work.
+4. **Test multi-Region behaviour deliberately**, including what your application does when one Region is slow rather than down.
+5. **Model cost on your real transaction mix.** DSQL bills on a distributed processing unit metric plus storage; the shape of your workload, not its raw volume, determines the bill.
+
+## Summary
+
+Aurora DSQL is a serverless, PostgreSQL-compatible distributed SQL database offering active-active multi-Region writes with strong consistency and no infrastructure management. It achieves that with a fully disaggregated architecture, a hardware-backed time source for transaction ordering, and optimistic concurrency control instead of locks — which means commits can be rejected and every write path needs retry logic. The price of admission is PostgreSQL compatibility: foreign keys, triggers, views, extensions and conventional sequences have been absent or restricted, and transaction size and duration are capped. Choose it for new, globally distributed OLTP services built around many small transactions. For everything else, including most migrations from existing PostgreSQL, Aurora PostgreSQL or Aurora Serverless v2 remains the right tool.

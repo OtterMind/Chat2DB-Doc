@@ -1,0 +1,232 @@
+---
+title: "PostgreSQL ANALYZE and Planner Statistics"
+description: "How PostgreSQL ANALYZE builds planner statistics, how to read pg_stats, when to raise default_statistics_target, and how extended statistics fix row estimates."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: September 20, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# PostgreSQL ANALYZE and Planner Statistics
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="September 20, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+Most "PostgreSQL picked a terrible plan" problems are not planner bugs. They are statistics problems. The PostgreSQL planner is a cost-based optimizer: before it chooses between a sequential scan and an index scan, or between a nested loop and a hash join, it estimates how many rows each step will produce. Those estimates come entirely from statistics collected by `ANALYZE`. When the statistics are stale, too coarse, or blind to a correlation between columns, the estimate is wrong, the cost model is fed garbage, and the plan that comes out is the plan you complain about.
+
+This guide covers what `ANALYZE` actually collects, how to read it back out of `pg_stats`, how to tell a statistics problem from a genuine tuning problem, and the two tools that fix the common cases: `default_statistics_target` and `CREATE STATISTICS`.
+
+## ANALYZE versus VACUUM ANALYZE versus EXPLAIN ANALYZE
+
+Three commands share a word and do different things. Getting them confused wastes a lot of time.
+
+- **`ANALYZE table`** samples rows and updates planner statistics. It takes only a `SHARE UPDATE EXCLUSIVE` lock, so it runs alongside normal reads and writes.
+- **`VACUUM ANALYZE table`** first reclaims dead tuples, then updates statistics. Use it after a bulk delete.
+- **`EXPLAIN ANALYZE query`** *executes* the query and reports actual timings next to the estimates. It collects no statistics at all, and it really does run the statement — wrap it in a transaction you roll back if the query writes.
+
+```sql
+ANALYZE orders;                 -- statistics only, whole table
+ANALYZE orders (status, region);-- statistics for two columns only
+ANALYZE VERBOSE orders;         -- show what was sampled
+ANALYZE;                        -- every table in the current database
+```
+
+Autovacuum runs `ANALYZE` automatically once roughly `autovacuum_analyze_scale_factor` (default 0.1, so 10%) of a table's rows have changed plus `autovacuum_analyze_threshold` (default 50). That is fine for steady workloads and badly wrong in two situations: immediately after a bulk load, and for very large tables where 10% is millions of rows that take hours to accumulate. **Always run `ANALYZE` manually after a bulk load, a restore, or a major version upgrade** — `pg_upgrade` does not carry statistics across, and the first hours after an upgrade are a classic "why is everything slow" incident.
+
+## What ANALYZE actually collects
+
+`ANALYZE` does not read the whole table. It takes a random sample of `300 × default_statistics_target` rows — 30,000 rows at the default target of 100 — and derives four things per column, stored in `pg_statistic` and exposed readably through the `pg_stats` view.
+
+Let us build a table with deliberately skewed data to see it:
+
+```sql
+CREATE TABLE orders (
+  id          bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  status      text        NOT NULL,
+  country     text        NOT NULL,
+  city        text        NOT NULL,
+  order_total numeric(12,2) NOT NULL,
+  created_at  timestamptz NOT NULL
+);
+
+INSERT INTO orders (status, country, city, order_total, created_at)
+SELECT CASE WHEN i % 100 = 0 THEN 'cancelled'
+            WHEN i % 20  = 0 THEN 'pending'
+            ELSE 'completed' END,
+       CASE WHEN i % 3 = 0 THEN 'US' WHEN i % 3 = 1 THEN 'DE' ELSE 'JP' END,
+       CASE WHEN i % 3 = 0 THEN 'Austin' WHEN i % 3 = 1 THEN 'Berlin' ELSE 'Tokyo' END,
+       (random() * 500)::numeric(12,2),
+       now() - (i || ' minutes')::interval
+FROM generate_series(1, 1000000) AS i;
+
+ANALYZE orders;
+```
+
+Now read the statistics back:
+
+```sql
+SELECT attname,
+       null_frac,
+       n_distinct,
+       most_common_vals,
+       most_common_freqs
+FROM   pg_stats
+WHERE  schemaname = 'public' AND tablename = 'orders'
+  AND  attname IN ('status', 'country');
+```
+
+```text
+ attname |  null_frac | n_distinct |        most_common_vals         |   most_common_freqs
+---------+------------+------------+---------------------------------+------------------------
+ status  |          0 |          3 | {completed,pending,cancelled}   | {0.9499,0.0451,0.0050}
+ country |          0 |          3 | {US,DE,JP}                      | {0.3334,0.3333,0.3333}
+```
+
+The four pieces:
+
+- **`null_frac`** — the fraction of NULLs, used to estimate `IS NULL` and `IS NOT NULL`.
+- **`n_distinct`** — the number of distinct values. A *positive* number is an absolute count; a *negative* number between -1 and 0 means "this fraction of the table", so `-1` means every row is unique. The planner uses it for `GROUP BY` and join estimates.
+- **`most_common_vals` / `most_common_freqs`** — the MCV list. For any value in this list the planner has an exact frequency, which is why `WHERE status = 'cancelled'` estimates well even though it matches only 0.5% of rows.
+- **`histogram_bounds`** — equal-frequency buckets covering everything *not* in the MCV list, used for range predicates like `order_total > 300`.
+
+There is a fifth, `correlation`: how closely physical row order matches logical column order, ranging from -1 to 1. A correlation near 1 (a monotonically increasing `created_at` on an append-only table) makes index scans much cheaper because the heap fetches are nearly sequential. This is the statistic that makes `CLUSTER` and BRIN indexes worth considering.
+
+## Diagnosing a statistics problem
+
+The diagnostic is always the same: compare estimated rows with actual rows in `EXPLAIN ANALYZE`.
+
+```sql
+EXPLAIN (ANALYZE, BUFFERS)
+SELECT * FROM orders WHERE status = 'pending' AND order_total > 400;
+```
+
+```text
+Seq Scan on orders  (cost=0.00..21925.00 rows=9020 width=62) (actual time=0.031..118.412 rows=8987 loops=1)
+  Filter: ((order_total > 400::numeric) AND (status = 'pending'::text))
+  Rows Removed by Filter: 991013
+```
+
+Estimated 9,020, actual 8,987 — within 1%. That plan is being chosen on good information; if it is slow, the fix is an index, not statistics.
+
+Now the pathological case. `country` and `city` are perfectly correlated in this data — every `US` row is `Austin`. The planner does not know that:
+
+```sql
+EXPLAIN ANALYZE
+SELECT * FROM orders WHERE country = 'US' AND city = 'Austin';
+```
+
+```text
+Seq Scan on orders  (cost=0.00..21925.00 rows=111111 width=62) (actual time=0.019..131.204 rows=333334 loops=1)
+  Filter: ((country = 'US'::text) AND (city = 'Austin'::text))
+```
+
+The planner estimated 111,111 and got 333,334 — a 3× error. It assumed the two conditions were independent and multiplied their selectivities (1/3 × 1/3 = 1/9) when in reality the second condition filters nothing. A 3× error on a leaf node is how you end up with a nested loop over three hundred thousand rows further up the plan.
+
+**The rule: if estimated and actual differ by more than roughly 10×, stop tuning indexes and fix the statistics.** Under 10×, the plan shape is usually still right.
+
+## Fix 1: raise default_statistics_target
+
+The MCV list and histogram both hold `default_statistics_target` entries — 100 by default. For a column with thousands of distinct values and a long tail, 100 buckets is too coarse, and values outside the MCV list all get the same flat estimate.
+
+Raise it per column rather than globally, because a higher target means a bigger sample, slower `ANALYZE` and slower planning for every query touching that column:
+
+```sql
+-- per column: the targeted fix
+ALTER TABLE orders ALTER COLUMN city SET STATISTICS 1000;
+ANALYZE orders (city);
+
+-- check what a column is currently set to (0 or -1 means "use the default")
+SELECT attname, attstattarget
+FROM   pg_attribute
+WHERE  attrelid = 'orders'::regclass AND attnum > 0;
+```
+
+Good candidates are columns with high cardinality and heavy skew that appear in `WHERE` clauses — tenant IDs in a multi-tenant table, product SKUs, status columns with a long tail of rare values. A value of 1000 is a reasonable ceiling for a problem column; the maximum is 10000 and you almost never need it.
+
+Changing it globally in `postgresql.conf` is a blunt instrument, but going from 100 to 200 or 250 is a defensible default on a large, heavily-queried database:
+
+```text
+default_statistics_target = 250
+```
+
+Remember that the new target only takes effect after the next `ANALYZE`.
+
+## Fix 2: extended statistics for correlated columns
+
+`default_statistics_target` cannot fix the `country`/`city` problem, because the issue is not resolution — it is the independence assumption. `CREATE STATISTICS` tells the planner that two or more columns are related:
+
+```sql
+CREATE STATISTICS orders_geo (dependencies, ndistinct, mcv)
+  ON country, city FROM orders;
+
+ANALYZE orders;
+
+EXPLAIN ANALYZE
+SELECT * FROM orders WHERE country = 'US' AND city = 'Austin';
+```
+
+```text
+Seq Scan on orders  (cost=0.00..21925.00 rows=333334 width=62) (actual time=0.017..129.882 rows=333334 loops=1)
+  Filter: ((country = 'US'::text) AND (city = 'Austin'::text))
+```
+
+The estimate is now exact. The three statistic kinds do different jobs:
+
+- **`dependencies`** captures functional dependencies — knowing `city` determines `country`. This fixes equality predicates on several columns.
+- **`ndistinct`** captures the number of distinct *combinations*, which fixes `GROUP BY country, city` estimates. Without it the planner multiplies distinct counts and wildly overestimates group counts, often leading to a hash aggregate that spills.
+- **`mcv`** stores a multi-column MCV list, which also handles inequality and range predicates rather than just equality.
+
+Inspect what was collected:
+
+```sql
+SELECT statistics_name, kinds, n_distinct, dependencies
+FROM   pg_stats_ext
+WHERE  tablename = 'orders';
+```
+
+PostgreSQL 14 added expression statistics, so you can also fix estimates for expressions you filter on frequently:
+
+```sql
+CREATE STATISTICS orders_month (ndistinct)
+  ON date_trunc('month', created_at) FROM orders;
+ANALYZE orders;
+```
+
+Extended statistics are cheap to maintain and dramatically underused. Any time two columns in a `WHERE` clause are semantically linked — country and city, brand and model, category and subcategory, tenant and region — they are worth adding.
+
+## A practical checklist
+
+1. **After any bulk load, restore or `pg_upgrade`, run `ANALYZE`.** This single step prevents more incidents than all the tuning below.
+2. **Check estimate versus actual first.** `EXPLAIN (ANALYZE, BUFFERS)` and compare `rows=` with `actual ... rows=`. Under 10× off, look at indexes. Over 10× off, look at statistics.
+3. **Find tables autovacuum is neglecting:**
+
+```sql
+SELECT relname,
+       n_live_tup,
+       n_mod_since_analyze,
+       last_analyze,
+       last_autoanalyze
+FROM   pg_stat_user_tables
+WHERE  n_mod_since_analyze > 10000
+ORDER  BY n_mod_since_analyze DESC
+LIMIT  20;
+```
+
+4. **Tighten autoanalyze on large tables** so 10% does not mean millions of rows:
+
+```sql
+ALTER TABLE orders SET (autovacuum_analyze_scale_factor = 0.02,
+                        autovacuum_analyze_threshold   = 5000);
+```
+
+5. **Raise statistics targets on skewed, high-cardinality filter columns**, one column at a time.
+6. **Add extended statistics wherever correlated columns appear together in predicates or `GROUP BY`.**
+7. **Re-measure.** Every change needs a fresh `EXPLAIN ANALYZE` to confirm the estimate improved, not just the wall-clock time of one run.
+
+Working through this loop means running the same query repeatedly with small changes and comparing plans. Chat2DB ([chat2db.ai/download](https://chat2db.ai/download)) keeps each query and its `EXPLAIN` output side by side across tabs and connections, which makes it much easier to see whether an estimate genuinely improved or you just got a warmer cache.
+
+## Summary
+
+PostgreSQL's planner is only as good as the statistics it is fed. `ANALYZE` samples `300 × default_statistics_target` rows and stores null fractions, distinct counts, a most-common-values list, a histogram and a physical correlation figure — all readable from `pg_stats`. Diagnose by comparing estimated to actual rows in `EXPLAIN ANALYZE`: large gaps mean statistics, not indexes. Fix resolution problems by raising `SET STATISTICS` on the specific column, and fix independence-assumption problems with `CREATE STATISTICS` on correlated columns. And whatever else you do, run `ANALYZE` after every bulk load — it is the cheapest performance fix PostgreSQL offers.

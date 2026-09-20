@@ -1,0 +1,186 @@
+---
+title: "Snowflake Architecture Explained: The Three Layers"
+description: "How Snowflake architecture works: storage, multi-cluster compute and cloud services, micro-partitions, virtual warehouses, caching and what it means for cost."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: September 20, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# Snowflake Architecture Explained: The Three Layers
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="September 20, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+Snowflake's architecture is the reason it behaves differently from every database that came before it, and understanding it is what separates people who fight their credit bill from people who control it. Almost every practical question — why did this query cost so much, why does that dashboard suddenly run in 200 ms, why can the finance team's giant query not slow down the product team, how does zero-copy cloning work — has the same answer: the three-layer design.
+
+This article walks through that design from the bottom up, explains micro-partitions and virtual warehouses concretely, shows how caching works at three separate levels, and connects each architectural fact to a decision you actually make.
+
+## The shape of the architecture
+
+Traditional databases fall into two camps. **Shared-disk** systems put all data on shared storage with multiple compute nodes coordinating access through a locking layer — simple to reason about, hard to scale because coordination becomes the bottleneck. **Shared-nothing** systems (classic Redshift, Teradata, Greenplum) give every node its own slice of the data, which scales compute well but ties storage to compute: to store more data you add nodes you may not need for compute, and resizing means physically redistributing data.
+
+Snowflake uses a hybrid usually described as **multi-cluster shared data**. There are three independent layers:
+
+1. **Database storage** — all data, in Snowflake's compressed columnar format, in cloud object storage.
+2. **Query processing** — virtual warehouses, which are independent MPP compute clusters.
+3. **Cloud services** — the brain: authentication, metadata, query optimization, transaction management, security.
+
+Each layer scales independently and is billed differently. That separation is the whole product.
+
+## Layer 1: storage and micro-partitions
+
+When you load data into Snowflake it is not stored as you sent it. Snowflake reorganises it into an internal, compressed, columnar format and writes it into cloud object storage — S3 on AWS, Blob Storage on Azure, GCS on Google Cloud. You cannot read those files directly; access is only through SQL.
+
+The unit of storage is the **micro-partition**: a contiguous block containing 50–500 MB of uncompressed data, stored columnar and compressed, typically holding a few hundred thousand rows. Micro-partitions are created automatically as data arrives, are immutable once written, and are never something you declare or manage.
+
+For each micro-partition, Snowflake records metadata in the cloud services layer: the range of values for every column, the number of distinct values, the count of NULLs. This metadata is what makes queries fast, through **pruning**. Given a query like:
+
+```sql
+SELECT order_id, order_total
+FROM   orders
+WHERE  order_date BETWEEN '2026-09-01' AND '2026-09-07'
+  AND  region = 'EMEA';
+```
+
+Snowflake first consults micro-partition metadata and eliminates every partition whose `order_date` range does not overlap the requested week and whose `region` values do not include EMEA. Only the survivors are read from storage. On a table with a hundred thousand micro-partitions this can mean reading a few dozen — the difference between a two-second query and a two-minute one.
+
+Two consequences follow directly.
+
+**Immutability explains Time Travel.** Because micro-partitions are never modified in place, an `UPDATE` writes new partitions and marks the old ones as no longer current — but the old ones still exist. That is why Snowflake can offer Time Travel:
+
+```sql
+-- query the table as it was an hour ago
+SELECT * FROM orders AT(OFFSET => -3600);
+
+-- or before a specific statement ran
+SELECT * FROM orders BEFORE(STATEMENT => '01a2b3c4-0000-...');
+
+-- and restore a dropped table
+UNDROP TABLE orders;
+```
+
+It is also why zero-copy cloning is instant and free at creation time: a clone just references the same immutable micro-partitions, and only diverging changes consume new storage.
+
+```sql
+CREATE TABLE orders_dev CLONE orders;
+CREATE DATABASE analytics_test CLONE analytics_prod;
+```
+
+Cloning an entire production database to test a migration, in seconds, with no storage cost until you modify it, is an architectural consequence, not a feature bolted on.
+
+**Pruning explains clustering.** Pruning only works if the values you filter on are physically co-located. Data loaded in date order naturally clusters by date. If your most common filter is on something uncorrelated with load order, pruning degrades as the table grows. Check it:
+
+```sql
+SELECT SYSTEM$CLUSTERING_INFORMATION('orders', '(region, order_date)');
+```
+
+The output reports average overlap and depth across micro-partitions; high overlap means many partitions contain the value you filter on, so few can be pruned. For very large tables you can define a clustering key and let Snowflake maintain the ordering automatically:
+
+```sql
+ALTER TABLE orders CLUSTER BY (region, order_date);
+```
+
+Automatic clustering is a background service that consumes credits continuously, so it is worth the money only on large tables with a stable, selective filter pattern. On small or frequently rewritten tables it is usually wasted spend.
+
+## Layer 2: virtual warehouses
+
+A **virtual warehouse** is a cluster of compute nodes that executes queries. It has no permanent data of its own; it reads from the shared storage layer and caches locally on SSD while running.
+
+Warehouses come in T-shirt sizes, and each step up doubles both the compute and the credit consumption rate: X-Small, Small, Medium, Large, X-Large and upward. Doubling the size roughly halves the runtime of a query that can parallelise, which means **a bigger warehouse often costs the same and finishes sooner** — an X-Small for 60 seconds and a Small for 30 seconds consume the same credits. This is the single most useful piece of Snowflake cost intuition, and it inverts the instinct to always pick the smallest option.
+
+```sql
+CREATE WAREHOUSE bi_wh
+  WAREHOUSE_SIZE   = 'SMALL'
+  AUTO_SUSPEND     = 60      -- seconds of idleness before suspending
+  AUTO_RESUME      = TRUE
+  INITIALLY_SUSPENDED = TRUE;
+
+CREATE WAREHOUSE etl_wh
+  WAREHOUSE_SIZE   = 'LARGE'
+  AUTO_SUSPEND     = 60
+  AUTO_RESUME      = TRUE;
+```
+
+Because warehouses are independent, they provide **workload isolation**: the ETL job on `etl_wh` cannot slow down the dashboards on `bi_wh`, even though both read the same tables. Running one shared warehouse for everything is the most common self-inflicted performance problem in Snowflake.
+
+Billing is per second with a **60-second minimum** each time a warehouse resumes. That minimum drives the two most important settings above. `AUTO_SUSPEND` too high leaves warehouses idling and burning credits; too low, on a warehouse that receives a query every two minutes, means you pay a fresh 60-second minimum constantly and throw away the local cache each time. For interactive BI, 60 to 300 seconds is a sensible range; for batch ETL, 60 seconds is right.
+
+### Scaling up versus scaling out
+
+These solve different problems and are constantly confused:
+
+- **Scaling up** (larger size) makes a *single* query faster by giving it more compute. Use it when individual queries are slow or spilling to disk.
+- **Scaling out** (multi-cluster warehouse) adds more clusters of the same size to handle *more concurrent* queries. Use it when queries are queuing.
+
+```sql
+ALTER WAREHOUSE bi_wh SET
+  MIN_CLUSTER_COUNT = 1
+  MAX_CLUSTER_COUNT = 4
+  SCALING_POLICY    = 'STANDARD';
+```
+
+The diagnostic is straightforward. In `QUERY_HISTORY`, high `QUEUED_OVERLOAD_TIME` means you need more clusters; high `BYTES_SPILLED_TO_LOCAL_STORAGE` or `BYTES_SPILLED_TO_REMOTE_STORAGE` means the query needs a bigger warehouse.
+
+```sql
+SELECT query_id,
+       warehouse_name,
+       total_elapsed_time / 1000 AS seconds,
+       queued_overload_time / 1000 AS queued_seconds,
+       bytes_spilled_to_remote_storage
+FROM   snowflake.account_usage.query_history
+WHERE  start_time > dateadd('day', -7, current_timestamp())
+  AND  (queued_overload_time > 0 OR bytes_spilled_to_remote_storage > 0)
+ORDER  BY total_elapsed_time DESC
+LIMIT  50;
+```
+
+Spilling to *remote* storage in particular is a red flag: the query has exhausted both memory and local SSD and is now paging to object storage, which is dramatically slower. Either enlarge the warehouse or reduce the working set.
+
+## Layer 3: cloud services
+
+The cloud services layer is a shared, multi-tenant set of services running on Snowflake-managed compute. It handles authentication and access control, metadata management, the query optimizer, transaction consistency, and the result cache.
+
+Crucially, this layer is what makes some queries cost nothing at all. Metadata-only queries never start a warehouse:
+
+```sql
+SELECT COUNT(*) FROM orders;              -- answered from metadata
+SELECT MIN(order_date), MAX(order_date) FROM orders;
+```
+
+Cloud services usage is free up to 10% of your daily compute credit consumption, and billed beyond that. Most accounts never exceed it; those that do are usually running enormous numbers of tiny metadata queries or very complex compilations.
+
+## Three levels of caching
+
+Understanding which cache answered a query explains most "why was it fast this time" confusion.
+
+1. **Result cache** (cloud services). If the exact same query text runs again, the underlying data has not changed, and it is within 24 hours, Snowflake returns the stored result. This costs *no* compute credits and needs no running warehouse. It is invalidated by any change to the underlying tables, and generally bypassed by non-deterministic functions like `CURRENT_TIMESTAMP()`.
+2. **Local disk cache** (virtual warehouse). Micro-partitions read from storage are cached on the warehouse's SSD. This is why the second run of a similar-but-not-identical query is faster. **Suspending a warehouse drops this cache**, which is the real cost of an aggressive `AUTO_SUSPEND`.
+3. **Remote storage.** The source of truth; everything else is a cache over it.
+
+You can disable the result cache to benchmark honestly:
+
+```sql
+ALTER SESSION SET USE_CACHED_RESULT = FALSE;
+```
+
+Anyone benchmarking Snowflake without setting this is measuring the cache, not the engine.
+
+## What the architecture means in practice
+
+Pulling it together into decisions:
+
+- **Separate warehouses per workload.** Isolation is free; contention is not.
+- **Right-size by measuring spill, not by guessing.** Bigger and shorter frequently costs the same or less.
+- **Tune `AUTO_SUSPEND` against the 60-second minimum and the value of the local cache**, not to the lowest possible number.
+- **Filter on clustered columns.** Pruning is where the performance is; a `WHERE` clause on an unclustered high-cardinality column reads the whole table no matter how large the warehouse.
+- **Use cloning for environments.** Zero-copy clones make realistic dev and test databases essentially free.
+- **Do not add clustering keys reflexively.** Automatic clustering bills continuously.
+
+Working across Snowflake and other engines — checking whether a query pruned properly, comparing a Snowflake result against the source PostgreSQL system it was loaded from — is much easier from a client that speaks both. [Chat2DB](https://chat2db.ai/download) connects to Snowflake alongside PostgreSQL, MySQL and 20+ other databases in one window, with AI assistance for writing and explaining SQL, and a browser version at [app.chat2db.ai](https://app.chat2db.ai) if you would rather not install anything.
+
+## Summary
+
+Snowflake's architecture is three independent layers: immutable, metadata-rich micro-partitions in cloud object storage; virtual warehouses that provide isolated, independently sized MPP compute; and a shared cloud services layer that optimizes queries, enforces security and caches results. Micro-partition metadata drives pruning, immutability gives you Time Travel and zero-copy cloning, warehouse independence gives you workload isolation, and per-second billing with a 60-second minimum shapes every sizing and suspension decision you make. Read a cost or performance problem through those three layers and the fix is usually obvious.

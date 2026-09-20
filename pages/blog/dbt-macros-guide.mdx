@@ -1,0 +1,289 @@
+---
+title: "dbt Macros: A Practical Guide with Real Examples"
+description: "Learn dbt macros from scratch: Jinja syntax, arguments, run_query, dbt_utils, custom generic tests, materializations, whitespace control and debugging tips."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: September 20, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# dbt Macros: A Practical Guide with Real Examples
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="September 20, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+A dbt macro is a function that writes SQL. That is the whole concept, and once it clicks, a lot of repetitive analytics engineering disappears. Instead of pasting the same twelve-line currency conversion into nine models, you write it once and call it. Instead of maintaining a hand-written list of 40 columns to pivot, you generate it from the data. Instead of copying a `CASE` expression that everyone slightly disagrees about, there is one definition and one place to change it.
+
+Macros are written in Jinja, the same templating language dbt uses everywhere else, and they live in the `macros/` directory of your project. This guide goes from the basic syntax to the patterns that are genuinely worth using in production, and — just as importantly — the ones that are not.
+
+## The basics
+
+Create `macros/cents_to_dollars.sql`:
+
+```sql
+{% macro cents_to_dollars(column_name, decimal_places=2) %}
+    round({{ column_name }}::numeric / 100, {{ decimal_places }})
+{% endmacro %}
+```
+
+Call it from a model:
+
+```sql
+-- models/staging/stg_payments.sql
+select
+    payment_id,
+    order_id,
+    {{ cents_to_dollars('amount_cents') }}        as amount_usd,
+    {{ cents_to_dollars('fee_cents', 4) }}        as fee_usd
+from {{ source('stripe', 'payments') }}
+```
+
+Three things to internalise straight away:
+
+- `{% ... %}` is a **statement** (logic, no output). `{{ ... }}` is an **expression** (renders into the SQL).
+- Arguments are strings containing SQL, not values. `cents_to_dollars('amount_cents')` passes the *name* of a column, and the macro pastes it into the generated text.
+- A macro produces text, nothing more. Everything a macro can do could be done by typing the SQL out — which is exactly why macros are safe, and why debugging them means looking at the generated text.
+
+Always confirm what was generated:
+
+```bash
+dbt compile --select stg_payments
+cat target/compiled/my_project/models/staging/stg_payments.sql
+```
+
+This one habit prevents most macro frustration. If the compiled SQL is right, the macro is right.
+
+## Control flow: loops and conditionals
+
+The payoff arrives when macros generate SQL you would not want to write by hand. A pivot is the canonical example:
+
+```sql
+{% macro pivot_status_counts(statuses) %}
+    {% for status in statuses %}
+    count(case when order_status = '{{ status }}' then 1 end) as {{ status }}_orders
+    {%- if not loop.last %},{% endif %}
+    {% endfor %}
+{% endmacro %}
+```
+
+```sql
+-- models/marts/customer_order_summary.sql
+select
+    customer_id,
+    {{ pivot_status_counts(['pending', 'completed', 'cancelled', 'refunded']) }}
+from {{ ref('fct_orders') }}
+group by customer_id
+```
+
+The `loop.last` check handles trailing commas, which is the single most common bug in generated SQL. Jinja's loop object also gives you `loop.first`, `loop.index` (1-based) and `loop.index0`.
+
+Conditionals let one model behave differently by environment:
+
+```sql
+select *
+from {{ ref('fct_orders') }}
+{% if target.name == 'dev' %}
+where order_date >= dateadd('day', -7, current_date)
+{% endif %}
+```
+
+This pattern — full data in production, a recent slice in development — cuts dev build times enormously and is one of the first macros most teams adopt.
+
+### Whitespace control
+
+Jinja leaves blank lines where your tags were, which turns compiled SQL into something unreadable. A hyphen strips whitespace on that side of the tag:
+
+```sql
+{%- for col in columns -%}
+    {{ col }}{% if not loop.last %},{% endif %}
+{%- endfor -%}
+```
+
+Compiled SQL that a human can read is compiled SQL a human can debug. Spend the extra minute on the hyphens.
+
+## Querying the warehouse at compile time
+
+Macros can run SQL during compilation using `run_query`, which is how you generate code from your actual data rather than a hard-coded list. Rewriting the pivot to discover statuses automatically:
+
+```sql
+{% macro pivot_all_statuses(relation, column_name) %}
+    {%- set query -%}
+        select distinct {{ column_name }}
+        from {{ relation }}
+        where {{ column_name }} is not null
+        order by 1
+    {%- endset -%}
+
+    {%- if execute -%}
+        {%- set results = run_query(query) -%}
+        {%- set values = results.columns[0].values() -%}
+    {%- else -%}
+        {%- set values = [] -%}
+    {%- endif -%}
+
+    {%- for value in values %}
+    count(case when {{ column_name }} = '{{ value }}' then 1 end) as {{ value | lower | replace(' ', '_') }}_count
+    {%- if not loop.last %},{% endif %}
+    {%- endfor -%}
+{% endmacro %}
+```
+
+The `{% if execute %}` guard is mandatory and frequently omitted. dbt parses your project twice: once to build the DAG (where `execute` is false and `run_query` returns nothing), then again to run it (where `execute` is true). Without the guard, the parse pass crashes trying to iterate a null result.
+
+`dbt_utils.get_column_values` does exactly this and is better tested, so prefer it unless you need something custom:
+
+```sql
+{% set statuses = dbt_utils.get_column_values(ref('fct_orders'), 'order_status') %}
+```
+
+Be aware of the cost: every `run_query` is a real warehouse query executed on every parse of that model. A handful is fine; forty of them makes `dbt compile` slow and expensive.
+
+## Macros that are worth writing
+
+### 1. A business definition with exactly one home
+
+```sql
+{% macro is_active_customer(last_order_date_column) %}
+    {{ last_order_date_column }} >= dateadd('day', -90, current_date)
+{% endmacro %}
+```
+
+When marketing decides active means 60 days, you change one file rather than grepping for `90` across the project. This is the highest-value macro category and the most underused.
+
+### 2. Safe division
+
+```sql
+{% macro safe_divide(numerator, denominator) %}
+    case when nullif({{ denominator }}, 0) is null
+         then null
+         else ({{ numerator }})::numeric / {{ denominator }}
+    end
+{% endmacro %}
+```
+
+Division by zero bugs are endemic in analytics SQL. One macro removes the whole class.
+
+### 3. Generating a date spine or surrogate key
+
+`dbt_utils` covers most of this — `dbt_utils.generate_surrogate_key`, `dbt_utils.date_spine`, `dbt_utils.star`, `dbt_utils.union_relations`. Install it before writing your own:
+
+```yaml
+# packages.yml
+packages:
+  - package: dbt-labs/dbt_utils
+    version: [">=1.1.0", "<2.0.0"]
+```
+
+`dbt_utils.star` is especially handy for "select everything except these columns":
+
+```sql
+select {{ dbt_utils.star(from=ref('stg_orders'), except=['_loaded_at', '_batch_id']) }}
+from {{ ref('stg_orders') }}
+```
+
+### 4. Custom generic tests
+
+A generic test *is* a macro — one that returns a query selecting failing rows. Put it in `tests/generic/`:
+
+```sql
+{% test positive_value(model, column_name) %}
+select *
+from {{ model }}
+where {{ column_name }} <= 0
+{% endtest %}
+```
+
+```yaml
+models:
+  - name: fct_orders
+    columns:
+      - name: subtotal_amount
+        data_tests:
+          - positive_value
+```
+
+Custom generic tests are the cleanest way to encode domain rules that `dbt_utils` does not cover, and they cost almost nothing to write.
+
+### 5. Hooks and grants
+
+```sql
+{% macro grant_select(role) %}
+    grant select on {{ this }} to role {{ role }};
+{% endmacro %}
+```
+
+```yaml
+models:
+  my_project:
+    marts:
+      +post-hook: "{{ grant_select('reporting_role') }}"
+```
+
+### 6. Operations you run by hand
+
+Macros do not have to be called from models. Wrap maintenance tasks and run them with `dbt run-operation`:
+
+```sql
+{% macro drop_old_dev_schemas(days=30) %}
+    {% set sql %}
+        select schema_name
+        from information_schema.schemata
+        where schema_name like 'dbt_%'
+          and last_altered < dateadd('day', -{{ days }}, current_date)
+    {% endset %}
+    {% if execute %}
+        {% for row in run_query(sql) %}
+            {% do log('Dropping ' ~ row[0], info=true) %}
+            {% do run_query('drop schema if exists ' ~ row[0] ~ ' cascade') %}
+        {% endfor %}
+    {% endif %}
+{% endmacro %}
+```
+
+```bash
+dbt run-operation drop_old_dev_schemas --args '{days: 14}'
+```
+
+## Overriding dbt's own behaviour
+
+Some macro names are special because dbt calls them itself. The most commonly overridden is `generate_schema_name`, which controls where models are built:
+
+```sql
+{% macro generate_schema_name(custom_schema_name, node) -%}
+    {%- set default_schema = target.schema -%}
+    {%- if custom_schema_name is none or target.name == 'dev' -%}
+        {{ default_schema }}
+    {%- else -%}
+        {{ custom_schema_name | trim }}
+    {%- endif -%}
+{%- endmacro %}
+```
+
+This gives every developer their own sandbox schema in dev while production writes to the proper named schemas. `generate_alias_name` and `generate_database_name` work the same way. Override these deliberately and document them — a surprising `generate_schema_name` is a classic source of "where did my table go".
+
+## Debugging macros
+
+- **Compile, then read.** `dbt compile --select my_model` then open `target/compiled/...`. Ninety percent of problems are visible there.
+- **Log from inside a macro.** `{% do log("statuses: " ~ statuses, info=true) %}` prints during the run.
+- **Check `execute`.** Any macro calling `run_query` needs the guard.
+- **Remember types.** Everything in Jinja is a string unless you cast it. `{{ 1 + 1 }}` is 2, but `{{ "1" + "1" }}` is an error; use `| int` and `| string` filters.
+- **Quote carefully.** `'{{ value }}'` for a string literal, `{{ column }}` for an identifier. Mixing these up produces errors that look like SQL syntax problems but are templating problems.
+
+Once compiled SQL is in front of you, running it directly against the warehouse is often the fastest way to confirm a fix. Pasting it into [Chat2DB](https://chat2db.ai/download) — or the browser version at [app.chat2db.ai](https://app.chat2db.ai) — lets you execute and tweak the generated query interactively before going back to edit the macro, which beats re-running `dbt compile` after every small change.
+
+## When not to write a macro
+
+Macros have a real cost: they make SQL harder to read, harder for a newcomer to trace, and harder to debug. Resist them when:
+
+- The logic appears **twice**. Duplication is cheaper than the wrong abstraction; wait for the third occurrence.
+- The macro would take **more than four or five arguments**. That is a model, not a macro.
+- A **CTE or an intermediate model** would express it more plainly. Composition beats templating.
+- **`dbt_utils` already has it.** Check the package first.
+
+The best macros in a mature project are short, few, and each encode one decision the business has made. If a reviewer cannot tell what a call site generates without opening the macro file, it is probably doing too much.
+
+## Summary
+
+dbt macros are Jinja functions that generate SQL. Use `{% macro %}` with named and default arguments, `{% for %}` with `loop.last` to avoid trailing commas, `{% if %}` for environment-specific behaviour, and hyphens for readable whitespace. Reach for `run_query` (guarded by `{% if execute %}`) when you need to generate SQL from real data, and prefer `dbt_utils` over writing your own. The highest-value macros encode a single business definition, wrap an error-prone SQL pattern, add a custom generic test, or automate a maintenance operation. Compile and read the output whenever something is wrong, and skip the macro entirely when a plain CTE would be clearer.

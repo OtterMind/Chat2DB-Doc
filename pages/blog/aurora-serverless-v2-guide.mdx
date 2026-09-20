@@ -1,0 +1,163 @@
+---
+title: "Aurora Serverless v2: A Practical Guide"
+description: "How Aurora Serverless v2 scales with ACUs, how it differs from v1 and provisioned Aurora, scaling to zero, cost control and when it is the wrong choice."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: September 20, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# Aurora Serverless v2: A Practical Guide
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="September 20, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+Aurora Serverless v2 is what Serverless v1 should have been. The original version scaled by pausing your database, provisioning a new one behind the scenes and switching over — which meant scaling events took tens of seconds, dropped connections, and only happened at quiet moments. v2 scales the instance you are already connected to, in place, in fractions of a second, without interrupting sessions. That single change moved Aurora Serverless from "interesting for dev environments" to something you can reasonably put in front of production traffic.
+
+This guide explains the ACU model that drives both performance and cost, how v2 compares with provisioned Aurora, what scaling to zero really does, and the cases where you should still choose a provisioned instance.
+
+## The ACU model
+
+Everything in Serverless v2 revolves around the **Aurora Capacity Unit**. One ACU is a bundle of roughly 2 GiB of memory with the CPU and network capacity that typically accompanies it. You do not pick an instance class; you pick a range:
+
+```bash
+aws rds create-db-cluster \
+  --db-cluster-identifier app-prod \
+  --engine aurora-postgresql \
+  --engine-version 16.4 \
+  --serverless-v2-scaling-configuration MinCapacity=2,MaxCapacity=64 \
+  --master-username postgres \
+  --manage-master-user-password
+
+aws rds create-db-instance \
+  --db-instance-identifier app-prod-writer \
+  --db-cluster-identifier app-prod \
+  --db-instance-class db.serverless \
+  --engine aurora-postgresql
+```
+
+Aurora then adjusts capacity continuously between `MinCapacity` and `MaxCapacity` based on CPU utilisation, memory pressure and connection load. Capacity is measured and billed per second, so a workload that sits at 3 ACUs overnight and 40 ACUs at lunchtime pays for exactly that shape.
+
+Two properties of this model matter far more than people expect.
+
+**Memory is the dominant scaling signal, and memory scales down slowly.** Aurora will add capacity quickly when demand rises — doubling within seconds — but reducing capacity requires evicting buffer cache, which it does cautiously to avoid destroying performance. In practice you will see capacity ramp up in seconds and drift down over many minutes. That asymmetry is deliberate, and it means a brief traffic spike keeps costing you for a while afterwards.
+
+**Minimum capacity sets your baseline cost and your buffer cache size.** Aurora PostgreSQL sizes `shared_buffers` relative to current capacity. Set `MinCapacity` too low and your cache is repeatedly discarded during quiet periods, so the first queries after a lull are slow and read from storage. For production, a minimum of 2 ACUs is a more realistic floor than 0.5.
+
+### Watch the scaling actually happen
+
+```sql
+-- current capacity, from inside the database
+SELECT * FROM aurora_stat_utils();
+```
+
+And in CloudWatch, the metric to graph is `ServerlessDatabaseCapacity`, with `ACUUtilization` alongside it. If `ACUUtilization` sits pinned near 100%, you have hit `MaxCapacity` and queries are being throttled by a ceiling you chose — raise it. If capacity never rises above your minimum, you are paying for a floor you do not need.
+
+## v2 versus v1 versus provisioned
+
+| | Serverless v1 | Serverless v2 | Provisioned |
+| --- | --- | --- | --- |
+| Scaling granularity | Doubling steps | 0.5 ACU increments | Manual resize |
+| Scaling speed | Tens of seconds | Sub-second, in place | Minutes, with failover |
+| Connections during scaling | Dropped | Preserved | N/A |
+| Read replicas | No | Yes | Yes |
+| Multi-AZ | Limited | Yes | Yes |
+| Global Database | No | Yes | Yes |
+| Scale to zero | Yes (pause) | Yes (on supported versions) | No |
+| Cost at steady high load | — | Higher than provisioned | Lowest |
+
+Aurora Serverless v1 has reached end of life, so any remaining v1 cluster needs a migration plan. The path is usually a snapshot restore into a v2 cluster, or a blue/green deployment for minimal downtime; note that v1 and v2 are not a simple in-place toggle, and v1 supported older engine versions that v2 does not, so an engine upgrade is often part of the work.
+
+Against **provisioned** Aurora, the trade is simple: serverless costs more per unit of steady capacity and saves you money whenever capacity would otherwise sit idle. Roughly, if your database runs near-constant utilisation 24 hours a day, provisioned instances with a reserved-instance commitment will be cheaper. If your load varies by more than about two or three times across the day, serverless usually wins — and it always wins on the operational side, because you never plan a resize.
+
+## Scaling to zero
+
+Newer Aurora PostgreSQL and MySQL versions support a minimum capacity of 0 ACUs, which pauses the database after a configurable idle period.
+
+```bash
+aws rds modify-db-cluster \
+  --db-cluster-identifier app-dev \
+  --serverless-v2-scaling-configuration \
+      MinCapacity=0,MaxCapacity=8,SecondsUntilAutoPause=3600
+```
+
+While paused you pay for storage and backups but not compute. The first connection afterwards wakes the cluster, which takes a matter of seconds — fine for a development environment, not fine for a user-facing request that expected 5 ms.
+
+Use scale-to-zero for development, staging, CI databases, internal tools and demo environments, where it can eliminate almost all compute cost. Do not use it for anything with a latency SLA, and be aware that a resumed cluster starts with a cold cache, so the first minute of queries will be slower than steady state. Check the current engine version requirements before planning around it — support arrived gradually across versions.
+
+## Cost control in practice
+
+Serverless v2 makes cost a function of your workload shape, so the levers are different from provisioned instances.
+
+**Set `MaxCapacity` deliberately.** It is a budget ceiling as much as a performance ceiling. A runaway query on a cluster with `MaxCapacity=128` can scale up and stay there. Set it to what you actually need, and alarm on approaching it:
+
+```bash
+aws cloudwatch put-metric-alarm \
+  --alarm-name aurora-acu-ceiling \
+  --metric-name ServerlessDatabaseCapacity \
+  --namespace AWS/RDS \
+  --statistic Average --period 300 --threshold 48 \
+  --comparison-operator GreaterThanThreshold --evaluation-periods 2 \
+  --dimensions Name=DBClusterIdentifier,Value=app-prod
+```
+
+**Fix the queries that drive capacity.** Because you now pay for CPU by the second, an unindexed query has a directly visible price. Enable `pg_stat_statements` and work the top of the list:
+
+```sql
+CREATE EXTENSION IF NOT EXISTS pg_stat_statements;
+
+SELECT round(total_exec_time::numeric / 1000, 1) AS total_seconds,
+       calls,
+       round(mean_exec_time::numeric, 2)         AS avg_ms,
+       round(100.0 * shared_blks_hit /
+             nullif(shared_blks_hit + shared_blks_read, 0), 1) AS cache_hit_pct,
+       query
+FROM   pg_stat_statements
+ORDER  BY total_exec_time DESC
+LIMIT  20;
+```
+
+On a serverless cluster this list is effectively a cost report. The query at the top is the one keeping your ACUs high, and a missing index on it is a line item. Reading these results alongside `EXPLAIN (ANALYZE, BUFFERS)` output is the whole optimisation loop; a client such as [Chat2DB](https://chat2db.ai/download) that keeps the statement list and the plan in adjacent tabs — and can suggest index changes with AI assistance — makes it considerably less tedious than doing it in `psql`.
+
+**Use reader instances rather than a bigger writer.** Serverless v2 supports read replicas, which can have their own capacity ranges. Routing analytics and reporting to a reader with a lower ceiling stops a heavy dashboard from inflating writer capacity:
+
+```bash
+aws rds create-db-instance \
+  --db-instance-identifier app-prod-reader \
+  --db-cluster-identifier app-prod \
+  --db-instance-class db.serverless \
+  --engine aurora-postgresql \
+  --promotion-tier 15
+```
+
+Applications connect to the cluster's reader endpoint for read-only work, which load-balances across readers automatically.
+
+**Mind connection overhead.** Each PostgreSQL connection consumes memory, and memory drives ACUs, so a badly configured application pool can hold capacity up on its own. Either size the pool properly or put RDS Proxy in front — the latter also helps enormously with Lambda workloads, which otherwise open a connection per invocation.
+
+**Do not forget I/O.** Aurora Standard bills storage I/O per request, which for an I/O-heavy workload can exceed the compute bill entirely. Aurora I/O-Optimized removes per-request I/O charges in exchange for higher compute and storage rates. Check your actual `VolumeReadIOPs` and `VolumeWriteIOPs` before assuming which is cheaper; AWS publishes a rough crossover guideline, but your numbers are the ones that matter. As always, confirm current rates on the AWS pricing page rather than trusting any figure quoted in an article.
+
+## When not to use Serverless v2
+
+- **Constant, predictable high load.** Provisioned instances with reserved capacity are cheaper, sometimes substantially.
+- **Hard sub-millisecond latency floors.** Capacity changes are fast but not free, and a scaling event can produce a small latency blip.
+- **Workloads requiring an engine version or feature v2 does not support.** Check the compatibility matrix before committing; v2 support trails new engine versions slightly.
+- **Tight budget ceilings without monitoring.** Serverless converts a capacity planning problem into a cost management problem. If nobody watches `ServerlessDatabaseCapacity`, you will find out at the end of the month.
+
+## A sensible default configuration
+
+For a production Aurora PostgreSQL cluster of moderate size:
+
+- `MinCapacity`: 2 ACUs, so the buffer cache survives quiet periods.
+- `MaxCapacity`: two to three times your observed peak, then alarm at 75% of it.
+- A reader instance in a second availability zone, sharing the same range, for failover and read offloading.
+- RDS Proxy if the application is serverless or the connection count is volatile.
+- `pg_stat_statements` enabled from day one, reviewed weekly.
+- I/O-Optimized evaluated once you have a month of real I/O metrics.
+
+For development and staging, the same cluster shape with `MinCapacity=0` and an auto-pause window measured in minutes, which typically removes the overwhelming majority of non-production database spend.
+
+## Summary
+
+Aurora Serverless v2 scales capacity in 0.5 ACU steps, in place and in under a second, without dropping connections — the defect that made v1 impractical. Capacity is driven mainly by memory pressure, rises quickly and falls slowly, and is billed per second, so your bill follows your traffic shape. Set `MinCapacity` high enough to keep a useful buffer cache, treat `MaxCapacity` as a budget ceiling with an alarm on it, push reads to reader instances, and use `pg_stat_statements` as a cost report. Choose it when load varies; choose provisioned Aurora when it does not; and use scale-to-zero aggressively everywhere outside production.

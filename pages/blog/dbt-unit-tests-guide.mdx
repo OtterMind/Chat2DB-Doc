@@ -1,0 +1,262 @@
+---
+title: "dbt Unit Tests: A Practical Guide with Examples"
+description: "How to write dbt unit tests with given/expect fixtures, how they differ from data tests, handling ephemeral and incremental models, CSV fixtures and CI setup."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: September 20, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# dbt Unit Tests: A Practical Guide with Examples
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="September 20, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+For most of dbt's history, "testing" meant one thing: run the models, then check whether the resulting rows satisfy some assertions. That is useful, but it is not what software engineers mean by a unit test. It needs real data, it needs a full build, and it tells you that today's data is fine without telling you whether your SQL logic is correct.
+
+dbt 1.8 added proper unit tests. You supply fixed input rows in YAML, dbt runs your model's SQL against exactly those rows, and compares the output to rows you declare. No production data, no waiting for a build, and — most importantly — you can test the cases that never appear in your warehouse until the night they break everything: the NULL discount, the refund larger than the order, the timestamp on a daylight-saving boundary.
+
+This guide covers how to write them, how they differ from data tests, and the awkward corners — ephemeral models, incremental models, and models that reference sources.
+
+## Unit tests versus data tests
+
+The distinction matters because the two catch different failures.
+
+| | Data test | Unit test |
+| --- | --- | --- |
+| Runs against | Rows in your warehouse | Fixtures you define in YAML |
+| Answers | "Is the data valid?" | "Is the SQL correct?" |
+| Needs a build first | Yes | No (compiles and runs in seconds) |
+| Catches | Bad upstream data, broken assumptions | Logic regressions, edge cases |
+| When it runs | After models are built | Before, in CI, on every PR |
+
+A `not_null` test on `order_id` is a data test. A test that says "given an order with a NULL discount, the model should output a total equal to the subtotal" is a unit test. You want both.
+
+dbt 1.8 also renamed the schema property from `tests:` to `data_tests:` precisely so the two are unambiguous. `tests:` still works but new projects should write `data_tests:`.
+
+## Your first unit test
+
+Take a model that computes an order total with a discount:
+
+```sql
+-- models/marts/fct_orders.sql
+select
+    order_id,
+    customer_id,
+    order_status,
+    subtotal_amount,
+    coalesce(discount_amount, 0)                       as discount_amount,
+    subtotal_amount - coalesce(discount_amount, 0)     as net_amount,
+    case
+        when order_status in ('cancelled', 'refunded') then 0
+        else subtotal_amount - coalesce(discount_amount, 0)
+    end                                                as recognised_revenue
+from {{ ref('stg_orders') }}
+```
+
+There are already three behaviours worth pinning down: NULL discounts become zero, cancelled orders recognise no revenue, and net amount subtracts the discount. A unit test states all three:
+
+```yaml
+# models/marts/_unit_tests.yml
+unit_tests:
+  - name: test_fct_orders_revenue_recognition
+    description: >
+      NULL discounts default to zero, and cancelled or refunded orders
+      recognise no revenue regardless of their amounts.
+    model: fct_orders
+    given:
+      - input: ref('stg_orders')
+        rows:
+          - { order_id: 1, customer_id: 10, order_status: 'completed', subtotal_amount: 100, discount_amount: 20 }
+          - { order_id: 2, customer_id: 11, order_status: 'completed', subtotal_amount: 100, discount_amount: null }
+          - { order_id: 3, customer_id: 12, order_status: 'cancelled', subtotal_amount: 100, discount_amount: 10 }
+          - { order_id: 4, customer_id: 13, order_status: 'refunded',  subtotal_amount: 250, discount_amount: null }
+    expect:
+      rows:
+        - { order_id: 1, discount_amount: 20, net_amount: 80,  recognised_revenue: 80 }
+        - { order_id: 2, discount_amount: 0,  net_amount: 100, recognised_revenue: 100 }
+        - { order_id: 3, discount_amount: 10, net_amount: 90,  recognised_revenue: 0 }
+        - { order_id: 4, discount_amount: 0,  net_amount: 250, recognised_revenue: 0 }
+```
+
+Run it:
+
+```bash
+dbt test --select fct_orders
+# or unit tests only
+dbt test --select "test_type:unit"
+```
+
+Two details make this practical. First, **you only need to supply the columns your model reads**; anything unreferenced can be omitted from `given`. Second, **`expect` only compares the columns you list**, so you can assert on the two output columns you care about and ignore passthroughs. Both keep fixtures small, which is what stops unit tests becoming a maintenance burden.
+
+## Testing edge cases that never occur in production
+
+This is where unit tests earn their keep. Add a second test for the cases that will eventually arrive:
+
+```yaml
+  - name: test_fct_orders_edge_cases
+    model: fct_orders
+    given:
+      - input: ref('stg_orders')
+        rows:
+          # discount larger than subtotal — should net go negative, or floor at zero?
+          - { order_id: 5, customer_id: 14, order_status: 'completed', subtotal_amount: 50, discount_amount: 80 }
+          # zero-value order
+          - { order_id: 6, customer_id: 15, order_status: 'completed', subtotal_amount: 0,  discount_amount: 0 }
+          # unknown status the CASE does not enumerate
+          - { order_id: 7, customer_id: 16, order_status: 'on_hold',   subtotal_amount: 75, discount_amount: 5 }
+    expect:
+      rows:
+        - { order_id: 5, net_amount: -30, recognised_revenue: -30 }
+        - { order_id: 6, net_amount: 0,   recognised_revenue: 0 }
+        - { order_id: 7, net_amount: 70,  recognised_revenue: 70 }
+```
+
+Writing that test forces a conversation: *should* an over-discount produce negative revenue? If the answer is no, the test fails, you add a `greatest(..., 0)`, and you have fixed a bug that would otherwise have surfaced as a finance ticket six months later. The test is valuable even when it passes, because it documents the decision.
+
+## Fixture formats
+
+Inline dictionaries are the default and best for small cases. Three other formats exist for when they are not enough.
+
+**Inline CSV** keeps wide tables readable:
+
+```yaml
+    given:
+      - input: ref('stg_orders')
+        format: csv
+        rows: |
+          order_id,customer_id,order_status,subtotal_amount,discount_amount
+          1,10,completed,100,20
+          2,11,completed,100,
+```
+
+Note that an empty CSV field becomes NULL, which is a common source of confusion — if you want an empty string, use the dict format.
+
+**CSV fixture files** live in `tests/fixtures/` and are reusable across tests:
+
+```yaml
+    given:
+      - input: ref('stg_orders')
+        format: csv
+        fixture: stg_orders_sample     # tests/fixtures/stg_orders_sample.csv
+```
+
+**Empty input** tests the degenerate case, which surprisingly often breaks aggregations:
+
+```yaml
+    given:
+      - input: ref('stg_orders')
+        rows: []
+    expect:
+      rows: []
+```
+
+## Testing models that read sources and seeds
+
+A unit test can override a `source()` the same way it overrides a `ref()`:
+
+```yaml
+  - name: test_stg_orders_cleaning
+    model: stg_orders
+    given:
+      - input: source('shop', 'raw_orders')
+        rows:
+          - { id: 1, status: '  COMPLETED  ', total: '100.50' }
+    expect:
+      rows:
+        - { order_id: 1, order_status: 'completed', subtotal_amount: 100.50 }
+```
+
+This is how you test the messy cleaning logic in staging models — trimming, casing, string-to-number casts — without needing the raw system to be available.
+
+Seeds do not need overriding: dbt uses the real seed data unless you explicitly provide an override. That is usually what you want for small mapping tables.
+
+## The awkward cases
+
+### Ephemeral models
+
+A unit test cannot target an ephemeral model directly, because it has no standalone SQL to run — it is inlined as a CTE into its consumers. You have two options: test the downstream model that materialises it, or change the intermediate model to a view. If a piece of logic is complex enough to deserve its own unit test, it is usually worth materialising anyway.
+
+### Incremental models
+
+Incremental models behave differently on first run and on subsequent runs, so you must tell dbt which path to test with the `overrides` block:
+
+```yaml
+  - name: test_incremental_orders_full_refresh
+    model: fct_orders_incremental
+    overrides:
+      macros:
+        is_incremental: false
+    given:
+      - input: ref('stg_orders')
+        rows:
+          - { order_id: 1, updated_at: '2026-09-20 10:00:00', amount: 100 }
+    expect:
+      rows:
+        - { order_id: 1, amount: 100 }
+
+  - name: test_incremental_orders_merge
+    model: fct_orders_incremental
+    overrides:
+      macros:
+        is_incremental: true
+    given:
+      - input: ref('stg_orders')
+        rows:
+          - { order_id: 1, updated_at: '2026-09-20 11:00:00', amount: 150 }
+      - input: this                       # the existing table contents
+        rows:
+          - { order_id: 1, updated_at: '2026-09-20 10:00:00', amount: 100 }
+    expect:
+      rows:
+        - { order_id: 1, updated_at: '2026-09-20 11:00:00', amount: 150 }
+```
+
+Testing the incremental branch is genuinely valuable, because late-arriving rows and duplicate keys in the merge condition are among the most common and least visible dbt bugs.
+
+### Overriding variables, environment variables and dbt_utils
+
+The `overrides` block also handles vars and env vars, which is how you test date-window logic deterministically:
+
+```yaml
+    overrides:
+      vars:
+        lookback_days: 7
+      env_vars:
+        DBT_RUN_DATE: '2026-09-20'
+      macros:
+        dbt_utils.current_timestamp: "'2026-09-20 00:00:00'"
+```
+
+Pinning the clock like this is essential for any model that uses `current_date` — otherwise the test passes today and fails at the next month boundary.
+
+## Running them in CI
+
+Unit tests are fast because they do not touch your real tables, so run them on every pull request before the build:
+
+```bash
+dbt deps
+dbt parse
+dbt test --select "test_type:unit"        # seconds, no build required
+dbt build --select state:modified+        # then the real thing
+```
+
+Running them *before* `dbt build` means a logic error fails the pipeline in under a minute rather than after a thirty-minute warehouse run. Note that unit tests do still need a warehouse connection — dbt executes the generated SQL against your adapter — so they are not fully offline, but they read no production tables and process only your handful of fixture rows.
+
+A common pattern is to require unit tests on mart models only, enforced in review, rather than on every staging model. Staging models are mostly renames and casts where data tests suffice; marts contain the business logic that is worth pinning.
+
+## Practical tips
+
+- **Write the test when you fix a bug.** The fixture row that reproduced the bug becomes permanent protection against its return.
+- **Keep fixtures minimal.** Two to five rows per test. A twenty-row fixture nobody can read is worse than no test.
+- **Name tests after the behaviour**, not the model: `test_orders_null_discount_defaults_to_zero` beats `test_orders_2`.
+- **Test one behaviour per test.** When a test with eight assertions fails, you still have to work out which.
+- **Use `--empty` for a cheap smoke test.** `dbt run --empty` builds your models with `limit 0`, validating that every reference and column resolves without processing data — a good complement to unit tests in CI.
+
+When you are writing fixtures, the hard part is usually knowing what the real data actually looks like: which statuses exist, whether a column is ever NULL, what the true range of a numeric field is. Querying the source table before writing the fixture is worth the minute it takes, and a client like [Chat2DB](https://chat2db.ai/download) makes that quick — connect to the warehouse, check distinct values and null counts, then write a fixture that reflects reality rather than what you assume.
+
+## Summary
+
+dbt unit tests run your model's SQL against fixtures you control and compare the result to an expected output, so they catch logic regressions in seconds without touching production data. Use `given` to override `ref()` and `source()` inputs, list only the columns you care about in `expect`, and reach for the `overrides` block to pin `is_incremental`, vars and the current timestamp. Keep fixtures small and behaviour-focused, run them ahead of `dbt build` in CI, and add a new fixture row every time you fix a bug. Pair them with data tests — unit tests prove your SQL is right, data tests prove your data is.
