@@ -1,0 +1,464 @@
+---
+title: "Deploying Valkey on Kubernetes with Helm"
+description: "Deploy Valkey on Kubernetes: Helm values, standalone vs replication vs cluster mode, persistence, Sentinel failover, and Docker Compose for development."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: September 21, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# Deploying Valkey on Kubernetes with Helm
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="September 21, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+Valkey is the Linux Foundation fork of Redis, created in 2024 after Redis moved away from BSD licensing. It is backed by AWS, Google, Oracle and Ericsson, remains BSD-licensed, and is a drop-in replacement — same RESP protocol, same commands, same client libraries. If you are deploying a Redis-compatible cache on Kubernetes today and want unambiguous open-source licensing, Valkey is the straightforward choice.
+
+This guide covers deploying it with Helm, choosing between the three topologies, getting persistence and failover right, and a local Docker Compose setup for development.
+
+## Local development first
+
+Before Kubernetes, the simplest possible setup — useful for development and for understanding the moving parts:
+
+```yaml
+# docker-compose.yml
+services:
+  valkey:
+    image: valkey/valkey:8-alpine
+    container_name: valkey
+    ports:
+      - "6379:6379"
+    command: >
+      valkey-server
+      --appendonly yes
+      --appendfsync everysec
+      --maxmemory 512mb
+      --maxmemory-policy allkeys-lru
+      --requirepass ${VALKEY_PASSWORD:-devpassword}
+    volumes:
+      - valkey-data:/data
+    healthcheck:
+      test: ["CMD", "valkey-cli", "-a", "${VALKEY_PASSWORD:-devpassword}", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+volumes:
+  valkey-data:
+```
+
+```bash
+docker compose up -d
+docker compose exec valkey valkey-cli -a devpassword ping
+# PONG
+```
+
+The CLI is `valkey-cli`, but `redis-cli` works against it identically — the protocol is the same.
+
+A replicated setup locally, if you want to exercise failover logic:
+
+```yaml
+services:
+  valkey-primary:
+    image: valkey/valkey:8-alpine
+    command: valkey-server --appendonly yes --requirepass devpassword --masterauth devpassword
+    ports: ["6379:6379"]
+    volumes: ["primary-data:/data"]
+
+  valkey-replica:
+    image: valkey/valkey:8-alpine
+    command: >
+      valkey-server --appendonly yes --requirepass devpassword --masterauth devpassword
+      --replicaof valkey-primary 6379
+    ports: ["6380:6379"]
+    volumes: ["replica-data:/data"]
+    depends_on: [valkey-primary]
+
+volumes:
+  primary-data:
+  replica-data:
+```
+
+```bash
+docker compose exec valkey-replica valkey-cli -a devpassword INFO replication
+# role:slave
+# master_link_status:up
+```
+
+Note `--masterauth`: replicas need the password to authenticate *to* the primary, separately from `--requirepass` which governs clients connecting to them. Forgetting it is the most common reason a replica never syncs.
+
+## Choosing a topology
+
+Three options, and picking the right one saves considerable trouble.
+
+**Standalone** — one pod. No replication, no failover. If the pod dies, the cache is briefly unavailable and (without persistence) empty when it returns. Perfectly acceptable for a cache whose loss is a performance event rather than a correctness event. Simplest to run.
+
+**Replication (primary + replicas)** — one writable primary, N read-only replicas, with Sentinel for automatic failover. Data fits on one node; replicas provide read scaling and high availability. This is the right default for most production caches.
+
+**Cluster** — the keyspace is sharded across 16,384 hash slots spread over multiple primaries, each with replicas. Use it when the dataset exceeds one node's memory or write throughput exceeds one primary. The cost is real: multi-key operations only work when keys hash to the same slot, which forces hash tags like `user:{1234}:profile` into your key design, and transactions and Lua scripts cannot span slots.
+
+The honest guidance is to **avoid cluster mode unless you need it**. A large amount of unnecessary complexity gets adopted because "cluster" sounds more production-ready. Replication with Sentinel handles high availability; cluster is for when a single node genuinely cannot hold the data.
+
+## Deploying with Helm
+
+The Bitnami chart is the most widely used:
+
+```bash
+helm repo add bitnami https://charts.bitnami.com/bitnami
+helm repo update
+helm search repo bitnami/valkey --versions | head
+```
+
+### Standalone
+
+```yaml
+# values-standalone.yaml
+architecture: standalone
+
+auth:
+  enabled: true
+  existingSecret: valkey-auth
+  existingSecretPasswordKey: password
+
+primary:
+  persistence:
+    enabled: true
+    size: 8Gi
+    storageClass: gp3
+  resources:
+    requests:
+      cpu: 250m
+      memory: 1Gi
+    limits:
+      memory: 2Gi
+  configuration: |-
+    maxmemory 1500mb
+    maxmemory-policy allkeys-lru
+    appendonly yes
+    appendfsync everysec
+
+metrics:
+  enabled: true
+  serviceMonitor:
+    enabled: true
+```
+
+Create the secret out-of-band rather than putting a password in values:
+
+```bash
+kubectl create secret generic valkey-auth \
+  --from-literal=password="$(openssl rand -base64 32)" \
+  -n cache
+
+helm install valkey bitnami/valkey \
+  -f values-standalone.yaml \
+  -n cache --create-namespace
+```
+
+### Replication with Sentinel
+
+```yaml
+# values-replication.yaml
+architecture: replication
+
+auth:
+  enabled: true
+  existingSecret: valkey-auth
+  existingSecretPasswordKey: password
+
+sentinel:
+  enabled: true
+  quorum: 2
+  downAfterMilliseconds: 10000
+  failoverTimeout: 30000
+  resources:
+    requests:
+      cpu: 100m
+      memory: 128Mi
+
+primary:
+  persistence:
+    enabled: true
+    size: 20Gi
+    storageClass: gp3
+  resources:
+    requests:
+      cpu: 500m
+      memory: 4Gi
+    limits:
+      memory: 6Gi
+  configuration: |-
+    maxmemory 3gb
+    maxmemory-policy allkeys-lru
+    appendonly yes
+    appendfsync everysec
+
+replica:
+  replicaCount: 2
+  persistence:
+    enabled: true
+    size: 20Gi
+    storageClass: gp3
+  resources:
+    requests:
+      cpu: 500m
+      memory: 4Gi
+    limits:
+      memory: 6Gi
+  podAntiAffinityPreset: hard
+
+metrics:
+  enabled: true
+  serviceMonitor:
+    enabled: true
+```
+
+Several details here matter.
+
+`sentinel.quorum: 2` with three Sentinels (one per pod) means two must agree the primary is down before failover. With `replicaCount: 2` you get three pods total and three Sentinels — an odd number, which is what you want to avoid split-brain.
+
+`podAntiAffinityPreset: hard` forces pods onto different nodes. Without it, Kubernetes may schedule your primary and both replicas onto the same node, and losing that node loses everything. This single line is the difference between real high availability and the appearance of it.
+
+Memory limits should sit comfortably above `maxmemory`. Valkey needs headroom for client buffers, replication buffers and AOF rewrite; if the container limit equals `maxmemory`, the kernel OOM-kills the pod instead of Valkey evicting keys. A limit around 1.5–2x `maxmemory` is a reasonable starting point.
+
+```bash
+helm install valkey bitnami/valkey -f values-replication.yaml -n cache
+kubectl get pods -n cache -w
+```
+
+Connecting from an application — Sentinel-aware clients need the Sentinel service, not the primary directly:
+
+```
+valkey-headless.cache.svc.cluster.local:26379   # Sentinel
+valkey-primary.cache.svc.cluster.local:6379     # direct primary
+valkey-replicas.cache.svc.cluster.local:6379    # read-only replicas
+```
+
+```python
+from redis.sentinel import Sentinel
+
+sentinel = Sentinel(
+    [("valkey-headless.cache.svc.cluster.local", 26379)],
+    socket_timeout=0.5,
+    sentinel_kwargs={"password": PASSWORD},
+    password=PASSWORD,
+)
+primary = sentinel.master_for("mymaster", socket_timeout=0.5)
+replica = sentinel.slave_for("mymaster", socket_timeout=0.5)
+
+primary.set("key", "value")
+print(replica.get("key"))
+```
+
+Using a Sentinel-aware client is the point of running Sentinel. If your application connects straight to `valkey-primary` and a failover occurs, the service will eventually point at the new primary but your client will see errors in the meantime and may not reconnect cleanly.
+
+### Cluster mode
+
+```yaml
+# values-cluster.yaml
+architecture: replication   # the cluster chart is separate; see note below
+```
+
+For cluster mode use the dedicated chart:
+
+```yaml
+# values-cluster.yaml for bitnami/valkey-cluster
+cluster:
+  nodes: 6          # 3 primaries + 3 replicas
+  replicas: 1
+
+auth:
+  enabled: true
+  existingSecret: valkey-auth
+  existingSecretPasswordKey: password
+
+persistence:
+  enabled: true
+  size: 20Gi
+  storageClass: gp3
+
+resources:
+  requests:
+    cpu: 500m
+    memory: 4Gi
+  limits:
+    memory: 6Gi
+
+podAntiAffinityPreset: hard
+
+metrics:
+  enabled: true
+```
+
+```bash
+helm install valkey-cluster bitnami/valkey-cluster -f values-cluster.yaml -n cache
+
+# Verify the cluster formed
+kubectl exec -n cache valkey-cluster-0 -- \
+  valkey-cli -a "$PASSWORD" CLUSTER INFO
+kubectl exec -n cache valkey-cluster-0 -- \
+  valkey-cli -a "$PASSWORD" CLUSTER NODES
+```
+
+`cluster_state:ok` and all 16,384 slots assigned means it worked. Clients must use cluster mode:
+
+```python
+from redis.cluster import RedisCluster
+
+rc = RedisCluster(
+    host="valkey-cluster.cache.svc.cluster.local",
+    port=6379,
+    password=PASSWORD,
+    decode_responses=True,
+)
+rc.set("user:{1234}:profile", "...")   # hash tag keeps related keys together
+rc.set("user:{1234}:settings", "...")  # same slot — MGET across them works
+```
+
+The braces are the hash tag: only the text inside them is hashed, so both keys land on the same slot and multi-key operations between them are legal.
+
+## The Valkey operator
+
+For fleets of Valkey instances, an operator manages them as custom resources rather than Helm releases:
+
+```yaml
+apiVersion: hyperspike.io/v1
+kind: Valkey
+metadata:
+  name: app-cache
+  namespace: cache
+spec:
+  nodes: 3
+  replicas: 1
+  storage:
+    spec:
+      accessModes: ["ReadWriteOnce"]
+      storageClassName: gp3
+      resources:
+        requests:
+          storage: 20Gi
+  resources:
+    requests:
+      cpu: 500m
+      memory: 4Gi
+    limits:
+      memory: 6Gi
+  tls: true
+  prometheus: true
+```
+
+The trade-off is the familiar one. A Helm chart is a templated set of manifests: easy to reason about, easy to `helm template` and inspect, no cluster-wide controller. An operator adds ongoing reconciliation — it can handle scaling, failover, certificate rotation and upgrades as first-class operations rather than a `helm upgrade` and hope.
+
+For one or two instances, Helm is simpler and entirely sufficient. For a platform team running Valkey for many tenants, an operator pays for itself.
+
+## Persistence
+
+Whether you need persistence at all is worth deciding deliberately.
+
+**Pure cache** — data is reconstructible from the source of truth. Disable persistence, save the disk and the I/O. A restart means a cold cache and a brief load spike on the database, which is usually acceptable.
+
+**Session store, rate limiter, queue** — losing data has user-visible consequences. Enable AOF.
+
+```
+appendonly yes
+appendfsync everysec
+auto-aof-rewrite-percentage 100
+auto-aof-rewrite-min-size 64mb
+```
+
+`appendfsync everysec` loses at most one second of writes on a hard crash, without the throughput penalty of `always`. RDB snapshots can be enabled alongside AOF as a faster-loading fallback.
+
+The Kubernetes-specific concern is that a `StatefulSet` with `ReadWriteOnce` volumes ties each pod to a specific volume in a specific availability zone. If that zone goes away, the pod cannot be rescheduled elsewhere with its data. For a cache this is fine — let it start empty. For anything you actually need, rely on replication across zones rather than on the volume.
+
+Use `topologySpreadConstraints` to spread across zones:
+
+```yaml
+replica:
+  topologySpreadConstraints:
+    - maxSkew: 1
+      topologyKey: topology.kubernetes.io/zone
+      whenUnsatisfiable: DoNotSchedule
+      labelSelector:
+        matchLabels:
+          app.kubernetes.io/name: valkey
+```
+
+## Monitoring
+
+With `metrics.enabled: true` and Prometheus Operator installed, a ServiceMonitor is created automatically. The signals worth alerting on:
+
+| Metric | Watch for |
+| --- | --- |
+| `valkey_up` | instance down |
+| `valkey_connected_clients` | approaching `maxclients` |
+| `valkey_memory_used_bytes / maxmemory` | above ~90% |
+| `valkey_evicted_keys_total` | rising — working set exceeds memory |
+| `valkey_keyspace_hits_total` vs misses | falling hit rate |
+| `valkey_connected_slaves` | below expected replica count |
+| `valkey_master_link_up` | replication broken |
+| `valkey_rdb_last_bgsave_status` | failed snapshots |
+
+A hit-rate alert:
+
+```
+rate(valkey_keyspace_hits_total[5m])
+  / (rate(valkey_keyspace_hits_total[5m]) + rate(valkey_keyspace_misses_total[5m]))
+  < 0.8
+```
+
+Quick checks from the shell:
+
+```bash
+POD=valkey-primary-0
+kubectl exec -n cache $POD -- valkey-cli -a "$PASSWORD" INFO replication
+kubectl exec -n cache $POD -- valkey-cli -a "$PASSWORD" INFO memory
+kubectl exec -n cache $POD -- valkey-cli -a "$PASSWORD" --bigkeys
+kubectl exec -n cache $POD -- valkey-cli -a "$PASSWORD" SLOWLOG GET 10
+```
+
+`--bigkeys` is the first thing to run when memory is higher than expected.
+
+To browse the keyspace from your laptop, port-forward and connect any Redis-compatible client:
+
+```bash
+kubectl port-forward -n cache svc/valkey-primary 6379:6379
+```
+
+[Chat2DB](https://chat2db.ai/download) connects to Valkey over the standard protocol alongside PostgreSQL, MySQL and others, which is convenient when you are tracing a cache-versus-database consistency problem across both; the [web version](https://app.chat2db.ai) avoids a local install.
+
+## Security
+
+```yaml
+auth:
+  enabled: true
+  existingSecret: valkey-auth
+
+tls:
+  enabled: true
+  authClients: false
+  existingSecret: valkey-tls
+  certFilename: tls.crt
+  certKeyFilename: tls.key
+  certCAFilename: ca.crt
+
+networkPolicy:
+  enabled: true
+  allowExternal: false
+```
+
+Three things, in order of importance. Always enable auth — an unauthenticated cache reachable inside the cluster is reachable by every compromised pod in it. Enable a NetworkPolicy with `allowExternal: false` so only labelled workloads can reach port 6379. Enable TLS if traffic crosses node or zone boundaries and you do not have a service mesh already encrypting it.
+
+Also consider disabling destructive commands:
+
+```
+rename-command FLUSHALL ""
+rename-command FLUSHDB ""
+```
+
+## Summary
+
+For most teams the right Valkey deployment on Kubernetes is **replication mode with Sentinel, three pods with hard anti-affinity, AOF persistence if the data matters, metrics enabled, auth enabled, and a NetworkPolicy**. That configuration survives a node failure, scales reads, and stays comprehensible.
+
+The two mistakes that cause the most pain are reaching for cluster mode when replication would do — inheriting hash-tag constraints for no benefit — and omitting pod anti-affinity, which produces a topology that looks highly available until the node holding all three pods reboots. Get those two right and the rest is tuning.

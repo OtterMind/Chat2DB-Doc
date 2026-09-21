@@ -1,0 +1,356 @@
+---
+title: "PostgreSQL JDBC Driver: Setup, URL and Tuning"
+description: "Guide to the Postgres JDBC driver: Maven setup, JDBC URL format, SSL, prepared statement tuning, batch inserts, and fixes for common connection errors."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: September 21, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# PostgreSQL JDBC Driver: Setup, URL and Tuning
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="September 21, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+The PostgreSQL JDBC driver — pgJDBC — is a pure-Java implementation of the PostgreSQL wire protocol. There is no native library to install, no client toolchain to match against the server: one JAR on the classpath and Java can talk to PostgreSQL. That simplicity hides a fair amount of configuration, and the defaults are tuned for compatibility rather than throughput. A default pgJDBC setup will work, but it will not use server-side prepared statements for the first few executions, will send batch inserts one statement at a time, and will not verify the server's TLS certificate.
+
+This guide covers getting the driver onto the classpath, the JDBC URL format in detail, the parameters that actually change performance, and the errors that send people to search engines.
+
+## Adding the driver
+
+pgJDBC is published to Maven Central as `org.postgresql:postgresql`.
+
+### Maven
+
+```xml
+<dependency>
+    <groupId>org.postgresql</groupId>
+    <artifactId>postgresql</artifactId>
+    <version>42.7.4</version>
+</dependency>
+```
+
+### Gradle
+
+```groovy
+dependencies {
+    implementation 'org.postgresql:postgresql:42.7.4'
+}
+```
+
+In a Spring Boot project the version is managed for you, so the dependency has no version tag at all:
+
+```xml
+<dependency>
+    <groupId>org.postgresql</groupId>
+    <artifactId>postgresql</artifactId>
+    <scope>runtime</scope>
+</dependency>
+```
+
+`runtime` scope is correct here: your code compiles against `java.sql`, not against pgJDBC classes, so the driver is only needed when the application runs.
+
+### Which version do I need?
+
+Modern pgJDBC versions (42.2.0 and later) require **Java 8 or newer** and speak to **PostgreSQL 8.2 and newer**. The protocol is stable enough that you should simply use the latest 42.x release regardless of your server version — newer drivers routinely fix bugs and add TLS improvements that benefit old servers too. There is no need to match driver version to server version.
+
+You no longer need `Class.forName("org.postgresql.Driver")`. Since JDBC 4.0, drivers are discovered through the service loader mechanism from `META-INF/services`. The line is harmless but it has been unnecessary for well over a decade.
+
+## The JDBC URL
+
+pgJDBC URLs follow this shape:
+
+```
+jdbc:postgresql://host:port/database?param1=value1&param2=value2
+```
+
+Note three things that differ from a libpq `postgresql://` URI: the `jdbc:` prefix is required, credentials go in query parameters rather than the authority section, and some parameter names are camel case rather than snake case. Handing a plain `postgresql://user:pass@host/db` string to `DriverManager` produces `No suitable driver found`, which is the single most common first error when a URL is copied out of a `.env` file written for a Python or Node service.
+
+Every component is optional:
+
+```
+jdbc:postgresql:/                       # localhost:5432, database = user name
+jdbc:postgresql:appdb                   # localhost:5432/appdb
+jdbc:postgresql://db.example.com/appdb  # default port 5432
+jdbc:postgresql://db.example.com:5433/appdb
+```
+
+Multiple hosts are supported for failover, exactly as in libpq:
+
+```
+jdbc:postgresql://primary.example.com:5432,replica.example.com:5432/appdb?targetServerType=primary
+```
+
+`targetServerType` accepts `any`, `primary`, `secondary`, `preferSecondary` and `preferPrimary`. Combined with `loadBalanceHosts=true`, read replicas can be balanced without a proxy.
+
+### Credentials
+
+```java
+// Credentials in the URL
+String url = "jdbc:postgresql://db.example.com:5432/appdb?user=alice&password=secret";
+Connection conn = DriverManager.getConnection(url);
+
+// Credentials as separate arguments — preferred
+String url = "jdbc:postgresql://db.example.com:5432/appdb";
+Connection conn = DriverManager.getConnection(url, "alice", "secret");
+
+// Credentials in a Properties object — best for many parameters
+Properties props = new Properties();
+props.setProperty("user", "alice");
+props.setProperty("password", "p@ssw0rd&more");   // no URL encoding needed
+props.setProperty("ssl", "true");
+props.setProperty("sslmode", "verify-full");
+props.setProperty("ApplicationName", "orders-api");
+Connection conn = DriverManager.getConnection(url, props);
+```
+
+The `Properties` form is worth defaulting to. Values in a URL query string must be URL-encoded, so a password containing `&`, `+`, `%` or a space will be silently mangled. Values in a `Properties` object are passed through untouched.
+
+## Parameters that matter
+
+### Prepared statement tuning
+
+This is the parameter with the largest performance impact, and its default surprises people.
+
+```
+prepareThreshold=5     # default
+```
+
+pgJDBC sends the first four executions of a `PreparedStatement` as unnamed, one-shot parse-bind-execute cycles. Only on the **fifth** execution does it create a named server-side prepared statement that PostgreSQL can cache a plan for. The idea is to avoid the cost of naming statements that only run once, but for an application that executes the same query thousands of times, those first four parses are wasted and the switchover is invisible when you are benchmarking.
+
+```
+prepareThreshold=1              # server-side prepare immediately
+preparedStatementCacheQueries=256   # how many statements to cache per connection (default 256)
+preparedStatementCacheSizeMiB=5     # cache memory cap per connection (default 5)
+```
+
+Setting `prepareThreshold=1` is the right call for most long-lived applications. Setting it to `0` disables server-side prepared statements entirely, which is what you need behind PgBouncer in transaction pooling mode.
+
+### Batch inserts
+
+By default, `addBatch()` / `executeBatch()` sends each statement separately over the wire. The round trips dominate, and a "batch" of 1,000 inserts takes roughly as long as 1,000 individual inserts.
+
+```
+reWriteBatchedInserts=true
+```
+
+With this enabled, pgJDBC rewrites a batch of single-row inserts into multi-row `INSERT ... VALUES (...), (...), (...)` statements. For bulk loads this is commonly a 2–3x improvement, sometimes far more on high-latency links. It applies only to simple `INSERT` statements without `RETURNING`.
+
+```java
+String sql = "INSERT INTO events (user_id, event_type, payload, created_at) VALUES (?, ?, ?::jsonb, ?)";
+
+try (PreparedStatement ps = conn.prepareStatement(sql)) {
+    conn.setAutoCommit(false);
+    int n = 0;
+    for (Event e : events) {
+        ps.setLong(1, e.userId());
+        ps.setString(2, e.type());
+        ps.setString(3, e.payloadJson());
+        ps.setObject(4, e.createdAt());   // OffsetDateTime maps to timestamptz
+        ps.addBatch();
+        if (++n % 1000 == 0) {
+            ps.executeBatch();
+        }
+    }
+    ps.executeBatch();
+    conn.commit();
+}
+```
+
+Note the periodic `executeBatch()` — accumulating a million rows in the batch before flushing just moves the memory pressure into the JVM.
+
+For genuinely large loads, skip JDBC batching and use `COPY` through the driver's `CopyManager`:
+
+```java
+import org.postgresql.copy.CopyManager;
+import org.postgresql.core.BaseConnection;
+
+CopyManager copy = new CopyManager(conn.unwrap(BaseConnection.class));
+long rows = copy.copyIn(
+    "COPY events (user_id, event_type, payload, created_at) FROM STDIN WITH (FORMAT csv)",
+    new BufferedReader(new FileReader("events.csv"))
+);
+System.out.println(rows + " rows copied");
+```
+
+`COPY` bypasses the per-row statement machinery entirely and is typically an order of magnitude faster than even rewritten batches.
+
+### Fetch size and memory
+
+By default pgJDBC reads the **entire** result set into memory before `ResultSet.next()` returns the first row. A `SELECT` over a large table will happily produce an `OutOfMemoryError` on the client while the server is perfectly fine.
+
+```java
+conn.setAutoCommit(false);   // required — cursors need a transaction
+try (PreparedStatement ps = conn.prepareStatement("SELECT * FROM big_table")) {
+    ps.setFetchSize(1000);   // stream 1000 rows at a time
+    try (ResultSet rs = ps.executeQuery()) {
+        while (rs.next()) {
+            process(rs.getLong("id"));
+        }
+    }
+}
+```
+
+Both parts are required: `setFetchSize` alone does nothing if autocommit is on, because pgJDBC can only use a cursor inside a transaction. This is a very common source of "I set the fetch size and it still OOMs".
+
+### TLS
+
+```
+ssl=true&sslmode=verify-full&sslrootcert=/etc/ssl/certs/rds-ca.pem
+```
+
+pgJDBC's `sslmode` values match libpq: `disable`, `allow`, `prefer`, `require`, `verify-ca`, `verify-full`. The default is `prefer`, which will fall back to an unencrypted connection without complaint. Historically pgJDBC's `ssl=true` alone meant "encrypt but do not verify", so always state `sslmode` explicitly.
+
+For a managed service using a publicly-trusted CA, the JVM's own trust store is usually enough and no `sslrootcert` is needed. For a private CA, either point `sslrootcert` at the PEM or import it into the JVM truststore with `keytool`.
+
+### Timeouts
+
+```
+connectTimeout=10          # seconds for the TCP connect
+socketTimeout=30           # seconds of socket inactivity before the connection is killed
+loginTimeout=10            # seconds for the whole authentication handshake
+cancelSignalTimeout=10
+tcpKeepAlive=true
+options=-c statement_timeout=30000    # server-side cap, in milliseconds
+```
+
+`socketTimeout` is a blunt instrument — it kills the connection rather than the query, and a legitimate long-running report will be destroyed by it. Prefer a server-side `statement_timeout` via `options`, which cancels the query cleanly and leaves the connection usable. Use `socketTimeout` as a backstop for genuinely wedged networks, set generously above your longest expected query.
+
+### Observability
+
+```
+ApplicationName=orders-api
+```
+
+Always set it. It appears in `pg_stat_activity.application_name` and turns connection debugging from guesswork into a query:
+
+```sql
+SELECT application_name,
+       state,
+       count(*)                                AS conns,
+       max(now() - query_start) FILTER (WHERE state = 'active') AS longest_query
+FROM pg_stat_activity
+WHERE backend_type = 'client backend'
+GROUP BY application_name, state
+ORDER BY conns DESC;
+```
+
+## A production URL
+
+```
+jdbc:postgresql://primary.example.com:5432,replica.example.com:5432/appdb?targetServerType=primary&sslmode=verify-full&connectTimeout=10&socketTimeout=60&prepareThreshold=1&reWriteBatchedInserts=true&ApplicationName=orders-api&options=-c%20statement_timeout%3D30000
+```
+
+In Spring Boot, the same thing in `application.yml`:
+
+```yaml
+spring:
+  datasource:
+    url: jdbc:postgresql://primary.example.com:5432/appdb?sslmode=verify-full&ApplicationName=orders-api
+    username: ${DB_USER}
+    password: ${DB_PASSWORD}
+    hikari:
+      maximum-pool-size: 10
+      minimum-idle: 10
+      connection-timeout: 10000
+      max-lifetime: 1500000       # keep below any proxy/firewall idle cutoff
+      data-source-properties:
+        prepareThreshold: 1
+        reWriteBatchedInserts: true
+        socketTimeout: 60
+```
+
+Driver properties that are not Hikari's own go under `data-source-properties`; putting `prepareThreshold` directly under `hikari` is silently ignored.
+
+## Type mapping
+
+pgJDBC maps PostgreSQL types to Java types as follows for the cases that cause confusion:
+
+| PostgreSQL | Java (recommended) | Notes |
+| --- | --- | --- |
+| `timestamptz` | `OffsetDateTime` | `getObject(n, OffsetDateTime.class)` |
+| `timestamp` | `LocalDateTime` | no zone information at all |
+| `date` | `LocalDate` | |
+| `uuid` | `java.util.UUID` | |
+| `jsonb` | `String` | cast with `?::jsonb` when inserting |
+| `text[]` | `java.sql.Array` | `conn.createArrayOf("text", arr)` |
+| `numeric` | `BigDecimal` | never `double` for money |
+
+Prefer the `java.time` types over the legacy `java.sql.Timestamp`, which applies the JVM default time zone and is a reliable source of off-by-one-hour bugs:
+
+```java
+// Good
+OffsetDateTime createdAt = rs.getObject("created_at", OffsetDateTime.class);
+
+// Avoid — silently reinterprets in the JVM's default zone
+Timestamp ts = rs.getTimestamp("created_at");
+```
+
+Arrays and JSON need a little ceremony:
+
+```java
+// text[] parameter
+Array tags = conn.createArrayOf("text", new String[]{"sql", "java", "postgres"});
+ps.setArray(1, tags);
+
+// jsonb parameter — cast in the SQL, bind as String
+PreparedStatement ps = conn.prepareStatement(
+    "INSERT INTO docs (body) VALUES (?::jsonb)");
+ps.setString(1, "{\"k\": \"v\"}");
+```
+
+## Common errors
+
+**`No suitable driver found for jdbc:postgresql://...`** — either the driver JAR is not on the runtime classpath, or the URL is missing the `jdbc:` prefix. Check both; the second is more common than the first.
+
+**`FATAL: no pg_hba.conf entry for host "10.0.1.5", user "alice", database "appdb", SSL off`** — the server has no matching rule in `pg_hba.conf`. The `SSL off` at the end is the clue in most cloud setups: there is a `hostssl` rule but your connection arrived unencrypted, so add `sslmode=require` or better.
+
+**`FATAL: sorry, too many clients already`** — you have exceeded `max_connections`. Almost always a connection pool that is too large, or connections leaking because they are not closed in a try-with-resources block. Count them:
+
+```sql
+SELECT application_name, count(*)
+FROM pg_stat_activity
+WHERE backend_type = 'client backend'
+GROUP BY application_name
+ORDER BY count(*) DESC;
+```
+
+**`ERROR: prepared statement "S_1" already exists`** — you are running through PgBouncer in transaction pooling mode, where a pooled server connection may already hold a statement with that name. Set `prepareThreshold=0`, or switch PgBouncer to session pooling.
+
+**`OutOfMemoryError` on a large SELECT** — the whole result set was buffered. Set `setFetchSize()` *and* turn off autocommit, as shown above.
+
+**`The connection attempt failed` wrapping `UnknownHostException`** — DNS, not PostgreSQL. Usually a hostname that resolves on your laptop but not inside the container.
+
+**Connections dying after a fixed idle period** — a firewall, NAT gateway or load balancer is dropping idle TCP connections. Set Hikari's `max-lifetime` below that cutoff (AWS NLB defaults to 350 seconds of idle) and enable `tcpKeepAlive=true`.
+
+## Verifying the setup
+
+A short self-check that confirms the driver version, the negotiated TLS and the server's view of the session:
+
+```java
+try (Connection conn = DriverManager.getConnection(url, props);
+     Statement st = conn.createStatement()) {
+
+    DatabaseMetaData md = conn.getMetaData();
+    System.out.printf("Driver: %s %s%n", md.getDriverName(), md.getDriverVersion());
+    System.out.printf("Server: %s%n", md.getDatabaseProductVersion());
+
+    try (ResultSet rs = st.executeQuery(
+            "SELECT current_database(), current_user, " +
+            "(SELECT ssl FROM pg_stat_ssl WHERE pid = pg_backend_pid()) AS ssl")) {
+        rs.next();
+        System.out.printf("db=%s user=%s ssl=%s%n",
+                rs.getString(1), rs.getString(2), rs.getBoolean(3));
+    }
+}
+```
+
+If `ssl` comes back `false` on a connection you believed was encrypted, `sslmode` fell back to the `prefer` default.
+
+When you need to check what the schema actually looks like while debugging a mapping problem, a GUI client is quicker than writing throwaway metadata queries. [Chat2DB](https://chat2db.ai/download) connects over the same JDBC driver, shows types and constraints directly, and lets you run the query your Java code is sending to see the raw result — the [browser version](https://app.chat2db.ai) needs no install at all.
+
+## Summary
+
+Getting pgJDBC right comes down to a handful of decisions. Use the latest 42.x driver regardless of server version. Put credentials in a `Properties` object rather than the URL so escaping never bites. State `sslmode` explicitly — `prefer` is not secure. Set `prepareThreshold=1` for long-lived applications and `0` behind a transaction pooler. Turn on `reWriteBatchedInserts` if you insert in batches, and reach for `CopyManager` when batches are not fast enough. Use `setFetchSize()` with autocommit off for large result sets. Prefer a server-side `statement_timeout` over `socketTimeout`. And always set `ApplicationName`, because the first step in diagnosing any connection problem is knowing which application opened the connection.

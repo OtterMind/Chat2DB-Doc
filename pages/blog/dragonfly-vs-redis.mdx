@@ -1,0 +1,202 @@
+---
+title: "Dragonfly vs Redis: A Practical Comparison"
+description: "Dragonfly vs Redis compared: multi-threaded architecture, memory efficiency, snapshotting, licensing and compatibility, and when switching is worth it."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: September 21, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# Dragonfly vs Redis: A Practical Comparison
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="September 21, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+Redis is single-threaded for command execution. That was a deliberate and largely correct decision in 2009 — it eliminates locking, makes every operation atomic for free, and keeps the codebase comprehensible. On the hardware of the time, a single core could saturate the network anyway.
+
+Hardware moved on. A modern server has 64 or 128 cores, and Redis will use one of them for command execution no matter how many you give it. The standard answer is Redis Cluster: run many Redis processes, shard the keyspace across them, and accept the operational complexity plus the loss of multi-key operations across slots.
+
+Dragonfly's premise is that this is solving the wrong problem. Instead of many single-threaded processes, run one process that uses all the cores properly.
+
+## Architecture
+
+### Redis
+
+One thread executes commands, sequentially, from an event loop. Background threads handle some I/O and lazy freeing, but the command path itself is serialised. Vertical scaling stops at one core's throughput — typically somewhere in the range of 100k–200k operations per second depending on command mix and pipelining.
+
+Scaling past that means Redis Cluster: 16,384 hash slots distributed across shards, each shard a separate Redis process with its own memory and replication. It works and it is well proven, but it brings constraints. Multi-key commands only work when the keys hash to the same slot, which forces hash tags into your key design. Transactions and Lua scripts cannot span slots. Resharding is an operation. Clients must be cluster-aware.
+
+### Dragonfly
+
+Dragonfly is a from-scratch reimplementation of the Redis and Memcached protocols with a **shared-nothing multi-threaded** architecture. The keyspace is partitioned across threads internally, and each thread owns its partition exclusively — so there is still no locking on the data, but all cores are used.
+
+Two design choices underpin it:
+
+**A shared-nothing thread-per-core model** built on `io_uring` for asynchronous I/O on modern Linux kernels. Each thread handles its own shard of the keyspace, and cross-shard operations are coordinated with a lightweight transactional framework rather than locks.
+
+**Dashtable instead of a simple hash table.** Dragonfly uses a dashtable — a hash table variant designed for better cache locality and, critically, incremental resizing. Redis's dictionary rehashing can cause latency spikes as it incrementally moves entries; dashtable growth is smoother and uses less memory overhead per entry.
+
+The practical result is one process that scales vertically across cores, with a single logical keyspace and no slot constraints on multi-key operations.
+
+## Performance
+
+Vendor benchmarks always favour the vendor, so treat specific multiples sceptically. The directionally reliable findings, which independent testing broadly supports:
+
+**Throughput scales with cores.** On a large instance, Dragonfly reaches throughput that a single Redis process cannot approach — this is the central claim and it holds. The gap widens with core count. On a 4-core box the difference is modest; on a 64-core box it is large.
+
+**Compared against Redis Cluster with equivalent total hardware, the gap narrows considerably.** Redis Cluster also uses all the cores, just across processes. Dragonfly's advantage there is less about raw throughput and more about operating one node instead of twelve, and about not having slot constraints.
+
+**Memory efficiency is generally better**, often meaningfully so for workloads with many small keys, thanks to dashtable's lower per-entry overhead. This translates directly into cost when you are paying for RAM.
+
+**Snapshotting behaves very differently.** Redis forks to take an RDB snapshot, and on a large dataset under heavy writes, copy-on-write can transiently double memory usage — a well-known operational hazard. Dragonfly uses a versioned point-in-time algorithm that does not fork, so snapshots have a much flatter memory profile. For large instances this is one of the more practically significant differences.
+
+**Tail latency under load** tends to be more stable on Dragonfly, partly because of the snapshot design and partly because incremental dashtable resizing avoids the rehashing spikes.
+
+The honest summary: if your Redis instance is not CPU-bound on its single thread, Dragonfly will not make your application faster. Most Redis deployments are nowhere near that limit. Check before assuming:
+
+```bash
+# Is the Redis process pegged at ~100% of one core?
+top -p $(pgrep -f redis-server)
+
+# Operations per second and command distribution
+redis-cli INFO stats | grep instantaneous_ops_per_sec
+redis-cli INFO commandstats | sort -t= -k2 -rn | head -20
+
+# Latency percentiles per command
+redis-cli --latency-history
+redis-cli LATENCY LATEST
+```
+
+If `instantaneous_ops_per_sec` sits at a few thousand and CPU is at 10%, your bottleneck is elsewhere and no amount of multi-threading will help.
+
+## Compatibility
+
+Dragonfly implements the RESP protocol and the large majority of Redis commands, so existing clients connect unchanged — no special driver, no code changes for typical usage:
+
+```python
+import redis
+
+# Identical code against either server
+r = redis.Redis(host="localhost", port=6379, decode_responses=True)
+r.set("greeting", "hello", ex=300)
+r.zadd("leaderboard", {"alice": 100, "bob": 85})
+print(r.zrevrange("leaderboard", 0, -1, withscores=True))
+```
+
+Supported: all core data structures (strings, lists, hashes, sets, sorted sets), expiration, pub/sub, Lua scripting, transactions, Streams, replication, and the Memcached protocol as a bonus.
+
+The gaps worth checking before migrating:
+
+- **Redis modules do not work.** RediSearch, RedisJSON, RedisGraph, RedisTimeSeries and RedisBloom are Redis-specific C extensions and will not load. Dragonfly has been adding native equivalents for some functionality, but if you depend on a module today, verify coverage carefully — this is the most common blocker.
+- **Cluster mode differs.** Dragonfly's approach is to scale vertically instead, and its cluster support is not a drop-in replacement for Redis Cluster's semantics.
+- **Some administrative and introspection commands** have partial or differing implementations. `INFO` fields in particular do not match one-for-one, which matters if you have dashboards or alerts parsing specific fields.
+- **`MONITOR`, `DEBUG` and similar diagnostics** may behave differently.
+
+The pragmatic check is to run your actual test suite against Dragonfly rather than reading a compatibility table:
+
+```bash
+docker run -d --name dragonfly -p 6379:6379 \
+  docker.dragonflydb.io/dragonflydb/dragonfly
+
+# Point your integration tests at localhost:6379 and run them
+```
+
+That will surface real incompatibilities in an afternoon.
+
+## Licensing
+
+This is where the decision often gets made, and it is worth being precise.
+
+**Redis** changed its licence in 2024 to a dual RSALv2 / SSPLv1 model, then in 2025 added AGPLv3 as an option from Redis 8. The SSPL and RSALv2 restrict offering Redis as a managed service; AGPLv3 is OSI-approved but copyleft.
+
+**Dragonfly** uses the Dragonfly Business Source License (BSL) 1.1. Source is available, free use is permitted for most purposes, but offering Dragonfly as a managed commercial service is restricted. Each release converts to Apache 2.0 after a set period.
+
+**Valkey**, the Linux Foundation fork of Redis backed by AWS, Google and Oracle, remains BSD-licensed and fully open source. It is single-threaded like Redis but has been adding I/O threading improvements.
+
+For most companies running a cache for their own product, all three licences permit what you want to do. If your organisation has a policy against non-OSI licences, Valkey is the one that satisfies it without qualification.
+
+## Operations
+
+Getting Dragonfly running:
+
+```bash
+# Docker
+docker run -d --name dragonfly \
+  -p 6379:6379 \
+  --ulimit memlock=-1 \
+  -v dragonfly-data:/data \
+  docker.dragonflydb.io/dragonflydb/dragonfly \
+  --maxmemory=8gb \
+  --dir=/data \
+  --dbfilename=dump
+
+# Common flags
+--proactor_threads=8          # worker threads; defaults to core count
+--maxmemory=16gb
+--cache_mode=true             # LRU-ish eviction, like allkeys-lru
+--snapshot_cron="0 */6 * * *" # periodic snapshots
+--requirepass=...
+--tls=true --tls_key_file=... --tls_cert_file=...
+```
+
+Dragonfly is configured mostly by command-line flags rather than a `redis.conf`, though it accepts a config file too. `--proactor_threads` defaults sensibly to the core count.
+
+Replication works with Dragonfly as a replica of Redis, which makes migration straightforward:
+
+```bash
+# On the Dragonfly instance — replicate from an existing Redis primary
+redis-cli -p 6379 REPLICAOF redis-primary.internal 6379
+
+# Watch it sync
+redis-cli -p 6379 INFO replication
+
+# When caught up, promote
+redis-cli -p 6379 REPLICAOF NO ONE
+```
+
+This gives you a live migration path with a short cutover rather than a dump-and-restore. Test it in staging first, and verify your `INFO`-based monitoring still parses what it expects.
+
+## Side by side
+
+| | Redis | Dragonfly | Valkey |
+| --- | --- | --- | --- |
+| Command execution | single-threaded | multi-threaded | single-threaded |
+| Vertical scaling | limited to one core | scales with cores | limited to one core |
+| Horizontal scaling | Redis Cluster | vertical-first | Redis Cluster |
+| Memory overhead | baseline | generally lower | ~ Redis |
+| Snapshot memory spike | fork-based, can spike | no fork, flat | fork-based |
+| Modules | full ecosystem | not supported | Redis-compatible |
+| Licence | RSALv2 / SSPL / AGPLv3 | BSL 1.1 | BSD (fully open) |
+| Maturity | 15+ years | younger | Redis lineage |
+| Client compatibility | native | drop-in | drop-in |
+| Managed offerings | many | fewer | growing (AWS, GCP) |
+
+## When to switch
+
+**Dragonfly is worth evaluating when:**
+
+- Your Redis process is genuinely CPU-saturated on its single thread and you have spare cores.
+- You are running Redis Cluster mainly for throughput rather than dataset size, and would prefer one node to twelve.
+- Memory cost is significant and you have many small keys.
+- Large-dataset snapshotting causes memory spikes or latency problems.
+- You want vertical headroom without redesigning keys around hash tags.
+
+**Stay on Redis (or move to Valkey) when:**
+
+- You depend on Redis modules. This is usually decisive.
+- Your instance is not CPU-bound — which covers the majority of deployments.
+- You need a managed service; the Redis and Valkey ecosystem is far broader.
+- Your organisation requires OSI-approved licensing, in which case Valkey is the direct answer.
+- Operational familiarity and the depth of available expertise matter more than peak throughput.
+
+The most useful diagnostic is the simplest one: look at CPU utilisation of the Redis process during peak load. If one core is pinned at 100% and the box has 30 idle cores, Dragonfly addresses your actual problem. If CPU is at 15%, your latency is coming from the network, from large values, from `KEYS` scans, or from the application — and changing the server will not help.
+
+Whatever you run, understanding what is actually in the keyspace and how it is used is the prerequisite for any of these decisions. Tools that let you inspect keys, memory distribution and command patterns across Redis-compatible servers make that easier; [Chat2DB](https://chat2db.ai/download) connects to Redis-protocol servers alongside PostgreSQL, MySQL and others, and the [web version](https://app.chat2db.ai) needs no install.
+
+## Summary
+
+Dragonfly is a serious piece of engineering that solves a real limitation: Redis cannot use more than one core for command execution, and the standard workaround is clustering with its attendant complexity. Dragonfly's shared-nothing threading, dashtable and fork-free snapshotting deliver genuinely higher vertical throughput, lower memory overhead and flatter latency under load.
+
+But it is a solution to a specific problem, and most Redis deployments do not have that problem. Measure first. If your Redis process is pegged on one core, Dragonfly is a compelling option and its replication-based migration path is low-risk. If it is not, the module ecosystem, breadth of managed offerings and sheer operational familiarity of Redis or Valkey are worth more than throughput you will never use.

@@ -1,0 +1,315 @@
+---
+title: "HikariCP Tuning Guide for PostgreSQL"
+description: "How to size and tune a HikariCP pool for PostgreSQL: maximumPoolSize, timeouts, maxLifetime, leak detection, and the metrics that reveal real problems."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: September 21, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# HikariCP Tuning Guide for PostgreSQL
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="September 21, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+HikariCP is the default connection pool in Spring Boot and the default choice almost everywhere else in the JVM ecosystem. It is fast, small and — unusually for infrastructure software — opinionated about having very few knobs. That is a feature. Most connection pool "tuning" consists of turning settings up until the symptoms move somewhere else, and Hikari's small surface area makes that harder to do.
+
+The one setting people get wrong is the most important one: pool size. The instinct is that a bigger pool serves more concurrent users. For PostgreSQL the opposite is usually true, and understanding why is most of what tuning a pool involves.
+
+## Why a smaller pool is usually faster
+
+A PostgreSQL connection is an operating system process, not a thread. Each backend has its own memory for sorts and hashes, its own entry in shared structures, and each one participates in every snapshot the server takes. Connections are not free, and they are not free in a way that scales badly: past a certain point, adding connections increases contention faster than it increases throughput.
+
+The database can only truly execute as many queries in parallel as it has resources for. If your server has 8 cores and a disk that can service a limited number of concurrent I/O requests, then 200 open connections do not produce 200 concurrent queries — they produce heavy context switching, lock contention in shared memory, and longer latency for everyone. Throughput plateaus and then declines while every individual request gets slower.
+
+HikariCP's own guidance, which mirrors long-standing PostgreSQL advice, is the formula:
+
+```
+connections = ((core_count * 2) + effective_spindle_count)
+```
+
+For an 8-core server on SSDs, that lands around 16–20. For a great many applications, a pool of 10 per instance is correct and a pool of 100 is actively harmful.
+
+The important consequence: **a pool that is too small manifests as waiting in your application, which is visible and measurable. A pool that is too large manifests as everything being slower, which is not.** The first is a much better failure mode. When in doubt, start small.
+
+There is a second constraint. PostgreSQL's `max_connections` is a hard limit across the whole server, and your pool size multiplies by the number of application instances:
+
+```
+total = maximumPoolSize × application_instances + admin/monitoring headroom
+```
+
+Ten Kubernetes pods with a pool of 50 each is 500 connections. Against a default `max_connections` of 100, most of those pods simply cannot connect. Check what you actually have:
+
+```sql
+SHOW max_connections;
+
+SELECT count(*) AS total,
+       count(*) FILTER (WHERE state = 'active')              AS active,
+       count(*) FILTER (WHERE state = 'idle')                AS idle,
+       count(*) FILTER (WHERE state = 'idle in transaction') AS idle_in_txn
+FROM pg_stat_activity
+WHERE backend_type = 'client backend';
+```
+
+If `idle` dwarfs `active` under load, your pool is larger than the work requires.
+
+## The settings that matter
+
+### maximumPoolSize
+
+```yaml
+spring:
+  datasource:
+    hikari:
+      maximum-pool-size: 10
+```
+
+The maximum number of connections Hikari will open. This is the setting to think hardest about and change least often. Start at 10 per instance, measure, and only raise it if you can show threads are waiting on the pool rather than on the database.
+
+### minimumIdle
+
+```yaml
+      minimum-idle: 10     # set equal to maximum-pool-size
+```
+
+The number of idle connections Hikari tries to keep warm. Hikari's documentation recommends **not setting this at all**, which makes it default to `maximumPoolSize` — a fixed-size pool.
+
+A fixed-size pool is the right default. Connection establishment against PostgreSQL involves a TCP handshake, a TLS handshake and an authentication round trip; doing that lazily under load means the first requests of a traffic spike pay for it, exactly when you can least afford the latency. A pool that shrinks when quiet and must re-expand when busy adds a latency spike to the start of every busy period.
+
+Set `minimumIdle` below `maximumPoolSize` only when you have many application instances against a constrained database and genuinely need idle instances to release connections.
+
+### connectionTimeout
+
+```yaml
+      connection-timeout: 10000    # 10s, default 30000
+```
+
+How long a thread waits for a connection from the pool before Hikari throws `SQLTransientConnectionException: Connection is not available, request timed out after ...`.
+
+That exception is not a bug — it is the pool doing its job. It means all connections were busy for the whole timeout. The fix is almost never to raise the timeout; raising it just converts a fast failure into a slow one and lets request threads pile up. The fix is to find out why connections are held so long.
+
+Ten seconds is a reasonable production value. Thirty seconds means a failing dependency takes half a minute to surface.
+
+### maxLifetime
+
+```yaml
+      max-lifetime: 1500000    # 25 min, default 1800000 (30 min)
+```
+
+How long a connection may live before Hikari retires and replaces it, done gradually so connections do not all expire together.
+
+This one interacts with infrastructure you may not control. Firewalls, NAT gateways and load balancers silently drop idle TCP connections, and PostgreSQL itself may have an `idle_session_timeout`. If anything in the path closes connections after N seconds, Hikari must retire them *before* that, or your application will periodically grab a dead connection and fail. AWS NLB's idle timeout is 350 seconds and is not configurable, so services behind one need `max-lifetime` well under that.
+
+The rule: **`maxLifetime` must be a few seconds shorter than any timeout imposed between the application and the database.** Hikari's documentation suggests 30 seconds of margin.
+
+### idleTimeout
+
+```yaml
+      idle-timeout: 600000     # 10 min, default 600000
+```
+
+How long an idle connection survives before being closed — but only when `minimumIdle < maximumPoolSize`. In a fixed-size pool it has no effect, which is why it rarely needs changing.
+
+### keepaliveTime
+
+```yaml
+      keepalive-time: 120000   # 2 min, 0 = disabled (default)
+```
+
+Hikari periodically pings idle connections to keep them alive through network equipment that would otherwise drop them. Enable it when you have a firewall in the path; it prevents the first query after a quiet period from failing on a silently-dead socket.
+
+### validationTimeout and connectionTestQuery
+
+```yaml
+      validation-timeout: 5000
+```
+
+Leave `connectionTestQuery` unset. Modern drivers including pgJDBC support the JDBC 4 `Connection.isValid()` API, which Hikari uses automatically and which is cheaper than issuing `SELECT 1`. Setting `connectionTestQuery` forces the slower path and Hikari logs a warning telling you so.
+
+### leakDetectionThreshold
+
+```yaml
+      leak-detection-threshold: 60000   # 60s, 0 = off (default)
+```
+
+If a connection is checked out for longer than this, Hikari logs a stack trace of whoever took it. This is the single most useful diagnostic setting in the pool, and it is off by default.
+
+A connection leak — code that borrows a connection and never returns it — looks exactly like a pool that is too small: requests start timing out under load. The difference is that a leak never recovers. Turning on leak detection tells you immediately which is which:
+
+```
+java.lang.Exception: Apparent connection leak detected
+    at com.example.ReportService.generateMonthlyReport(ReportService.java:88)
+    ...
+```
+
+Set it to comfortably above your longest legitimate query, so genuine slow work does not produce noise. Sixty seconds is a common starting point. It is cheap enough to leave on in production.
+
+## A complete configuration
+
+```yaml
+spring:
+  datasource:
+    url: jdbc:postgresql://db.example.com:5432/appdb?sslmode=verify-full&ApplicationName=orders-api
+    username: ${DB_USER}
+    password: ${DB_PASSWORD}
+    hikari:
+      pool-name: orders-api-pool
+      maximum-pool-size: 10
+      minimum-idle: 10
+      connection-timeout: 10000
+      validation-timeout: 5000
+      idle-timeout: 600000
+      max-lifetime: 1500000
+      keepalive-time: 120000
+      leak-detection-threshold: 60000
+      auto-commit: true
+      data-source-properties:
+        prepareThreshold: 1
+        reWriteBatchedInserts: true
+        socketTimeout: 60
+        tcpKeepAlive: true
+        options: -c statement_timeout=30000
+```
+
+Two details worth calling out. `pool-name` shows up in logs and metrics — with more than one datasource, unnamed pools are miserable to debug. And driver-level properties go under `data-source-properties`; putting `prepareThreshold` directly under `hikari` is silently ignored, which is a quiet way to lose the performance win you thought you had configured.
+
+Without Spring Boot the same thing is:
+
+```java
+HikariConfig config = new HikariConfig();
+config.setJdbcUrl("jdbc:postgresql://db.example.com:5432/appdb");
+config.setUsername(System.getenv("DB_USER"));
+config.setPassword(System.getenv("DB_PASSWORD"));
+config.setPoolName("orders-api-pool");
+config.setMaximumPoolSize(10);
+config.setConnectionTimeout(10_000);
+config.setMaxLifetime(1_500_000);
+config.setKeepaliveTime(120_000);
+config.setLeakDetectionThreshold(60_000);
+config.addDataSourceProperty("prepareThreshold", "1");
+config.addDataSourceProperty("reWriteBatchedInserts", "true");
+config.addDataSourceProperty("ApplicationName", "orders-api");
+
+HikariDataSource ds = new HikariDataSource(config);
+```
+
+## The real enemy: idle in transaction
+
+Pool exhaustion is usually blamed on pool size. More often the cause is connections held far longer than the query they were borrowed for.
+
+The classic version is a transaction that spans a network call:
+
+```java
+@Transactional
+public void processOrder(Order order) {
+    orderRepository.save(order);
+    paymentGateway.charge(order);      // HTTP call — 2 seconds, sometimes 30
+    order.setStatus(PAID);
+    orderRepository.save(order);
+}
+```
+
+The database connection is held for the entire method, including the external HTTP request. Ten concurrent orders exhaust a pool of ten, and every other request in the application starts timing out on a database that is doing nothing at all. On the server side these sit in `idle in transaction` — holding locks, holding back `VACUUM`, and pinning a backend for no benefit.
+
+Find them:
+
+```sql
+SELECT pid,
+       application_name,
+       state,
+       now() - state_change AS duration,
+       left(query, 120)     AS last_query
+FROM pg_stat_activity
+WHERE state = 'idle in transaction'
+  AND now() - state_change > interval '10 seconds'
+ORDER BY duration DESC;
+```
+
+The fix is structural rather than configuration: shorten the transaction so the external call happens outside it.
+
+```java
+public void processOrder(Order order) {
+    saveOrder(order);                  // short transaction, connection released
+    paymentGateway.charge(order);      // no connection held
+    markPaid(order.getId());           // short transaction
+}
+```
+
+As a safety net, cap it on the server so a stuck transaction cannot hold a connection forever:
+
+```sql
+ALTER ROLE app_user SET idle_in_transaction_session_timeout = '30s';
+ALTER ROLE app_user SET statement_timeout = '30s';
+```
+
+These are per-role settings and apply to new sessions. Be careful applying `statement_timeout` to a role that also runs migrations or long reports — give those their own role.
+
+## Measuring instead of guessing
+
+Hikari exposes metrics through Micrometer. With Spring Boot Actuator on the classpath they appear automatically:
+
+| Metric | What it tells you |
+| --- | --- |
+| `hikaricp.connections.active` | connections currently in use |
+| `hikaricp.connections.idle` | connections available |
+| `hikaricp.connections.pending` | **threads waiting for a connection** |
+| `hikaricp.connections.usage` | how long connections are held |
+| `hikaricp.connections.acquire` | how long threads wait to get one |
+| `hikaricp.connections.timeout` | failed acquisitions |
+
+`pending` is the one to alert on. It is the direct, unambiguous signal that the pool is the bottleneck:
+
+- **`pending` consistently zero, `active` well below max** — the pool is comfortably sized. If requests are slow, the database or the queries are the problem, not the pool.
+- **`pending` above zero, `active` pinned at max, `usage` short** — genuinely more concurrent work than the pool allows. This is the one case where raising `maximumPoolSize` is the right answer, and only if PostgreSQL has the headroom.
+- **`pending` above zero, `active` pinned at max, `usage` long** — connections are being held too long. Long transactions, external calls inside transactions, or leaks. Do not raise the pool size; it will only move the contention into the database.
+
+That third case is the most common, and the one where the instinct to raise `maximumPoolSize` makes things worse. A larger pool lets more slow transactions run simultaneously, which increases lock contention and slows each one further.
+
+Enable the health dump for a snapshot of pool state on demand:
+
+```java
+// Logs a full pool state dump
+((HikariDataSource) dataSource).getHikariPoolMXBean().getActiveConnections();
+```
+
+Or simply set the Hikari logger to `DEBUG`, which prints pool statistics every 30 seconds:
+
+```yaml
+logging:
+  level:
+    com.zaxxer.hikari.pool.HikariPool: DEBUG
+```
+
+## When to put PgBouncer in front
+
+At some scale, per-instance pools stop working. Fifty application pods, each needing a handful of connections, exceeds what a single PostgreSQL server should hold even if every individual pool is well sized. That is when you add PgBouncer in transaction pooling mode: the application pools connect to PgBouncer, which multiplexes a much smaller number of real PostgreSQL connections.
+
+Two configuration changes are needed. On the JDBC side, disable server-side prepared statements, because a pooled backend may already hold a statement with the same name:
+
+```yaml
+      data-source-properties:
+        prepareThreshold: 0
+```
+
+And keep the Hikari pool small — PgBouncer is now doing the multiplexing, so a large application-side pool just moves the queue.
+
+In transaction pooling mode, session-scoped features stop working: `SET` that is expected to persist across statements, advisory locks held between statements, `LISTEN`/`NOTIFY`, and session temporary tables. Audit for those before switching.
+
+To inspect what a pooled setup actually looks like from the database's side — which sessions exist, what they are holding, whether `idle in transaction` is accumulating — a client that shows `pg_stat_activity` alongside your schema is quicker than re-typing diagnostic queries. [Chat2DB](https://chat2db.ai/download) connects over the same JDBC driver your application uses, so what you see is what the pool sees; the [web version](https://app.chat2db.ai) works without an install.
+
+## A tuning checklist
+
+1. **Start with `maximum-pool-size: 10`.** Resist raising it until metrics justify it.
+2. **Set `minimum-idle` equal to `maximum-pool-size`** for a fixed-size pool with no cold-start penalty.
+3. **Check the total** against `max_connections`: pool size × instances, plus headroom for migrations and monitoring.
+4. **Set `max-lifetime` below any network idle timeout** in the path — 30 seconds of margin or more.
+5. **Turn on `leak-detection-threshold`.** It costs nothing and distinguishes a leak from a small pool.
+6. **Set `connection-timeout` to 10 seconds** so failures surface fast.
+7. **Alert on `hikaricp.connections.pending`,** not on pool size.
+8. **Add `statement_timeout` and `idle_in_transaction_session_timeout`** on the database role as a backstop.
+9. **Never do network I/O inside a transaction.**
+10. **Only then** consider raising the pool size — and check `connections.usage` first to confirm the connections are actually busy.
+
+Most pool problems are not pool problems. They are long transactions wearing a pool problem's clothes, and the metrics above will tell you which you have within minutes.
