@@ -1,0 +1,238 @@
+---
+title: "PostgreSQL BRIN Index: When It Beats B-tree"
+description: "A practical guide to PostgreSQL BRIN indexes: how block range indexes work, when they beat B-tree, pages_per_range tuning, correlation, and summarization."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: September 22, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# PostgreSQL BRIN Index: When It Beats B-tree
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="September 22, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+A B-tree index on a 500 GB append-only events table can easily cost 40 GB by itself. A BRIN index on the same column might cost 200 KB. That is not a typo — it is three orders of magnitude, and on the right table the BRIN index answers the same range queries almost as fast.
+
+BRIN (Block Range INdex) has been in PostgreSQL since 9.5, and it remains one of the most underused features in the system. It is also easy to misuse: on the wrong table a BRIN index is worse than no index, because the planner will choose it and then scan most of the heap anyway. This guide covers what BRIN actually stores, the one property your data must have for it to work, how to tune `pages_per_range`, and how to keep the index accurate as rows are inserted.
+
+## What a BRIN index actually stores
+
+A B-tree stores one entry per row. That is why it is precise and why it is large.
+
+BRIN stores one entry per *block range* — by default, per 128 consecutive 8 KB heap pages, so one entry per megabyte of table. For each range, it stores a summary: for the default `minmax` operator class, that is just the minimum and maximum value of the indexed column within those pages.
+
+When you query `WHERE created_at >= '2026-09-01'`, PostgreSQL walks the tiny BRIN index, discards every range whose recorded maximum is below the target, and produces a bitmap of the ranges that might contain matching rows. It then scans only those heap pages and re-checks every row. BRIN is *lossy*: it never tells you which rows match, only which megabytes of table cannot possibly match.
+
+That design produces the trade-off in one sentence: **BRIN is small because it is imprecise, and it is fast only when imprecision is cheap.**
+
+## The one thing that must be true: physical correlation
+
+Imprecision is cheap only when values are clustered on disk. If rows written near each other in time also have near-identical `created_at` values, each block range has a narrow min/max window and most ranges get eliminated. If `created_at` values are scattered randomly across the table, every range spans the whole date interval, nothing gets eliminated, and the "index scan" degenerates into a sequential scan plus overhead.
+
+PostgreSQL tracks this as **correlation**, and you can read it directly:
+
+```sql
+SELECT attname,
+       correlation,
+       n_distinct
+FROM pg_stats
+WHERE schemaname = 'public'
+  AND tablename  = 'events'
+  AND attname IN ('created_at', 'user_id', 'id');
+```
+
+Correlation ranges from -1 to 1. Values near ±1 mean physical order matches logical order — a perfect BRIN candidate. Values near 0 mean random placement — do not use BRIN.
+
+In practice the columns that correlate well are the ones that come from the insert process itself:
+
+- `created_at` / `inserted_at` on an append-only log
+- A `BIGSERIAL` or identity primary key
+- A partition key on time-partitioned data
+- Sensor readings ingested in timestamp order
+
+The columns that correlate badly are the interesting ones from a business perspective: `user_id`, `status`, `email`, anything updated after insert. Those still need a B-tree.
+
+## Creating and measuring a BRIN index
+
+Build one on a realistic table and compare:
+
+```sql
+CREATE TABLE events (
+    id          BIGSERIAL PRIMARY KEY,
+    user_id     BIGINT      NOT NULL,
+    event_type  TEXT        NOT NULL,
+    payload     JSONB,
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- 50 million rows, inserted in timestamp order
+INSERT INTO events (user_id, event_type, created_at)
+SELECT (random() * 100000)::bigint,
+       (ARRAY['click','view','purchase','signup'])[1 + (random()*3)::int],
+       '2025-01-01'::timestamptz + (g || ' seconds')::interval
+FROM generate_series(1, 50000000) g;
+
+CREATE INDEX events_created_brin  ON events USING brin  (created_at);
+CREATE INDEX events_created_btree ON events USING btree (created_at);
+```
+
+Now compare the sizes:
+
+```sql
+SELECT indexrelname,
+       pg_size_pretty(pg_relation_size(indexrelid)) AS size
+FROM pg_stat_user_indexes
+WHERE relname = 'events'
+ORDER BY pg_relation_size(indexrelid) DESC;
+```
+
+The B-tree will be in the gigabytes; the BRIN will be in the hundreds of kilobytes. The BRIN index is small enough to stay permanently in shared buffers, which matters more than the raw number: the index lookup never touches disk.
+
+Check the plan against the BRIN index specifically:
+
+```sql
+DROP INDEX events_created_btree;
+
+EXPLAIN (ANALYZE, BUFFERS)
+SELECT count(*), event_type
+FROM events
+WHERE created_at >= '2026-06-01' AND created_at < '2026-06-02'
+GROUP BY event_type;
+```
+
+The plan shows a `Bitmap Heap Scan` fed by a `Bitmap Index Scan on events_created_brin`, and the heap scan line reports both `Heap Blocks: lossy=N` and a `Rows Removed by Index Recheck` count. That recheck count is your accuracy metric: it is how many rows PostgreSQL read and threw away. A small recheck count means tight ranges; a recheck count comparable to the table size means BRIN is not helping.
+
+## Tuning pages_per_range
+
+`pages_per_range` is the knob that trades index size against precision. The default of 128 pages (1 MB) is conservative.
+
+```sql
+CREATE INDEX events_created_brin_32
+    ON events USING brin (created_at) WITH (pages_per_range = 32);
+```
+
+Lowering it to 32 makes the index four times larger — still trivial — and each range covers a quarter as much data, so the recheck count drops roughly fourfold. For queries that select a narrow slice of a very large table, this is almost always worth it.
+
+Raising it makes sense in the opposite case: an enormous table where queries always select months at a time, and you want the index to be as close to free as possible.
+
+A reasonable procedure: start at the default, measure `Rows Removed by Index Recheck` on your actual queries, and halve `pages_per_range` until the recheck cost stops mattering or the index stops being negligible in size. Because rebuilding a BRIN index takes seconds rather than hours, this experimentation is cheap — unlike tuning a large B-tree.
+
+## Summarization: the trap with fresh data
+
+Here is the behaviour that surprises people. When you insert rows into pages beyond the last summarized range, **BRIN does not automatically index them**. The new pages belong to an unsummarized range, and an unsummarized range is always considered a possible match — so recent data is scanned in full.
+
+On an append-only table, "recent data" is exactly what everyone queries. The index looks broken.
+
+There are two fixes. The first is to summarize manually:
+
+```sql
+SELECT brin_summarize_new_values('events_created_brin');
+```
+
+The second, and the right answer for a live table, is to turn on autosummarization so autovacuum handles it:
+
+```sql
+ALTER INDEX events_created_brin SET (autosummarize = on);
+```
+
+Or at creation time:
+
+```sql
+CREATE INDEX events_created_brin
+    ON events USING brin (created_at)
+    WITH (pages_per_range = 32, autosummarize = on);
+```
+
+You can inspect what is summarized with the `pageinspect` extension:
+
+```sql
+CREATE EXTENSION IF NOT EXISTS pageinspect;
+
+SELECT range_start, range_end, all_nulls, has_nulls, value
+FROM brin_page_items(
+        get_raw_page('events_created_brin', 2),
+        'events_created_brin')
+LIMIT 10;
+```
+
+Rows where `value` is empty are unsummarized ranges.
+
+## Operator classes beyond minmax
+
+`minmax` is the default and the one people know, but it is not the only choice.
+
+**`minmax_multi`** (PostgreSQL 14+) stores several disjoint min/max intervals per range instead of one. This makes BRIN tolerant of the single most common failure mode: a mostly-ordered table with occasional out-of-order rows. One backfilled row from 2019 in a 2026 range widens a `minmax` summary to seven years and destroys its selectivity; `minmax_multi` records it as a separate interval and keeps the rest tight.
+
+```sql
+CREATE INDEX events_created_brin_multi
+    ON events USING brin (created_at timestamptz_minmax_multi_ops);
+```
+
+If you have any backfill, correction or late-arriving-data process at all, prefer `minmax_multi`.
+
+**`bloom`** (also 14+) stores a Bloom filter per range instead of a min/max. That makes it useful for *equality* lookups on columns with no ordering correlation — a UUID column, for example — where `minmax` is useless:
+
+```sql
+CREATE INDEX events_uuid_bloom
+    ON events USING brin (request_uuid uuid_bloom_ops)
+    WITH (pages_per_range = 64, n_distinct_per_range = 1000, false_positive_rate = 0.01);
+```
+
+**`inclusion`** handles geometric and range types, summarizing each block range with a bounding box or enclosing range.
+
+## Multi-column BRIN and partitioning
+
+Unlike a B-tree, a multi-column BRIN index has no leading-column requirement. Each column is summarized independently within the same range, so the index is usable for a predicate on any subset of its columns:
+
+```sql
+CREATE INDEX events_brin_multi
+    ON events USING brin (created_at, id)
+    WITH (pages_per_range = 32);
+```
+
+This is genuinely useful on wide fact tables, where a handful of correlated columns can share one tiny index.
+
+BRIN also pairs well with declarative partitioning. Partition pruning eliminates whole partitions by the partition key; BRIN then eliminates block ranges within the surviving partition. A time-partitioned table with a BRIN index on the timestamp is one of the cheapest large-scale designs PostgreSQL offers.
+
+Note the interaction with `CLUSTER`: if correlation has degraded because of updates, `CLUSTER events USING events_created_btree` physically reorders the table and restores it. This rewrites the table and takes an `ACCESS EXCLUSIVE` lock, so it is a maintenance-window operation, and the ordering decays again as new updates land.
+
+## When not to use BRIN
+
+Be direct about the failure cases:
+
+- **Low correlation.** If `pg_stats.correlation` is below roughly 0.7, BRIN will read most of the table.
+- **Point lookups.** `WHERE id = 12345` with BRIN reads an entire block range — up to 1 MB — to return one row. A B-tree reads three or four pages. Never replace a primary key index with BRIN.
+- **Unique constraints.** BRIN cannot enforce uniqueness at all.
+- **Index-only scans.** BRIN never provides one; it always visits the heap.
+- **Ordering.** BRIN cannot satisfy an `ORDER BY`, so it does not remove a sort the way a B-tree can.
+- **Heavily updated tables.** `UPDATE` moves rows to new pages, destroying correlation over time.
+
+The honest summary is that BRIN is a specialist index for large, append-mostly tables queried by range. That is a narrow description, but it fits an enormous amount of real data: logs, events, metrics, IoT readings, audit trails, immutable financial transactions.
+
+## Checking whether it worked
+
+After deploying, verify with real usage rather than assumptions:
+
+```sql
+SELECT indexrelname,
+       idx_scan,
+       idx_tup_read,
+       pg_size_pretty(pg_relation_size(indexrelid)) AS size
+FROM pg_stat_user_indexes
+WHERE relname = 'events';
+```
+
+`idx_scan` climbing means the planner is choosing it. A large `idx_tup_read` relative to the rows your queries return means the ranges are too coarse — lower `pages_per_range` or switch to `minmax_multi`.
+
+If you would rather read plans and index statistics in a UI than assemble these catalog queries by hand, [Chat2DB](https://chat2db.ai/download) shows table and index sizes, execution plans and row estimates side by side, and its web version at [app.chat2db.ai](https://app.chat2db.ai) works without a local install.
+
+## Summary
+
+BRIN indexes summarize block ranges rather than rows, which makes them thousands of times smaller than an equivalent B-tree and effectively free to maintain. They pay off when physical row order correlates with the indexed value — append-only timestamps, identity keys, partitioned time-series — and they hurt when it does not.
+
+The practical checklist is short. Confirm correlation above ~0.7 in `pg_stats`. Create the index with `autosummarize = on` so fresh rows are indexed. Prefer `minmax_multi` if any data arrives out of order. Measure `Rows Removed by Index Recheck` in `EXPLAIN (ANALYZE, BUFFERS)` and lower `pages_per_range` until that number stops mattering. Keep B-trees for point lookups, uniqueness and ordering.
+
+On a large, append-mostly table, that combination gives you range queries at nearly B-tree speed for roughly a thousandth of the storage and a fraction of the write overhead.

@@ -1,0 +1,230 @@
+---
+title: "StarRocks vs Apache Doris: Which to Pick in 2026"
+description: "StarRocks vs Apache Doris compared: shared history, architecture, table models, lakehouse support, materialized views and how to choose between them in 2026."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: September 22, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# StarRocks vs Apache Doris: Which to Pick in 2026
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="September 22, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+StarRocks and Apache Doris look almost identical from the outside: MySQL-protocol OLAP engines with a frontend/backend split, columnar storage, MPP execution and sub-second queries on billions of rows. That resemblance is not a coincidence — StarRocks began life in 2020 as a fork of Apache Doris, then called DorisDB.
+
+Six years of separate development have made them genuinely different systems. This is a look at where they diverged and how to decide.
+
+## Shared inheritance
+
+Both descend from Apache Doris, which itself grew out of Baidu's Palo project. Both keep the same basic shape:
+
+- **Frontend (FE)** nodes handle SQL parsing, planning and metadata. They run a Raft-like consensus protocol among themselves for metadata replication.
+- **Backend (BE)** nodes store data and execute query fragments.
+- **MySQL wire protocol**, so any MySQL client connects — `mysql` CLI, JDBC, or a GUI client such as [Chat2DB](https://chat2db.ai/download).
+- **Columnar storage** with a vectorized execution engine and runtime filters.
+- **Pipeline execution** and cost-based optimization.
+
+Connecting looks the same for both:
+
+```bash
+mysql -h fe-host -P 9030 -u root
+```
+
+```sql
+CREATE DATABASE analytics;
+USE analytics;
+
+CREATE TABLE events (
+    event_date   DATE         NOT NULL,
+    event_hour   TINYINT      NOT NULL,
+    user_id      BIGINT       NOT NULL,
+    event_type   VARCHAR(32)  NOT NULL,
+    revenue      DECIMAL(18,4)
+)
+DUPLICATE KEY(event_date, event_hour, user_id)
+PARTITION BY RANGE(event_date) (
+    PARTITION p202609 VALUES [('2026-09-01'), ('2026-10-01'))
+)
+DISTRIBUTED BY HASH(user_id) BUCKETS 32;
+```
+
+That DDL runs on both. The divergence appears once you go past the basics.
+
+## Table models
+
+Both inherited four table models, and both use them the same way:
+
+| Model | Behaviour | Typical use |
+|---|---|---|
+| Duplicate | Keeps every row as written | Raw logs, events |
+| Aggregate | Pre-aggregates on load by key | Rollup metrics |
+| Unique | Keeps the latest row per key | CDC targets, dimensions |
+| Primary Key | Latest row per key with efficient partial updates | Real-time upserts |
+
+The Primary Key model is where they differ most in practice. StarRocks has invested heavily in it, and it supports partial column updates and conditional updates cleanly:
+
+```sql
+-- StarRocks: update only the columns present in the load
+CREATE TABLE user_profile (
+    user_id     BIGINT      NOT NULL,
+    email       VARCHAR(255),
+    last_login  DATETIME,
+    ltv         DECIMAL(18,2)
+)
+PRIMARY KEY(user_id)
+DISTRIBUTED BY HASH(user_id)
+PROPERTIES ("enable_persistent_index" = "true");
+```
+
+`enable_persistent_index` moves the primary key index to disk instead of holding it entirely in memory, which is what makes very large Primary Key tables practical. Doris has its own merge-on-write implementation for its Unique model that achieves a similar goal by a different route; both are viable, and both have improved substantially since the fork.
+
+## Where StarRocks went: the lakehouse
+
+StarRocks made a deliberate bet that the data would increasingly live in open table formats and that the engine should query it in place, without ingesting it. Its external catalog support is the strongest differentiator:
+
+```sql
+-- Query Iceberg tables directly, no ingestion
+CREATE EXTERNAL CATALOG iceberg_catalog
+PROPERTIES (
+    "type" = "iceberg",
+    "iceberg.catalog.type" = "rest",
+    "iceberg.catalog.uri" = "http://rest-catalog:8181",
+    "aws.s3.region" = "us-east-1"
+);
+
+SET CATALOG iceberg_catalog;
+SELECT count(*) FROM warehouse.sales WHERE sale_date >= '2026-09-01';
+```
+
+StarRocks supports catalogs for Iceberg, Hudi, Delta Lake, Hive, JDBC sources and Paimon, and it can join across catalogs in a single query — an internal StarRocks table joined to an Iceberg table joined to a MySQL table:
+
+```sql
+SELECT o.order_id, o.amount, c.segment
+FROM iceberg_catalog.warehouse.orders o
+JOIN default_catalog.analytics.customer_segments c
+  ON o.customer_id = c.customer_id
+WHERE o.order_date >= '2026-09-01';
+```
+
+The other major StarRocks investment is asynchronous materialized views with **transparent query rewrite**. You define the view; the optimizer then rewrites matching queries to use it without the query author knowing it exists:
+
+```sql
+CREATE MATERIALIZED VIEW daily_revenue
+DISTRIBUTED BY HASH(event_date)
+REFRESH ASYNC EVERY (INTERVAL 10 MINUTE)
+AS
+SELECT event_date,
+       event_type,
+       sum(revenue) AS total_revenue,
+       count(DISTINCT user_id) AS unique_users
+FROM events
+GROUP BY event_date, event_type;
+```
+
+A subsequent `SELECT event_date, sum(revenue) FROM events GROUP BY event_date` can be served from the materialized view automatically. Crucially, StarRocks can build materialized views over *external* catalog tables too, which effectively gives you a caching layer over a data lake.
+
+StarRocks also offers a **shared-data** deployment mode that separates storage from compute: BE nodes become stateless cache nodes and the durable copy lives in object storage. That decouples scaling and makes elastic compute realistic.
+
+## Where Doris went: breadth and the Apache foundation
+
+Apache Doris stayed in the Apache Software Foundation, and that has consequences beyond licensing. Governance is community-based, releases follow ASF process, and for organisations with procurement rules about foundation-backed projects that alone can decide the question. StarRocks is Apache 2.0 licensed and is a Linux Foundation project, but its development is more strongly steered by CelerData, the company behind it.
+
+Technically, Doris has prioritised operational breadth:
+
+- **Inverted indexes** for text search on log data, which makes it a credible destination for observability workloads:
+
+```sql
+CREATE TABLE logs (
+    ts       DATETIME NOT NULL,
+    level    VARCHAR(16),
+    service  VARCHAR(64),
+    message  TEXT,
+    INDEX idx_message (message) USING INVERTED PROPERTIES("parser" = "english")
+)
+DUPLICATE KEY(ts)
+PARTITION BY RANGE(ts) ()
+DISTRIBUTED BY RANDOM BUCKETS 16
+PROPERTIES ("dynamic_partition.enable" = "true");
+
+SELECT ts, service, message
+FROM logs
+WHERE message MATCH_ANY 'timeout connection'
+  AND ts >= '2026-09-22 00:00:00';
+```
+
+- **Variant type** for semi-structured JSON with automatic schema inference, which avoids the choice between a rigid schema and an opaque JSON blob.
+- **Compute-storage separation** in recent versions, similar in intent to the StarRocks shared-data mode.
+- **Workload groups** for resource isolation between tenants or query classes.
+- A large ecosystem of load methods: Stream Load, Broker Load, Routine Load from Kafka, Flink and Spark connectors.
+
+Doris also has good external table support — Hive, Iceberg, Hudi, JDBC — though StarRocks is generally ahead on lakehouse depth, particularly around materialized views on external data.
+
+## Ingestion
+
+Both support the same main paths. Streaming from Kafka is declarative in both:
+
+```sql
+CREATE ROUTINE LOAD analytics.events_stream ON events
+COLUMNS(event_date, event_hour, user_id, event_type, revenue)
+PROPERTIES (
+    "desired_concurrent_number" = "3",
+    "max_batch_interval" = "10",
+    "format" = "json"
+)
+FROM KAFKA (
+    "kafka_broker_list" = "kafka:9092",
+    "kafka_topic" = "events",
+    "property.group.id" = "doris-events"
+);
+```
+
+And synchronous micro-batch HTTP load:
+
+```bash
+curl --location-trusted -u root: \
+  -H "format:json" \
+  -H "strip_outer_array:true" \
+  -T events.json \
+  http://fe-host:8030/api/analytics/events/_stream_load
+```
+
+Neither has a decisive advantage here. Both handle high-throughput ingestion; both want you to batch rather than insert row by row.
+
+## Operational notes
+
+A few things apply to both and cost people time:
+
+- **Bucket count matters.** Too few buckets and you cannot use all your cores; too many and you get small-file overhead. A reasonable heuristic is to target 1–10 GB of compressed data per bucket, and both engines now support automatic bucketing so you can leave it unset if unsure.
+- **Partition by time, distribute by a high-cardinality key.** Partitioning on a low-cardinality column and distributing on a skewed one is the most common design mistake.
+- **FE nodes need an odd count** (typically 3) for quorum. Running two is worse than running one.
+- **Compaction is where mysterious slowdowns live.** Frequent small loads create many versions; check compaction score before blaming the query planner.
+
+## Choosing
+
+**Choose StarRocks if:**
+
+- Your data lives in Iceberg, Hudi, Delta Lake or Paimon and you want to query it in place rather than copy it.
+- You want transparent materialized-view rewrite so query authors do not need to know about pre-aggregations.
+- You are building a lakehouse query layer rather than a self-contained warehouse.
+- You want shared-data architecture with elastic compute over object storage.
+- Real-time upsert throughput on Primary Key tables is a core requirement.
+
+**Choose Apache Doris if:**
+
+- Apache Software Foundation governance matters for your organisation.
+- You are consolidating logs and metrics as well as analytics, and want inverted-index text search in the same engine.
+- Your data is semi-structured and the `variant` type saves you a schema design problem.
+- You want a single self-contained system without a lake layer.
+- Your team already runs Doris; the migration cost is unlikely to be repaid by feature differences alone.
+
+**Either is fine if** you are running a straightforward internal BI warehouse on structured data at moderate scale. At that point the decision should come down to which one your team can operate, which has better support in your region, and which integrates with the tooling you already have. Both speak MySQL protocol, so your existing clients, dashboards and drivers work unchanged — you can point [Chat2DB](https://chat2db.ai/download) or its web version at [app.chat2db.ai](https://app.chat2db.ai) at either one and explore the schema the same way.
+
+## Summary
+
+StarRocks and Apache Doris started as the same codebase and remain close enough that most SQL, most DDL and all client tooling port between them. The meaningful split is strategic: StarRocks has gone deep on the lakehouse — external catalogs, cross-catalog joins, materialized views over Iceberg, shared-data compute — while Doris has gone broad, adding inverted indexes for log search, a variant type for semi-structured data, and staying inside Apache governance.
+
+Pick StarRocks if the data lake is the centre of your architecture and the engine is a query layer over it. Pick Doris if you want one system that absorbs analytics, logs and semi-structured data, or if ASF governance is a requirement. Run a proof of concept with your own data and your own queries before committing either way; on this pair, published benchmarks tend to reflect the publisher more than the workload.

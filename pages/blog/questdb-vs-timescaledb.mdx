@@ -1,0 +1,239 @@
+---
+title: "QuestDB vs TimescaleDB: Time-Series Comparison"
+description: "QuestDB vs TimescaleDB compared: storage engine, ingestion protocols, SQL dialect, ASOF joins, hypertables, compression and how to choose for time-series data."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: September 22, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# QuestDB vs TimescaleDB: Time-Series Comparison
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="September 22, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+Both QuestDB and TimescaleDB speak PostgreSQL wire protocol, both target time-series data, and both will happily ingest millions of rows. Underneath they are almost opposites: TimescaleDB is a PostgreSQL extension that makes Postgres good at time-series, while QuestDB is a purpose-built column store written from scratch that borrowed the Postgres protocol for compatibility.
+
+That difference decides which one fits. Here is what it means in practice.
+
+## TimescaleDB: PostgreSQL, extended
+
+TimescaleDB adds hypertables — tables automatically partitioned by time into chunks — plus compression, continuous aggregates and retention policies. Everything else is PostgreSQL.
+
+```sql
+CREATE EXTENSION IF NOT EXISTS timescaledb;
+
+CREATE TABLE sensor_data (
+    time        TIMESTAMPTZ      NOT NULL,
+    sensor_id   INTEGER          NOT NULL,
+    location    TEXT             NOT NULL,
+    temperature DOUBLE PRECISION,
+    humidity    DOUBLE PRECISION
+);
+
+SELECT create_hypertable('sensor_data', by_range('time', INTERVAL '1 day'));
+
+CREATE INDEX ON sensor_data (sensor_id, time DESC);
+```
+
+Compression turns older chunks into a columnar layout:
+
+```sql
+ALTER TABLE sensor_data SET (
+    timescaledb.compress,
+    timescaledb.compress_segmentby = 'sensor_id',
+    timescaledb.compress_orderby   = 'time DESC'
+);
+
+SELECT add_compression_policy('sensor_data', INTERVAL '7 days');
+```
+
+`compress_segmentby` is the setting that matters most: it groups rows by that column before compressing, so queries filtering on `sensor_id` can skip whole compressed batches. Getting it wrong is the usual reason TimescaleDB compression disappoints.
+
+Continuous aggregates are materialized views that refresh incrementally:
+
+```sql
+CREATE MATERIALIZED VIEW sensor_hourly
+WITH (timescaledb.continuous) AS
+SELECT time_bucket('1 hour', time) AS bucket,
+       sensor_id,
+       avg(temperature) AS avg_temp,
+       max(temperature) AS max_temp,
+       count(*)         AS readings
+FROM sensor_data
+GROUP BY bucket, sensor_id;
+
+SELECT add_continuous_aggregate_policy('sensor_hourly',
+    start_offset      => INTERVAL '3 days',
+    end_offset        => INTERVAL '1 hour',
+    schedule_interval => INTERVAL '30 minutes');
+
+SELECT add_retention_policy('sensor_data', INTERVAL '90 days');
+```
+
+Two things follow from being a PostgreSQL extension, and they are the whole argument for TimescaleDB.
+
+First, **you get all of PostgreSQL**: joins against ordinary relational tables, foreign keys, transactions, `JSONB`, PostGIS, `pg_trgm`, row-level security, logical replication, every driver, every ORM, every backup tool. Time-series data almost never lives alone — it references devices, customers, sites, alert rules — and in TimescaleDB those are just tables you join.
+
+```sql
+SELECT d.name, d.installed_at, avg(s.temperature) AS avg_temp
+FROM sensor_hourly s
+JOIN devices d ON d.id = s.sensor_id
+JOIN sites   t ON t.id = d.site_id
+WHERE t.region = 'eu-west'
+  AND s.bucket > now() - INTERVAL '24 hours'
+GROUP BY d.name, d.installed_at;
+```
+
+Second, **you inherit PostgreSQL's write path**: WAL, MVCC, row versions, autovacuum. That is what gives you durability and concurrent transactional correctness, and it is also what limits raw ingestion throughput compared to an engine with no such obligations.
+
+## QuestDB: purpose-built column store
+
+QuestDB stores each column in its own file, appends in timestamp order, and keeps a designated timestamp column that the query engine uses for everything.
+
+```sql
+CREATE TABLE sensor_data (
+    timestamp   TIMESTAMP,
+    sensor_id   INT,
+    location    SYMBOL CAPACITY 1000 CACHE,
+    temperature DOUBLE,
+    humidity    DOUBLE
+) TIMESTAMP(timestamp) PARTITION BY DAY WAL
+  DEDUP UPSERT KEYS(timestamp, sensor_id);
+```
+
+Several QuestDB-specific ideas appear in that one statement:
+
+- **`TIMESTAMP(timestamp)`** designates the time column. Data is stored sorted by it, which is what makes range scans and time-ordered operations cheap.
+- **`SYMBOL`** is an interned string type. Repeated values — location names, tickers, status codes — are stored once and referenced by integer. On tag-like columns this is dramatically more compact than `TEXT` and makes equality filters very fast.
+- **`WAL`** enables the write-ahead log, which permits concurrent ingestion and out-of-order writes.
+- **`DEDUP UPSERT KEYS`** deduplicates on ingest, which matters when your producer may retry.
+
+Ingestion is where QuestDB is deliberately different. Rather than `INSERT`, the high-throughput path is the InfluxDB Line Protocol over TCP or HTTP:
+
+```
+sensor_data,location=warehouse-a sensor_id=1i,temperature=22.5,humidity=48.0 1758499200000000000
+```
+
+```python
+from questdb.ingress import Sender, TimestampNanos
+
+with Sender.from_conf("http::addr=localhost:9000;") as sender:
+    sender.row(
+        "sensor_data",
+        symbols={"location": "warehouse-a"},
+        columns={"sensor_id": 1, "temperature": 22.5, "humidity": 48.0},
+        at=TimestampNanos.now(),
+    )
+    sender.flush()
+```
+
+This path is schema-on-write with automatic column creation, batched, and does not go through SQL parsing at all. It is the reason QuestDB posts very high ingestion numbers.
+
+## SQL: extensions vs standard
+
+QuestDB adds time-series operators that are genuinely convenient and that PostgreSQL lacks.
+
+**`SAMPLE BY`** — downsampling without a `GROUP BY` expression:
+
+```sql
+SELECT timestamp, location, avg(temperature), max(temperature)
+FROM sensor_data
+WHERE timestamp > dateadd('d', -7, now())
+SAMPLE BY 1h
+FILL(PREV);
+```
+
+`FILL` handles gaps declaratively — `NONE`, `NULL`, `PREV`, `LINEAR` or a constant. Doing this in standard SQL requires a `generate_series` join and a window function.
+
+**`LATEST ON`** — the most recent row per series, which is otherwise a `DISTINCT ON` or a ranked subquery:
+
+```sql
+SELECT * FROM sensor_data
+LATEST ON timestamp PARTITION BY sensor_id;
+```
+
+**`ASOF JOIN`** — join two time series on nearest preceding timestamp:
+
+```sql
+SELECT t.timestamp, t.price, q.bid, q.ask
+FROM trades t
+ASOF JOIN quotes q ON (symbol);
+```
+
+That one is the reason QuestDB shows up in financial workloads so often. Matching each trade to the prevailing quote is awkward and slow in standard SQL, and it is a single operator here. QuestDB also has `LT JOIN` (strictly preceding) and `SPLICE JOIN`.
+
+TimescaleDB answers with its own hyperfunctions, which are less syntactically elegant but are ordinary SQL functions:
+
+```sql
+-- Downsampling
+SELECT time_bucket('1 hour', time) AS bucket, avg(temperature)
+FROM sensor_data GROUP BY bucket;
+
+-- Gap filling with interpolation
+SELECT time_bucket_gapfill('1 hour', time) AS bucket,
+       sensor_id,
+       interpolate(avg(temperature)) AS temp
+FROM sensor_data
+WHERE time > now() - INTERVAL '7 days'
+GROUP BY bucket, sensor_id;
+
+-- Latest per series
+SELECT DISTINCT ON (sensor_id) * FROM sensor_data ORDER BY sensor_id, time DESC;
+
+-- Statistical aggregates and counter handling
+SELECT sensor_id,
+       stats_agg(temperature) AS stats,
+       approx_percentile(0.95, percentile_agg(temperature)) AS p95
+FROM sensor_data GROUP BY sensor_id;
+```
+
+TimescaleDB's `time_bucket_gapfill` with `interpolate` and `locf` covers the same ground as `SAMPLE BY ... FILL`. Its toolkit adds `counter_agg` for monotonic counters, `state_agg` for state tracking, and approximate percentile structures — genuinely useful things QuestDB does not have.
+
+## What QuestDB does not have
+
+This list is the deciding factor more often than performance:
+
+- **No foreign keys or referential integrity.**
+- **Limited joins.** Joins work, but the engine is optimised for time-series joins; complex multi-table relational queries are not its strength.
+- **Limited `UPDATE` and `DELETE`.** `UPDATE` exists; deletes are effectively partition drops. This is an append-oriented system.
+- **No full MVCC transactions.** There is no `BEGIN`/`COMMIT` in the PostgreSQL sense across multiple statements.
+- **No extensions ecosystem.** No PostGIS, no `pg_trgm`, no `pgvector`.
+- **Narrower type system.** No `JSONB`, no arrays, no user-defined types.
+- **Thinner tooling integration.** Many ORMs and migration tools assume PostgreSQL semantics that QuestDB does not provide, even though the wire protocol matches.
+
+Both accept a `psql` connection and both work with standard PostgreSQL clients for querying — you can point [Chat2DB](https://chat2db.ai/download) or the web version at [app.chat2db.ai](https://app.chat2db.ai) at either — but only TimescaleDB behaves like PostgreSQL once you go past `SELECT`.
+
+## Scaling and operations
+
+**TimescaleDB** scales vertically, with read replicas via standard PostgreSQL streaming replication. Chunk-level operations — compression, retention, reordering — keep large tables manageable. Backups use `pg_dump`, `pg_basebackup`, pgBackRest or any standard tool. Multi-node distributed hypertables were deprecated, so plan on a single write node.
+
+**QuestDB** also scales vertically in its open-source form, with replication available in the enterprise edition. Its storage layout means partition management is largely `DROP PARTITION`, and its memory footprint per row is low. Operationally it is simple — one process, one data directory — but the tooling around it is younger and there is less accumulated operational knowledge to draw on.
+
+## Choosing
+
+**Choose TimescaleDB if:**
+
+- Your time-series data joins to relational data, which it almost always does.
+- You need transactions, foreign keys, or updates and deletes as ordinary operations.
+- You already run PostgreSQL and want one system, one backup strategy, one set of drivers.
+- You want PostGIS, `pgvector`, JSONB or any other extension alongside the time series.
+- Your ingestion is in the tens to low hundreds of thousands of rows per second, which covers the great majority of applications.
+
+**Choose QuestDB if:**
+
+- Ingestion rate is the binding constraint and the data is genuinely append-only.
+- `ASOF JOIN` and `LATEST ON` map directly onto your queries — market data, tick data, telemetry alignment.
+- You want the InfluxDB Line Protocol ingestion path from existing collectors.
+- Your query pattern is narrow: time-range scans, downsampling, last-value lookups.
+- Relational integrity is genuinely not required because an upstream system owns it.
+
+**A common combination** is both: QuestDB or a similar engine absorbing raw high-rate telemetry, with aggregates rolled up into PostgreSQL for the application to query and join. That costs you a pipeline to maintain, so only do it when a single system has demonstrably failed rather than in anticipation.
+
+## Summary
+
+TimescaleDB is PostgreSQL with time-series capabilities added; QuestDB is a time-series engine with PostgreSQL's wire protocol on the front. The first gives you the full relational feature set, extensions and ecosystem, at the cost of PostgreSQL's write path. The second gives you very high append throughput and elegant time-series SQL, at the cost of transactions, referential integrity, extensions and general-purpose query flexibility.
+
+If your time-series data needs to join to the rest of your data — and most does — TimescaleDB is the default. If you are ingesting tick data or high-rate telemetry into an append-only store and `ASOF JOIN` describes your core query, QuestDB will do that job with less hardware. Prototype with your real ingest rate and your real queries; the architectural fit will be obvious long before the benchmark numbers are.

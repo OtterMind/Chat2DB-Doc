@@ -1,0 +1,241 @@
+---
+title: "Turso and libSQL: SQLite for Distributed Apps"
+description: "A practical guide to Turso and libSQL: embedded replicas, database-per-tenant, vector search, migrations, and when SQLite at the edge actually fits."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: September 22, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# Turso and libSQL: SQLite for Distributed Apps
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="September 22, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+SQLite is the most deployed database in the world and it has one structural limitation for web applications: it is a file on a disk, and your application server is somewhere else. Every attempt to fix this — network filesystems, replication daemons, VFS layers — has traded away something important.
+
+libSQL is an open-source fork of SQLite that adds the network layer properly, and Turso is the managed service built on it. The interesting part is not "SQLite in the cloud"; it is the embedded replica model, which gives you microsecond local reads with a durable remote primary. That, plus the ability to create databases cheaply enough to give every tenant their own, is what makes it worth understanding.
+
+## What libSQL changes
+
+libSQL is a fork rather than an extension because SQLite does not accept external contributions to its core. The additions that matter:
+
+- **A server mode** (`sqld`) speaking HTTP and WebSocket, so clients connect over a network rather than opening a file.
+- **Embedded replicas** — a local SQLite file kept in sync with a remote primary, so reads are local and writes go to the primary.
+- **Native replication** via a write-ahead log shipped to replicas.
+- **`ALTER TABLE` improvements**, including `ALTER TABLE ... ALTER COLUMN`, which stock SQLite lacks.
+- **Vector search** built into the core rather than bolted on as an extension.
+- **Extensions on the server side** — including randomised UUIDs and a crypto module.
+
+It stays wire-compatible with SQLite file format, so an existing `.db` file opens unchanged.
+
+## Three connection modes
+
+This is the first design decision and it determines everything else.
+
+**Remote only.** Every query is an HTTP round trip to the primary. Simple, stateless, works in serverless functions and edge runtimes where there is no persistent filesystem.
+
+```js
+import { createClient } from "@libsql/client";
+
+const db = createClient({
+  url: "libsql://my-db-myorg.turso.io",
+  authToken: process.env.TURSO_AUTH_TOKEN,
+});
+
+const result = await db.execute({
+  sql: "SELECT id, title FROM posts WHERE author_id = ? ORDER BY created_at DESC LIMIT 20",
+  args: [42],
+});
+console.log(result.rows);
+```
+
+**Local file.** Plain SQLite, no network. Useful for tests and local development with exactly the same client API:
+
+```js
+const db = createClient({ url: "file:local.db" });
+```
+
+**Embedded replica.** The one that justifies the whole project:
+
+```js
+const db = createClient({
+  url: "file:local-replica.db",        // local SQLite file
+  syncUrl: "libsql://my-db-myorg.turso.io",
+  authToken: process.env.TURSO_AUTH_TOKEN,
+  syncInterval: 60,                     // background sync, seconds
+});
+
+// Reads hit the local file — no network
+const posts = await db.execute("SELECT * FROM posts LIMIT 100");
+
+// Writes go to the remote primary, then the local copy is refreshed
+await db.execute({
+  sql: "INSERT INTO posts (title, author_id) VALUES (?, ?)",
+  args: ["Hello", 42],
+});
+
+// Pull the latest changes explicitly when you need to
+await db.sync();
+```
+
+Reads become local filesystem reads — microseconds, no network variance. Writes still go to the primary, so they carry normal network latency. The consistency model is read-your-writes for the connection that performed the write, and eventual consistency for everything else within the sync interval.
+
+That trade is excellent for read-heavy applications and wrong for anything needing strict global consistency. A dashboard, a CMS, a docs site, per-user application data: good fit. A ledger where two servers must not both see a stale balance: bad fit.
+
+## Database-per-tenant
+
+Multi-tenant applications usually pick one of two bad options: one shared database with a `tenant_id` column on every table and row-level security you must never get wrong, or one database per tenant on a system where databases are expensive.
+
+libSQL databases are cheap — they are files. Turso builds on this with schema-linked databases:
+
+```bash
+# A parent database holding the schema
+turso db create app-schema --type schema
+
+# Tenant databases that inherit and track it
+turso db create tenant-acme  --schema app-schema
+turso db create tenant-globex --schema app-schema
+```
+
+Migrations applied to the parent propagate to every child:
+
+```bash
+turso db shell app-schema "ALTER TABLE users ADD COLUMN locale TEXT DEFAULT 'en'"
+```
+
+The isolation properties are genuinely better than a shared table: a query bug cannot leak across tenants, a tenant can be exported or deleted as a single file, backups are per tenant, and a heavy tenant does not scan another's rows. The cost is that cross-tenant analytics becomes a separate problem — you cannot `GROUP BY tenant` across thousands of databases, so you need a separate aggregation pipeline into a warehouse.
+
+Creating and routing databases programmatically is the normal pattern:
+
+```js
+// Provision on signup via the platform API
+const res = await fetch(`https://api.turso.tech/v1/organizations/${org}/databases`, {
+  method: "POST",
+  headers: { Authorization: `Bearer ${process.env.TURSO_PLATFORM_TOKEN}` },
+  body: JSON.stringify({ name: `tenant-${tenantId}`, group: "default", schema: "app-schema" }),
+});
+```
+
+## SQL: what you get and what you do not
+
+It is SQLite, so the dialect is SQLite's — with the strengths and gaps that implies.
+
+Available and useful:
+
+```sql
+-- Window functions
+SELECT user_id,
+       created_at,
+       sum(amount) OVER (PARTITION BY user_id ORDER BY created_at) AS running_total
+FROM payments;
+
+-- CTEs, including recursive
+WITH RECURSIVE thread(id, parent_id, depth) AS (
+    SELECT id, parent_id, 0 FROM comments WHERE id = ?
+    UNION ALL
+    SELECT c.id, c.parent_id, t.depth + 1
+    FROM comments c JOIN thread t ON c.parent_id = t.id
+)
+SELECT * FROM thread ORDER BY depth;
+
+-- JSON functions
+SELECT json_extract(metadata, '$.plan') AS plan, count(*)
+FROM accounts GROUP BY 1;
+
+-- UPSERT
+INSERT INTO counters (key, n) VALUES ('views', 1)
+ON CONFLICT(key) DO UPDATE SET n = n + 1;
+
+-- Full-text search
+CREATE VIRTUAL TABLE posts_fts USING fts5(title, body, content='posts', content_rowid='id');
+SELECT * FROM posts_fts WHERE posts_fts MATCH 'sqlite AND replication';
+
+-- Generated columns and partial indexes
+ALTER TABLE orders ADD COLUMN year INTEGER GENERATED ALWAYS AS (strftime('%Y', created_at)) VIRTUAL;
+CREATE INDEX idx_open_orders ON orders(created_at) WHERE status = 'open';
+```
+
+Missing relative to PostgreSQL: no `RIGHT JOIN` before SQLite 3.39 (present in current libSQL), no stored procedures, no native `UUID`/`INET`/array/range types, no `MERGE`, limited `ALTER TABLE` even with libSQL's extensions, and dynamic typing unless you opt into `STRICT` tables — which you should:
+
+```sql
+CREATE TABLE users (
+    id         INTEGER PRIMARY KEY,
+    email      TEXT NOT NULL UNIQUE,
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+) STRICT;
+```
+
+Without `STRICT`, SQLite will happily store the string `'abc'` in an `INTEGER` column.
+
+## Vector search
+
+libSQL has native vector types, so a small RAG application does not need a separate vector database:
+
+```sql
+CREATE TABLE documents (
+    id        INTEGER PRIMARY KEY,
+    content   TEXT NOT NULL,
+    embedding F32_BLOB(768)
+);
+
+CREATE INDEX documents_embedding_idx
+    ON documents (libsql_vector_idx(embedding));
+
+-- Nearest neighbours
+SELECT d.id, d.content, vector_distance_cos(d.embedding, vector32(?)) AS distance
+FROM vector_top_k('documents_embedding_idx', vector32(?), 10) AS v
+JOIN documents d ON d.rowid = v.id
+ORDER BY distance;
+```
+
+This is a real feature, not a toy, but calibrate expectations: it is appropriate for thousands to low millions of vectors per database. Beyond that, a dedicated vector engine will handle index build time, filtering and recall tuning far better.
+
+## Migrations and operations
+
+Turso does not prescribe a migration tool. Drizzle, Prisma, Atlas and plain SQL files all work; the important part is that DDL is applied to the primary, which then replicates.
+
+```bash
+# Plain SQL
+turso db shell my-db < migrations/001_initial.sql
+
+# Interactive inspection
+turso db shell my-db
+```
+
+Backups use SQLite's native mechanism plus point-in-time restore from the WAL:
+
+```bash
+turso db create restored-db --from-db my-db --timestamp 2026-09-22T10:00:00Z
+turso db shell my-db ".dump" > backup.sql
+```
+
+Because the result is an ordinary SQLite file, you can also open a downloaded copy in any SQLite client. Tools like [Chat2DB](https://chat2db.ai/download) connect to SQLite files directly for browsing schemas and running ad-hoc queries, and its web version at [app.chat2db.ai](https://app.chat2db.ai) is handy when you are inspecting an exported snapshot rather than a live primary.
+
+## When it fits and when it does not
+
+**Good fit:**
+
+- Read-heavy applications where the working set is small enough to replicate locally.
+- Multi-tenant SaaS where per-tenant isolation is worth more than cross-tenant queries.
+- Edge and serverless deployments that need low-latency reads from many regions.
+- Local-first and offline-capable apps where the client holds a real database.
+- Small vector workloads embedded in an existing application.
+
+**Poor fit:**
+
+- Write-heavy workloads. There is one primary, and every write goes to it.
+- Strong consistency across regions.
+- Large analytical queries over hundreds of gigabytes — use DuckDB, ClickHouse or a warehouse.
+- Schemas needing PostgreSQL's type system, extensions or stored procedures.
+- Teams that would rather operate one large database than thousands of small ones. Database-per-tenant is an operational model, not just a technical choice, and it needs tooling for provisioning, migration rollout and observability across the fleet.
+
+## Summary
+
+libSQL is SQLite with the network layer it always needed, and Turso is that packaged as a service. The embedded replica model is the genuinely novel part: a local SQLite file that stays in sync with a remote primary, giving local-filesystem read latency with durable centralised writes, at the cost of eventual consistency for readers other than the writer.
+
+Database-per-tenant is the second reason to look at it — libSQL databases are cheap enough that per-tenant isolation becomes the default rather than an enterprise tier, and schema-linked databases solve the migration-fan-out problem that usually kills the idea.
+
+Use it for read-heavy, multi-tenant or edge-deployed applications where SQLite's dialect is sufficient. Stay with PostgreSQL when you need its type system, extensions, strong consistency or high write throughput, and reach for a dedicated analytical engine once queries start scanning more than a few gigabytes.

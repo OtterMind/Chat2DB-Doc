@@ -1,0 +1,215 @@
+---
+title: "PostgreSQL MERGE: Syntax, Examples and Pitfalls"
+description: "A practical guide to the PostgreSQL MERGE statement: syntax, MERGE vs INSERT ON CONFLICT, RETURNING, RULE, concurrency pitfalls and upsert patterns that work."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: September 22, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# PostgreSQL MERGE: Syntax, Examples and Pitfalls
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="September 22, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+PostgreSQL 15 added `MERGE`, the SQL-standard statement for conditionally inserting, updating and deleting rows in one pass. PostgreSQL 17 extended it with `RETURNING` and `WHEN NOT MATCHED BY SOURCE`. If you have been reaching for `INSERT ... ON CONFLICT` for everything, it is worth knowing where each one actually belongs — because they are not interchangeable, and `MERGE` has a concurrency behaviour that surprises people who assume it is just a nicer upsert.
+
+## The basic shape
+
+`MERGE` joins a target table against a source, then applies a different action depending on whether each source row found a match:
+
+```sql
+MERGE INTO customers AS t
+USING customer_updates AS s
+   ON t.customer_id = s.customer_id
+WHEN MATCHED THEN
+    UPDATE SET name = s.name,
+               email = s.email,
+               updated_at = now()
+WHEN NOT MATCHED THEN
+    INSERT (customer_id, name, email, created_at)
+    VALUES (s.customer_id, s.name, s.email, now());
+```
+
+The source does not have to be a table. A subquery, a VALUES list or a CTE all work:
+
+```sql
+MERGE INTO inventory AS t
+USING (VALUES ('SKU-1001', 25),
+              ('SKU-1002', 0),
+              ('SKU-1099', 12)) AS s(sku, qty)
+   ON t.sku = s.sku
+WHEN MATCHED AND s.qty = 0 THEN
+    DELETE
+WHEN MATCHED THEN
+    UPDATE SET quantity = s.qty, updated_at = now()
+WHEN NOT MATCHED THEN
+    INSERT (sku, quantity) VALUES (s.sku, s.qty);
+```
+
+Three things to note in that example. Clauses are evaluated **in order**, and the first one whose condition holds wins — so the `s.qty = 0` DELETE branch must come before the unconditional UPDATE branch, or it will never fire. Each clause can carry its own `AND` condition. And a row that matches no clause at all is simply skipped, with no error.
+
+## What MERGE does that ON CONFLICT cannot
+
+`INSERT ... ON CONFLICT` is excellent at one job: insert a row, and if a *unique constraint* would be violated, update it instead. That constraint requirement is the limitation.
+
+`MERGE` matches on an arbitrary join condition. Consider merging by a composite business key that has no unique index, or matching on a range, or matching on a computed expression:
+
+```sql
+MERGE INTO daily_rollup AS t
+USING staging_events AS s
+   ON t.tenant_id = s.tenant_id
+  AND t.metric    = s.metric
+  AND t.day       = date_trunc('day', s.event_at)
+WHEN MATCHED THEN
+    UPDATE SET total = t.total + s.value,
+               events = t.events + 1
+WHEN NOT MATCHED THEN
+    INSERT (tenant_id, metric, day, total, events)
+    VALUES (s.tenant_id, s.metric, date_trunc('day', s.event_at), s.value, 1);
+```
+
+`ON CONFLICT` cannot express that unless you create a unique index on exactly `(tenant_id, metric, day)`.
+
+`MERGE` also does deletes, which `ON CONFLICT` cannot do at all, and it can have several `WHEN MATCHED` branches with different conditions.
+
+## WHEN NOT MATCHED BY SOURCE (PostgreSQL 17+)
+
+Before 17, `MERGE` could only act on rows present in the source. PostgreSQL 17 added `WHEN NOT MATCHED BY SOURCE`, which fires for target rows that the source did *not* mention. This turns `MERGE` into a full synchronisation primitive:
+
+```sql
+MERGE INTO product_catalog AS t
+USING supplier_feed AS s
+   ON t.sku = s.sku
+WHEN MATCHED AND (t.price, t.title) IS DISTINCT FROM (s.price, s.title) THEN
+    UPDATE SET price = s.price, title = s.title, synced_at = now()
+WHEN NOT MATCHED BY TARGET THEN
+    INSERT (sku, title, price, synced_at)
+    VALUES (s.sku, s.title, s.price, now())
+WHEN NOT MATCHED BY SOURCE THEN
+    UPDATE SET discontinued = true, synced_at = now();
+```
+
+One statement now makes the catalog exactly reflect the feed: changed rows updated, new rows inserted, missing rows flagged. The `IS DISTINCT FROM` guard on the first branch matters — without it, every row in the feed generates a write even when nothing changed, which inflates WAL, bloats the table and triggers unnecessary index maintenance. `IS DISTINCT FROM` rather than `<>` because it handles NULLs correctly.
+
+`WHEN NOT MATCHED BY TARGET` is the new explicit spelling of the plain `WHEN NOT MATCHED`; both mean the same thing.
+
+## RETURNING and MERGE_ACTION (PostgreSQL 17+)
+
+PostgreSQL 17 lets `MERGE` return rows, with a special function that tells you which branch produced each one:
+
+```sql
+MERGE INTO customers AS t
+USING customer_updates AS s
+   ON t.customer_id = s.customer_id
+WHEN MATCHED THEN
+    UPDATE SET email = s.email, updated_at = now()
+WHEN NOT MATCHED THEN
+    INSERT (customer_id, name, email) VALUES (s.customer_id, s.name, s.email)
+RETURNING merge_action() AS action, t.customer_id, t.email;
+```
+
+```
+ action | customer_id |        email
+--------+-------------+----------------------
+ UPDATE |        1021 | a.chen@example.com
+ INSERT |        5540 | m.rossi@example.com
+ UPDATE |        1188 | j.novak@example.com
+```
+
+That is immediately useful for ETL auditing: wrap the statement in a CTE and write the counts to a job log.
+
+```sql
+WITH merged AS (
+    MERGE INTO customers AS t
+    USING customer_updates AS s
+       ON t.customer_id = s.customer_id
+    WHEN MATCHED THEN UPDATE SET email = s.email
+    WHEN NOT MATCHED THEN INSERT (customer_id, email) VALUES (s.customer_id, s.email)
+    RETURNING merge_action() AS action
+)
+INSERT INTO etl_log (run_at, inserted, updated)
+SELECT now(),
+       count(*) FILTER (WHERE action = 'INSERT'),
+       count(*) FILTER (WHERE action = 'UPDATE')
+FROM merged;
+```
+
+## The concurrency pitfall
+
+This is the part that catches people, so be clear about it.
+
+`INSERT ... ON CONFLICT` is atomic with respect to concurrent inserts. It uses speculative insertion: if another transaction inserts the same key first, PostgreSQL detects the conflict and takes the `DO UPDATE` path. It cannot fail with a duplicate key error on the conflict target.
+
+`MERGE` does not do this. It evaluates the join once, at the start of the statement, against the snapshot it can see. If a concurrent transaction inserts a matching row after that evaluation but before the `MERGE` commits, the `NOT MATCHED` branch still runs — and if a unique constraint covers those columns, you get:
+
+```
+ERROR:  duplicate key value violates unique constraint "customers_pkey"
+```
+
+Under `READ COMMITTED`, PostgreSQL will re-check a row it was about to update and may re-evaluate the conditions, but it will **not** convert an insert into an update. Under `REPEATABLE READ` or `SERIALIZABLE` you get a serialization failure instead:
+
+```
+ERROR:  could not serialize access due to concurrent update
+```
+
+So the rules are:
+
+- **Concurrent upserts on a unique key → use `INSERT ... ON CONFLICT`.** This is the common web-application case: two requests racing to create the same user.
+- **Single-writer batch loads → `MERGE` is fine and clearer.** ETL jobs, nightly syncs, staging-to-target loads.
+- **If you need `MERGE` semantics under concurrency**, either take an explicit lock or retry:
+
+```sql
+BEGIN;
+LOCK TABLE customers IN SHARE ROW EXCLUSIVE MODE;
+MERGE INTO customers ...;
+COMMIT;
+```
+
+`SHARE ROW EXCLUSIVE` blocks other writers but allows readers. It serialises your merges, which is exactly what you want for a batch job and exactly what you do not want on a hot OLTP path.
+
+Any production code path using `MERGE` concurrently also needs a retry wrapper around the serialization-failure and unique-violation cases. If that sounds like more work than `ON CONFLICT`, that is the correct conclusion — use `ON CONFLICT` there.
+
+## Other restrictions worth knowing
+
+- **No `WITH RECURSIVE`** in the source query.
+- **Rules are not applied.** If the target table has `CREATE RULE` definitions, `MERGE` errors out rather than silently ignoring them.
+- **Views are limited.** `MERGE` supports auto-updatable views, and from PostgreSQL 15 you can target a view with `INSTEAD OF` triggers only in specific cases — test it rather than assuming.
+- **Partitioned tables work**, and rows can move between partitions on update, but the usual partition-key update rules apply.
+- **`DO NOTHING`** is available as an action: `WHEN MATCHED THEN DO NOTHING` skips the row explicitly, which is clearer than a condition that excludes it.
+- **No `ON CONFLICT` inside `MERGE`.** You cannot nest the two.
+
+## Choosing between MERGE and ON CONFLICT
+
+A short decision guide:
+
+| Situation | Use |
+|---|---|
+| Upsert on a unique/PK constraint, concurrent writers | `INSERT ... ON CONFLICT` |
+| Match on an arbitrary join condition | `MERGE` |
+| Need to delete unmatched rows | `MERGE` |
+| Need to flag rows absent from the source | `MERGE` (17+, `NOT MATCHED BY SOURCE`) |
+| Several different update branches | `MERGE` |
+| Simple "insert or update one row" in application code | `INSERT ... ON CONFLICT` |
+| Batch load from staging into a warehouse table | `MERGE` |
+| Portability to Oracle / SQL Server | `MERGE` (it is the standard) |
+
+Performance is broadly comparable when both can express the task; `MERGE` on a large source benefits from an index on the join columns of the target exactly as any join would, and you should check that with `EXPLAIN (ANALYZE, BUFFERS)` rather than assuming a merge join:
+
+```sql
+EXPLAIN (ANALYZE, BUFFERS)
+MERGE INTO customers AS t
+USING customer_updates AS s ON t.customer_id = s.customer_id
+WHEN MATCHED THEN UPDATE SET email = s.email
+WHEN NOT MATCHED THEN INSERT (customer_id, email) VALUES (s.customer_id, s.email);
+```
+
+A `Seq Scan` on the target inside the merge means you are missing an index on the join key. If you would rather read plans, row counts and table statistics in one place than piece them together from `psql` output, [Chat2DB](https://chat2db.ai/download) shows them side by side and also runs in the browser at [app.chat2db.ai](https://app.chat2db.ai).
+
+## Summary
+
+`MERGE` gives PostgreSQL the standard multi-action conditional write: insert, update and delete against one target, driven by an arbitrary join, with per-branch conditions. PostgreSQL 17 rounded it out with `RETURNING`, `merge_action()` and `WHEN NOT MATCHED BY SOURCE`, which together make full table synchronisation a single statement.
+
+The one thing to internalise is that `MERGE` is not a concurrency-safe upsert. It resolves matches against a snapshot and will raise a unique-violation or serialization error if another transaction inserts the same key mid-statement. Keep `INSERT ... ON CONFLICT` for racing writers on a unique key, reach for `MERGE` for batch synchronisation and for the matching logic `ON CONFLICT` cannot express, and put an explicit lock or a retry loop around any `MERGE` that genuinely has to run concurrently.

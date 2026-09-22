@@ -1,0 +1,254 @@
+---
+title: "Milvus vs Weaviate vs Qdrant: Vector DB Guide"
+description: "Milvus vs Weaviate vs Qdrant compared: architecture, indexing, filtering, hybrid search, scaling model and deployment, with code for each and how to choose."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: September 22, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# Milvus vs Weaviate vs Qdrant: Vector DB Guide
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="September 22, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+Most comparisons of vector databases are benchmark tables, and most benchmark tables are unhelpful — recall and latency trade off against each other continuously, so any single pair of numbers reflects a chosen operating point rather than a property of the system. What actually determines the right choice is architecture: how the system scales, how it filters, what it stores alongside the vector, and how much operational work it demands.
+
+Milvus, Weaviate and Qdrant are the three serious open-source options. They make different structural choices, and those choices map onto different workloads.
+
+## The one-paragraph version
+
+**Milvus** is a distributed system built from separate, independently scalable components coordinated through a message queue. It is the right answer at billion-vector scale and overkill below roughly ten million.
+
+**Weaviate** is an object database that happens to index vectors. It brings its own embedding pipeline, a GraphQL API and modules for reranking and generative search. Choose it when you want the search stack rather than just the index.
+
+**Qdrant** is a focused vector search engine written in Rust. It is a single binary, operationally simple, and unusually strong at filtered search. Choose it when you want the index to be excellent and the rest to be your problem.
+
+## Architecture
+
+### Milvus: disaggregated
+
+Milvus separates four planes — access, coordinator, worker and storage — and scales them independently. A production deployment includes etcd for metadata, object storage (S3/MinIO) for segments, and a message queue (Pulsar or Kafka) for the write log.
+
+That means a minimal production install is several stateful services. The payoff is real: query nodes scale separately from index nodes, data is durable in object storage rather than on local disk, and the system genuinely handles billions of vectors.
+
+```python
+from pymilvus import MilvusClient, DataType
+
+client = MilvusClient(uri="http://localhost:19530")
+
+schema = client.create_schema(auto_id=True, enable_dynamic_field=True)
+schema.add_field("id", DataType.INT64, is_primary=True)
+schema.add_field("embedding", DataType.FLOAT_VECTOR, dim=1536)
+schema.add_field("category", DataType.VARCHAR, max_length=64)
+schema.add_field("published_at", DataType.INT64)
+
+index_params = client.prepare_index_params()
+index_params.add_index(
+    field_name="embedding",
+    index_type="HNSW",
+    metric_type="COSINE",
+    params={"M": 32, "efConstruction": 256},
+)
+
+client.create_collection("documents", schema=schema, index_params=index_params)
+
+results = client.search(
+    collection_name="documents",
+    data=[query_vector],
+    limit=10,
+    filter='category == "engineering" and published_at > 1735689600',
+    output_fields=["category", "published_at"],
+    search_params={"params": {"ef": 128}},
+)
+```
+
+Milvus supports the widest index selection of the three: HNSW, IVF_FLAT, IVF_SQ8, IVF_PQ, DiskANN, SCANN, plus GPU indexes (GPU_IVF_FLAT, GPU_CAGRA). If your dataset does not fit in RAM, DiskANN is the reason to look at Milvus specifically.
+
+Milvus Lite exists for local development — `pip install milvus-lite` and it runs embedded, with the same client API.
+
+### Weaviate: an object database with vectors
+
+Weaviate stores objects with properties and vectorizes them for you. The schema is closer to a document database than a vector index:
+
+```python
+import weaviate
+import weaviate.classes as wvc
+
+client = weaviate.connect_to_local()
+
+client.collections.create(
+    name="Document",
+    vectorizer_config=wvc.config.Configure.Vectorizer.text2vec_openai(
+        model="text-embedding-3-small"
+    ),
+    generative_config=wvc.config.Configure.Generative.openai(),
+    properties=[
+        wvc.config.Property(name="title",    data_type=wvc.config.DataType.TEXT),
+        wvc.config.Property(name="body",     data_type=wvc.config.DataType.TEXT),
+        wvc.config.Property(name="category", data_type=wvc.config.DataType.TEXT),
+    ],
+)
+
+docs = client.collections.get("Document")
+docs.data.insert({"title": "Indexing in Postgres", "body": "...", "category": "engineering"})
+```
+
+You never compute an embedding — Weaviate calls the model. Query with text:
+
+```python
+response = docs.query.hybrid(
+    query="how do BRIN indexes work",
+    alpha=0.6,                      # 0 = pure keyword, 1 = pure vector
+    limit=10,
+    filters=wvc.query.Filter.by_property("category").equal("engineering"),
+)
+```
+
+Hybrid search combining BM25 and vector similarity is built in, with a single `alpha` knob. So is retrieval-augmented generation:
+
+```python
+response = docs.generate.near_text(
+    query="explain database indexing",
+    limit=5,
+    grouped_task="Summarise these documents for a junior engineer.",
+)
+print(response.generated)
+```
+
+That is the Weaviate proposition: less code to a working RAG application, at the price of coupling your search layer to Weaviate's module ecosystem. Weaviate also supports cross-references between objects, which is genuinely useful for graph-ish data and which neither of the others offers.
+
+### Qdrant: focused and Rust-native
+
+Qdrant is one binary with no external dependencies. Start it, and you have a working vector database.
+
+```python
+from qdrant_client import QdrantClient, models
+
+client = QdrantClient(url="http://localhost:6333")
+
+client.create_collection(
+    collection_name="documents",
+    vectors_config=models.VectorParams(size=1536, distance=models.Distance.COSINE),
+    hnsw_config=models.HnswConfigDiff(m=32, ef_construct=256),
+    quantization_config=models.ScalarQuantization(
+        scalar=models.ScalarQuantizationConfig(type=models.ScalarType.INT8, always_ram=True)
+    ),
+)
+
+# Payload indexes make filtering fast — create them explicitly
+client.create_payload_index("documents", "category", models.PayloadSchemaType.KEYWORD)
+client.create_payload_index("documents", "published_at", models.PayloadSchemaType.INTEGER)
+
+results = client.query_points(
+    collection_name="documents",
+    query=query_vector,
+    limit=10,
+    query_filter=models.Filter(
+        must=[
+            models.FieldCondition(key="category", match=models.MatchValue(value="engineering")),
+            models.FieldCondition(key="published_at", range=models.Range(gte=1735689600)),
+        ]
+    ),
+    search_params=models.SearchParams(hnsw_ef=128),
+)
+```
+
+Qdrant is single-binary but not single-node — it supports sharding and replication for horizontal scale. What it deliberately omits is the embedding pipeline: you bring your own vectors.
+
+## Filtered search: the real differentiator
+
+Every application filters. "Find similar documents *in this workspace*, *not archived*, *from this year*." How a vector database handles that predicate matters more than raw unfiltered throughput, because unfiltered search is not what you run.
+
+The problem is that HNSW is a graph, and removing nodes that fail the filter can disconnect it. Two naive strategies both fail: pre-filtering to a candidate set then brute-forcing it is slow when the set is large; post-filtering a vector search is wrong when the filter is selective, because the top-k neighbours may contain nothing that passes.
+
+**Qdrant** is the strongest here. It builds payload indexes, estimates filter cardinality, and picks a strategy per query: brute force over the filtered set when it is small, filtered HNSW traversal when it is large. It also adds extra links to the HNSW graph during construction so that filtered subgraphs stay connected. Explicitly creating payload indexes is required to get this behaviour, and it is the single most common Qdrant mistake to skip it.
+
+**Milvus** supports scalar filtering with a familiar expression syntax and has improved considerably, including bitmap indexes for low-cardinality fields. Partitioning by a key is the idiomatic approach for strongly partitioned tenancy:
+
+```python
+client.create_partition("documents", "tenant_42")
+client.search(collection_name="documents", partition_names=["tenant_42"], data=[v], limit=10)
+```
+
+**Weaviate** applies filters during the HNSW traversal and switches to a flat search when the filtered set is small enough. It works well; it is less explicitly tunable than Qdrant.
+
+## Memory, quantization and cost
+
+Vectors are large. A million 1536-dimension float32 vectors is about 6 GB before index overhead, and HNSW adds a substantial graph on top.
+
+All three support quantization, but with different emphasis:
+
+- **Qdrant**: scalar (int8), product and **binary** quantization. Binary quantization with rescoring is the most aggressive option and works well for high-dimensional embeddings from modern models.
+- **Milvus**: IVF_SQ8, IVF_PQ, plus DiskANN for datasets that exceed RAM entirely.
+- **Weaviate**: product quantization, binary quantization and scalar quantization, plus a flat index with compression for smaller collections.
+
+Qdrant's on-disk mode with quantized vectors held in RAM is a particularly practical configuration: the index stays fast while the raw vectors live on disk for rescoring.
+
+```python
+client.create_collection(
+    collection_name="documents",
+    vectors_config=models.VectorParams(size=1536, distance=models.Distance.COSINE, on_disk=True),
+    quantization_config=models.BinaryQuantization(
+        binary=models.BinaryQuantizationConfig(always_ram=True)
+    ),
+)
+```
+
+## Operational reality
+
+This is where the decision usually lands.
+
+**Qdrant** is a Docker container or a single binary. Backups are snapshots. There is no external dependency. A team without dedicated infrastructure engineers can run it.
+
+**Weaviate** is also straightforward to deploy — one service, optionally with sidecar model containers if you use local inference modules. The complexity is in the module configuration rather than the topology.
+
+**Milvus** in distributed mode is a real platform: etcd, object storage, a message queue and several Milvus services. The Helm chart and the Milvus Operator make this tractable on Kubernetes, and Milvus Standalone collapses it to one process for smaller deployments. But if you are choosing Milvus for its scale and not running it distributed, you are paying the complexity without the benefit.
+
+All three offer managed services (Zilliz Cloud, Weaviate Cloud, Qdrant Cloud), which changes this calculus substantially.
+
+## Do you need a vector database at all?
+
+Worth asking. If you have fewer than a few million vectors and already run PostgreSQL, `pgvector` with an HNSW index is likely sufficient:
+
+```sql
+CREATE EXTENSION IF NOT EXISTS vector;
+
+CREATE TABLE documents (
+    id         BIGSERIAL PRIMARY KEY,
+    content    TEXT,
+    category   TEXT,
+    embedding  vector(1536)
+);
+
+CREATE INDEX ON documents USING hnsw (embedding vector_cosine_ops)
+    WITH (m = 16, ef_construction = 64);
+
+SELECT id, content, embedding <=> $1 AS distance
+FROM documents
+WHERE category = 'engineering'
+ORDER BY embedding <=> $1
+LIMIT 10;
+```
+
+The advantages are substantial: transactional consistency between your vectors and your relational data, one system to back up and monitor, no synchronisation pipeline, and ordinary SQL joins. The limits appear at scale — index build time, memory pressure, and filtered-search quality — but "we outgrew pgvector" is a much better problem than "we deployed a distributed vector database for 200,000 embeddings". You can inspect and query a pgvector table with any Postgres client, including [Chat2DB](https://chat2db.ai/download) or its web version at [app.chat2db.ai](https://app.chat2db.ai).
+
+## Choosing
+
+**Milvus** — billions of vectors, GPU indexing, DiskANN for datasets larger than RAM, and a team that can operate a distributed system on Kubernetes.
+
+**Weaviate** — you want the whole retrieval stack: managed embeddings, hybrid search, reranking and generative modules, with less integration code to write.
+
+**Qdrant** — heavily filtered search, tight memory budgets, operational simplicity, or a Rust/Python stack where a single fast binary is exactly what you want.
+
+**pgvector** — under a few million vectors and PostgreSQL is already in your architecture.
+
+Whichever you shortlist, benchmark with your own embeddings, your own filter patterns and your target recall. Published numbers are measured on ANN-Benchmarks datasets with no filtering, which is not the workload anyone actually runs.
+
+## Summary
+
+Milvus, Weaviate and Qdrant solve the same problem with different centres of gravity: Milvus optimises for scale through disaggregation, Weaviate for developer velocity through an integrated retrieval stack, and Qdrant for efficiency and filtered-search quality in a single simple binary.
+
+Decide on architecture and filtering behaviour rather than benchmark charts. Then check whether you need any of them yet — for a large fraction of applications, `pgvector` alongside the data you already have is the right answer, and the migration to a dedicated engine is straightforward if and when the scale arrives.

@@ -1,0 +1,269 @@
+---
+title: "Postgres Prepared Statements and the Plan Cache"
+description: "How PostgreSQL prepared statements, generic plans and plan_cache_mode work, why the sixth execution turns slow, and how to fix it under PgBouncer."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: September 22, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# Postgres Prepared Statements and the Plan Cache
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="September 22, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+There is a specific, maddening PostgreSQL failure that goes like this: a query is fast in `psql`, fast in staging, fast the first few times the application runs it — and then, in production, it becomes slow and stays slow until the connection is recycled. Nothing changed. No deploy, no data migration, no index drop.
+
+The usual cause is the plan cache. On the sixth execution of a prepared statement, PostgreSQL may switch from planning the query with your actual parameter values to planning it once, generically, for all values. When the data is skewed, the generic plan can be far worse.
+
+This is worth understanding properly, because the fix depends on which of several situations you are in — and because connection poolers add a second, unrelated set of problems with the same feature.
+
+## What a prepared statement actually is
+
+A prepared statement is a parsed and analysed query held on the server under a name, executed later with parameters:
+
+```sql
+PREPARE user_orders (bigint) AS
+    SELECT order_id, total, status
+    FROM orders
+    WHERE customer_id = $1
+    ORDER BY created_at DESC
+    LIMIT 50;
+
+EXECUTE user_orders(4711);
+EXECUTE user_orders(9042);
+
+DEALLOCATE user_orders;
+```
+
+Two benefits: the parse and analyse work happens once, and the values are sent separately from the SQL text, which makes SQL injection structurally impossible for those parameters.
+
+Most applications never write `PREPARE`. They get prepared statements implicitly through the extended query protocol, which drivers use when you pass parameters:
+
+```java
+// JDBC — server-side prepare after prepareThreshold executions (default 5)
+PreparedStatement ps = conn.prepareStatement(
+    "SELECT order_id, total FROM orders WHERE customer_id = ?");
+ps.setLong(1, customerId);
+```
+
+```python
+# psycopg 3 — uses the extended protocol; prepares after prepare_threshold (default 5)
+cur.execute("SELECT order_id, total FROM orders WHERE customer_id = %s", (customer_id,))
+```
+
+```javascript
+// node-postgres — only prepares when you give the query a name
+await client.query({
+  name: "user-orders",
+  text: "SELECT order_id, total FROM orders WHERE customer_id = $1",
+  values: [customerId],
+});
+```
+
+Inspect what a session currently holds:
+
+```sql
+SELECT name, statement, generic_plans, custom_plans, prepare_time
+FROM pg_prepared_statements;
+```
+
+Those `generic_plans` and `custom_plans` counters are the key diagnostic, and we will come back to them.
+
+## Custom plans, generic plans, and the number five
+
+When PostgreSQL executes a prepared statement it can plan it two ways.
+
+A **custom plan** is built with the actual parameter values substituted. The planner can use column statistics — most common values, histogram bounds, null fraction — to estimate selectivity precisely. The result is the best possible plan for those values, and it costs a full planning cycle every execution.
+
+A **generic plan** is built once with the parameters left as unknowns. The planner assumes average selectivity. Planning happens once and is reused forever, which is cheap, but the plan cannot adapt.
+
+PostgreSQL's default `plan_cache_mode = auto` makes the choice heuristically: it builds a custom plan for the first five executions, records their costs, then builds a generic plan and compares. If the generic plan's estimated cost is not worse than the average custom plan cost, it switches to the generic plan permanently for that statement.
+
+That heuristic is usually right and occasionally catastrophic. It fails when the column is **skewed**, because "average selectivity" then describes no real query.
+
+Consider a multi-tenant `orders` table where one tenant has 40 million rows and the rest have a few thousand each:
+
+```sql
+SELECT * FROM orders WHERE tenant_id = $1 AND status = 'open';
+```
+
+With a small tenant's id, the planner uses the index on `tenant_id` — a few hundred rows. With the huge tenant's id, a sequential scan is correct. The generic plan sees an average of perhaps 50,000 rows per tenant and picks something in between, which is wrong for everyone: too slow for the small tenants it should index-scan, and possibly fine for the big one.
+
+The signature in production is exactly the one described at the top: fast for five executions, slow from the sixth, per connection, forever.
+
+## Diagnosing it
+
+First, confirm a switch is happening:
+
+```sql
+SELECT name,
+       generic_plans,
+       custom_plans,
+       left(statement, 70) AS statement
+FROM pg_prepared_statements
+WHERE generic_plans > 0
+ORDER BY generic_plans DESC;
+```
+
+A statement with a large `generic_plans` count and a small `custom_plans` count has locked in a generic plan.
+
+Next, see the two plans side by side. From PostgreSQL 16, `EXPLAIN` accepts `GENERIC_PLAN`, so you can inspect a generic plan without executing anything:
+
+```sql
+EXPLAIN (GENERIC_PLAN, COSTS)
+SELECT * FROM orders WHERE tenant_id = $1 AND status = 'open';
+```
+
+Compare that against the plan for a real value:
+
+```sql
+EXPLAIN (ANALYZE, BUFFERS)
+SELECT * FROM orders WHERE tenant_id = 42 AND status = 'open';
+```
+
+If the generic plan is a `Seq Scan` while the value-specific plan is an `Index Scan`, you have found it.
+
+On PostgreSQL 15 and earlier, force the behaviour instead:
+
+```sql
+SET plan_cache_mode = force_generic_plan;
+PREPARE p (bigint) AS SELECT * FROM orders WHERE tenant_id = $1 AND status = 'open';
+EXPLAIN (ANALYZE) EXECUTE p(42);
+RESET plan_cache_mode;
+```
+
+Check how skewed the column really is before concluding:
+
+```sql
+SELECT most_common_vals, most_common_freqs, n_distinct
+FROM pg_stats
+WHERE tablename = 'orders' AND attname = 'tenant_id';
+```
+
+A few values with high frequencies and a large `n_distinct` is the classic skew profile.
+
+## The fixes, in order of preference
+
+**1. Force custom plans for the statement.** The most direct fix, applied as narrowly as possible:
+
+```sql
+-- Per session, around the offending query
+SET plan_cache_mode = force_custom_plan;
+```
+
+```sql
+-- Or for a whole role, if that role runs only the affected workload
+ALTER ROLE reporting SET plan_cache_mode = force_custom_plan;
+```
+
+The cost is re-planning on every execution. For queries running thousands of times a second on simple indexed lookups, that overhead is real and you should measure it. For the skewed queries that triggered this, planning cost is negligible next to the plan difference.
+
+Setting it globally is a blunt instrument; prefer role-level or session-level scoping.
+
+**2. Raise the statistics target so the generic plan is better informed.** This does not stop the switch, but it can make the generic plan correct:
+
+```sql
+ALTER TABLE orders ALTER COLUMN tenant_id SET STATISTICS 1000;
+ANALYZE orders;
+```
+
+**3. Add extended statistics for correlated columns.** If the planner is misestimating because two predicates are dependent — `tenant_id` and `region`, say — it is not the plan cache that is wrong, it is the row estimate:
+
+```sql
+CREATE STATISTICS orders_tenant_region (dependencies, ndistinct)
+    ON tenant_id, region FROM orders;
+ANALYZE orders;
+```
+
+**4. Disable server-side prepare in the driver**, for the specific query or globally:
+
+```
+# JDBC: never switch to server-side prepared statements
+jdbc:postgresql://host:5432/db?prepareThreshold=0
+```
+
+```python
+# psycopg 3: per-cursor
+cur.execute(sql, params, prepare=False)
+```
+
+This is the sledgehammer — you also give up the parse-time saving — but it is a one-line change that can be deployed immediately while you work out the real fix.
+
+**5. Split the query.** If one tenant genuinely needs a different plan, route it to a different statement. Partitioning by `tenant_id` achieves the same thing structurally, and partition pruning then does the work the planner was guessing at.
+
+## The other problem: connection poolers
+
+This is a separate issue with the same feature, and it catches people migrating to PgBouncer.
+
+Prepared statements are **per session**. In PgBouncer's `session` pooling mode that is fine — a client owns a server connection for its whole session. In `transaction` pooling mode, which is the reason most people deploy PgBouncer, a client gets a different server connection for each transaction. A statement prepared on one backend does not exist on the next, and you get:
+
+```
+ERROR:  prepared statement "S_1" does not exist
+```
+
+Historically the only answers were to disable server-side prepares (`prepareThreshold=0`) or use session pooling and lose most of the multiplexing benefit.
+
+PgBouncer 1.21 and later added `max_prepared_statements`, which makes the pooler track prepared statements and replay them onto whichever backend a transaction lands on:
+
+```ini
+[pgbouncer]
+pool_mode = transaction
+max_prepared_statements = 200
+```
+
+Set it above zero and protocol-level prepared statements work under transaction pooling. Note that this covers the extended-protocol path drivers use; explicit `PREPARE` SQL statements are still session state and are not tracked. Supavisor and PgCat have equivalent support.
+
+If you are on an older PgBouncer you cannot upgrade, disabling server-side prepares in the driver remains the correct workaround.
+
+## Memory: the cache is not free
+
+Each prepared statement holds a parse tree and one or more plans in the backend's private memory. A connection that prepares hundreds of distinct statements and never deallocates them grows steadily, and because it is backend-local memory it does not show up in shared buffer metrics.
+
+Watch for it:
+
+```sql
+SELECT pid,
+       usename,
+       application_name,
+       backend_start,
+       state,
+       pg_size_pretty(
+         (SELECT sum(total_bytes) FROM pg_get_backend_memory_contexts() )
+       ) AS backend_mem
+FROM pg_stat_activity
+WHERE backend_type = 'client backend'
+ORDER BY backend_start
+LIMIT 10;
+```
+
+`pg_get_backend_memory_contexts()` reports the current backend only; PostgreSQL 14+ also offers `pg_log_backend_memory_contexts(pid)` to dump another backend's contexts into the server log, which is the practical way to investigate a specific bloated connection.
+
+Practical mitigations: cap the driver's statement cache (`preparedStatementCacheQueries` in JDBC, `prepare_threshold` plus `prepared_max` in psycopg 3), avoid generating unbounded distinct SQL texts — an `IN` list with a varying number of placeholders produces a new statement for every length, so use `= ANY($1)` with an array instead:
+
+```sql
+-- One statement regardless of how many ids
+SELECT * FROM orders WHERE order_id = ANY($1::bigint[]);
+```
+
+And recycle connections periodically so caches cannot accumulate indefinitely.
+
+## A short checklist
+
+When a query is mysteriously slow only in production:
+
+1. `SELECT * FROM pg_prepared_statements` on an affected backend — is `generic_plans` climbing?
+2. `EXPLAIN (GENERIC_PLAN)` versus `EXPLAIN (ANALYZE)` with a real value. Different plan shapes confirm it.
+3. Check `pg_stats` for skew on the parameterised column.
+4. Fix in this order: raise statistics target, add extended statistics, then `plan_cache_mode = force_custom_plan` scoped to the role or session.
+5. If you use PgBouncer in transaction mode, set `max_prepared_statements` or disable server-side prepares.
+
+Comparing two execution plans line by line is the step that actually identifies the problem, and doing it in a terminal is painful. A client that shows plans and table statistics together makes it quicker — [Chat2DB](https://chat2db.ai/download) renders execution plans alongside the schema, and runs in the browser at [app.chat2db.ai](https://app.chat2db.ai) if you would rather not install anything.
+
+## Summary
+
+PostgreSQL prepares a statement, plans it with real values five times, then decides whether a single generic plan is good enough to reuse forever. On evenly distributed data that decision saves planning time. On skewed data it can replace a fast index scan with a sequential scan, permanently, from the sixth execution onward — which is why the symptom is "it was fine, then it wasn't, and nothing changed."
+
+Diagnose with `pg_prepared_statements` and `EXPLAIN (GENERIC_PLAN)`. Prefer fixing the estimates first with a higher statistics target or extended statistics, and fall back to `plan_cache_mode = force_custom_plan` scoped as narrowly as you can. Separately, if you run PgBouncer in transaction pooling mode, set `max_prepared_statements` so protocol-level prepared statements survive being moved between backends.
