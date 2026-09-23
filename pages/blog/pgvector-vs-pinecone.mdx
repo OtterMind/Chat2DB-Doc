@@ -1,0 +1,231 @@
+---
+title: "pgvector vs Pinecone: Which Vector DB to Choose"
+description: "A fair pgvector vs Pinecone comparison: architecture, HNSW and IVFFlat indexing, filtering and joins, cost models, scaling, and when to choose each."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: September 23, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# pgvector vs Pinecone: Which Vector DB to Choose
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="September 23, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+Every retrieval-augmented generation (RAG) project hits the same decision early: where do the embeddings live? Two of the most common answers are **pgvector**, an open-source extension that turns PostgreSQL into a vector database, and **Pinecone**, a fully managed vector database service. Both can store embeddings and return nearest neighbours quickly. They differ sharply in architecture, operational model, how they handle filtering and relational data, and how you pay for them.
+
+This article compares pgvector vs Pinecone on the dimensions that actually decide real projects. It avoids made-up benchmark numbers and prices — both products change quickly, and performance depends heavily on your data, dimensions, recall target and hardware. Instead, it explains *how* each system works so you can reason about your own workload, with runnable examples for both.
+
+## Architecture: an extension vs a managed service
+
+### pgvector: vectors inside your Postgres
+
+pgvector is a PostgreSQL extension. Once installed, it adds a `vector` column type, distance operators and two approximate nearest neighbour (ANN) index types. Your embeddings sit in ordinary tables, next to the rows they describe. They are covered by the same transactions, the same backups, the same replication, the same roles and row-level security policies as the rest of your data.
+
+That means a vector store based on pgvector is exactly as available, scalable and expensive as the PostgreSQL deployment you run it on. That deployment could be a self-hosted server, or a managed service such as Amazon RDS, Aurora, Google Cloud SQL, Azure Database for PostgreSQL, Supabase or Neon — most major managed Postgres providers offer pgvector, though the available version varies.
+
+### Pinecone: a purpose-built, managed vector database
+
+Pinecone is a proprietary, hosted service. You do not install anything; you create an index through the API or console, choose the dimension and distance metric, and send vectors over HTTPS or gRPC. Pinecone's current flagship offering is a serverless architecture that separates storage from compute, keeping index data in object storage and loading what is needed for queries. Older pod-based indexes, where you provisioned fixed capacity, still exist for some customers.
+
+Pinecone records consist of an ID, a dense vector, optional sparse values and a JSON-like metadata object. Records can be partitioned into **namespaces** inside an index, which is a common way to isolate tenants. Pinecone is not a relational database: there are no joins, no SQL and no multi-record transactions.
+
+## Getting started: runnable examples
+
+### pgvector in SQL
+
+```sql
+CREATE EXTENSION IF NOT EXISTS vector;
+
+CREATE TABLE documents (
+    id          bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    tenant_id   int         NOT NULL,
+    category    text        NOT NULL,
+    title       text        NOT NULL,
+    body        text        NOT NULL,
+    created_at  timestamptz NOT NULL DEFAULT now(),
+    embedding   vector(3)   NOT NULL   -- use your model's dimension, e.g. 1536
+);
+
+INSERT INTO documents (tenant_id, category, title, body, embedding) VALUES
+  (1, 'docs', 'Install guide',  'How to install...',   '[0.10, 0.20, 0.30]'),
+  (1, 'blog', 'Release notes',  'What is new...',      '[0.90, 0.10, 0.00]'),
+  (2, 'docs', 'API reference',  'Endpoints and...',    '[0.12, 0.18, 0.33]');
+
+-- k-nearest neighbours by cosine distance
+SELECT id, title, embedding <=> '[0.11, 0.19, 0.31]' AS cosine_distance
+FROM documents
+ORDER BY embedding <=> '[0.11, 0.19, 0.31]'
+LIMIT 5;
+```
+
+pgvector provides several distance operators: `<->` for Euclidean (L2) distance, `<=>` for cosine distance, `<#>` for negative inner product, and in recent versions `<+>` for L1 distance. The operator in your `ORDER BY` must match the operator class of your index for the index to be used.
+
+### Pinecone in Python
+
+```python
+from pinecone import Pinecone, ServerlessSpec
+
+pc = Pinecone(api_key="YOUR_API_KEY")
+
+index_name = "documents"
+if not pc.has_index(index_name):
+    pc.create_index(
+        name=index_name,
+        dimension=3,                 # must match your embedding model
+        metric="cosine",
+        spec=ServerlessSpec(cloud="aws", region="us-east-1"),
+    )
+
+index = pc.Index(index_name)
+
+index.upsert(
+    vectors=[
+        {"id": "1", "values": [0.10, 0.20, 0.30],
+         "metadata": {"category": "docs", "title": "Install guide"}},
+        {"id": "2", "values": [0.90, 0.10, 0.00],
+         "metadata": {"category": "blog", "title": "Release notes"}},
+    ],
+    namespace="tenant-1",
+)
+
+result = index.query(
+    vector=[0.11, 0.19, 0.31],
+    top_k=5,
+    filter={"category": {"$eq": "docs"}},
+    include_metadata=True,
+    namespace="tenant-1",
+)
+for match in result.matches:
+    print(match.id, match.score, match.metadata["title"])
+```
+
+The Pinecone SDK API has changed across major versions, so check the client version you install against the current documentation. The overall shape — create index, upsert records, query with an optional metadata filter — has stayed stable.
+
+## Indexing: HNSW and IVFFlat vs managed indexes
+
+### pgvector index options
+
+Without an index, pgvector performs an exact scan: it computes the distance to every row. That gives perfect recall and is perfectly reasonable for tens of thousands of rows. For larger tables you add an ANN index.
+
+**HNSW** (Hierarchical Navigable Small World) builds a multi-layer graph. It generally offers a strong speed/recall trade-off and can be created on an empty table, but builds are slower and use more memory than IVFFlat.
+
+```sql
+CREATE INDEX documents_embedding_hnsw
+ON documents USING hnsw (embedding vector_cosine_ops)
+WITH (m = 16, ef_construction = 64);
+
+-- Per session or per transaction: larger ef_search = better recall, slower queries
+SET hnsw.ef_search = 100;
+```
+
+**IVFFlat** clusters vectors into lists and searches only the nearest lists at query time. It builds faster and uses less memory, but it should be created *after* the table holds representative data, because the cluster centres are computed at build time.
+
+```sql
+CREATE INDEX documents_embedding_ivf
+ON documents USING ivfflat (embedding vector_cosine_ops)
+WITH (lists = 100);
+
+SET ivfflat.probes = 10;
+```
+
+Useful facts to keep in mind: the `vector` type can be indexed up to 2,000 dimensions, while `halfvec` (half-precision) can be indexed up to 4,000, which helps with large embedding models. pgvector also offers `sparsevec` for sparse vectors and binary quantization via `bit` columns. Building an HNSW index on a large table benefits from a generous `maintenance_work_mem`, and parallel builds are supported in recent releases.
+
+The flip side of this control is responsibility. You pick the index type, tune `m`, `ef_construction`, `lists`, `probes` and `ef_search`, and you measure recall against an exact scan on a sample of queries. The pgvector HNSW vs IVFFlat choice alone is worth an evaluation on your own data.
+
+### Pinecone's managed indexing
+
+In Pinecone you choose the dimension and metric (cosine, Euclidean or dot product) and the service handles the index structure, its tuning, and background compaction. You do not pick graph parameters or list counts. For many teams that is the whole point: there is nothing to tune and nothing to rebuild when the data grows.
+
+The trade-off is transparency. You cannot inspect or adjust the internals, and you rely on Pinecone's defaults for the recall/latency balance. Pinecone also supports sparse-dense hybrid search and offers hosted embedding and reranking models, which can remove a separate inference service from your architecture.
+
+## Filtering and joins with relational data
+
+This is where the two systems differ the most, and for many applications it decides the question.
+
+### Filtering in pgvector
+
+With pgvector, metadata is just columns. You filter with ordinary `WHERE` clauses and join to any other table:
+
+```sql
+SELECT d.id, d.title, u.display_name AS author
+FROM documents d
+JOIN document_authors da ON da.document_id = d.id
+JOIN users u            ON u.id = da.user_id
+WHERE d.tenant_id = 1
+  AND d.category = 'docs'
+  AND d.created_at > now() - interval '90 days'
+ORDER BY d.embedding <=> '[0.11, 0.19, 0.31]'
+LIMIT 10;
+```
+
+There is an important caveat with approximate indexes: the index returns candidates first and the filter is applied afterwards. With a very selective filter, an HNSW scan might return fewer than `LIMIT` rows because most candidates were filtered out. pgvector 0.8.0 added **iterative index scans** to address this:
+
+```sql
+SET hnsw.iterative_scan = relaxed_order;   -- or strict_order
+SET hnsw.max_scan_tuples = 20000;
+```
+
+Other techniques include a B-tree index on the filter column so the planner can choose an exact scan over a small subset, partial HNSW indexes per category, or partitioning by tenant. Row-level security can enforce tenant isolation for vector queries the same way it does for everything else.
+
+### Filtering in Pinecone
+
+Pinecone applies metadata filters as part of the query, using a MongoDB-style syntax with operators such as `$eq`, `$ne`, `$in`, `$nin`, `$gt`, `$lt`, `$and` and `$or`. Filtering is integrated into the search rather than applied as an afterthought, which avoids the "not enough results" problem for selective filters.
+
+What Pinecone cannot do is join. If your answer needs the author's name, the customer's subscription tier or the latest price, you either copy those values into metadata (and keep them in sync) or make a second call to your primary database using the returned IDs. Metadata size per record is also limited, so large documents are typically stored elsewhere and referenced by ID.
+
+## Consistency and data freshness
+
+With pgvector, an embedding written in a transaction is visible to other sessions as soon as that transaction commits, under normal PostgreSQL MVCC rules. You can insert a document row and its embedding atomically, and delete them together.
+
+Pinecone is eventually consistent: freshly upserted or deleted records typically become visible to queries after a short delay. For most search and RAG use cases that is fine; for workflows that must read their own writes immediately, it needs design attention. Keeping Pinecone in sync with a system of record also means building a pipeline — change data capture, a queue, or application-level dual writes — and handling its failure modes.
+
+## Operations and cost model
+
+This comparison stays qualitative on purpose; check current pricing pages before you decide.
+
+### pgvector costs
+
+pgvector itself is free and open source under the PostgreSQL license. You pay for the PostgreSQL instance: CPU, RAM, storage and replicas, whether self-managed or through a managed provider. HNSW indexes perform best when they fit in memory, so large vector collections tend to push you toward bigger instances. The costs are predictable and often already budgeted if you run Postgres anyway. The operational work — upgrades, vacuum, index builds, monitoring and capacity planning — is yours or your provider's.
+
+### Pinecone costs
+
+Pinecone's serverless pricing is usage-based: you are billed along dimensions such as stored data, read operations and write operations, with paid plans that may include a monthly minimum and a free starter tier for small projects. Costs scale with query volume as well as data size, so a read-heavy workload with a small dataset and a write-heavy workload with a large dataset can have very different bills. The operational work is largely absorbed by Pinecone, which is what you are paying for.
+
+A fair summary: pgvector costs look like infrastructure; Pinecone costs look like a metered API. Which is cheaper depends entirely on your volumes and on how much engineering time you would otherwise spend on operations.
+
+## Scaling
+
+A single PostgreSQL node scales vertically well, and read replicas can serve additional query traffic. Partitioning by tenant or time keeps individual HNSW indexes smaller. Beyond one node's capacity, you need a sharding approach such as Citus, or application-level sharding, and that is real engineering work.
+
+Pinecone's serverless architecture is designed to scale storage and query capacity without you provisioning nodes. Very large collections and many-tenant setups with namespaces are its home ground. You still need to consider rate limits, index-per-region placement and data residency requirements.
+
+## When to choose which
+
+### Choose pgvector when
+
+- You already run PostgreSQL and your vectors describe rows in it.
+- Queries combine similarity with relational filters, joins, or permissions.
+- You need transactional consistency between source data and embeddings.
+- Your collection fits comfortably on a well-sized Postgres instance.
+- You want open source, self-hosting options and no additional vendor.
+
+### Choose Pinecone when
+
+- You want vector search with essentially no database operations.
+- The collection is very large or growing unpredictably, and you do not want to plan capacity.
+- You need many isolated tenants and namespaces map naturally to them.
+- Your team values managed hybrid search, hosted inference or reranking.
+- Your source-of-truth data already lives somewhere else and syncing is acceptable.
+
+Many teams start with pgvector because it is already next to their data, and only move to a dedicated service when scale or operational load justifies it. Others start with Pinecone to ship a prototype quickly. Both paths are reasonable as long as you measure recall and latency on your own queries.
+
+## Working with pgvector day to day
+
+Because pgvector is just PostgreSQL, the usual tools work: `EXPLAIN ANALYZE` shows whether your HNSW index is used, `pg_stat_user_indexes` shows its size and usage, and `pg_stat_progress_create_index` tracks long index builds. A SQL client such as [Chat2DB](https://chat2db.ai/download) makes it easy to inspect vector tables, check index definitions and iterate on similarity queries alongside the rest of your schema.
+
+## Conclusion
+
+The pgvector vs Pinecone decision is less about raw speed and more about architecture. pgvector puts vectors inside your relational database, giving you SQL, joins, transactions and a single system to operate, in exchange for owning tuning and scaling. Pinecone gives you a purpose-built, managed service with integrated filtering and elastic scale, in exchange for a separate system to sync and a metered bill. Benchmark both on your own embeddings, filters and recall targets, and pick the one whose trade-offs match your team.

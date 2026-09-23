@@ -1,0 +1,350 @@
+---
+title: "Postgres ltree: Hierarchical Data Made Simple"
+description: "Model trees in PostgreSQL with ltree: label paths, lquery operators, GiST indexes, subtree moves, and a comparison with recursive CTEs and closure tables."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: September 23, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# Postgres ltree: Hierarchical Data Made Simple
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="September 23, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+Product categories, org charts, file systems, threaded comments, bill-of-materials trees, geographic regions: almost every application eventually needs to store a hierarchy. Relational tables are flat, so every team has to choose how to encode "this row lives under that row". The classic answer is an adjacency list (`parent_id`) queried with a recursive CTE. PostgreSQL also ships a less famous option that is often simpler and faster for read-heavy trees: the **ltree** extension.
+
+This guide explains how ltree represents a path, how to query it with the `@>`, `<@`, `~` and `?` operators, how to index it with GiST, how to move whole subtrees in one statement, and when you should prefer an adjacency list, a closure table, or ltree.
+
+## What ltree is
+
+`ltree` is a contrib extension that adds a data type for **label paths**. A label path is a sequence of labels separated by dots, such as:
+
+```
+Top.Science.Astronomy.Cosmology
+```
+
+Each label represents one node, and the full path encodes every ancestor of that node. Instead of asking "who is my parent, and who is their parent" row by row, you store the whole lineage in a single column and let specialised operators answer ancestry questions directly.
+
+Labels are made of letters, digits and underscores; PostgreSQL 16 and later also accept hyphens. There is a length limit per label and per path, and it has changed between versions, so check the documentation for your release if you plan to store long identifiers. In practice most teams use short slugs or numeric IDs as labels.
+
+Enable the extension once per database:
+
+```sql
+CREATE EXTENSION IF NOT EXISTS ltree;
+```
+
+`ltree` is marked as a trusted extension in recent PostgreSQL versions, so a user with `CREATE` privilege on the database can usually install it without being a superuser. Managed services such as Amazon RDS, Cloud SQL and Azure Database for PostgreSQL include it.
+
+## Building a category tree
+
+Let us model an e-commerce category tree:
+
+```sql
+CREATE TABLE category (
+    id    bigserial PRIMARY KEY,
+    name  text  NOT NULL,
+    path  ltree NOT NULL UNIQUE
+);
+
+INSERT INTO category (name, path) VALUES
+  ('All products',        'root'),
+  ('Electronics',         'root.electronics'),
+  ('Computers',           'root.electronics.computers'),
+  ('Laptops',             'root.electronics.computers.laptops'),
+  ('Desktops',            'root.electronics.computers.desktops'),
+  ('Phones',              'root.electronics.phones'),
+  ('Home',                'root.home'),
+  ('Kitchen',             'root.home.kitchen'),
+  ('Coffee machines',     'root.home.kitchen.coffee_machines'),
+  ('Garden',              'root.home.garden');
+```
+
+A string literal is cast to `ltree` implicitly on insert. You can also convert explicitly with `'root.home'::ltree` or `text2ltree('root.home')`, and back to text with `ltree2text(path)`.
+
+A common design choice is whether labels should be human-readable slugs or surrogate IDs. Slugs make paths readable in query output, but renaming a category then requires rewriting the paths of every descendant. Numeric IDs (`'1.4.17'`) never change when names change, so many production systems use IDs in the path and keep the display name in a separate column. The examples here use slugs for readability.
+
+## Querying with ltree operators
+
+### Ancestors and descendants: `@>` and `<@`
+
+The two operators you will use most:
+
+- `a @> b` is true when `a` is an ancestor of `b` (or equal to it).
+- `a <@ b` is true when `a` is a descendant of `b` (or equal to it).
+
+All descendants of Electronics, including Electronics itself:
+
+```sql
+SELECT name, path
+FROM category
+WHERE path <@ 'root.electronics'
+ORDER BY path;
+```
+
+All ancestors of Laptops (the breadcrumb trail):
+
+```sql
+SELECT name, path
+FROM category
+WHERE path @> 'root.electronics.computers.laptops'
+ORDER BY nlevel(path);
+```
+
+No recursion, no loop, a single predicate. To exclude the node itself, add `AND path <> 'root.electronics'`.
+
+### Depth with `nlevel` and slicing with `subpath`
+
+`nlevel(path)` returns the number of labels. That makes "direct children only" easy:
+
+```sql
+SELECT name, path
+FROM category
+WHERE path <@ 'root.electronics'
+  AND nlevel(path) = nlevel('root.electronics') + 1;
+```
+
+`subpath(path, offset, len)` extracts part of a path (offsets are zero-based, and negative offsets count from the end). `subpath(path, 0, nlevel(path) - 1)` gives the parent path of any node:
+
+```sql
+SELECT name,
+       path,
+       subpath(path, 0, nlevel(path) - 1) AS parent_path
+FROM category
+WHERE nlevel(path) > 1;
+```
+
+Other useful helpers include `index(a, b)` (position of path `b` inside `a`) and `lca(...)` (the lowest common ancestor of several paths).
+
+### Pattern matching with `lquery` and `~`
+
+`lquery` is a small regular-expression-like language for label paths. You match it with the `~` operator. Key syntax:
+
+- `*` matches zero or more labels.
+- `*{n}` and `*{n,m}` match an exact or bounded number of labels.
+- `foo*` matches any label starting with `foo`.
+- `foo|bar` matches either label.
+- `!foo` matches any label except `foo`.
+- `@` after a label makes the match case-insensitive.
+
+Every node exactly two levels below `root`:
+
+```sql
+SELECT path FROM category WHERE path ~ 'root.*{2}';
+```
+
+Every node anywhere in the tree that has a label starting with `coffee`:
+
+```sql
+SELECT path FROM category WHERE path ~ '*.coffee*.*';
+```
+
+Everything under `root` except the `home` branch, at any depth:
+
+```sql
+SELECT path FROM category WHERE path ~ 'root.!home.*';
+```
+
+### Matching several patterns with `?`
+
+The `?` operator matches an `ltree` against an **array** of `lquery` values and returns true if any of them match. This is handy when a user filters by several branches at once:
+
+```sql
+SELECT name, path
+FROM category
+WHERE path ? ARRAY['root.electronics.phones.*', 'root.home.kitchen.*']::lquery[];
+```
+
+### Full-text-like queries with `ltxtquery` and `@`
+
+`ltxtquery` lets you search for labels anywhere in a path using boolean logic, without caring about order:
+
+```sql
+SELECT path
+FROM category
+WHERE path @ 'kitchen & coffee*';
+```
+
+This returns paths that contain a `kitchen` label and a label starting with `coffee`. Use `|` for OR and `!` for NOT.
+
+## Indexing ltree with GiST
+
+Without an index, every `<@` or `~` predicate scans the whole table. A GiST index supports `<@`, `@>`, `~`, `?` and `@`, as well as equality:
+
+```sql
+CREATE INDEX category_path_gist ON category USING gist (path);
+```
+
+On PostgreSQL 13 and later you can tune the signature length of the `gist_ltree_ops` operator class. A larger signature makes the index bigger but reduces false positives on large, deep trees:
+
+```sql
+CREATE INDEX category_path_gist ON category
+USING gist (path gist_ltree_ops (siglen = 100));
+```
+
+A B-tree index is also useful. `ltree` values sort in path order, so B-tree supports `=`, `<`, `>` and `ORDER BY path`, which is exactly the order you want when rendering a tree depth-first. The `UNIQUE` constraint in the table above already creates a B-tree index, so a typical setup has both: B-tree for uniqueness and ordering, GiST for hierarchy predicates.
+
+Always confirm with `EXPLAIN`:
+
+```sql
+EXPLAIN (ANALYZE, BUFFERS)
+SELECT * FROM category WHERE path <@ 'root.home';
+```
+
+On a tiny table the planner will still choose a sequential scan, which is correct. Load realistic data before judging index usage. A GUI client like [Chat2DB](https://chat2db.ai/download) makes it easy to run the same `EXPLAIN` repeatedly while you test different index definitions.
+
+## Moving a subtree
+
+Moving a branch is the operation that scares people away from path-based models, because every descendant's path must change. With ltree it is still one statement. Suppose we want to move `root.home.kitchen` (and everything under it) to become `root.appliances.kitchen`.
+
+First, create the new parent:
+
+```sql
+INSERT INTO category (name, path) VALUES ('Appliances', 'root.appliances');
+```
+
+Then rewrite every path in the subtree by concatenating the new parent with the part of the old path that starts at the moved node:
+
+```sql
+UPDATE category
+SET path = 'root.appliances'::ltree
+           || subpath(path, nlevel('root.home.kitchen'::ltree) - 1)
+WHERE path <@ 'root.home.kitchen';
+```
+
+Step by step:
+
+1. `WHERE path <@ 'root.home.kitchen'` selects the moved node and all descendants.
+2. `nlevel('root.home.kitchen') - 1` is `2`, the zero-based position of the `kitchen` label.
+3. `subpath(path, 2)` turns `root.home.kitchen.coffee_machines` into `kitchen.coffee_machines`.
+4. `||` prepends the new parent, producing `root.appliances.kitchen.coffee_machines`.
+
+Because of the `UNIQUE` constraint, the statement fails if the destination already contains a node with the same path, which protects you from silently merging branches. Wrap moves in a transaction, and guard against moving a node under its own descendant:
+
+```sql
+BEGIN;
+
+-- abort if the target parent lies inside the subtree being moved
+SELECT 1
+FROM category
+WHERE 'root.appliances'::ltree <@ 'root.home.kitchen'::ltree;
+-- the application should ROLLBACK if this returns a row
+
+UPDATE category
+SET path = 'root.appliances'::ltree
+           || subpath(path, nlevel('root.home.kitchen'::ltree) - 1)
+WHERE path <@ 'root.home.kitchen';
+
+COMMIT;
+```
+
+The cost of a move is proportional to the size of the subtree. For a category tree with thousands of nodes this is trivial; for a tree where huge branches move constantly, an adjacency list may be cheaper to maintain.
+
+## Keeping parent references honest
+
+ltree does not enforce that a node's parent exists. If you insert `root.toys.lego` without `root.toys`, PostgreSQL accepts it. If orphan prevention matters, add a stored parent column with a foreign key:
+
+```sql
+ALTER TABLE category
+  ADD COLUMN parent_path ltree
+  GENERATED ALWAYS AS (
+    CASE WHEN nlevel(path) > 1
+         THEN subpath(path, 0, nlevel(path) - 1)
+    END
+  ) STORED;
+
+ALTER TABLE category
+  ADD CONSTRAINT category_parent_fk
+  FOREIGN KEY (parent_path) REFERENCES category (path)
+  DEFERRABLE INITIALLY DEFERRED;
+```
+
+The foreign key references the unique `path` column, so committing a child with no parent now fails. When you move a subtree, the generated column is recomputed for each updated row, and because the whole branch moves in one statement, every new parent path exists by the time the constraint is checked. Declaring the constraint `DEFERRABLE INITIALLY DEFERRED` moves the check to commit time, which gives you extra room when a move is split across several statements. Note that PostgreSQL does not allow `ON UPDATE CASCADE` on a foreign key whose referencing column is generated, so the subtree `UPDATE` itself remains responsible for keeping paths consistent.
+
+## ltree vs recursive CTE vs closure table
+
+There are three mainstream ways to store trees in PostgreSQL. Each wins in different situations.
+
+### Adjacency list with a recursive CTE
+
+Each row stores only its `parent_id`:
+
+```sql
+CREATE TABLE category_adj (
+    id        bigint PRIMARY KEY,
+    parent_id bigint REFERENCES category_adj (id),
+    name      text NOT NULL
+);
+
+WITH RECURSIVE subtree AS (
+    SELECT id, parent_id, name, 1 AS depth
+    FROM category_adj
+    WHERE id = 2            -- Electronics
+  UNION ALL
+    SELECT c.id, c.parent_id, c.name, s.depth + 1
+    FROM category_adj c
+    JOIN subtree s ON c.parent_id = s.id
+)
+SELECT * FROM subtree;
+```
+
+Strengths: moving a subtree is a single-row update, the foreign key guarantees integrity, and the model is universally understood. Weaknesses: every subtree or ancestor query runs one iteration per level, each doing an index lookup on `parent_id`. It is fine for shallow trees and occasional queries, but deep trees queried on every page view add up, and patterns like "any node whose path contains X" are awkward.
+
+### Closure table
+
+A separate table stores every ancestor–descendant pair:
+
+```sql
+CREATE TABLE category_closure (
+    ancestor_id   bigint NOT NULL,
+    descendant_id bigint NOT NULL,
+    depth         int    NOT NULL,
+    PRIMARY KEY (ancestor_id, descendant_id)
+);
+```
+
+Subtree and ancestor queries become plain joins on indexed columns, and it works on any SQL database. The price is storage (a node at depth d contributes d + 1 rows) and more complex writes: inserting a node inserts one row per ancestor, and moving a subtree requires deleting and re-inserting many pairs.
+
+### ltree
+
+Subtree, ancestor, depth and pattern queries are single indexed predicates, the path doubles as a natural sort order, and there is no side table. The trade-offs: it is PostgreSQL-specific, moves rewrite every descendant, parent integrity needs the extra constraint shown above, and labels have character restrictions.
+
+### Choosing
+
+- **Mostly reads, moderate size, moves are rare** (categories, taxonomies, document folders): ltree is usually the simplest and fastest option.
+- **Frequent re-parenting of large branches**, or portability across databases: adjacency list, optionally with a recursive CTE wrapped in a view.
+- **Complex reporting across many ancestor levels on a non-PostgreSQL stack**: closure table.
+
+Hybrids are common and perfectly reasonable: keep `parent_id` as the source of truth and maintain an `ltree` path with a trigger for fast reads.
+
+## Practical tips
+
+- Store IDs rather than names in labels if names change.
+- Keep both a B-tree (uniqueness, ordering) and a GiST index (hierarchy operators).
+- Use `ORDER BY path` to render a depth-first tree, and `nlevel(path)` to indent it.
+- Aggregate over subtrees with a join: `JOIN category c ON p.category_path <@ c.path` lets you count products per category including all descendants.
+- When exploring an unfamiliar schema that uses ltree, [Chat2DB](https://app.chat2db.ai) can generate the `<@` and `~` queries from a plain-language question, which is helpful while the lquery syntax is still new to you.
+
+## FAQ
+
+### Is ltree faster than a recursive CTE?
+
+For subtree and ancestor reads on an indexed column, ltree typically needs a single index scan while a recursive CTE needs one iteration per level. The actual difference depends on tree depth, table size and caching, so measure with `EXPLAIN ANALYZE` on your own data.
+
+### Can ltree labels contain spaces or dots?
+
+No. The dot is the separator and spaces are not allowed. Store display names in a separate column and use slugs or numeric IDs as labels.
+
+### Does ltree work with ORMs?
+
+Most ORMs treat it as text on read and write. You may need raw SQL or a custom type mapping for the operators such as `<@` and `~`.
+
+### How do I get the parent of a node?
+
+Use `subpath(path, 0, nlevel(path) - 1)`, or store it in a generated column as shown above.
+
+## Summary
+
+ltree stores the full lineage of each node in one column and gives you operators (`@>`, `<@`, `~`, `?`, `@`) that answer hierarchy questions in a single indexed predicate. Add a GiST index, use `subpath` and `nlevel` for slicing and moving subtrees, and back it with a parent constraint if integrity matters. For read-heavy trees it is often simpler than both recursive CTEs and closure tables; for trees that are constantly re-parented, the adjacency list remains a strong choice.

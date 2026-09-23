@@ -1,0 +1,392 @@
+---
+title: "MySQL Create User and Grant Privileges in 8.x"
+description: "How to create users and grant privileges in MySQL 8: host patterns, auth plugins, GRANT levels, roles, SHOW GRANTS, REVOKE, and fixing ERROR 1064."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: September 23, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# MySQL Create User and Grant Privileges in 8.x
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="September 23, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+User management in MySQL changed significantly with version 8.0. The one-line `GRANT ALL ON db.* TO 'user'@'%' IDENTIFIED BY 'password'` that appears in countless old tutorials now fails with a syntax error, the default authentication plugin is different, and roles are available as a first-class feature. MySQL 8.4 LTS went a step further and disabled the legacy `mysql_native_password` plugin by default.
+
+This guide shows the modern way to create a MySQL user, grant privileges at every level, organize permissions with roles, inspect them with `SHOW GRANTS`, and take them away with `REVOKE`. All examples are tested syntax for MySQL 8.0 and 8.4.
+
+## How MySQL identifies an account
+
+A MySQL account is not just a username. It is a pair: `'user'@'host'`. The host part says where the client is allowed to connect from, and `'app'@'localhost'` and `'app'@'%'` are two completely separate accounts with separate passwords and privileges.
+
+Common host patterns:
+
+- `'localhost'` — connections through the local Unix socket (or named pipe on Windows), and by convention local TCP connections that use the name `localhost`.
+- `'127.0.0.1'` — local TCP connections to the loopback address. This is not the same account as `'localhost'`.
+- `'%'` — any host. Convenient, but it widens the attack surface.
+- `'10.0.1.%'` — any host in a subnet, using `%` as a wildcard.
+- `'10.0.1.0/255.255.255.0'` — the same subnet expressed as a netmask.
+- `'app-server.internal'` — a specific hostname (requires working reverse DNS and is affected by the `skip_name_resolve` setting).
+
+When a client connects, MySQL picks the most specific matching account. A frequent surprise: you create `'app'@'%'`, but an anonymous account `''@'localhost'` exists, and local connections match it instead. Removing anonymous accounts (the `mysql_secure_installation` script does this) avoids the problem.
+
+To see what accounts exist:
+
+```sql
+SELECT user, host, plugin, account_locked
+FROM mysql.user
+ORDER BY user, host;
+```
+
+## CREATE USER in MySQL 8
+
+The basic form:
+
+```sql
+CREATE USER 'app'@'%' IDENTIFIED BY 'Str0ng!Passw0rd';
+```
+
+Adding `IF NOT EXISTS` makes scripts idempotent:
+
+```sql
+CREATE USER IF NOT EXISTS 'app'@'10.0.1.%' IDENTIFIED BY 'Str0ng!Passw0rd';
+```
+
+A newly created user has no privileges other than `USAGE`, which means "can connect, cannot do anything". You must grant privileges separately.
+
+`CREATE USER` also accepts resource limits and account policies at creation time:
+
+```sql
+CREATE USER 'report'@'%'
+  IDENTIFIED BY 'An0ther!Secret'
+  WITH MAX_USER_CONNECTIONS 10
+  PASSWORD EXPIRE INTERVAL 90 DAY
+  FAILED_LOGIN_ATTEMPTS 5 PASSWORD_LOCK_TIME 1;
+```
+
+`FAILED_LOGIN_ATTEMPTS` and `PASSWORD_LOCK_TIME` (in days) were added in 8.0.19 and temporarily lock the account after repeated bad passwords.
+
+If the `validate_password` component is installed, weak passwords are rejected with `ERROR 1819 (HY000): Your password does not satisfy the current policy requirements`. Check the active rules with `SHOW VARIABLES LIKE 'validate_password%';`.
+
+## Authentication plugins: caching_sha2_password vs mysql_native_password
+
+Since MySQL 8.0, the default plugin is `caching_sha2_password`. It uses SHA-256 based hashing and is more secure than the older `mysql_native_password`, which relied on SHA-1.
+
+The timeline for the legacy plugin:
+
+- **8.0.34** — `mysql_native_password` is deprecated.
+- **8.4 LTS** — the plugin is still shipped but disabled by default. You must start the server with `--mysql-native-password=ON` (or set it in the config file) to use it.
+- **9.0** — the plugin is removed.
+
+So the right move for new accounts is to stay with the default. You can name it explicitly if you like:
+
+```sql
+CREATE USER 'app'@'%' IDENTIFIED WITH caching_sha2_password BY 'Str0ng!Passw0rd';
+```
+
+If an old client library cannot handle `caching_sha2_password`, you will see errors such as `Authentication plugin 'caching_sha2_password' cannot be loaded`. The long-term fix is upgrading the client or connector. As a stopgap on 8.0, you can create that one account with `IDENTIFIED WITH mysql_native_password BY '...'`, but plan to move away from it before upgrading to 8.4 or later.
+
+A related connector error is `Public Key Retrieval is not allowed` from MySQL Connector/J. It happens when `caching_sha2_password` authenticates over an unencrypted connection and the client must fetch the server's RSA public key. Using TLS solves it; `allowPublicKeyRetrieval=true` also works but should be paired with a trusted network.
+
+## GRANT privileges at every level
+
+The general shape is:
+
+```sql
+GRANT privilege_list ON scope TO 'user'@'host';
+```
+
+The scope determines the privilege level.
+
+### Global level
+
+`*.*` applies to every database on the server, including future ones:
+
+```sql
+GRANT ALL PRIVILEGES ON *.* TO 'dba'@'localhost' WITH GRANT OPTION;
+```
+
+This effectively creates a second root account. Keep global grants for administrators, and prefer the dynamic admin privileges (below) when you only need a narrow capability.
+
+### Database level
+
+`dbname.*` applies to every table, view, and routine in one database. This is the right level for most application accounts:
+
+```sql
+GRANT SELECT, INSERT, UPDATE, DELETE ON shop.* TO 'app'@'10.0.1.%';
+```
+
+A migration or deployment account usually also needs DDL privileges:
+
+```sql
+GRANT CREATE, ALTER, DROP, INDEX, REFERENCES, CREATE VIEW, SHOW VIEW,
+      CREATE ROUTINE, ALTER ROUTINE, EXECUTE, TRIGGER, LOCK TABLES
+  ON shop.* TO 'migrator'@'10.0.1.%';
+```
+
+"mysql grant all privileges" on one database is simply:
+
+```sql
+GRANT ALL PRIVILEGES ON shop.* TO 'owner'@'localhost';
+```
+
+### Table level
+
+```sql
+GRANT SELECT, INSERT ON shop.orders TO 'ingest'@'%';
+```
+
+### Column level
+
+Column privileges let you expose only part of a table, which is useful for keeping personal data away from reporting users:
+
+```sql
+GRANT SELECT (id, created_at, total_amount, status)
+  ON shop.orders TO 'report'@'%';
+
+GRANT UPDATE (status) ON shop.orders TO 'fulfillment'@'%';
+```
+
+The `report` user can now run `SELECT id, total_amount FROM shop.orders`, but `SELECT *` fails because it includes columns they cannot read.
+
+### Routine level
+
+```sql
+GRANT EXECUTE ON PROCEDURE shop.close_month TO 'finance'@'%';
+```
+
+### Dynamic privileges
+
+MySQL 8 splits much of the old `SUPER` privilege into fine-grained dynamic privileges such as `BACKUP_ADMIN`, `REPLICATION_SLAVE_ADMIN`, `SYSTEM_VARIABLES_ADMIN`, `CONNECTION_ADMIN`, and `PROCESS` (a static privilege, but often grouped with them). Grant only what a tool needs:
+
+```sql
+GRANT PROCESS, REPLICATION CLIENT ON *.* TO 'monitor'@'%';
+GRANT BACKUP_ADMIN, RELOAD, SELECT, LOCK TABLES, SHOW VIEW, EVENT, TRIGGER
+  ON *.* TO 'backup'@'localhost';
+```
+
+Dynamic privileges are always global, so they use `*.*`.
+
+## WITH GRANT OPTION
+
+`WITH GRANT OPTION` allows the recipient to pass privileges they hold to other accounts:
+
+```sql
+GRANT SELECT, INSERT ON shop.* TO 'team_lead'@'%' WITH GRANT OPTION;
+```
+
+`team_lead` can now grant `SELECT` or `INSERT` on `shop.*` to anyone. They cannot grant privileges they do not have. Use this sparingly; it makes auditing who can access what much harder.
+
+## Why GRANT ... IDENTIFIED BY fails in MySQL 8 (ERROR 1064)
+
+In MySQL 5.7 and earlier, this created the user and granted privileges in one statement:
+
+```sql
+-- Works in 5.7, fails in 8.0+
+GRANT ALL PRIVILEGES ON shop.* TO 'app'@'%' IDENTIFIED BY 'secret';
+```
+
+On MySQL 8.0 it produces:
+
+```text
+ERROR 1064 (42000): You have an error in your SQL syntax; check the manual that corresponds
+to your MySQL server version for the right syntax to use near 'IDENTIFIED BY 'secret'' at line 1
+```
+
+The implicit user creation behavior of `GRANT` was removed in 8.0. Account creation and privilege assignment are now separate statements:
+
+```sql
+CREATE USER 'app'@'%' IDENTIFIED BY 'secret';
+GRANT ALL PRIVILEGES ON shop.* TO 'app'@'%';
+```
+
+Similarly, granting to an account that does not exist returns `ERROR 1410 (42000): You are not allowed to create a user with GRANT`. The fix is the same: `CREATE USER` first. A frequent variant of this error comes from a host mismatch, such as creating `'app'@'localhost'` and then granting to `'app'@'%'`.
+
+## Do you need FLUSH PRIVILEGES?
+
+No, not after `CREATE USER`, `GRANT`, `REVOKE`, `ALTER USER`, `DROP USER`, or `SET PASSWORD`. These statements update the in-memory grant tables immediately.
+
+`FLUSH PRIVILEGES` is only needed if someone modifies the grant tables directly with `INSERT`, `UPDATE`, or `DELETE` on `mysql.user` and friends, which you should not do. Running it after a `GRANT` is harmless but unnecessary; it is a habit carried over from old tutorials.
+
+Note that privilege changes affect new statements, but a session that already selected a database may keep database-level privileges it had checked. For certainty, have the client reconnect after major changes.
+
+## Roles: managing privileges in groups
+
+Roles, added in MySQL 8.0, are named collections of privileges. Instead of repeating the same `GRANT` list for every developer, you grant it once to a role and assign the role.
+
+### Create roles and grant them privileges
+
+```sql
+CREATE ROLE 'shop_read', 'shop_write', 'shop_ddl';
+
+GRANT SELECT ON shop.* TO 'shop_read';
+GRANT INSERT, UPDATE, DELETE ON shop.* TO 'shop_write';
+GRANT CREATE, ALTER, DROP, INDEX ON shop.* TO 'shop_ddl';
+```
+
+### Assign roles to users
+
+```sql
+CREATE USER 'alice'@'%' IDENTIFIED BY 'Al1ce!Pass';
+CREATE USER 'bob'@'%'   IDENTIFIED BY 'B0b!Pass';
+
+GRANT 'shop_read', 'shop_write' TO 'alice'@'%';
+GRANT 'shop_read' TO 'bob'@'%';
+```
+
+### Activate roles
+
+This is the step people miss. Granting a role does not make it active in the user's sessions. Until activated, `alice` has the role but cannot use its privileges, and `SELECT CURRENT_ROLE();` returns `NONE`.
+
+There are three ways to activate roles:
+
+```sql
+-- 1. Per user default: active automatically at every login
+SET DEFAULT ROLE ALL TO 'alice'@'%', 'bob'@'%';
+
+-- 2. Per session, run by the user themselves
+SET ROLE 'shop_read';
+
+-- 3. Server-wide: activate all granted roles at login
+SET PERSIST activate_all_roles_on_login = ON;
+```
+
+`SET DEFAULT ROLE` is the most explicit option. `activate_all_roles_on_login` is simpler to operate, but it applies to every account on the server.
+
+You can also force a role on every account with the `mandatory_roles` system variable, which is useful for a baseline such as read access to a shared reference database.
+
+### Removing roles
+
+```sql
+REVOKE 'shop_write' FROM 'alice'@'%';
+DROP ROLE 'shop_ddl';
+```
+
+Dropping a role removes it from every account that had it.
+
+## SHOW GRANTS: inspecting privileges
+
+To see an account's privileges:
+
+```sql
+SHOW GRANTS FOR 'app'@'10.0.1.%';
+```
+
+Example output:
+
+```text
++-------------------------------------------------------------------------+
+| Grants for app@10.0.1.%                                                 |
++-------------------------------------------------------------------------+
+| GRANT USAGE ON *.* TO `app`@`10.0.1.%`                                  |
+| GRANT SELECT, INSERT, UPDATE, DELETE ON `shop`.* TO `app`@`10.0.1.%`    |
++-------------------------------------------------------------------------+
+```
+
+For your own session, use `SHOW GRANTS;` or `SHOW GRANTS FOR CURRENT_USER();`.
+
+For role-based accounts, plain `SHOW GRANTS` lists only the roles granted, not what they contain. Add `USING` to expand them:
+
+```sql
+SHOW GRANTS FOR 'alice'@'%' USING 'shop_read', 'shop_write';
+```
+
+For auditing across many accounts, query the information schema:
+
+```sql
+SELECT grantee, table_schema, privilege_type
+FROM information_schema.schema_privileges
+WHERE table_schema = 'shop'
+ORDER BY grantee, privilege_type;
+```
+
+`information_schema.user_privileges`, `table_privileges`, and `column_privileges` cover the other levels.
+
+## REVOKE: removing privileges
+
+`REVOKE` mirrors `GRANT`:
+
+```sql
+REVOKE DELETE ON shop.* FROM 'app'@'10.0.1.%';
+REVOKE ALL PRIVILEGES, GRANT OPTION FROM 'team_lead'@'%';
+```
+
+A revoke must match the level at which the privilege was granted. If a user has `SELECT` on `*.*`, running `REVOKE SELECT ON shop.*` fails with an error saying there is no such grant, because there is no database-level grant to remove. MySQL 8.0.16 added the `partial_revokes` system variable; when it is enabled, you can revoke a database-level privilege out of a global grant, for example giving someone `SELECT` everywhere except the `mysql` schema.
+
+To remove an account completely:
+
+```sql
+DROP USER IF EXISTS 'old_app'@'%';
+```
+
+## ALTER USER: passwords, expiry, and locking
+
+Change a password:
+
+```sql
+ALTER USER 'app'@'10.0.1.%' IDENTIFIED BY 'N3w!Passw0rd';
+```
+
+Users can change their own password with `ALTER USER USER() IDENTIFIED BY '...'`.
+
+Password expiry:
+
+```sql
+ALTER USER 'report'@'%' PASSWORD EXPIRE INTERVAL 90 DAY;
+ALTER USER 'report'@'%' PASSWORD EXPIRE NEVER;
+ALTER USER 'temp'@'%' PASSWORD EXPIRE;   -- must change on next login
+```
+
+Lock and unlock an account without dropping it, which is handy when offboarding or rotating a service:
+
+```sql
+ALTER USER 'old_app'@'%' ACCOUNT LOCK;
+ALTER USER 'old_app'@'%' ACCOUNT UNLOCK;
+```
+
+MySQL 8 also supports dual passwords for zero-downtime rotation. `ALTER USER 'app'@'%' IDENTIFIED BY 'new' RETAIN CURRENT PASSWORD;` keeps the old password valid while you roll out the new one, and `ALTER USER 'app'@'%' DISCARD OLD PASSWORD;` retires it afterward.
+
+## A complete, least-privilege example
+
+Putting it together for a typical web application:
+
+```sql
+-- Roles
+CREATE ROLE IF NOT EXISTS 'shop_app', 'shop_readonly';
+GRANT SELECT, INSERT, UPDATE, DELETE ON shop.* TO 'shop_app';
+GRANT SELECT ON shop.* TO 'shop_readonly';
+
+-- Application account, limited to the app subnet
+CREATE USER IF NOT EXISTS 'shop_api'@'10.0.1.%'
+  IDENTIFIED BY 'Replace-Me-With-A-Secret'
+  WITH MAX_USER_CONNECTIONS 50;
+GRANT 'shop_app' TO 'shop_api'@'10.0.1.%';
+SET DEFAULT ROLE 'shop_app' TO 'shop_api'@'10.0.1.%';
+
+-- Analyst account
+CREATE USER IF NOT EXISTS 'analyst'@'%'
+  IDENTIFIED BY 'Replace-Me-Too'
+  PASSWORD EXPIRE INTERVAL 90 DAY;
+GRANT 'shop_readonly' TO 'analyst'@'%';
+SET DEFAULT ROLE 'shop_readonly' TO 'analyst'@'%';
+
+-- Verify
+SHOW GRANTS FOR 'shop_api'@'10.0.1.%' USING 'shop_app';
+```
+
+If you do not want to hand-write these statements, Chat2DB offers a free [MySQL GRANT generator](https://chat2db.ai/tools/mysql-grant-generator) that builds `CREATE USER` and `GRANT` statements from a form. For ongoing account management, [Chat2DB](https://chat2db.ai/download) lets you run and review these statements against your servers in a SQL editor.
+
+## Quick reference
+
+- Create: `CREATE USER 'u'@'host' IDENTIFIED BY 'pw';`
+- Grant: `GRANT SELECT, INSERT ON db.* TO 'u'@'host';`
+- Grant everything on one database: `GRANT ALL PRIVILEGES ON db.* TO 'u'@'host';`
+- Inspect: `SHOW GRANTS FOR 'u'@'host';`
+- Remove a privilege: `REVOKE INSERT ON db.* FROM 'u'@'host';`
+- Lock: `ALTER USER 'u'@'host' ACCOUNT LOCK;`
+- Drop: `DROP USER 'u'@'host';`
+
+Keep accounts narrow in both host and privilege, use roles for anything shared by more than one person, and remember that in MySQL 8 creating a user and granting to it are always two separate steps.

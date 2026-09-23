@@ -1,0 +1,267 @@
+---
+title: "Postgres fillfactor and HOT Updates Explained"
+description: "How PostgreSQL HOT (heap only tuple) updates work, how to measure them, and how tuning fillfactor reduces index writes and bloat on update-heavy tables."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: September 23, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# Postgres fillfactor and HOT Updates Explained
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="September 23, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+In PostgreSQL an `UPDATE` never overwrites a row in place. It writes a new row version and marks the old one as dead. On a table with five indexes, a naive update therefore means one new heap tuple plus five new index entries, even if you only changed a `last_seen_at` timestamp that no index cares about. Multiply that by thousands of updates per second and you get write amplification, WAL volume, and index bloat.
+
+PostgreSQL has an optimisation that avoids most of this cost: **HOT updates** (Heap Only Tuple). Whether an update can be HOT depends on two things, one of which you control directly through the table's **fillfactor**. This guide explains the HOT conditions, how to measure the HOT ratio with `pg_stat_user_tables` and `pageinspect`, how to tune fillfactor, and why changing fillfactor on an existing table needs a rewrite before it fully takes effect.
+
+## How a normal update works
+
+Every heap page is 8 KB. It contains a header, an array of line pointers (item identifiers), and the tuples themselves. Indexes do not point at tuples directly; they point at a `(page, line pointer)` pair known as a TID or `ctid`.
+
+When you update a row without HOT:
+
+1. PostgreSQL writes a new tuple version, on the same page if there is room or on another page if not.
+2. The old version's `ctid` is set to point at the new version, and the old version becomes dead once no transaction can still see it.
+3. **Every index on the table** gets a new entry pointing at the new tuple's TID.
+
+Step 3 is the expensive part. Index inserts cost I/O and WAL, and the old index entries remain until `VACUUM` removes them, so indexes grow even when the logical data does not.
+
+## What makes an update HOT
+
+A HOT update skips step 3 entirely. The new tuple is written to the **same heap page**, is flagged as a heap-only tuple, and gets **no index entries**. Index scans still find it: they land on the original line pointer and follow the chain of versions within the page, called a HOT chain.
+
+An update can be HOT only when both conditions hold:
+
+1. **No indexed column changes.** If the update modifies any column used by any index on the table, including columns in expression indexes and columns referenced by partial-index predicates, the update cannot be HOT. The comparison is on the actual value: setting a column to the value it already has does not by itself prevent HOT. Starting with PostgreSQL 16, columns that appear only in summarizing indexes such as BRIN no longer block HOT; the BRIN index is still updated as needed.
+2. **The new version fits on the same page.** There must be enough free space on the page that holds the old version.
+
+When both are true, PostgreSQL also gains a cheap cleanup path. During normal page access, if the page is getting full, PostgreSQL can **prune** dead tuples of HOT chains without waiting for `VACUUM`, turning the root line pointer into a redirect to the live version and reclaiming the space. That is why HOT reduces both write amplification and bloat.
+
+## Condition 2 and fillfactor
+
+By default, table fillfactor is 100: `INSERT` and `COPY` pack each heap page completely before moving to the next. On a table that is written once and updated heavily later, this means pages are full when updates start, so the first update of a row usually has nowhere to go on its own page and must move to another page, making it non-HOT.
+
+**Fillfactor** tells PostgreSQL to leave a percentage of each page free during inserts. With `fillfactor = 80`, inserts stop filling a page at roughly 80 percent, leaving about 20 percent for future updated versions of rows already on that page. Valid values are 10 to 100.
+
+```sql
+CREATE TABLE session_state (
+    session_id   uuid        PRIMARY KEY,
+    user_id      bigint      NOT NULL,
+    last_seen_at timestamptz NOT NULL,
+    hits         integer     NOT NULL DEFAULT 0,
+    payload      jsonb
+) WITH (fillfactor = 80);
+```
+
+For an existing table:
+
+```sql
+ALTER TABLE session_state SET (fillfactor = 80);
+```
+
+Two important details:
+
+- The `ALTER TABLE ... SET (fillfactor = ...)` statement is quick and does not rewrite the table. It only affects pages filled **from now on**. Pages that are already full stay full.
+- Updates themselves are not limited by fillfactor. They may use the reserved space; fillfactor only restricts inserts.
+
+Note also that indexes have their own fillfactor setting (B-tree defaults to 90). That setting controls page splits in the index and is a separate topic; this article is about the table's fillfactor.
+
+## Measuring HOT updates with pg_stat_user_tables
+
+The cumulative statistics views count total and HOT updates per table:
+
+```sql
+SELECT relname,
+       n_tup_upd,
+       n_tup_hot_upd,
+       round(100.0 * n_tup_hot_upd / NULLIF(n_tup_upd, 0), 1) AS hot_pct,
+       n_dead_tup,
+       last_autovacuum
+FROM pg_stat_user_tables
+WHERE n_tup_upd > 0
+ORDER BY n_tup_upd DESC
+LIMIT 20;
+```
+
+On PostgreSQL 16 and later, `n_tup_newpage_upd` shows how many updates had to move the new version to a different page. It helps separate the two failure modes:
+
+```sql
+SELECT relname,
+       n_tup_upd,
+       n_tup_hot_upd,
+       n_tup_newpage_upd
+FROM pg_stat_user_tables
+WHERE relname = 'session_state';
+```
+
+Interpretation:
+
+- **High `n_tup_newpage_upd` relative to non-HOT updates**: condition 2 is failing. Pages have no room, and a lower fillfactor is likely to help.
+- **Low HOT ratio but few new-page updates**: condition 1 is failing. The updates touch indexed columns, and fillfactor will not fix it.
+
+These counters are cumulative since the last statistics reset, so compare snapshots taken before and after a change rather than reading lifetime totals. A convenient way is to save the query in [Chat2DB](https://chat2db.ai/download) and rerun it at intervals against the same connection.
+
+## When an index kills HOT
+
+Condition 1 is the one people overlook. Consider the session table above plus a seemingly harmless index for a dashboard:
+
+```sql
+CREATE INDEX session_state_last_seen_idx ON session_state (last_seen_at);
+```
+
+The application updates `last_seen_at` on every request:
+
+```sql
+UPDATE session_state
+SET last_seen_at = now(), hits = hits + 1
+WHERE session_id = '6f1c9a2e-3b4d-4c8e-9f10-2a3b4c5d6e7f';
+```
+
+Because `last_seen_at` is indexed, **none** of these updates can be HOT, no matter the fillfactor. Every request writes a heap tuple plus entries in both the primary key index and the timestamp index.
+
+Options, from simplest to most involved:
+
+1. **Question the index.** If the dashboard runs once an hour, a sequential scan or a BRIN index may be acceptable. On PostgreSQL 16 and later, a BRIN-only column no longer blocks HOT.
+2. **Split the hot columns out.** Move frequently updated, unindexed counters into a narrow side table keyed by `session_id`, and keep indexed, rarely updated columns in the main table.
+3. **Avoid unnecessary writes.** An update that sets `hits = hits + 1` on every request might be batched in the application.
+
+Remember that expression indexes count too. An index on `lower(email)` blocks HOT for updates that change `email`, and a partial index `WHERE status = 'active'` blocks HOT for updates that change `status`, even though `status` is not an indexed key column.
+
+To see which columns are indexed on a table:
+
+```sql
+SELECT i.relname AS index_name,
+       pg_get_indexdef(ix.indexrelid) AS definition
+FROM pg_index ix
+JOIN pg_class i ON i.oid = ix.indexrelid
+WHERE ix.indrelid = 'session_state'::regclass;
+```
+
+## Seeing HOT chains with pageinspect
+
+`pageinspect` lets you look at the raw contents of a heap page. It requires superuser privileges by default, so use it on a test instance.
+
+```sql
+CREATE EXTENSION IF NOT EXISTS pageinspect;
+
+CREATE TABLE hot_demo (
+    id    int PRIMARY KEY,
+    val   int,
+    note  text
+) WITH (fillfactor = 70);
+
+INSERT INTO hot_demo
+SELECT g, 0, 'row ' || g FROM generate_series(1, 50) AS g;
+
+-- update a non-indexed column: should be HOT
+UPDATE hot_demo SET val = val + 1 WHERE id = 1;
+UPDATE hot_demo SET val = val + 1 WHERE id = 1;
+```
+
+Now inspect page 0:
+
+```sql
+SELECT lp,
+       lp_flags,
+       t_ctid,
+       (heap_tuple_infomask_flags(t_infomask, t_infomask2)).raw_flags
+FROM heap_page_items(get_raw_page('hot_demo', 0))
+WHERE lp IN (1, 51, 52)
+ORDER BY lp;
+```
+
+The function `heap_tuple_infomask_flags` is available in PostgreSQL 13 and later. What you should see:
+
+- Line pointer 1, the original version, has `t_ctid` pointing to `(0,51)` and the `HEAP_HOT_UPDATED` flag.
+- Line pointer 51 has `HEAP_HOT_UPDATED` and `HEAP_ONLY_TUPLE`, with `t_ctid` pointing to `(0,52)`.
+- Line pointer 52, the live version, has `HEAP_ONLY_TUPLE`.
+
+The primary key index still has a single entry pointing at `(0,1)`. After the page is pruned, for example by a later access or by `VACUUM`, line pointer 1 becomes a redirect (`lp_flags = 2`) to the live version and the dead intermediate tuples are removed.
+
+For comparison, update the indexed column:
+
+```sql
+UPDATE hot_demo SET id = 1000 WHERE id = 2;
+```
+
+That new version carries neither HOT flag, and the primary key index gains a new entry.
+
+You can also check how much free space pages have, which tells you whether fillfactor is leaving room as expected:
+
+```sql
+SELECT lower, upper, upper - lower AS free_bytes
+FROM page_header(get_raw_page('hot_demo', 0));
+```
+
+The `pg_freespacemap` extension gives a table-wide view via `pg_freespace('hot_demo')`, though its values are approximate and updated by `VACUUM`.
+
+## The effect on bloat
+
+HOT affects bloat in two ways.
+
+**Index bloat drops.** Non-HOT updates add index entries that later become dead. Even after `VACUUM` removes them, B-tree pages that were split to make room do not shrink back. HOT updates add no index entries, so indexes on update-heavy tables stay much closer to their minimal size.
+
+**Heap bloat is managed locally.** Pruning reclaims space from dead HOT versions on the same page during normal operation, so the free space fillfactor reserves gets reused repeatedly rather than consumed once.
+
+The trade-off is that a lower fillfactor makes the table larger from the start. At fillfactor 80, a freshly loaded table needs roughly a quarter more pages than at 100, and sequential scans read correspondingly more data. That is why fillfactor tuning belongs on update-heavy tables, not on append-only tables such as logs or events, where 100 is the right value.
+
+A practical approach:
+
+1. Identify tables with many updates and a low HOT ratio.
+2. Check whether the updated columns are indexed. If they are, fix condition 1 first.
+3. If new-page updates dominate, lower fillfactor in steps, for example 90, then 80, and measure the HOT ratio after each change. Very low values rarely pay off.
+
+## Applying a new fillfactor to existing data
+
+Since `ALTER TABLE ... SET (fillfactor = ...)` only affects future inserts, existing full pages keep causing non-HOT updates until the table is rewritten. You have three main options.
+
+### VACUUM FULL
+
+```sql
+ALTER TABLE session_state SET (fillfactor = 80);
+VACUUM (FULL, VERBOSE, ANALYZE) session_state;
+```
+
+`VACUUM FULL` rewrites the table and its indexes, respecting the new fillfactor. It holds an `ACCESS EXCLUSIVE` lock for the whole operation, blocking reads and writes, and needs enough disk space for a full copy. Use it for small tables or during a maintenance window.
+
+### CLUSTER
+
+`CLUSTER session_state USING session_state_pkey;` also rewrites the table under an exclusive lock, and additionally orders rows by the chosen index. It is useful only when that physical ordering matters to you.
+
+### pg_repack
+
+The `pg_repack` extension rebuilds the table online, holding an exclusive lock only briefly at the start and end:
+
+```bash
+pg_repack --dbname=appdb --table=public.session_state
+```
+
+It honours the table's fillfactor setting when copying data. It requires the extension to be installed in the database, the table to have a primary key or a suitable unique index, and extra disk space during the rebuild. Most managed PostgreSQL services support it, but check your provider.
+
+After a rewrite, reset or snapshot the statistics and watch `n_tup_hot_upd` over a representative period. If the HOT ratio rises and new-page updates fall, the change worked.
+
+## FAQ
+
+### What is a good fillfactor for an update-heavy table?
+
+There is no universal number. Values between 70 and 90 are common starting points for tables where rows are updated repeatedly. Start conservatively, measure the HOT ratio and table size, and adjust.
+
+### Does fillfactor help if every update changes an indexed column?
+
+No. HOT requires that no indexed column changes. Fillfactor only addresses the free-space condition.
+
+### Does a HOT update write WAL?
+
+Yes. The new heap tuple is still WAL-logged. HOT saves the WAL and I/O for the index insertions, which on tables with several indexes is often the larger share.
+
+### Do I need to rewrite the table after changing fillfactor?
+
+Not strictly. New pages follow the new setting immediately, and as rows are updated and move off full pages, the table gradually adopts the new layout. A rewrite with `VACUUM FULL` or `pg_repack` simply applies it to all existing data at once.
+
+## Summary
+
+A HOT update writes a new row version on the same page and skips all index maintenance. It happens only when no indexed column changes and the page has room. Measure it with `n_tup_hot_upd` and, on PostgreSQL 16 and later, `n_tup_newpage_upd`. Lower fillfactor when updates fail for lack of space, remove or restructure indexes when they fail because indexed columns change, and use `VACUUM FULL` or `pg_repack` to apply a new fillfactor to existing pages. Confirm the result with `pageinspect` on a test copy before rolling the change out widely.

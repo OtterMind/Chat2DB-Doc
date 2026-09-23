@@ -1,0 +1,324 @@
+---
+title: "PostgreSQL Domain Types: CREATE DOMAIN Guide"
+description: "Learn Postgres domain types: CREATE DOMAIN with CHECK, NOT NULL and DEFAULT, safe ALTER DOMAIN changes, catalog queries, and the gotchas to avoid."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: September 23, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# PostgreSQL Domain Types: CREATE DOMAIN Guide
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="September 23, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+Most schemas repeat the same validation rules over and over. An email column appears in `users`, `invitations`, `newsletter_subscribers` and `audit_contacts`, and each one carries its own slightly different `CHECK` constraint — or none at all. A money column is `numeric(12,2)` in one table and `numeric(10,2)` in another, and only half of them reject negative amounts.
+
+PostgreSQL has a feature built for exactly this problem: the **domain**. A Postgres domain is a custom data type layered on top of an existing base type, with optional constraints and a default attached. You define the rule once, give it a name, and every column that uses the domain inherits the rule. This guide walks through `CREATE DOMAIN` from first principles, shows how to change domain constraints safely on large tables, compares domains with plain `CHECK` constraints, enums and composite types, and covers the edge cases that surprise people in production.
+
+## What a Postgres domain is
+
+A domain is a named type that behaves like its base type in every way except that values must satisfy the domain's constraints. If you create a domain over `text`, all text operators and functions work on it. If you create a domain over `numeric`, arithmetic works as usual. The difference is that whenever a value is converted *into* the domain type — on `INSERT`, `UPDATE`, an explicit cast, a function return, or an assignment to a PL/pgSQL variable — PostgreSQL checks the domain's constraints.
+
+The general syntax is:
+
+```sql
+CREATE DOMAIN name AS base_type
+    [ COLLATE collation ]
+    [ DEFAULT expression ]
+    [ CONSTRAINT constraint_name ] { NOT NULL | NULL | CHECK (expression) } ...;
+```
+
+Inside a domain `CHECK` expression, the keyword `VALUE` refers to the value being tested. That is the only column-like reference you can use; a domain check cannot look at other columns or other tables.
+
+## Creating your first domains
+
+Let us build three domains that show up in almost every business schema: an email address, a US postal code, and a non-negative money amount.
+
+### An email domain
+
+Email validation with a regular expression is never perfect, so the goal here is a sanity check rather than RFC compliance: reject empty strings, strings without an `@`, and values with whitespace.
+
+```sql
+CREATE DOMAIN email AS text
+    CONSTRAINT email_format
+    CHECK (VALUE ~ '^[^@\s]+@[^@\s]+\.[^@\s]+$');
+
+CREATE DOMAIN email_ci AS text COLLATE "C"
+    CONSTRAINT email_ci_lower
+    CHECK (VALUE = lower(VALUE) AND VALUE ~ '^[^@\s]+@[^@\s]+\.[^@\s]+$');
+```
+
+The second version forces lowercase storage, which makes uniqueness checks predictable without needing the `citext` extension. Applications normalise the address before inserting it, and the domain guarantees they did.
+
+### A US postal code domain
+
+US ZIP codes are either five digits or ZIP+4 in the form `12345-6789`. Storing them as integers is a classic mistake because leading zeros disappear (Boston ZIP codes start with `02`). A domain over `text` fixes both the type and the format:
+
+```sql
+CREATE DOMAIN us_postal_code AS text
+    CONSTRAINT us_postal_code_format
+    CHECK (VALUE ~ '^\d{5}(-\d{4})?$');
+```
+
+### A positive money domain
+
+For money, `numeric` with a fixed scale is the safe base type. The `money` type depends on the `lc_monetary` setting and is generally avoided for new designs.
+
+```sql
+CREATE DOMAIN positive_money AS numeric(12,2)
+    DEFAULT 0
+    CONSTRAINT positive_money_non_negative CHECK (VALUE >= 0);
+```
+
+Note the name says "positive" but the check allows zero; decide which rule your business needs and make the name match. A strictly positive variant would use `VALUE > 0` and would drop the `DEFAULT 0`, since a default that violates the domain's own check causes every insert that relies on it to fail.
+
+### Using the domains in tables
+
+```sql
+CREATE TABLE customers (
+    customer_id  bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    email        email_ci NOT NULL UNIQUE,
+    postal_code  us_postal_code,
+    credit_limit positive_money NOT NULL
+);
+
+INSERT INTO customers (email, postal_code)
+VALUES ('ana@example.com', '02139');
+-- credit_limit becomes 0.00 through the domain default
+
+INSERT INTO customers (email, postal_code, credit_limit)
+VALUES ('Bob@Example.com', '9021', -5);
+-- ERROR:  value for domain email_ci violates check constraint "email_ci_lower"
+```
+
+The error message names both the domain and the constraint, which makes debugging much easier than a generic column check failure. Notice also that `credit_limit` picked up its default from the domain. A column-level `DEFAULT` would override the domain default if both were present.
+
+Domains work anywhere a type works: function parameters, return types, composite type fields, and casts.
+
+```sql
+SELECT '10001-1234'::us_postal_code;   -- ok
+SELECT 'ABCDE'::us_postal_code;        -- error
+
+CREATE FUNCTION apply_discount(amount positive_money, pct numeric)
+RETURNS positive_money
+LANGUAGE sql IMMUTABLE
+AS $$ SELECT round(amount * (1 - pct / 100), 2) $$;
+
+SELECT apply_discount(100, 150);
+-- ERROR: value for domain positive_money violates check constraint
+```
+
+The function's return value is coerced to `positive_money`, so a nonsensical discount is caught at the boundary instead of silently producing a negative price.
+
+## Changing domains safely with ALTER DOMAIN
+
+Domains become really valuable when requirements change. Instead of hunting down every table that stores a postal code, you change the domain once.
+
+### Adding a constraint the normal way
+
+```sql
+ALTER DOMAIN positive_money
+    ADD CONSTRAINT positive_money_max CHECK (VALUE <= 1000000);
+```
+
+PostgreSQL immediately scans every column of every table that uses `positive_money` and verifies the new rule against existing data. If any row fails, the whole command fails. On large tables that scan can take a long time, and it holds locks that block writes to those tables while it runs.
+
+### Adding a constraint with NOT VALID, then validating
+
+The better approach for large tables is the two-step pattern you may already know from foreign keys:
+
+```sql
+-- Step 1: add the rule without checking existing rows (fast)
+ALTER DOMAIN us_postal_code
+    ADD CONSTRAINT us_postal_code_not_placeholder
+    CHECK (VALUE <> '00000') NOT VALID;
+
+-- Step 2: find and fix legacy rows at your own pace
+SELECT customer_id, postal_code
+FROM customers
+WHERE postal_code = '00000';
+
+UPDATE customers SET postal_code = NULL WHERE postal_code = '00000';
+
+-- Step 3: validate the constraint against existing data
+ALTER DOMAIN us_postal_code
+    VALIDATE CONSTRAINT us_postal_code_not_placeholder;
+```
+
+After step 1, all *new* inserts and updates are checked, so the problem stops growing. Step 3 scans the existing rows, and once it succeeds the constraint is marked as validated in the catalog. Check the documentation for your PostgreSQL version for the exact lock levels involved, and run validation in a low-traffic window if your tables are very large.
+
+### Other ALTER DOMAIN operations
+
+```sql
+ALTER DOMAIN positive_money SET DEFAULT 0;
+ALTER DOMAIN positive_money DROP DEFAULT;
+ALTER DOMAIN email_ci RENAME CONSTRAINT email_ci_lower TO email_ci_normalised;
+ALTER DOMAIN positive_money DROP CONSTRAINT positive_money_max;
+ALTER DOMAIN us_postal_code RENAME TO zip_code;
+```
+
+What you *cannot* do is change the base type of a domain in place. If `positive_money` needs to become `numeric(14,2)`, you create a new domain and alter each column to use it, which rewrites those tables.
+
+## Domains vs CHECK constraints vs enums vs composite types
+
+Domains overlap with several other PostgreSQL features. Choosing the right one depends on whether the rule is reusable, whether the set of values is fixed, and whether the value has one part or several.
+
+### Domains vs table CHECK constraints
+
+A table `CHECK` constraint can reference multiple columns in the same row, such as `CHECK (end_date >= start_date)`. A domain check can only see `VALUE`. So:
+
+- Use a **domain** for rules about a single value that repeat across tables (formats, ranges, non-negativity).
+- Use a **table CHECK** for rules that relate columns to each other, or that are specific to one table.
+
+Both are enforced by the database for every client, which is the main advantage over application-only validation.
+
+### Domains vs enums
+
+An enum is a static, ordered list of labels:
+
+```sql
+CREATE TYPE order_status AS ENUM ('pending', 'paid', 'shipped', 'cancelled');
+```
+
+Enums store compactly and sort in declaration order. Adding a value is easy with `ALTER TYPE ... ADD VALUE`, but removing or renaming values is awkward, and removing one generally means creating a new type. A domain over `text` with `CHECK (VALUE IN (...))` is easier to modify — drop and re-add the constraint — but sorts alphabetically and stores the full string. A lookup table with a foreign key is a third option when the list of values is data that business users manage.
+
+### Domains vs composite types
+
+A composite type groups several fields into one value:
+
+```sql
+CREATE TYPE postal_address AS (
+    street  text,
+    city    text,
+    state   char(2),
+    zip     us_postal_code
+);
+```
+
+Composite types answer a different question — "this value has several parts" — and they combine nicely with domains, as the `zip` field shows. Since PostgreSQL 11 you can also create a domain *over* a composite type to add a check across its fields, for example requiring that `city` is present whenever `street` is.
+
+## How domains appear in information_schema and pg_type
+
+Because domains are types, you can inspect them through both the SQL-standard `information_schema` views and the PostgreSQL system catalogs. This matters when you want to audit which tables use a domain before changing it.
+
+### Listing domains and their constraints
+
+```sql
+SELECT d.domain_schema,
+       d.domain_name,
+       d.data_type,
+       d.numeric_precision,
+       d.numeric_scale,
+       d.domain_default
+FROM information_schema.domains d
+WHERE d.domain_schema = 'public'
+ORDER BY d.domain_name;
+
+SELECT dc.domain_name,
+       dc.constraint_name,
+       cc.check_clause
+FROM information_schema.domain_constraints dc
+JOIN information_schema.check_constraints cc
+  ON cc.constraint_schema = dc.constraint_schema
+ AND cc.constraint_name  = dc.constraint_name
+WHERE dc.domain_schema = 'public';
+```
+
+### Finding every column that uses a domain
+
+```sql
+SELECT table_schema, table_name, column_name
+FROM information_schema.columns
+WHERE domain_name = 'us_postal_code';
+```
+
+### Using pg_type and pg_constraint directly
+
+In the system catalogs, a domain is a row in `pg_type` with `typtype = 'd'`. The `typbasetype` column points to the base type, and `typnotnull` records whether the domain is declared `NOT NULL`. Domain check constraints live in `pg_constraint` with `contypid` set to the domain's OID.
+
+```sql
+SELECT t.typname                          AS domain,
+       format_type(t.typbasetype, t.typtypmod) AS base_type,
+       t.typnotnull,
+       c.conname,
+       pg_get_constraintdef(c.oid)        AS definition,
+       c.convalidated
+FROM pg_type t
+LEFT JOIN pg_constraint c ON c.contypid = t.oid
+WHERE t.typtype = 'd'
+  AND t.typnamespace = 'public'::regnamespace
+ORDER BY t.typname, c.conname;
+```
+
+The `convalidated` column is the quickest way to find constraints that were added `NOT VALID` and never validated. In `psql`, `\dD` lists domains with their constraints. If you prefer a visual tool, [Chat2DB](https://chat2db.ai/download) shows table structures and lets you run these catalog queries side by side, which is handy when you audit an unfamiliar schema.
+
+## Gotchas and edge cases
+
+Domains are simple, but a few behaviours are not obvious from the syntax.
+
+### NOT NULL on a domain is weaker than it looks
+
+It is tempting to write `CREATE DOMAIN email AS text NOT NULL` and consider nulls handled. The PostgreSQL documentation specifically advises against this. A column of a domain type can still read as null in several situations, the most common being an outer join:
+
+```sql
+CREATE DOMAIN strict_code AS text NOT NULL;
+
+CREATE TABLE a (id int PRIMARY KEY);
+CREATE TABLE b (id int PRIMARY KEY, code strict_code);
+
+INSERT INTO a VALUES (1), (2);
+INSERT INTO b VALUES (1, 'X');
+
+SELECT a.id, b.code
+FROM a LEFT JOIN b USING (id);
+-- id=2 returns code = NULL, even though code's type is "NOT NULL"
+```
+
+The result column is typed `strict_code` yet contains a null, because outer joins produce nulls for missing rows without running domain checks. Scalar subqueries that return no row behave similarly. The practical rule: keep domains nullable, and put `NOT NULL` on the column in the table definition where it is enforced reliably.
+
+### Operators return the base type
+
+Arithmetic on a domain returns the base type, not the domain. `credit_limit - 500` is a plain `numeric`, so a negative intermediate result is allowed until you cast or store it back into a `positive_money` column. This is usually what you want, but do not assume domain rules apply to computed expressions.
+
+### Domains over arrays check the whole array
+
+PostgreSQL supports domains over array types, and the check sees the entire array as `VALUE`:
+
+```sql
+CREATE DOMAIN positive_int_array AS int[]
+    CHECK (VALUE IS NULL OR (array_position(VALUE, NULL) IS NULL AND 0 < ALL (VALUE)));
+
+SELECT ARRAY[1, 2, 3]::positive_int_array;   -- ok
+SELECT ARRAY[1, -2]::positive_int_array;     -- error
+SELECT ARRAY[1, NULL]::positive_int_array;   -- error
+```
+
+Two subtleties here. First, `0 < ALL (VALUE)` returns null — not false — when the array contains a null element, and a `CHECK` treats null as a pass, which is why the explicit `array_position` test is needed. Second, updating a single element such as `SET tags[2] = -1` still triggers the domain check on the whole resulting array.
+
+The reverse case, an array *of* a domain (for example `us_postal_code[]`), is also supported, and each element is checked individually.
+
+### ALTER DOMAIN and nested usage
+
+`ALTER DOMAIN ... ADD CONSTRAINT`, `VALIDATE CONSTRAINT` and `SET NOT NULL` fail if the domain is used inside a container type column — a composite, array or range column — anywhere in the database, because PostgreSQL cannot yet verify nested values. If you plan to evolve a domain frequently, prefer using it directly as a column type.
+
+### Check expressions should be immutable
+
+PostgreSQL assumes a domain check gives the same answer for the same value forever. A check that calls `now()` or reads another table might pass today and fail tomorrow, and existing rows are not re-checked when that happens. Restore and upgrade operations can then fail when data is reloaded. Keep domain checks pure functions of `VALUE`.
+
+## A practical adoption checklist
+
+1. Identify repeated single-value rules in your schema: emails, codes, identifiers, amounts, percentages.
+2. Create a domain for each, with a clear constraint name so error messages are readable.
+3. Leave domains nullable; enforce `NOT NULL` at the column level.
+4. Migrate columns with `ALTER TABLE ... ALTER COLUMN ... TYPE new_domain`. When the base type is unchanged, PostgreSQL does not need to rewrite the table, but it does check existing values.
+5. For future rule changes, use `ADD CONSTRAINT ... NOT VALID` followed by `VALIDATE CONSTRAINT`.
+6. Periodically query `pg_constraint` for `convalidated = false` to catch forgotten validations.
+
+## Conclusion
+
+Postgres domain types are one of the cheapest ways to make a schema self-documenting and consistent. A column typed `us_postal_code` tells every reader what it holds, and the database enforces the format for every client. Use `CREATE DOMAIN` for reusable single-value rules, table `CHECK` constraints for cross-column logic, enums or lookup tables for fixed label sets, and composite types for multi-part values. Keep `NOT NULL` on columns rather than domains, remember that array domains see the entire array, and use `NOT VALID` plus `VALIDATE CONSTRAINT` to evolve rules on large tables without long blocking scans.
+
+If you want to explore domains in an existing database, open it in [Chat2DB](https://app.chat2db.ai) and run the catalog queries above to see which rules your schema already enforces — and which ones it should.
