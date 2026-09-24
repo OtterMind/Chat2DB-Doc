@@ -1,0 +1,333 @@
+---
+title: "Postgres WITHOUT OVERLAPS: Temporal Keys in PG18"
+description: "Build PostgreSQL temporal tables with PG18 WITHOUT OVERLAPS keys and PERIOD foreign keys, plus EXCLUDE constraints and history tables for older versions."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: September 24, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# Postgres WITHOUT OVERLAPS: Temporal Keys in PG18
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="September 24, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+Many tables do not describe how things *are*, but how things *were* over time: an employee's department between two dates, a product's price for a season, a customer's address before and after a move, an insurance policy's coverage periods. These are **temporal** or **valid-time** tables. Each row carries a period, and the key rule is simple to say and hard to enforce: for any given entity, periods must not overlap.
+
+For years, PostgreSQL users enforced that rule with range types and `EXCLUDE USING gist` constraints. PostgreSQL 18 adds first-class syntax for it: `PRIMARY KEY` and `UNIQUE` constraints with `WITHOUT OVERLAPS`, and temporal foreign keys using `PERIOD`. This article explains both approaches, shows how they map onto each other, and finishes with a trigger-based history table for tracking *when changes were made* in the database.
+
+## Valid time vs. system time
+
+Two different notions of time show up in temporal data, and it pays to keep them apart:
+
+- **Valid time (application time)** is when a fact is true in the real world. "Alice worked in Sales from 2024-03-01 to 2025-06-30." Your application sets it, and it can be in the past or the future.
+- **System time (transaction time)** is when the database stored a version of a row. "This row was the current version from 10:02 to 14:37 yesterday." Only the database should set it, and it is used for auditing and point-in-time queries.
+
+`WITHOUT OVERLAPS` and `PERIOD` foreign keys in PostgreSQL 18 are about **valid time**. PostgreSQL does not include SQL-standard system-versioned tables (`WITH SYSTEM VERSIONING`) in core, so system time is still usually implemented with triggers and a history table, which we build later.
+
+## Representing periods with range types
+
+Both approaches below store a period in a single range column rather than two timestamp columns. For dates use `daterange`; for instants use `tstzrange`. Use the half-open form `[start, end)` so consecutive periods touch without overlapping, and an unbounded upper end for "still valid":
+
+```sql
+SELECT daterange('2024-03-01', '2025-07-01');  -- [2024-03-01,2025-07-01)
+SELECT daterange('2025-07-01', NULL);          -- [2025-07-01,) open-ended
+SELECT daterange('2024-03-01', '2025-07-01') && daterange('2025-07-01', NULL);  -- false
+```
+
+The `&&` operator (overlaps) is what every non-overlap constraint is ultimately built on.
+
+## The classic approach: EXCLUDE USING gist
+
+This works on every supported PostgreSQL version and is still the most flexible option. An exclusion constraint forbids any two rows for which all listed comparisons are true at once:
+
+```sql
+CREATE EXTENSION IF NOT EXISTS btree_gist;
+
+CREATE TABLE employee_dept (
+    emp_id   int       NOT NULL,
+    dept     text      NOT NULL,
+    valid_at daterange NOT NULL CHECK (NOT isempty(valid_at)),
+    CONSTRAINT employee_dept_no_overlap
+        EXCLUDE USING gist (emp_id WITH =, valid_at WITH &&)
+);
+```
+
+The constraint reads: no two rows may have the same `emp_id` and overlapping `valid_at`. The `btree_gist` extension is required because GiST has no built-in operator class for `=` on `int`; the extension supplies one so the scalar and the range can share a single GiST index.
+
+```sql
+INSERT INTO employee_dept VALUES
+  (1, 'Sales',     '[2024-03-01,2025-07-01)'),
+  (1, 'Marketing', '[2025-07-01,)');          -- touches, does not overlap: OK
+
+INSERT INTO employee_dept VALUES
+  (1, 'Finance',   '[2025-01-01,2025-02-01)');
+-- ERROR:  conflicting key value violates exclusion constraint "employee_dept_no_overlap"
+```
+
+The error uses SQLSTATE `23P01` (`exclusion_violation`). The `CHECK (NOT isempty(valid_at))` matters: an empty range overlaps nothing, so without the check an empty period would slip past the constraint.
+
+Exclusion constraints are more general than temporal keys: you can combine several equality columns, use other operators, or add a `WHERE` predicate to make the constraint partial. For more patterns, see the [Postgres exclusion constraints guide](https://chat2db.ai/resources/blog/postgres-exclusion-constraints-guide).
+
+What the classic approach does **not** give you is a key that other tables can reference. A regular foreign key cannot point at an exclusion constraint, so referential integrity across time needs triggers on PostgreSQL 17 and earlier.
+
+## PostgreSQL 18: PRIMARY KEY ... WITHOUT OVERLAPS
+
+PostgreSQL 18 lets you declare the same rule as a primary key or unique constraint. The last column in the key gets the `WITHOUT OVERLAPS` modifier and must be a range or multirange type:
+
+```sql
+CREATE EXTENSION IF NOT EXISTS btree_gist;
+
+CREATE TABLE employee_dept (
+    emp_id   int       NOT NULL,
+    dept     text      NOT NULL,
+    valid_at daterange NOT NULL,
+    PRIMARY KEY (emp_id, valid_at WITHOUT OVERLAPS)
+);
+```
+
+Semantically this means: the non-period columns (`emp_id`) are compared for equality, and the period column must not overlap between rows that share those values. Under the hood PostgreSQL builds a GiST index rather than a B-tree, which is why `btree_gist` is still needed when the other key columns are ordinary scalar types like `int`, `bigint`, `text` or `uuid`.
+
+Rules worth knowing:
+
+- `WITHOUT OVERLAPS` applies to the **last** column of the key only.
+- That column must be a range or multirange type.
+- At least one other column must precede it; a key consisting only of the period is not allowed.
+- `UNIQUE (..., period WITHOUT OVERLAPS)` works the same way, if you want a surrogate primary key but still need the temporal uniqueness rule.
+
+Behaviourally it is very close to the exclusion constraint above:
+
+```sql
+INSERT INTO employee_dept VALUES
+  (1, 'Sales',     '[2024-03-01,2025-07-01)'),
+  (1, 'Marketing', '[2025-07-01,)');
+
+INSERT INTO employee_dept VALUES
+  (1, 'Finance',   '[2025-01-01,2025-02-01)');
+-- ERROR:  conflicting key value violates ... "employee_dept_pkey"
+```
+
+The second insert fails because the Finance period overlaps the Sales period for the same `emp_id`. PostgreSQL 18 also rejects empty ranges in a `WITHOUT OVERLAPS` column, closing the loophole that the `isempty` check covered in the classic version.
+
+The real win is not the shorter syntax, it is that the constraint is now a proper **key** that foreign keys can reference.
+
+## Temporal foreign keys with PERIOD
+
+A temporal foreign key says: for every moment covered by the child row's period, a matching parent row must exist. In PostgreSQL 18 you mark the period column on both sides with `PERIOD`:
+
+```sql
+CREATE TABLE department (
+    dept_id  int       NOT NULL,
+    name     text      NOT NULL,
+    valid_at daterange NOT NULL,
+    PRIMARY KEY (dept_id, valid_at WITHOUT OVERLAPS)
+);
+
+CREATE TABLE assignment (
+    emp_id   int       NOT NULL,
+    dept_id  int       NOT NULL,
+    valid_at daterange NOT NULL,
+    PRIMARY KEY (emp_id, valid_at WITHOUT OVERLAPS),
+    FOREIGN KEY (dept_id, PERIOD valid_at)
+        REFERENCES department (dept_id, PERIOD valid_at)
+);
+```
+
+The check is about **coverage**, not equality. A child row's period must be fully covered by the union of the matching parent rows' periods. The parent can be split into several contiguous versions, for example because the department was renamed, and a single long child period spanning both versions is still valid:
+
+```sql
+INSERT INTO department VALUES
+  (10, 'Research',       '[2024-01-01,2025-01-01)'),
+  (10, 'Research & Dev', '[2025-01-01,)');
+
+-- spans both department versions: OK
+INSERT INTO assignment VALUES (1, 10, '[2024-06-01,2025-06-01)');
+
+-- starts before department 10 existed: rejected
+INSERT INTO assignment VALUES (2, 10, '[2023-06-01,2024-06-01)');
+-- ERROR:  insert or update on table "assignment" violates foreign key constraint ...
+```
+
+Deleting or shrinking a parent period that a child still depends on is rejected as well. Referential actions for temporal foreign keys are more limited than for ordinary ones, so keep the default `NO ACTION` and check the documentation for your exact release before relying on anything else.
+
+### Migrating an existing EXCLUDE constraint
+
+If you are upgrading to PostgreSQL 18 and want temporal foreign keys, replace the exclusion constraint with a temporal primary key. Because both are backed by GiST indexes that enforce the same rule, the data that satisfied the old constraint will satisfy the new one, apart from any empty ranges:
+
+```sql
+BEGIN;
+DELETE FROM employee_dept WHERE isempty(valid_at);  -- or fix them
+ALTER TABLE employee_dept DROP CONSTRAINT employee_dept_no_overlap;
+ALTER TABLE employee_dept
+    ADD CONSTRAINT employee_dept_pkey PRIMARY KEY (emp_id, valid_at WITHOUT OVERLAPS);
+COMMIT;
+```
+
+Building the new index takes a lock on the table, so plan it for a maintenance window on large tables.
+
+## Emulating temporal foreign keys on PostgreSQL 17 and earlier
+
+Before PostgreSQL 18, you enforce the child side with a trigger. The key tool is `range_agg`, available since PostgreSQL 14, which merges the parent periods into a multirange so you can test coverage with `@>`:
+
+```sql
+CREATE OR REPLACE FUNCTION assignment_check_department()
+RETURNS trigger
+LANGUAGE plpgsql AS $$
+DECLARE
+    covered boolean;
+BEGIN
+    SELECT coalesce(range_agg(d.valid_at) @> NEW.valid_at, false)
+      INTO covered
+      FROM department d
+     WHERE d.dept_id = NEW.dept_id;
+
+    IF NOT covered THEN
+        RAISE EXCEPTION 'department % does not cover period %', NEW.dept_id, NEW.valid_at
+            USING ERRCODE = 'foreign_key_violation';
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+CREATE TRIGGER assignment_fk_department
+BEFORE INSERT OR UPDATE OF dept_id, valid_at ON assignment
+FOR EACH ROW EXECUTE FUNCTION assignment_check_department();
+```
+
+Here the tables are declared with `EXCLUDE USING gist` instead of `WITHOUT OVERLAPS`, and the `FOREIGN KEY ... PERIOD` clause is left out. Two caveats apply to any trigger-based foreign key:
+
+1. You also need a trigger on the **parent** table, on `UPDATE` and `DELETE`, that checks no child period loses coverage. Without it, deleting a department version silently orphans assignments.
+2. Under concurrency, a trigger check can race with a parent delete in another transaction. Lock the relevant parent rows, for example with `SELECT ... FOR KEY SHARE` in the child trigger, or run these writes at `SERIALIZABLE` isolation.
+
+This is exactly the bookkeeping the built-in PostgreSQL 18 feature does for you, which is the strongest reason to upgrade if temporal integrity matters.
+
+## Querying temporal tables
+
+Whichever version you use, queries look the same because they operate on ranges.
+
+The department an employee was in on a given day:
+
+```sql
+SELECT dept
+FROM employee_dept
+WHERE emp_id = 1
+  AND valid_at @> DATE '2025-01-15';
+```
+
+The full, merged employment history, collapsing adjacent rows:
+
+```sql
+SELECT emp_id, range_agg(valid_at) AS employed
+FROM employee_dept
+GROUP BY emp_id;
+```
+
+A temporal join, matching each assignment with the department name that was valid during each part of it:
+
+```sql
+SELECT a.emp_id,
+       d.name,
+       a.valid_at * d.valid_at AS during
+FROM assignment a
+JOIN department d
+  ON d.dept_id = a.dept_id
+ AND d.valid_at && a.valid_at
+ORDER BY a.emp_id, during;
+```
+
+The `*` operator returns the intersection of two ranges, so an assignment spanning a rename produces two rows, one per department name.
+
+### Updating a period
+
+The SQL standard defines `UPDATE ... FOR PORTION OF` to change a value for part of a row's period, automatically splitting the row. PostgreSQL 18 does not include it, so splits are done by hand in a transaction. To move employee 1 to Finance from 2026-01-01:
+
+```sql
+BEGIN;
+UPDATE employee_dept
+   SET valid_at = daterange(lower(valid_at), '2026-01-01')
+ WHERE emp_id = 1
+   AND valid_at @> DATE '2026-01-01';
+
+INSERT INTO employee_dept VALUES (1, 'Finance', '[2026-01-01,)');
+COMMIT;
+```
+
+Shrinking first and inserting second keeps the non-overlap constraint satisfied at every statement.
+
+## History tables for system time
+
+Valid time answers "what was true then?". To answer "what did the database say then?" you need system-time versioning. A common pattern is a current table plus a history table maintained by a trigger:
+
+```sql
+CREATE TABLE customer (
+    id         int PRIMARY KEY,
+    email      text NOT NULL,
+    sys_period tstzrange NOT NULL DEFAULT tstzrange(now(), NULL)
+);
+
+CREATE TABLE customer_history (LIKE customer);
+
+CREATE INDEX customer_history_id_period
+    ON customer_history USING gist (id, sys_period);
+
+CREATE OR REPLACE FUNCTION customer_versioning()
+RETURNS trigger
+LANGUAGE plpgsql AS $$
+BEGIN
+    INSERT INTO customer_history (id, email, sys_period)
+    VALUES (OLD.id, OLD.email, tstzrange(lower(OLD.sys_period), now()));
+
+    IF TG_OP = 'UPDATE' THEN
+        NEW.sys_period := tstzrange(now(), NULL);
+        RETURN NEW;
+    END IF;
+    RETURN OLD;
+END;
+$$;
+
+CREATE TRIGGER customer_versioning
+BEFORE UPDATE OR DELETE ON customer
+FOR EACH ROW EXECUTE FUNCTION customer_versioning();
+```
+
+Every update or delete copies the old version into `customer_history` with a closed period, and the current row gets a fresh open period. The GiST index relies on `btree_gist` for the `int` column. `now()` returns the transaction start time, so all changes in one transaction share a timestamp; if a row is updated twice within one transaction, the intermediate history row gets an empty period, which is usually acceptable.
+
+To see the state of the table as of a past instant, union the current and history tables:
+
+```sql
+SELECT id, email
+FROM (
+    SELECT id, email, sys_period FROM customer
+    UNION ALL
+    SELECT id, email, sys_period FROM customer_history
+) v
+WHERE sys_period @> TIMESTAMPTZ '2026-09-01 12:00+00';
+```
+
+Because the trigger sets `sys_period` itself, application code cannot fake the audit trail, and the `tstzrange` column lets you use the same operators as for valid time. You can combine both: a table with a `WITHOUT OVERLAPS` key on `valid_at` plus system-time history is a so-called bitemporal table.
+
+When working through these schemas, a database client that shows constraints and indexes per table is handy; in [Chat2DB](https://chat2db.ai/download) you can inspect the generated GiST index behind a temporal key and test the failure cases from this article interactively.
+
+## FAQ
+
+### Do I still need btree_gist with WITHOUT OVERLAPS?
+
+Yes, whenever the key includes ordinary scalar columns such as `int` or `text`. The temporal key is enforced by a GiST index, and those types need the operator classes that `btree_gist` provides.
+
+### Can I use two timestamp columns instead of a range?
+
+Not for `WITHOUT OVERLAPS` or `PERIOD`: the period column must be a range or multirange type. You can keep legacy start and end columns and add a generated range column for the constraint.
+
+### Which should I choose on PostgreSQL 18, EXCLUDE or WITHOUT OVERLAPS?
+
+Use `WITHOUT OVERLAPS` when the rule is "unique key plus non-overlapping period", and especially when other tables need to reference it. Use `EXCLUDE` for anything more unusual, such as partial constraints or operators other than equality and overlap.
+
+### Does WITHOUT OVERLAPS work with multiranges?
+
+Yes, the period column may be a multirange type, which lets a single row hold a non-contiguous validity, for example a seasonal contract.
+
+### Is there FOR PORTION OF or system versioning in PostgreSQL 18?
+
+No. PostgreSQL 18 covers temporal primary keys, unique constraints and foreign keys. Partial-period updates and system-versioned tables still require the manual transaction and trigger patterns shown above.

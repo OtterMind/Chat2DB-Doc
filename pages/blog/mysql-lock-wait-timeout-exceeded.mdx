@@ -1,0 +1,375 @@
+---
+title: "MySQL Error 1205: Lock Wait Timeout Exceeded"
+description: "Fix MySQL ERROR 1205 lock wait timeout exceeded: find the blocking transaction with data_locks and sys.innodb_lock_waits, fix indexes, and add retry logic."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: September 24, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# MySQL Error 1205: Lock Wait Timeout Exceeded
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="September 24, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+Few MySQL errors cause as much confusion as this one:
+
+```text
+ERROR 1205 (HY000): Lock wait timeout exceeded; try restarting transaction
+```
+
+The message suggests the statement that failed is the problem. Usually it is not. MySQL error 1205 means your statement waited for a row lock (or a metadata lock) held by **another** session, and gave up after a configured number of seconds. The real culprit is the transaction holding that lock, and it is often idle, forgotten, or doing far more locking than it needs to.
+
+This guide explains what the error means, how to find the blocking transaction in MySQL 8.0 using `performance_schema.data_locks`, `performance_schema.data_lock_waits`, `sys.innodb_lock_waits` and `information_schema.innodb_trx`, why missing indexes make lock waits much more likely, how 1205 differs from a deadlock (error 1213), and how to write retry logic that handles it correctly.
+
+## What "lock wait timeout exceeded" actually means
+
+InnoDB uses row-level locks. When a transaction updates or deletes a row, or reads it with `SELECT ... FOR UPDATE` or `FOR SHARE`, it takes a lock on the index records it touches and holds that lock until the transaction commits or rolls back. A second transaction that wants a conflicting lock on the same record has to wait.
+
+The wait is not unlimited. The system variable `innodb_lock_wait_timeout` sets how many seconds a statement waits for a row lock before InnoDB returns error 1205. The default is 50 seconds.
+
+```sql
+SELECT @@GLOBAL.innodb_lock_wait_timeout, @@SESSION.innodb_lock_wait_timeout;
+```
+
+### What gets rolled back
+
+This is the detail that bites most applications. By default (`innodb_rollback_on_timeout = OFF`), InnoDB rolls back **only the statement** that timed out, not the whole transaction. Your transaction is still open, it still holds every lock it acquired before the failed statement, and any earlier changes are still pending.
+
+If your code catches the error and simply continues, or returns the connection to a pool without rolling back, those locks stay held and the next request may hit 1205 as well. The safe response to 1205 is almost always an explicit `ROLLBACK` of the whole transaction followed by a retry.
+
+`innodb_rollback_on_timeout` is not dynamic; setting it to `ON` requires a server restart. It makes InnoDB roll back the entire transaction on timeout, but explicit rollback in application code is clearer and works regardless of server configuration.
+
+### A quick reproduction
+
+Open two sessions against a test table:
+
+```sql
+CREATE TABLE accounts (
+  id      INT PRIMARY KEY,
+  owner   VARCHAR(50),
+  balance DECIMAL(12,2)
+) ENGINE=InnoDB;
+
+INSERT INTO accounts VALUES (1, 'alice', 100.00), (2, 'bob', 50.00);
+```
+
+Session A:
+
+```sql
+START TRANSACTION;
+UPDATE accounts SET balance = balance - 10 WHERE id = 1;
+-- no COMMIT yet
+```
+
+Session B:
+
+```sql
+SET SESSION innodb_lock_wait_timeout = 5;
+UPDATE accounts SET balance = balance + 10 WHERE id = 1;
+-- waits about 5 seconds, then:
+-- ERROR 1205 (HY000): Lock wait timeout exceeded; try restarting transaction
+```
+
+Session A did nothing wrong in terms of SQL. It simply never committed. That pattern, an open transaction sitting idle while holding locks, is the single most common cause of error 1205 in production.
+
+## Finding the blocking transaction in MySQL 8.0
+
+In MySQL 5.7 you would query `information_schema.innodb_locks` and `innodb_lock_waits`. Those tables were removed in MySQL 8.0 and replaced by Performance Schema tables. The investigation only works while the wait is happening, so run these queries during the incident or reproduce the problem with a longer timeout.
+
+### Start with sys.innodb_lock_waits
+
+The `sys` schema view joins everything for you and is the fastest first look:
+
+```sql
+SELECT
+  wait_started,
+  wait_age,
+  locked_table,
+  locked_index,
+  locked_type,
+  waiting_pid,
+  waiting_query,
+  blocking_pid,
+  blocking_query,
+  sql_kill_blocking_connection
+FROM sys.innodb_lock_waits
+ORDER BY wait_started;
+```
+
+Key columns:
+
+- `waiting_pid` and `blocking_pid` are processlist IDs, the same numbers you see in `SHOW PROCESSLIST` and pass to `KILL`.
+- `locked_index` tells you which index the conflict is on. `PRIMARY` means the clustered index.
+- `blocking_query` is the statement the blocker is **currently** running. If it is `NULL`, the blocker is idle inside an open transaction, which confirms the "forgot to commit" pattern.
+- `sql_kill_blocking_connection` is a ready-made `KILL` statement.
+
+### Look at the raw locks in performance_schema
+
+For more detail, query the underlying tables. `data_lock_waits` lists who waits on whom, and `data_locks` lists every lock currently held or requested:
+
+```sql
+SELECT
+  w.REQUESTING_ENGINE_TRANSACTION_ID AS waiting_trx,
+  w.BLOCKING_ENGINE_TRANSACTION_ID   AS blocking_trx,
+  bl.OBJECT_SCHEMA, bl.OBJECT_NAME, bl.INDEX_NAME,
+  bl.LOCK_TYPE, bl.LOCK_MODE, bl.LOCK_DATA
+FROM performance_schema.data_lock_waits w
+JOIN performance_schema.data_locks bl
+  ON bl.ENGINE_LOCK_ID = w.BLOCKING_ENGINE_LOCK_ID;
+```
+
+`LOCK_MODE` values tell you what kind of lock is involved:
+
+- `X` or `S` on a record is a next-key lock: the record plus the gap before it.
+- `X,REC_NOT_GAP` is a lock on the record only.
+- `X,GAP` is a gap lock, which blocks inserts into the gap but not the record itself.
+- `X,INSERT_INTENTION` is an insert waiting for a gap lock to be released.
+- `IX` or `IS` with `LOCK_TYPE = TABLE` are intention locks and rarely the source of the conflict.
+
+`LOCK_DATA` shows the key values of the locked record, which is often enough to identify exactly which row is contended.
+
+To see how many locks each transaction holds:
+
+```sql
+SELECT ENGINE_TRANSACTION_ID, OBJECT_NAME, INDEX_NAME, LOCK_MODE, COUNT(*) AS locks
+FROM performance_schema.data_locks
+GROUP BY ENGINE_TRANSACTION_ID, OBJECT_NAME, INDEX_NAME, LOCK_MODE
+ORDER BY locks DESC;
+```
+
+A transaction holding thousands of record locks for what should be a single-row update is a strong hint of a missing index, covered below.
+
+### Check information_schema.innodb_trx for long transactions
+
+`information_schema.innodb_trx` lists every open InnoDB transaction, including idle ones that are not waiting for anything:
+
+```sql
+SELECT
+  trx_id,
+  trx_state,
+  trx_started,
+  TIMESTAMPDIFF(SECOND, trx_started, NOW()) AS age_seconds,
+  trx_mysql_thread_id AS pid,
+  trx_rows_locked,
+  trx_rows_modified,
+  trx_query
+FROM information_schema.innodb_trx
+ORDER BY trx_started;
+```
+
+Anything that has been open for minutes in an OLTP system deserves attention. `trx_query` is `NULL` for idle transactions, so to find out what the blocker ran earlier, look up its recent statements in the Performance Schema statement history:
+
+```sql
+SELECT h.EVENT_ID, h.SQL_TEXT, h.TIMER_START
+FROM performance_schema.events_statements_history h
+JOIN performance_schema.threads t ON t.THREAD_ID = h.THREAD_ID
+WHERE t.PROCESSLIST_ID = 12345   -- the blocking pid
+ORDER BY h.EVENT_ID;
+```
+
+The `events_statements_history` consumer is enabled by default in MySQL 8.0 and keeps the last few statements per thread, which is usually enough to identify the code path that opened the transaction. The `PROCESSLIST_USER` and `PROCESSLIST_HOST` columns of the `threads` table also tell you which application server owns the connection.
+
+### Resolving the incident
+
+Once you know the blocker, you have two choices: let the owning application commit or roll back, or kill the session:
+
+```sql
+KILL 12345;
+```
+
+Killing the connection rolls back its transaction and releases its locks. If the transaction had modified many rows, the rollback itself can take a while. Killing fixes the symptom; the rest of this article is about preventing it from coming back.
+
+`SHOW ENGINE INNODB STATUS` is still useful as a cross-check. Its `TRANSACTIONS` section shows each transaction, how long it has been active, how many lock structs and row locks it holds, and for waiting transactions, the lock they are waiting on.
+
+## Common root causes
+
+### Long or idle transactions
+
+Typical sources:
+
+- Application code that opens a transaction, then calls an external API, sends email, or waits for user input before committing.
+- Connections with `autocommit = 0` (set in a driver or framework) where a read-only request never commits, and a `SELECT ... FOR UPDATE` early in the request keeps its locks.
+- Batch jobs that update millions of rows in a single transaction.
+- An interactive session in a SQL client where someone ran an `UPDATE` inside a transaction and went to lunch.
+
+The fix is structural: keep transactions short, do slow work outside them, commit explicitly, and break big batch updates into chunks:
+
+```sql
+-- Repeat until 0 rows affected; each iteration is its own short transaction
+UPDATE orders
+SET status = 'archived'
+WHERE status = 'closed' AND closed_at < '2025-01-01'
+LIMIT 5000;
+```
+
+### Missing indexes turn one-row updates into table locks
+
+InnoDB locks the index records it **scans**, not only the ones that match. Under the default `REPEATABLE READ` isolation level, it takes next-key locks on every record the scan visits. If the `WHERE` clause has no usable index, the scan is a full scan of the clustered index, and the statement locks every row in the table plus the gaps between them.
+
+```sql
+CREATE TABLE jobs (
+  id         BIGINT AUTO_INCREMENT PRIMARY KEY,
+  queue      VARCHAR(30),
+  status     VARCHAR(20),
+  payload    JSON
+) ENGINE=InnoDB;
+
+-- No index on (queue, status): this locks every row it scans
+START TRANSACTION;
+UPDATE jobs SET status = 'running' WHERE queue = 'email' AND status = 'pending' LIMIT 1;
+```
+
+Any other session that touches any row of `jobs`, or tries to insert into it, will now wait. Adding an index makes the locked range match the rows that actually qualify:
+
+```sql
+ALTER TABLE jobs ADD INDEX idx_queue_status (queue, status);
+```
+
+Use `EXPLAIN` on every `UPDATE`, `DELETE`, and `SELECT ... FOR UPDATE` in a hot path. A `type` of `ALL` or a very large `rows` estimate on a locking statement is a lock-wait problem waiting to happen.
+
+### Gap and next-key locks under REPEATABLE READ
+
+Even with a good index, range conditions lock gaps. `DELETE FROM sessions WHERE expires_at < NOW()` locks the gap after the last matching record, so an `INSERT` of a new session whose key falls into that gap has to wait. Locking reads on a value that does not exist also lock the gap where it would be.
+
+If your application does not depend on repeatable-read semantics, `READ COMMITTED` removes most gap locking (gap locks are still used for foreign-key and duplicate-key checks), and InnoDB releases locks on non-matching rows after evaluating the `WHERE` clause:
+
+```sql
+SET SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED;
+```
+
+Change isolation deliberately, after checking the application logic, and ideally per session or per transaction rather than globally.
+
+### Metadata locks
+
+Error 1205 is also returned when a statement times out waiting for a **metadata lock**, for example an `ALTER TABLE` blocked by an open transaction that has read from the table. That wait is controlled by `lock_wait_timeout` (default one year), not `innodb_lock_wait_timeout`, and shows up in `SHOW PROCESSLIST` as "Waiting for table metadata lock". Investigate it with `sys.schema_table_lock_waits`:
+
+```sql
+SELECT object_schema, object_name, waiting_pid, waiting_query,
+       blocking_pid, sql_kill_blocking_connection
+FROM sys.schema_table_lock_waits;
+```
+
+This requires the `wait/lock/metadata/sql/mdl` instrument, which is enabled by default in MySQL 8.0. For DDL on busy tables, setting a short `lock_wait_timeout` in the migration session prevents the `ALTER` from queuing behind a long transaction and blocking every query that arrives after it.
+
+## Lock wait timeout vs deadlock (error 1213)
+
+The two errors are related but behave differently:
+
+| | ERROR 1205 lock wait timeout | ERROR 1213 deadlock |
+| --- | --- | --- |
+| Situation | A waits for B; B is busy or idle | A waits for B and B waits for A |
+| Detection | After `innodb_lock_wait_timeout` seconds | Immediately, by the deadlock detector |
+| What is rolled back | The statement (by default) | The whole transaction of the victim |
+| Could it resolve alone? | Yes, if B commits in time | No, a cycle never resolves |
+
+A deadlock is a cycle, so waiting would never help; InnoDB detects it (when `innodb_deadlock_detect` is `ON`, the default) and rolls back one transaction. A lock wait timeout is a plain queue that took too long. On very high-concurrency systems some operators disable deadlock detection and rely on a low `innodb_lock_wait_timeout` instead, in which case deadlocks surface as 1205. To log every deadlock to the error log, enable `innodb_print_all_deadlocks`. The same ideas apply in PostgreSQL, where the equivalent problem is described in our guide to [fixing "deadlock detected" in PostgreSQL](https://chat2db.ai/resources/blog/postgres-deadlock-detected-fix).
+
+## Tuning innodb_lock_wait_timeout
+
+Raising the timeout rarely fixes anything; it only makes requests wait longer before failing. Lowering it can be useful for interactive workloads that should fail fast and retry:
+
+```sql
+-- For one session, e.g. a web request handler
+SET SESSION innodb_lock_wait_timeout = 5;
+
+-- Globally, for new connections
+SET GLOBAL innodb_lock_wait_timeout = 10;
+```
+
+For work-queue patterns, MySQL 8.0 offers better tools than a timeout. `NOWAIT` fails immediately if the row is locked, and `SKIP LOCKED` returns only unlocked rows:
+
+```sql
+START TRANSACTION;
+SELECT id, payload
+FROM jobs
+WHERE queue = 'email' AND status = 'pending'
+ORDER BY id
+LIMIT 10
+FOR UPDATE SKIP LOCKED;
+-- process and update these rows, then
+COMMIT;
+```
+
+With `SKIP LOCKED`, multiple workers can pull from the same table without waiting on each other at all.
+
+## Retry logic in application code
+
+Both 1205 and 1213 are transient: the same transaction will usually succeed if retried. The retry must restart the **whole** transaction, because after 1213 everything was rolled back, and after 1205 your earlier statements are in an unknown state from the application's point of view.
+
+A Python example with PyMySQL:
+
+```python
+import random
+import time
+import pymysql
+
+RETRYABLE = {1205, 1213}
+
+def transfer(conn, src, dst, amount, max_attempts=5):
+    for attempt in range(1, max_attempts + 1):
+        try:
+            with conn.cursor() as cur:
+                conn.begin()
+                cur.execute(
+                    "UPDATE accounts SET balance = balance - %s WHERE id = %s",
+                    (amount, src),
+                )
+                cur.execute(
+                    "UPDATE accounts SET balance = balance + %s WHERE id = %s",
+                    (amount, dst),
+                )
+            conn.commit()
+            return
+        except pymysql.err.MySQLError as e:
+            conn.rollback()
+            code = e.args[0] if e.args else None
+            if code not in RETRYABLE or attempt == max_attempts:
+                raise
+            # exponential backoff with jitter
+            time.sleep(min(2 ** attempt * 0.05, 2.0) + random.random() * 0.05)
+```
+
+Guidelines for retry loops:
+
+1. Always `ROLLBACK` before retrying, even for 1205.
+2. Retry the entire unit of work, re-reading any data the transaction depends on.
+3. Use a small, bounded number of attempts with backoff and jitter so retries do not create a thundering herd.
+4. Log each retry with the error code. A rising retry rate is an early warning that a blocker or a missing index has appeared.
+5. Keep side effects such as sending email or calling external services outside the retried block, or make them idempotent.
+
+## A practical checklist
+
+When error 1205 appears:
+
+1. Query `sys.innodb_lock_waits` while the wait is happening and note `blocking_pid` and `locked_index`.
+2. If `blocking_query` is `NULL`, check `information_schema.innodb_trx` for long idle transactions and look up their history in `events_statements_history`.
+3. Run `EXPLAIN` on the blocking and waiting statements. Add indexes so locking statements scan only the rows they change.
+4. Shorten transactions, chunk batch jobs, and make sure every code path commits or rolls back.
+5. Add retry logic for 1205 and 1213 that rolls back the whole transaction.
+
+Running these diagnostic queries side by side in a SQL client such as [Chat2DB](https://chat2db.ai/download), with one tab on `sys.innodb_lock_waits` and another on `innodb_trx`, makes it easier to watch a lock queue form and clear during an incident.
+
+## FAQ
+
+### Does error 1205 roll back my transaction?
+
+Not by default. Only the failed statement is rolled back, and the transaction remains open with its locks. Roll back explicitly, or enable `innodb_rollback_on_timeout` (requires a restart).
+
+### Should I increase innodb_lock_wait_timeout?
+
+Usually no. It hides the blocker instead of fixing it. Find the long transaction or the missing index first. Increase it only for specific batch sessions that legitimately need to wait longer.
+
+### Why is blocking_query NULL in sys.innodb_lock_waits?
+
+The blocking session is idle inside an open transaction. It already ran the statement that took the lock and has not committed. Check `events_statements_history` for its earlier statements.
+
+### What replaced information_schema.innodb_locks in MySQL 8.0?
+
+`performance_schema.data_locks` and `performance_schema.data_lock_waits`. The `sys.innodb_lock_waits` view was updated to use them.
+
+### Can a plain SELECT cause a lock wait timeout?
+
+A plain `SELECT` under `READ COMMITTED` or `REPEATABLE READ` uses a consistent snapshot and takes no row locks. Locking reads (`FOR UPDATE`, `FOR SHARE`), `INSERT ... SELECT` sources in some cases, and metadata locks from DDL can all cause waits.

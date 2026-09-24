@@ -1,0 +1,317 @@
+---
+title: "Postgres TABLESAMPLE: Fast Random Samples"
+description: "Use Postgres TABLESAMPLE to select random rows fast: SYSTEM vs BERNOULLI, REPEATABLE seeds, tsm_system_rows, and when ORDER BY random() is still right."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: September 24, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# Postgres TABLESAMPLE: Fast Random Samples
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="September 24, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+Sooner or later every team wants "a random sample" from a big table: a few thousand rows to eyeball data quality, a quick estimate of how many orders match a condition, a training set for a model, or a handful of random products for a homepage widget. The first query most people reach for is `ORDER BY random() LIMIT n`. It is correct, simple, and on large tables painfully slow, because PostgreSQL has to read every row and generate a random number for each one before it can pick the winners.
+
+PostgreSQL has a dedicated feature for this problem: the `TABLESAMPLE` clause, part of the SQL standard and available since PostgreSQL 9.5. It lets the executor read only a fraction of a table, either block by block or row by row, and optionally reproduce the same sample again with a seed. Two contrib extensions, `tsm_system_rows` and `tsm_system_time`, add sampling by row count and by time budget.
+
+This article explains how each sampling method works, what "random" really means for each, how to estimate row counts from a sample, and when the old `ORDER BY random()` approach is still the right tool.
+
+## The TABLESAMPLE syntax
+
+`TABLESAMPLE` goes directly after a table name in the `FROM` clause:
+
+```sql
+SELECT *
+FROM events TABLESAMPLE SYSTEM (1);
+```
+
+The general form is:
+
+```sql
+SELECT ...
+FROM table_name [ AS alias ] TABLESAMPLE method ( argument [, ...] ) [ REPEATABLE ( seed ) ]
+WHERE ...;
+```
+
+Some ground rules:
+
+- The built-in methods are `SYSTEM` and `BERNOULLI`. Both take a single argument: the **percentage** of the table to sample, from 0 to 100. Values outside that range raise "sample percentage must be between 0 and 100".
+- `TABLESAMPLE` can only be applied to tables and materialized views. Using it on a view or a subquery fails with "TABLESAMPLE clause can only be applied to tables and materialized views".
+- Sampling happens **before** the `WHERE` clause. `TABLESAMPLE BERNOULLI (1) WHERE country = 'DE'` returns roughly 1% of the table and then filters it, not 1% of German rows.
+
+To follow along, create a test table with a million rows:
+
+```sql
+CREATE TABLE events AS
+SELECT g AS id,
+       now() - (g || ' seconds')::interval AS created_at,
+       (random() * 100)::int AS score,
+       md5(g::text) AS payload
+FROM generate_series(1, 1000000) AS g;
+
+ANALYZE events;
+```
+
+If you need more realistic synthetic data, the article on [generating random data in PostgreSQL](https://chat2db.ai/resources/blog/how-to-generate-random-data-in-postgresql) walks through more patterns.
+
+## SYSTEM: block-level sampling
+
+`SYSTEM` works at the level of table pages (8 kB blocks by default). For each block it makes one random decision: include the whole block, or skip it. With `SYSTEM (1)`, about 1% of the blocks are read and **every row on those blocks** is returned.
+
+```sql
+SELECT count(*) FROM events TABLESAMPLE SYSTEM (1);
+```
+
+Run it a few times and the count will vary around 10,000, because the number of chosen blocks is random and blocks do not all hold the same number of rows.
+
+The advantage is speed. Skipped blocks are never read from disk, so the I/O is roughly proportional to the sampling percentage. `EXPLAIN` shows a dedicated plan node:
+
+```sql
+EXPLAIN SELECT * FROM events TABLESAMPLE SYSTEM (1);
+```
+
+```
+ Sample Scan on events  (cost=0.00..516.00 rows=10000 width=49)
+   Sampling: system ('1'::real)
+```
+
+Compare the cost with a full sequential scan of the same table and you can see why this matters on tables measured in gigabytes.
+
+### The catch: clustering
+
+Because whole blocks are taken together, `SYSTEM` samples are **clustered**. Rows that were inserted together usually sit on the same page, so they tend to appear together in the sample:
+
+```sql
+SELECT id FROM events TABLESAMPLE SYSTEM (0.01) LIMIT 5;
+```
+
+You will typically see consecutive IDs such as `745640, 745641, 745642, ...`. For a rough count or a quick look at data shape, that is fine. For statistics that assume independent rows, it is not: if values correlate with insertion order (timestamps, tenant IDs, batch imports), a `SYSTEM` sample can be biased, and its variance is higher than a row-level sample of the same size.
+
+## BERNOULLI: row-level sampling
+
+`BERNOULLI` makes an independent random decision for **each row**, including it with the given probability:
+
+```sql
+SELECT count(*) FROM events TABLESAMPLE BERNOULLI (1);
+```
+
+The result is close to a true simple random sample; rows next to each other on disk are no more likely to be picked together than any other pair. The price is I/O: PostgreSQL still has to visit every block to look at every row, so `BERNOULLI` reads the whole table. It is still usually much cheaper than `ORDER BY random()`, because it does not compute and sort a random key for every row; it only evaluates a cheap per-row test and streams the survivors.
+
+```sql
+EXPLAIN ANALYZE
+SELECT * FROM events TABLESAMPLE BERNOULLI (1) WHERE score > 50;
+```
+
+```
+ Sample Scan on events  (...)
+   Sampling: bernoulli ('1'::real)
+   Filter: (score > 50)
+   Rows Removed by Filter: ...
+```
+
+Notice the `Filter` line: the `WHERE` condition is applied to the sampled rows, confirming that sampling comes first.
+
+### SYSTEM vs BERNOULLI at a glance
+
+| | `SYSTEM` | `BERNOULLI` |
+| --- | --- | --- |
+| Unit of sampling | table block | individual row |
+| Reads whole table | no | yes |
+| Sample quality | clustered, higher variance | close to simple random sample |
+| Exact row count | no | no |
+| Best for | quick estimates on huge tables | statistically sound samples |
+
+Neither method returns an exact number of rows. Both return "about p percent", with the actual count varying from run to run.
+
+## REPEATABLE: reproducible samples
+
+Add `REPEATABLE (seed)` and the same seed returns the same sample, as long as the table has not changed and the method and percentage are identical:
+
+```sql
+SELECT count(*) FROM events TABLESAMPLE SYSTEM (1) REPEATABLE (42);
+SELECT count(*) FROM events TABLESAMPLE SYSTEM (1) REPEATABLE (42);
+-- both return the same number
+```
+
+This is valuable for:
+
+- **Reproducible analysis**: a colleague rerunning your notebook sees the same rows.
+- **Stable test fixtures**: extract the same 1% sample into a dev database every time.
+- **Debugging**: when a sample reveals a strange row, you can get back to it.
+
+Be aware that "the table has not changed" includes physical changes. Inserts, updates, `VACUUM FULL` or a restore that lays rows out differently on disk can all change which rows a given seed selects. If you need a sample that stays stable over time, materialise it:
+
+```sql
+CREATE TABLE events_sample_2026_09 AS
+SELECT * FROM events TABLESAMPLE BERNOULLI (1) REPEATABLE (20260924);
+```
+
+Without `REPEATABLE`, each query uses a fresh random seed.
+
+## Exact row counts with tsm_system_rows
+
+Often you want exactly N rows, not "about 1%". The `tsm_system_rows` contrib extension adds a `SYSTEM_ROWS` method whose argument is a row count:
+
+```sql
+CREATE EXTENSION IF NOT EXISTS tsm_system_rows;
+
+SELECT * FROM events TABLESAMPLE SYSTEM_ROWS (100);
+```
+
+This returns exactly 100 rows (or the whole table if it has fewer). Internally it is block-based like `SYSTEM`: it picks random blocks and reads rows from them until it has enough. That makes it fast, it can stop early, but it inherits the clustering problem. Asking for 10 rows from a table with around 100 rows per page will very likely return 10 neighbours from a single block.
+
+Two practical limitations:
+
+- `SYSTEM_ROWS` does **not** support `REPEATABLE`; PostgreSQL reports "tablesample method system_rows does not support REPEATABLE".
+- A `WHERE` clause still runs after sampling, so `SYSTEM_ROWS (100) WHERE score > 90` returns fewer than 100 rows.
+
+A useful trick to reduce clustering is to oversample by blocks and then shuffle a small set:
+
+```sql
+SELECT *
+FROM (
+    SELECT * FROM events TABLESAMPLE SYSTEM_ROWS (5000)
+) s
+ORDER BY random()
+LIMIT 50;
+```
+
+The inner query touches only a few dozen blocks; the outer `ORDER BY random()` sorts just 5,000 rows. The result is still not a perfect random sample of the full table, but it spreads the 50 rows across many more pages than `SYSTEM_ROWS (50)` would.
+
+## Time-bounded sampling with tsm_system_time
+
+The `tsm_system_time` extension adds `SYSTEM_TIME`, whose argument is a time budget in milliseconds. PostgreSQL reads random blocks until the budget runs out and returns whatever it has collected:
+
+```sql
+CREATE EXTENSION IF NOT EXISTS tsm_system_time;
+
+SELECT count(*) FROM events TABLESAMPLE SYSTEM_TIME (5);
+```
+
+The number of rows returned depends on hardware, caching and load, so it varies a lot between runs and servers. It is useful for interactive tooling where responsiveness matters more than sample size, for example a data profiler that must answer within a fixed time. Like `SYSTEM_ROWS`, it does not accept `REPEATABLE`, which makes sense because the result depends on timing.
+
+## ORDER BY random() LIMIT n: when it is still right
+
+The classic approach looks like this:
+
+```sql
+SELECT * FROM events ORDER BY random() LIMIT 10;
+```
+
+Its plan explains the cost:
+
+```
+ Limit
+   ->  Sort
+         Sort Key: (random())
+         Sort Method: top-N heapsort
+         ->  Seq Scan on events
+```
+
+PostgreSQL scans every row, computes `random()` for each, and keeps the smallest N in a top-N heap. Memory stays small thanks to the heapsort, but CPU and I/O scale with the full table size.
+
+Despite that, it has properties the sampling methods lack:
+
+- It returns **exactly** N rows (if at least N match).
+- It is a **true uniform random sample**; every subset of size N is equally likely.
+- It works on **anything**: views, joins, subqueries, CTEs and results already filtered by `WHERE`.
+
+That last point matters. If you want 20 random rows among the customers in one country, `WHERE country = 'DE' ORDER BY random() LIMIT 20` samples from the filtered set, and with an index on `country` it only touches those rows. `TABLESAMPLE` cannot do that because it samples before filtering.
+
+For repeatable results with `random()`, call `setseed()` in the same session before the query:
+
+```sql
+SELECT setseed(0.42);
+SELECT * FROM events ORDER BY random() LIMIT 10;
+```
+
+This only helps if the scan order is also stable, so treat it as a debugging aid rather than a guarantee.
+
+### Random rows by ID
+
+When a table has a dense integer primary key, another fast pattern is to generate random IDs and look them up via the index:
+
+```sql
+SELECT e.*
+FROM (
+    SELECT DISTINCT (1 + floor(random() * (SELECT max(id) FROM events)))::bigint AS id
+    FROM generate_series(1, 30)
+) r
+JOIN events e USING (id)
+LIMIT 20;
+```
+
+It generates a few extra candidates to compensate for duplicates and gaps. It only works well if IDs are reasonably dense; after heavy deletes, rows that follow a gap are more likely to be chosen, so the sample is biased.
+
+## Estimating row counts from a sample
+
+Sampling is a handy way to approximate counts without scanning a huge table. Multiply the sampled count by the inverse of the sampling fraction:
+
+```sql
+SELECT count(*) * 100 AS estimated_high_scores
+FROM events TABLESAMPLE SYSTEM (1)
+WHERE score > 90;
+```
+
+Use `BERNOULLI` if the condition correlates with physical order, for example recent timestamps in an append-only table, since `SYSTEM` might hit a cluster of recent pages or miss them entirely:
+
+```sql
+SELECT count(*) * 100 AS estimated_last_day
+FROM events TABLESAMPLE BERNOULLI (1)
+WHERE created_at > now() - interval '1 day';
+```
+
+For the total row count of a whole table, you often do not need to sample at all. The planner already keeps an estimate:
+
+```sql
+SELECT reltuples::bigint AS estimated_rows, relpages
+FROM pg_class
+WHERE oid = 'events'::regclass;
+```
+
+`reltuples` is refreshed by `VACUUM`, `ANALYZE` and autovacuum, so it can lag behind recent changes, but it costs nothing to read.
+
+### How accurate is a sampled count?
+
+For a row-level sample, the relative error of a count shrinks roughly with the square root of the number of **matching rows in the sample**. If your 1% sample contains 10,000 matching rows, the estimate is typically within about 1 to 2 percent of the truth; if it contains only 25 matching rows, the error can easily be 20 percent or more. Two rules of thumb follow:
+
+1. Rare conditions need bigger samples. If only a handful of sampled rows match, raise the percentage.
+2. Block sampling is less accurate than row sampling at the same percentage, because rows on one page are not independent. Treat `SYSTEM` estimates as rough, especially for conditions tied to insertion order.
+
+Running the same estimate with a few different `REPEATABLE` seeds and looking at the spread is a cheap, practical way to see how stable your number is.
+
+## Choosing the right method
+
+- **Quick look at a huge table, or a rough count**: `TABLESAMPLE SYSTEM (p)`.
+- **Statistically meaningful sample or estimate**: `TABLESAMPLE BERNOULLI (p)`, with `REPEATABLE` if others need to reproduce it.
+- **Exactly N rows, fast, randomness quality not critical**: `TABLESAMPLE SYSTEM_ROWS (n)`, optionally oversampled and shuffled.
+- **Fixed latency budget**: `TABLESAMPLE SYSTEM_TIME (ms)`.
+- **Exactly N truly random rows from a filtered set, view or join**: `ORDER BY random() LIMIT n`.
+
+Trying these side by side against your own data is the fastest way to build intuition. A client such as [Chat2DB](https://chat2db.ai/download) makes it easy to run each variant, compare `EXPLAIN ANALYZE` plans and timings, and export the sampled rows.
+
+## FAQ
+
+### Does TABLESAMPLE use indexes?
+
+No. Sampling methods operate on the table heap directly, and the plan shows a Sample Scan node. Indexes cannot help choose which blocks or rows are sampled, which is also why sampling happens before `WHERE`.
+
+### Why does TABLESAMPLE return a different number of rows each time?
+
+`SYSTEM` and `BERNOULLI` include blocks or rows with a probability, so the count follows a random distribution around the target percentage. Use `SYSTEM_ROWS` or `ORDER BY random() LIMIT n` if you need an exact count.
+
+### Can I sample from a join?
+
+Apply `TABLESAMPLE` to one base table in the join, for example `FROM orders TABLESAMPLE BERNOULLI (5) JOIN customers ...`. To sample the result of a join, wrap it in a subquery and use `ORDER BY random() LIMIT n`.
+
+### Is TABLESAMPLE supported on partitioned tables?
+
+You can apply `TABLESAMPLE` to a partitioned table, and PostgreSQL samples each partition with the same method and percentage. Check the plan with `EXPLAIN` to confirm the behaviour on your version.
+
+### Are tsm_system_rows and tsm_system_time available on managed services?
+
+They are standard contrib modules shipped with PostgreSQL, and major managed services generally allow them, but the list of permitted extensions differs by provider. Check `SELECT * FROM pg_available_extensions WHERE name LIKE 'tsm%';` on your server.
