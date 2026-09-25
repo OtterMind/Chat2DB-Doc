@@ -1,0 +1,470 @@
+---
+title: "Postgres JSON_TABLE: Turn JSON into Rows (PG 17)"
+description: "Learn PostgreSQL 17 JSON_TABLE: COLUMNS, PATH, FOR ORDINALITY, NESTED PATH, EXISTS, ON EMPTY and ON ERROR, plus pre-17 fallbacks and indexing tips."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: September 25, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# Postgres JSON_TABLE: Turn JSON into Rows (PG 17)
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="September 25, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+JSON columns are convenient for storing data whose shape changes over time, but reports, joins, and aggregates want plain rows and typed columns. For years PostgreSQL users bridged that gap with a mix of `jsonb_array_elements`, `jsonb_to_recordset`, `LATERAL` joins, and a lot of `->>` casts. PostgreSQL 17 adds the SQL-standard `JSON_TABLE` function, which does the whole job declaratively: you describe the rows you want with a JSON path, describe each output column with its own path and type, and PostgreSQL produces a relational result you can query like any other table.
+
+This guide covers the complete `JSON_TABLE` syntax as implemented in PostgreSQL 17, walks through realistic examples step by step, compares it with the older set-returning functions, shows fallbacks for PostgreSQL 16 and earlier, and explains how to keep queries fast with indexes.
+
+## Version requirements
+
+`JSON_TABLE` is available starting with **PostgreSQL 17**. On PostgreSQL 16 or earlier the query fails with a syntax error at or near the opening parenthesis after `JSON_TABLE`. Check your server version first:
+
+```sql
+SELECT version();
+SHOW server_version_num;  -- 170000 or higher is required
+```
+
+PostgreSQL 17 also introduced the related SQL/JSON query functions `JSON_EXISTS`, `JSON_QUERY`, and `JSON_VALUE`. `JSON_TABLE` uses the same path language and the same error-handling vocabulary, so what you learn here transfers directly to those functions. The path expressions themselves are the SQL/JSON path language that PostgreSQL has supported since version 12; if you need a refresher on it, see the [PostgreSQL jsonpath guide](/resources/blog/postgres-jsonpath-guide).
+
+## Sample data
+
+All examples below use this small order table. Each order stores its customer and line items in a `jsonb` document:
+
+```sql
+CREATE TABLE orders (
+    id       bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    doc      jsonb NOT NULL,
+    created  timestamptz NOT NULL DEFAULT now()
+);
+
+INSERT INTO orders (doc) VALUES
+('{
+   "order_no": "A-1001",
+   "customer": {"name": "Ada", "email": "ada@example.com", "vip": true},
+   "items": [
+     {"sku": "KB-01", "qty": 2, "price": 49.90, "tags": ["hardware", "usb"]},
+     {"sku": "MS-02", "qty": 1, "price": 19.50}
+   ],
+   "coupons": ["WELCOME10"]
+ }'),
+('{
+   "order_no": "A-1002",
+   "customer": {"name": "Linus", "email": "linus@example.com"},
+   "items": [
+     {"sku": "MON-27", "qty": 1, "price": "239.00", "tags": ["display"]},
+     {"sku": "CBL-HD", "qty": "three", "price": 7.25}
+   ]
+ }'),
+('{
+   "order_no": "A-1003",
+   "customer": {"name": "Grace"},
+   "items": []
+ }');
+```
+
+Notice the deliberate imperfections: one price is a string, one quantity is not a number, one order has no items, and some keys are missing. Real JSON looks like this, and `JSON_TABLE` gives you explicit control over each case.
+
+## The shape of a JSON_TABLE call
+
+The general form in PostgreSQL 17 is:
+
+```sql
+JSON_TABLE (
+    context_item,
+    row_path_expression [ AS json_path_name ]
+    [ PASSING value AS varname [, ...] ]
+    COLUMNS ( column_definition [, ...] )
+    [ { ERROR | EMPTY [ARRAY] } ON ERROR ]
+)
+```
+
+It has three parts:
+
+1. **Context item**: the JSON value to read, usually a column such as `o.doc`. The input is processed as `jsonb`.
+2. **Row path**: a JSON path expression. Every item it returns becomes one output row. `'$.items[*]'` means "one row per element of the items array".
+3. **COLUMNS clause**: one definition per output column. Each column path is evaluated relative to the current row item, not the whole document.
+
+`JSON_TABLE` appears in the `FROM` clause. When it follows another table, it can reference that table's columns directly, just like an implicit `LATERAL` join, so no `LATERAL` keyword is needed.
+
+## A first query: one row per line item
+
+```sql
+SELECT o.id, jt.*
+FROM orders AS o,
+     JSON_TABLE(
+         o.doc, '$.items[*]'
+         COLUMNS (
+             sku   text    PATH '$.sku',
+             qty   int     PATH '$.qty',
+             price numeric PATH '$.price'
+         )
+     ) AS jt;
+```
+
+Step by step, this is what happens:
+
+1. For each row of `orders`, PostgreSQL evaluates `$.items[*]` against `o.doc`.
+2. Each array element becomes a row item, for example `{"sku": "KB-01", "qty": 2, ...}`.
+3. For each column, the column path (`$.sku`, `$.qty`, `$.price`) is evaluated against that item and the result is cast to the declared SQL type.
+4. Order `A-1003` has an empty array, so the row path returns nothing and that order contributes no rows. Use a `LEFT JOIN ... ON true` if you want to keep it (shown later).
+
+Two results deserve attention. The string `"239.00"` converts successfully to `numeric`, because the scalar value is coerced into the target type. The quantity `"three"` cannot be converted to `int`; by default a column-level error produces `NULL` instead of aborting the query. That default is convenient but can hide bad data, which is why the `ON ERROR` clause exists.
+
+## Column definitions in detail
+
+### Regular columns and PATH
+
+A regular column is `name type [PATH path]`. If you omit `PATH`, PostgreSQL uses `$.name` with the column name as written. Because unquoted SQL identifiers are folded to lower case, an unquoted column called orderNo becomes `orderno` and looks for `$.orderno`, which does not match the key `orderNo`. When JSON keys are camelCase, either quote the column name or give an explicit path:
+
+```sql
+SELECT jt.*
+FROM JSON_TABLE(
+    '{"orderNo": "X-1", "totalCents": 1299}'::jsonb, '$'
+    COLUMNS (
+        "orderNo"  text,                     -- implicit path $.orderNo
+        total_cents int PATH '$.totalCents'  -- explicit path
+    )
+) AS jt;
+```
+
+For scalar SQL types, a regular column behaves like `JSON_VALUE`: it expects a single scalar. If the path yields an object, an array, or more than one item, that is an error for the column.
+
+### Returning JSON fragments
+
+When a column's type is `json` or `jsonb`, or when you add `FORMAT JSON`, the column behaves like `JSON_QUERY` and can return objects and arrays. The wrapper and quote options control the output:
+
+```sql
+SELECT jt.*
+FROM orders AS o,
+     JSON_TABLE(
+         o.doc, '$.items[*]'
+         COLUMNS (
+             sku       text  PATH '$.sku',
+             tags      jsonb PATH '$.tags',
+             first_tag text  PATH '$.tags[0]',
+             all_tags  jsonb PATH '$.tags[*]' WITH WRAPPER
+         )
+     ) AS jt;
+```
+
+- `tags` returns the whole array as `jsonb`.
+- `first_tag` returns a single scalar as `text`.
+- `all_tags` uses `WITH WRAPPER` because `$.tags[*]` can return several items, and several items can only be returned as one value if they are wrapped into an array. Without the wrapper, a multi-item result is an error (turned into `NULL` by default).
+
+`WITH CONDITIONAL WRAPPER` wraps only when the result is not already a single array or object, and `OMIT QUOTES` strips the quotes from a scalar string when returning it as JSON text.
+
+### FOR ORDINALITY
+
+A `FOR ORDINALITY` column is a counter, starting at 1, numbering the rows produced by its path level. It is the easiest way to preserve the original array position:
+
+```sql
+SELECT o.doc->>'order_no' AS order_no, jt.*
+FROM orders AS o,
+     JSON_TABLE(
+         o.doc, '$.items[*]'
+         COLUMNS (
+             line_no FOR ORDINALITY,
+             sku     text PATH '$.sku'
+         )
+     ) AS jt
+ORDER BY o.id, jt.line_no;
+```
+
+The counter restarts for each input row, so `line_no` is the position inside that order's array, which is exactly what you want for line numbers.
+
+### EXISTS columns
+
+An `EXISTS` column returns whether the path matches anything, instead of the value itself:
+
+```sql
+SELECT jt.*
+FROM orders AS o,
+     JSON_TABLE(
+         o.doc, '$'
+         COLUMNS (
+             order_no    text    PATH '$.order_no',
+             has_email   boolean EXISTS PATH '$.customer.email',
+             is_vip      boolean EXISTS PATH '$.customer.vip ? (@ == true)',
+             has_coupons boolean EXISTS PATH '$.coupons[*]'
+         )
+     ) AS jt;
+```
+
+Here the row path is `$`, so each order produces exactly one row. `is_vip` combines `EXISTS` with a jsonpath filter, which is a compact way to turn a nested flag into a boolean column. The column type can also be an integer type, in which case true and false become 1 and 0.
+
+## Handling missing and invalid data
+
+This is where `JSON_TABLE` pulls ahead of hand-written extraction. Each regular column can specify two independent behaviors:
+
+- **ON EMPTY** applies when the path finds nothing, for example a missing key.
+- **ON ERROR** applies when the path or the conversion fails, for example `"three"` cast to `int`, or multiple items for a scalar column.
+
+The possible actions are `NULL`, `ERROR`, `DEFAULT expression`, and for JSON-typed columns also `EMPTY ARRAY` or `EMPTY OBJECT`. For regular columns both default to `NULL`.
+
+```sql
+SELECT o.id, jt.*
+FROM orders AS o,
+     JSON_TABLE(
+         o.doc, '$.items[*]'
+         COLUMNS (
+             sku   text    PATH '$.sku'   ERROR ON EMPTY,
+             qty   int     PATH '$.qty'   DEFAULT 1 ON EMPTY DEFAULT -1 ON ERROR,
+             price numeric PATH '$.price' DEFAULT 0 ON EMPTY
+         )
+     ) AS jt;
+```
+
+Reading this column by column:
+
+1. `sku` is mandatory. If an item has no `sku`, the query raises an error instead of silently returning `NULL`.
+2. `qty` defaults to 1 when missing, and becomes -1 when present but not convertible, so the `"three"` value shows up as a clearly flagged sentinel you can query for.
+3. `price` defaults to 0 when missing.
+
+Column-level clauses are separate from the top-level clause of the whole function. By default, the top-level `ON ERROR` behavior of `JSON_TABLE` is `EMPTY ARRAY`, which means an error while evaluating the **row path** produces an empty result for that input row. If you want strict validation of the whole document, specify it explicitly:
+
+```sql
+SELECT jt.*
+FROM orders AS o,
+     JSON_TABLE(
+         o.doc, 'strict $.items[*]'
+         COLUMNS (sku text PATH '$.sku')
+         ERROR ON ERROR
+     ) AS jt;
+```
+
+The `strict` keyword changes path semantics: in the default `lax` mode, a missing key or an accessor applied to the wrong type quietly returns nothing, while in `strict` mode it is an error. Combine `strict` paths with `ERROR ON ERROR` when you are loading data and want bad documents to fail loudly; keep the lax defaults when you are exploring or reporting.
+
+## PASSING variables into paths
+
+Hard-coding filter values inside path strings leads to string concatenation. The `PASSING` clause lets you bind SQL values to jsonpath variables instead:
+
+```sql
+SELECT o.doc->>'order_no' AS order_no, jt.*
+FROM orders AS o,
+     JSON_TABLE(
+         o.doc, '$.items[*] ? (@.price >= $min_price)'
+         PASSING 20 AS min_price
+         COLUMNS (
+             sku   text    PATH '$.sku',
+             price numeric PATH '$.price'
+         )
+     ) AS jt;
+```
+
+In an application you would pass a bind parameter such as `$1` in place of the literal 20. This keeps the path constant, which is friendlier to prepared statements and to query statistics tools.
+
+## NESTED PATH: flattening several levels
+
+Line items contain a `tags` array. To produce one row per tag while keeping the item and order columns, use `NESTED PATH`:
+
+```sql
+SELECT jt.*
+FROM orders AS o,
+     JSON_TABLE(
+         o.doc, '$'
+         COLUMNS (
+             order_no text PATH '$.order_no',
+             NESTED PATH '$.items[*]' COLUMNS (
+                 item_no FOR ORDINALITY,
+                 sku     text PATH '$.sku',
+                 NESTED PATH '$.tags[*]' COLUMNS (
+                     tag text PATH '$'
+                 )
+             )
+         )
+     ) AS jt;
+```
+
+How the rows are formed:
+
+1. The outer level produces one row per order with `order_no`.
+2. The first nested level produces one row per item and joins it to its parent order.
+3. The innermost level produces one row per tag. The join between a parent and its nested path is an outer join, so an item without tags still appears once, with `tag` set to `NULL`.
+
+When a level has **two sibling** `NESTED PATH` clauses, for example items and coupons side by side, PostgreSQL does not multiply them into a cross product. It produces the rows of the first sibling with the second sibling's columns set to `NULL`, followed by the rows of the second sibling with the first sibling's columns set to `NULL`, a union-style result. That avoids accidental row explosions:
+
+```sql
+SELECT jt.*
+FROM orders AS o,
+     JSON_TABLE(
+         o.doc, '$'
+         COLUMNS (
+             order_no text PATH '$.order_no',
+             NESTED PATH '$.items[*]' COLUMNS (sku text PATH '$.sku'),
+             NESTED PATH '$.coupons[*]' COLUMNS (coupon text PATH '$')
+         )
+     ) AS jt;
+```
+
+The SQL standard also defines a `PLAN` clause to customize how nested paths are joined. PostgreSQL 17 does not implement it, so the default outer-join and union behavior described above is what you get.
+
+## Keeping parents with no matching rows
+
+Because `JSON_TABLE` in a comma join behaves like an inner lateral join, orders whose row path returns nothing disappear. Use an explicit outer join to keep them:
+
+```sql
+SELECT o.doc->>'order_no' AS order_no, jt.sku, jt.qty
+FROM orders AS o
+LEFT JOIN JSON_TABLE(
+    o.doc, '$.items[*]'
+    COLUMNS (sku text PATH '$.sku', qty int PATH '$.qty')
+) AS jt ON true;
+```
+
+Order `A-1003` now appears with `NULL` item columns.
+
+## Turning the result into a view or a table
+
+A common pattern is to expose JSON documents to BI tools as a relational view:
+
+```sql
+CREATE VIEW order_lines AS
+SELECT o.id AS order_id,
+       o.created,
+       jt.*
+FROM orders AS o,
+     JSON_TABLE(
+         o.doc, '$.items[*]'
+         COLUMNS (
+             line_no FOR ORDINALITY,
+             sku     text    PATH '$.sku',
+             qty     int     PATH '$.qty'   DEFAULT 1 ON EMPTY,
+             price   numeric PATH '$.price' DEFAULT 0 ON EMPTY
+         )
+     ) AS jt;
+
+SELECT sku, sum(qty * price) AS revenue
+FROM order_lines
+GROUP BY sku
+ORDER BY revenue DESC;
+```
+
+For a one-time migration from a document layout to normalized tables, the same query feeds `INSERT INTO order_line (...) SELECT ...`. Running such a migration interactively is easier in a SQL client that shows result grids and lets you inspect `jsonb` values side by side; [Chat2DB](https://chat2db.ai/download) can also draft the `COLUMNS` list from a sample document if you describe the columns you need in plain language.
+
+## Comparison with pre-17 functions
+
+`JSON_TABLE` does not unlock anything that was strictly impossible before, but it replaces several functions with one consistent construct. Here is the same line-item query written three ways.
+
+### jsonb_array_elements with LATERAL
+
+```sql
+SELECT o.id,
+       item->>'sku'               AS sku,
+       (item->>'qty')::int        AS qty,
+       (item->>'price')::numeric  AS price,
+       ord                        AS line_no
+FROM orders AS o
+CROSS JOIN LATERAL jsonb_array_elements(o.doc->'items')
+     WITH ORDINALITY AS e(item, ord);
+```
+
+This works on every supported PostgreSQL version. The weaknesses: every column needs its own `->>` plus cast, and a single bad value such as `"three"` makes the **whole query** fail with an invalid input syntax error. Tolerating bad data requires extra `CASE` expressions or a helper function.
+
+### jsonb_to_recordset
+
+```sql
+SELECT o.id, r.*
+FROM orders AS o
+CROSS JOIN LATERAL jsonb_to_recordset(o.doc->'items')
+     AS r(sku text, qty int, price numeric);
+```
+
+`jsonb_to_recordset` maps keys to columns by name and is concise when keys and column names match exactly. It has no per-column paths, so it cannot reach into nested objects without a second step, it has no ordinality column, and it offers no `DEFAULT` or `ON ERROR` handling. The `"three"` quantity again aborts the query.
+
+### Which to choose
+
+- On PostgreSQL 17 and later, prefer `JSON_TABLE` for anything beyond a trivial flattening: nested levels, missing keys, typed defaults, validation, or ordinality.
+- `jsonb_to_recordset` is still fine for flat, trusted arrays whose keys match column names.
+- `jsonb_array_elements` remains useful when you want each element as a `jsonb` value to pass into other functions.
+
+For the full set of operators used in the fallback examples, see [PostgreSQL JSONB operators and functions](/resources/blog/postgres-jsonb-operators-and-functions).
+
+## Pre-17 fallback with jsonb_path_query
+
+If you are on PostgreSQL 12 to 16 and like the path-based style, `jsonb_path_query` gets you close:
+
+```sql
+SELECT o.id,
+       item->>'sku' AS sku,
+       jsonb_path_query_first(item, '$.tags[0]') #>> '{}' AS first_tag
+FROM orders AS o
+CROSS JOIN LATERAL jsonb_path_query(o.doc, '$.items[*] ? (@.price > 10)') AS item;
+```
+
+To emulate `DEFAULT ... ON ERROR` for numeric conversions, filter with a jsonpath type check before casting:
+
+```sql
+SELECT item->>'sku' AS sku,
+       CASE WHEN jsonb_path_exists(item, '$.qty ? (@.type() == "number")')
+            THEN (item->>'qty')::int
+            ELSE -1
+       END AS qty
+FROM orders AS o
+CROSS JOIN LATERAL jsonb_array_elements(o.doc->'items') AS item;
+```
+
+It is more verbose, which is precisely the problem `JSON_TABLE` was designed to solve, but it gives equivalent results and makes a later migration mechanical.
+
+## Indexing and performance notes
+
+`JSON_TABLE` is evaluated per input row, and it cannot use an index by itself; it simply reads whatever documents the rest of the query hands to it. Performance therefore depends on reducing the number of documents **before** they reach `JSON_TABLE`.
+
+### Filter with indexable operators
+
+A GIN index on the `jsonb` column supports the containment operator `@>` and the jsonpath operators `@?` and `@@`:
+
+```sql
+CREATE INDEX orders_doc_gin ON orders USING gin (doc jsonb_path_ops);
+
+SELECT jt.*
+FROM orders AS o,
+     JSON_TABLE(
+         o.doc, '$.items[*]'
+         COLUMNS (sku text PATH '$.sku', qty int PATH '$.qty')
+     ) AS jt
+WHERE o.doc @> '{"items": [{"sku": "KB-01"}]}';
+```
+
+The `WHERE` clause narrows the candidate orders using the index, and `JSON_TABLE` only expands the matching documents. Note that a condition on a `JSON_TABLE` output column, such as `WHERE jt.sku = 'KB-01'`, cannot use the GIN index: it is applied after expansion. Similarly, the new `JSON_EXISTS` function is not an indexable operator, so use `@?` when you need index support for a path condition:
+
+```sql
+SELECT count(*)
+FROM orders
+WHERE doc @? '$.items[*] ? (@.sku == "KB-01")';
+```
+
+### Expression indexes for hot scalar fields
+
+If you filter frequently on one scalar field, an expression B-tree index is usually smaller and faster than GIN:
+
+```sql
+CREATE INDEX orders_order_no_idx ON orders ((doc->>'order_no'));
+
+SELECT jt.*
+FROM orders AS o,
+     JSON_TABLE(o.doc, '$.items[*]' COLUMNS (sku text PATH '$.sku')) AS jt
+WHERE o.doc->>'order_no' = 'A-1001';
+```
+
+### Materialize when you query the same shape repeatedly
+
+If dashboards run the same `JSON_TABLE` expansion all day, consider a materialized view or a normalized side table maintained on write. Expanding large arrays on every read costs CPU, and a plain table of lines can be indexed on `sku` directly. Always check the actual plan with `EXPLAIN (ANALYZE, BUFFERS)`; the node for `JSON_TABLE` appears as a table function scan, and the explain output shows how many rows it produced. The article on [reading EXPLAIN ANALYZE query plans](/resources/blog/postgres-explain-analyze-query-plans) explains how to interpret those numbers.
+
+### json versus jsonb input
+
+`JSON_TABLE` works on `jsonb` internally. If your column is `json`, it is converted on every evaluation, which adds parsing cost. For documents that are queried often, `jsonb` is the better storage type; the trade-offs are covered in [JSON vs JSONB in PostgreSQL](/resources/blog/postgres-json-vs-jsonb).
+
+## Common mistakes
+
+- **Expecting camelCase keys to match unquoted column names.** Use explicit `PATH` expressions.
+- **Forgetting that errors become NULL.** The default `NULL ON ERROR` hides bad data. Add `ERROR ON ERROR` during imports or a sentinel `DEFAULT` during reporting.
+- **Losing parents with empty arrays.** Use `LEFT JOIN JSON_TABLE(...) ON true`.
+- **Returning arrays into scalar columns.** Use a `jsonb` column type, or `WITH WRAPPER` when a path can yield several items.
+- **Filtering on output columns and expecting index use.** Move selective predicates to the base table with `@>` or `@?`.
+
+## Summary
+
+`JSON_TABLE` in PostgreSQL 17 turns JSON documents into typed rows with a single declarative clause. The row path picks the items that become rows, the `COLUMNS` clause maps paths to typed columns, `FOR ORDINALITY` numbers them, `EXISTS` turns path matches into booleans, `NESTED PATH` flattens deeper arrays with outer-join semantics, and `ON EMPTY` and `ON ERROR` make missing or malformed values an explicit decision instead of a runtime surprise. On older versions, `jsonb_array_elements`, `jsonb_to_recordset`, and `jsonb_path_query` with `LATERAL` still get the job done with more code. Whichever you use, filter documents with indexable operators before expanding them, and verify the plan with `EXPLAIN ANALYZE`.

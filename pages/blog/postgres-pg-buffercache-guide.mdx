@@ -1,0 +1,327 @@
+---
+title: "pg_buffercache: Inspect Postgres shared_buffers"
+description: "Use pg_buffercache to see what sits in Postgres shared_buffers: install it, read usagecount and isdirty, find cached relations, and use the PG16/PG17 helpers."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: September 25, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# pg_buffercache: Inspect Postgres shared_buffers
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="September 25, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+PostgreSQL keeps recently used data pages in a shared memory area called **shared_buffers**. Every read and write of a table or index page goes through this cache, so its contents have a direct effect on query latency. Yet from the outside it is a black box: `pg_stat_database` tells you how many block reads were hits or misses, but not *which* tables and indexes are actually occupying the cache right now.
+
+The `pg_buffercache` extension opens that box. It exposes one row per buffer in shared_buffers, telling you which relation and block each buffer holds, whether it is dirty, how "hot" it is, and whether anyone is pinning it. This guide covers installing the extension, reading each column, practical queries for answering real questions about postgres shared_buffers usage, the lighter summary functions added in PostgreSQL 16, the eviction function added in PostgreSQL 17, and how to use all of it when sizing shared_buffers or warming the cache with `pg_prewarm`.
+
+## How shared_buffers works in one minute
+
+shared_buffers is an array of fixed-size buffers, each the size of one block (8 kB unless PostgreSQL was compiled with a different `block_size`). When a backend needs a page, it looks it up in a hash table keyed by relation, fork and block number. If the page is present, that is a buffer hit. If not, PostgreSQL chooses a victim buffer, writes it out first if it is dirty, and reads the requested page from the operating system into it.
+
+Victim selection uses a **clock-sweep** algorithm. Each buffer has a usage count that is incremented (up to a maximum of 5) whenever the buffer is accessed. The clock hand walks around the buffer array, decrementing usage counts as it passes, and takes the first unpinned buffer whose count has reached zero. Frequently used pages keep getting their count bumped back up and survive; pages used once drift down to zero and are recycled.
+
+Two more states matter:
+
+- **Dirty**: the page was modified in memory and has not yet been written to disk. The checkpointer, the background writer, or a backend evicting it will write it out.
+- **Pinned**: a backend is currently using the buffer. A pinned buffer cannot be evicted.
+
+`pg_buffercache` shows you all of this state, buffer by buffer.
+
+## Installing pg_buffercache
+
+The extension ships with the standard PostgreSQL contrib package. On most Linux distributions it is already installed alongside the server; on Debian and Ubuntu it is part of the `postgresql-contrib` or version-specific server package. No `shared_preload_libraries` change or restart is needed.
+
+Create it in the database you want to inspect:
+
+```sql
+CREATE EXTENSION IF NOT EXISTS pg_buffercache;
+
+-- Confirm the installed version
+SELECT extname, extversion
+FROM pg_extension
+WHERE extname = 'pg_buffercache';
+```
+
+By default the view and functions are restricted to superusers and members of the `pg_monitor` role. To let a monitoring user query it without superuser rights:
+
+```sql
+GRANT pg_monitor TO monitoring_user;
+```
+
+Note that the view shows buffers for **all** databases in the cluster, but you can only resolve relation names for the database you are connected to, because `pg_class` is per-database. That affects how you write the join queries below.
+
+## What the pg_buffercache view shows
+
+Query a few rows to get a feel for it:
+
+```sql
+SELECT *
+FROM pg_buffercache
+LIMIT 5;
+```
+
+The columns are:
+
+| Column | Meaning |
+| --- | --- |
+| `bufferid` | Buffer number, from 1 to the number of buffers in shared_buffers |
+| `relfilenode` | Filenode of the relation stored in the buffer; NULL if the buffer is unused |
+| `reltablespace` | OID of the tablespace of the relation |
+| `reldatabase` | OID of the database; 0 for shared catalogs such as `pg_database` |
+| `relforknumber` | Fork number: 0 = main, 1 = free space map, 2 = visibility map, 3 = init fork |
+| `relblocknumber` | Block number of the page within the fork |
+| `isdirty` | True if the page has been modified and not yet written out |
+| `usagecount` | Clock-sweep usage count, 0 to 5 |
+| `pinning_backends` | Number of backends currently pinning the buffer (PostgreSQL 9.5 and later) |
+
+A few details are easy to get wrong:
+
+1. **`relfilenode` is not the relation OID.** They start out equal, but `TRUNCATE`, `VACUUM FULL`, `CLUSTER`, `REINDEX` and some `ALTER TABLE` forms assign a new filenode. Always join through `pg_relation_filenode(c.oid)` rather than `c.relfilenode`, because the function also handles mapped catalogs whose `relfilenode` column is 0.
+2. **Buffers from other databases show up with a different `reldatabase`.** Filter on your current database OID plus 0 (shared catalogs) before joining to `pg_class`, or you will mismatch filenodes that happen to collide across databases.
+3. **The number of rows equals the number of buffers**, not the number of used buffers. Unused buffers have NULL relation columns.
+
+## Useful queries
+
+The examples below assume the default 8 kB block size. Rather than hard-coding it, they read `current_setting('block_size')`.
+
+### How full is shared_buffers?
+
+```sql
+SELECT count(*)                                         AS total_buffers,
+       count(relfilenode)                               AS used_buffers,
+       count(*) - count(relfilenode)                    AS unused_buffers,
+       count(*) FILTER (WHERE isdirty)                  AS dirty_buffers,
+       round(100.0 * count(relfilenode) / count(*), 1)  AS pct_used
+FROM pg_buffercache;
+```
+
+Right after a restart most buffers are unused. On a busy server that has been up for a while, shared_buffers is normally close to 100% used, because PostgreSQL has no reason to empty a buffer until it needs it for something else. A full cache is not a problem in itself; what matters is what it is full *of*.
+
+### Top relations in shared_buffers
+
+This is the query most people install the extension for:
+
+```sql
+SELECT n.nspname                                        AS schema,
+       c.relname                                        AS relation,
+       c.relkind,
+       count(*)                                         AS buffers,
+       pg_size_pretty(count(*) * current_setting('block_size')::bigint) AS cached,
+       round(100.0 * count(*) /
+             (SELECT setting::bigint FROM pg_settings WHERE name = 'shared_buffers'), 2)
+                                                        AS pct_of_shared_buffers
+FROM pg_buffercache b
+JOIN pg_class c
+  ON b.relfilenode = pg_relation_filenode(c.oid)
+ AND b.reldatabase IN (0, (SELECT oid FROM pg_database
+                           WHERE datname = current_database()))
+JOIN pg_namespace n ON n.oid = c.relnamespace
+GROUP BY n.nspname, c.relname, c.relkind
+ORDER BY buffers DESC
+LIMIT 20;
+```
+
+Step by step:
+
+1. The join on `pg_relation_filenode(c.oid)` maps each buffer to the relation that owns it.
+2. The `reldatabase` filter keeps only buffers from the current database and shared catalogs.
+3. `count(*)` per relation is the number of 8 kB pages cached; multiplying by the block size gives bytes.
+4. The `shared_buffers` setting in `pg_settings` is expressed in units of blocks, so dividing by it gives a percentage of the whole cache.
+
+`relkind` tells you whether the entry is a table (`r`), index (`i`), materialized view (`m`), TOAST table (`t`) or sequence (`S`). It is common to find that indexes take a larger share than expected, which is usually good news: index pages are small, dense and reused often.
+
+### What percentage of each relation is cached
+
+Knowing that a table has 2 GB in cache means little unless you know how big the table is. This query compares cached pages with the relation's size on disk:
+
+```sql
+SELECT c.relname,
+       pg_size_pretty(pg_relation_size(c.oid))          AS rel_size,
+       pg_size_pretty(count(*) * current_setting('block_size')::bigint) AS cached,
+       round(100.0 * count(*) * current_setting('block_size')::bigint
+             / nullif(pg_relation_size(c.oid), 0), 1)   AS pct_of_rel_cached
+FROM pg_buffercache b
+JOIN pg_class c
+  ON b.relfilenode = pg_relation_filenode(c.oid)
+ AND b.reldatabase = (SELECT oid FROM pg_database WHERE datname = current_database())
+WHERE b.relforknumber = 0          -- main fork only, to match pg_relation_size
+GROUP BY c.oid, c.relname
+ORDER BY count(*) DESC
+LIMIT 20;
+```
+
+Restricting to fork 0 matters because `pg_relation_size(oid)` with one argument returns the size of the main fork only. The `nullif` guards against division by zero for empty relations.
+
+How to read the result:
+
+- A small, heavily used table or index at close to 100% cached is exactly what you want.
+- A large table at a low percentage is normal if queries only touch recent rows.
+- A large table that is mostly cached but rarely queried can indicate that a batch job or sequential scan is pushing out more valuable pages, although PostgreSQL limits this: large sequential scans, `VACUUM` and bulk writes use a small **ring buffer** instead of flooding the whole cache.
+
+### Usage count distribution
+
+The usage count reveals how hot the cache is overall:
+
+```sql
+SELECT usagecount,
+       count(*)                          AS buffers,
+       count(*) FILTER (WHERE isdirty)   AS dirty,
+       round(100.0 * count(*) / sum(count(*)) OVER (), 1) AS pct
+FROM pg_buffercache
+WHERE relfilenode IS NOT NULL
+GROUP BY usagecount
+ORDER BY usagecount;
+```
+
+Interpretation is qualitative, not a precise formula:
+
+- If most buffers sit at usage count 5, the working set is being re-read constantly and fits in shared_buffers. Adding more memory may not change much, or the working set may be larger than the cache and every page that makes it in gets hammered. Look at hit ratios too.
+- If most buffers sit at 0 or 1, pages are cycled through quickly and few are reused. Either the workload is scan-heavy, or the hot set is larger than shared_buffers and the clock sweep is evicting pages before they can accumulate reuse.
+
+You can also break usage counts down per relation to see which tables contribute the hot pages:
+
+```sql
+SELECT c.relname,
+       count(*) FILTER (WHERE b.usagecount >= 3) AS hot_buffers,
+       count(*) FILTER (WHERE b.usagecount <= 1) AS cold_buffers
+FROM pg_buffercache b
+JOIN pg_class c
+  ON b.relfilenode = pg_relation_filenode(c.oid)
+ AND b.reldatabase = (SELECT oid FROM pg_database WHERE datname = current_database())
+GROUP BY c.relname
+ORDER BY hot_buffers DESC
+LIMIT 20;
+```
+
+### Dirty buffers by relation
+
+Dirty buffers must be written before the next checkpoint completes. If one relation holds most of the dirty pages, it is the one generating write I/O:
+
+```sql
+SELECT c.relname,
+       count(*) AS dirty_buffers,
+       pg_size_pretty(count(*) * current_setting('block_size')::bigint) AS dirty_size
+FROM pg_buffercache b
+JOIN pg_class c
+  ON b.relfilenode = pg_relation_filenode(c.oid)
+ AND b.reldatabase = (SELECT oid FROM pg_database WHERE datname = current_database())
+WHERE b.isdirty
+GROUP BY c.relname
+ORDER BY dirty_buffers DESC
+LIMIT 20;
+```
+
+Run it just before and just after a checkpoint (`CHECKPOINT;` as a superuser on a test system) and you will see the dirty count drop. A persistently large dirty set that spikes at checkpoint time is worth correlating with `checkpoint_timeout`, `max_wal_size` and the checkpointer statistics (`pg_stat_checkpointer` in PostgreSQL 17, `pg_stat_bgwriter` in earlier releases).
+
+### Pinned buffers
+
+```sql
+SELECT bufferid, relfilenode, relblocknumber, pinning_backends
+FROM pg_buffercache
+WHERE pinning_backends > 0
+ORDER BY pinning_backends DESC;
+```
+
+Pins are normally held very briefly, so you will usually see only a handful. A buffer pinned for a long time by an open cursor can block `VACUUM` from cleaning that page, which is occasionally useful when debugging a stuck vacuum.
+
+## The cost of querying pg_buffercache
+
+The view is not free. For every buffer it reads the buffer header under that buffer's header spinlock and copies the data out. Since PostgreSQL 10 it no longer takes all buffer-mapping partition locks at once, so it does not freeze the whole buffer manager while it runs, but it still touches every buffer header. On a server with a very large shared_buffers, that is millions of headers per call, plus the memory to materialize the result and the cost of the joins.
+
+Two consequences:
+
+- **Results are not a consistent snapshot.** Each buffer is read independently, so totals can be slightly off from any single instant. For monitoring purposes that is fine.
+- **Do not poll it every few seconds** from a monitoring agent on a large production server. Run the detailed queries on demand, and use the lighter summary functions described next for regular collection.
+
+## pg_buffercache_summary() and pg_buffercache_usage_counts() (PostgreSQL 16+)
+
+PostgreSQL 16 added two aggregate functions that return totals without producing a row per buffer. The documentation notes that they do not acquire buffer manager locks, which makes them much cheaper and suitable for frequent sampling. After upgrading, run `ALTER EXTENSION pg_buffercache UPDATE;` in each database where the extension already exists to get them.
+
+```sql
+-- One row of cache-wide totals (PostgreSQL 16+)
+SELECT * FROM pg_buffercache_summary();
+```
+
+It returns `buffers_used`, `buffers_unused`, `buffers_dirty`, `buffers_pinned` and `usagecount_avg`. The first four are the same numbers as the "how full" query above, and `usagecount_avg` is a quick single-number indicator of cache temperature.
+
+```sql
+-- One row per usage count value (PostgreSQL 16+)
+SELECT * FROM pg_buffercache_usage_counts();
+```
+
+This returns `usage_count`, `buffers`, `dirty` and `pinned`, which is the usage count distribution query without scanning the view yourself. Neither function tells you *which* relations are cached; for that you still need the full view.
+
+## pg_buffercache_evict() (PostgreSQL 17+)
+
+PostgreSQL 17 added `pg_buffercache_evict(bufferid)`, a superuser-only function that tries to evict one buffer from shared_buffers. If the buffer is dirty it is written out first. It fails to evict if the buffer is pinned or becomes pinned or dirtied concurrently, and it reports whether the eviction happened.
+
+It is intended for **testing**, not for tuning production. The classic use is to benchmark a query's cold-cache behavior for a single table without restarting the server:
+
+```sql
+-- PostgreSQL 17+, superuser, test systems only
+SELECT pg_buffercache_evict(b.bufferid)
+FROM pg_buffercache b
+WHERE b.relfilenode = pg_relation_filenode('orders'::regclass)
+  AND b.reldatabase = (SELECT oid FROM pg_database WHERE datname = current_database());
+```
+
+The page may still be in the operating system's page cache, so this simulates a PostgreSQL cache miss rather than a true disk read. In PostgreSQL 17 the function returns a boolean. PostgreSQL 18 changed its output to report both whether the buffer was evicted and whether it had to be flushed, and added `pg_buffercache_evict_relation()` and `pg_buffercache_evict_all()` for evicting a whole relation or the whole cache in one call. Check the documentation for your exact major version before scripting against the return type.
+
+## Using pg_buffercache when sizing shared_buffers
+
+A common starting guideline is to give shared_buffers around a quarter of RAM on a dedicated database server, leaving the rest to the operating system cache and to per-query memory such as `work_mem`. PostgreSQL relies on double buffering: a page evicted from shared_buffers often remains in the OS page cache, so a shared_buffers miss is not necessarily a disk read.
+
+pg_buffercache helps you move beyond the rule of thumb:
+
+1. **Identify the hot set.** Run the top-relations query during peak load. Add up the relations and indexes your critical queries rely on.
+2. **Check whether it fits.** If the important indexes and tables are close to fully cached with high usage counts, the cache is doing its job. If they are only partially cached and the usage count distribution is skewed toward low values, the working set probably does not fit.
+3. **Correlate with hit ratios.** Use `pg_stat_database` and `pg_statio_user_tables` to see block hits versus reads per table. pg_buffercache tells you what is cached; the statio views tell you how often lookups miss.
+4. **Change one thing and measure.** Changing shared_buffers requires a restart. After the change, let the cache warm up for a representative period and repeat the same queries before drawing conclusions.
+
+Keep in mind that a larger shared_buffers is not automatically better. Bigger caches mean more dirty data to write at each checkpoint and more memory taken away from the OS cache and query execution. Measure on your own workload rather than trusting any universal percentage.
+
+## Relation to pg_prewarm
+
+After a restart shared_buffers is empty, and the first queries pay the cost of reading everything from disk or the OS cache. The `pg_prewarm` extension addresses that, and pg_buffercache is how you verify it worked.
+
+Load a relation into shared_buffers manually:
+
+```sql
+CREATE EXTENSION IF NOT EXISTS pg_prewarm;
+
+-- Returns the number of blocks read into shared_buffers
+SELECT pg_prewarm('orders');
+SELECT pg_prewarm('orders_pkey');
+```
+
+The default mode is `'buffer'`, which reads into shared_buffers. The `'read'` and `'prefetch'` modes only warm the OS cache.
+
+To restore the cache automatically after a restart, enable the autoprewarm background worker:
+
+```ini
+# postgresql.conf (requires restart)
+shared_preload_libraries = 'pg_prewarm'
+pg_prewarm.autoprewarm = on
+pg_prewarm.autoprewarm_interval = 300s
+```
+
+The worker periodically saves the list of cached blocks to `autoprewarm.blocks` in the data directory and reloads those blocks at startup. Before and after a restart, run the top-relations query from this article to confirm that the same relations come back into the cache.
+
+## Inspecting the cache from a GUI
+
+All of these queries are plain SQL, so any client works. If you want to keep them as saved snippets, run them against several servers, and chart the results, a tool like [Chat2DB](https://chat2db.ai/download) lets you store the queries, switch connections quickly, and ask its AI assistant to adapt a query, for example "show only indexes in the sales schema", without rewriting the joins by hand.
+
+## Summary
+
+- `pg_buffercache` exposes one row per shared buffer with relation, block, dirty flag, usage count and pin count.
+- Join through `pg_relation_filenode(c.oid)` and filter on the current `reldatabase` to map buffers to relations correctly.
+- The key questions are which relations dominate the cache, what fraction of each relation is cached, how hot the cache is, and which relations produce dirty pages.
+- The full view touches every buffer header, so query it on demand. Use `pg_buffercache_summary()` and `pg_buffercache_usage_counts()` (PostgreSQL 16+) for frequent monitoring.
+- `pg_buffercache_evict()` (PostgreSQL 17+) is a testing tool for cold-cache experiments.
+- Combine it with hit-ratio statistics when sizing shared_buffers, and with `pg_prewarm` to warm and verify the cache after restarts.
+
+For the concurrency side of how pages change while they sit in the cache, see [Postgres MVCC Explained](/resources/blog/postgres-mvcc-explained).

@@ -1,0 +1,320 @@
+---
+title: "Vitess vs Citus: MySQL vs Postgres Sharding"
+description: "Vitess vs Citus compared: VTGate and VTTablet vs coordinator and workers, vindexes vs distribution columns, resharding, cross-shard queries and operations."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: September 25, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# Vitess vs Citus: MySQL vs Postgres Sharding
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="September 25, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+When a single database server stops being enough, and read replicas, bigger hardware, and partitioning have all been tried, the next step is sharding: splitting data across many servers while keeping a single logical database for the application. In the open source world, two projects dominate this space. **Vitess** shards MySQL. **Citus** shards PostgreSQL.
+
+Comparing Vitess vs Citus is really comparing two different answers to the same question. Vitess puts a routing and management layer around many independent MySQL servers. Citus extends PostgreSQL itself so that one PostgreSQL node can plan and execute queries across many others. That difference in approach shapes everything else: how you pick a sharding key, how you add capacity, what SQL works across shards, and how you operate the system.
+
+This article compares the two on architecture, sharding keys, resharding, cross-shard queries and transactions, and operations. It does not include performance numbers; results depend on schema, workload, and hardware, and should be measured on your own data.
+
+## The Short Version
+
+| Aspect | Vitess | Citus |
+|--------|--------|-------|
+| Underlying database | MySQL (and compatible Percona Server) | PostgreSQL |
+| Form | Separate system of proxies and sidecars around MySQL | PostgreSQL extension |
+| Query routing | VTGate (stateless proxy speaking MySQL protocol) | Coordinator node (and, since Citus 11, any node) |
+| Sharding definition | VSchema with vindexes | `create_distributed_table` with a distribution column |
+| Small shared tables | Unsharded keyspace or reference tables | Reference tables replicated to every node |
+| Resharding | VReplication workflows (Reshard, MoveTables) | Shard rebalancer, `alter_distributed_table` |
+| Cross-shard writes | Best-effort multi-shard by default, optional two-phase commit | Two-phase commit for multi-node transactions |
+| Managed offerings | PlanetScale | Azure Cosmos DB for PostgreSQL |
+| License | Apache 2.0 | AGPL 3.0 |
+
+## Architecture
+
+### Vitess: VTGate, VTTablet, and the topology service
+
+Vitess started at YouTube and is a graduated project of the Cloud Native Computing Foundation. Its main components:
+
+- **VTGate** is a stateless proxy. Applications connect to it using the regular MySQL protocol and drivers. VTGate parses each query, consults the VSchema to decide which shards are involved, sends the query to them, and merges the results.
+- **VTTablet** runs next to every MySQL instance, as a sidecar. It manages the MySQL process, pools connections, enforces query rules and limits, and takes part in replication and resharding workflows.
+- **The topology service** is a consistent key-value store, typically etcd (ZooKeeper and Consul are also supported). It holds cluster metadata: keyspaces, shards, which tablets are primaries and replicas, and the VSchema.
+- **vtctld** and the **vtctldclient** CLI are the administrative interface for schema changes, VSchema updates, and workflows.
+- **VTOrc** detects failed primaries and repairs replication, handling automatic failover.
+
+The data model uses a few Vitess-specific terms. A **keyspace** is a logical database. A keyspace is either unsharded (one shard) or sharded. Each **shard** covers a range of **keyspace IDs** and is named after that range, for example `-80` and `80-` for a two-way split. Each shard is a normal MySQL primary with its own replicas.
+
+Because every shard is plain MySQL, the storage engine, replication, and backup tools are the ones MySQL teams already know. Vitess adds the layer that makes those shards behave like one database.
+
+### Citus: coordinator, workers, and distributed tables
+
+Citus is an extension for PostgreSQL, originally developed by Citus Data, which Microsoft acquired in 2019. Since Citus 11 the entire extension, including features that were previously commercial such as the online shard rebalancer, is open source.
+
+A Citus cluster is a set of PostgreSQL servers with the extension installed:
+
+- **The coordinator** stores the metadata about distributed tables and shards. Clients connect to it, and its distributed planner decides how to execute each query across the cluster.
+- **Worker nodes** store the shards. Each shard is an ordinary PostgreSQL table, named after the logical table with a shard ID suffix, such as `orders_102008`.
+- **Metadata sync**: since Citus 11, metadata is propagated to workers by default, so applications can also send queries to workers, which spreads the query-routing load.
+
+Citus classifies tables into three kinds:
+
+- **Distributed tables** are hash-partitioned across shards by a distribution column.
+- **Reference tables** are small tables copied in full to every node, so they can be joined locally with any shard.
+- **Local tables** live only on the coordinator, like in plain PostgreSQL.
+
+Citus 12 added **schema-based sharding**, where each PostgreSQL schema becomes a unit of distribution. That is useful for multi-tenant applications that already use one schema per tenant.
+
+Because Citus is an extension, the SQL surface is PostgreSQL's, and PostgreSQL features such as JSONB, extensions, and the standard tooling remain available, with the limits described below for queries that span shards.
+
+For a deeper walkthrough of Citus alone, see [Postgres sharding with Citus](/resources/blog/postgres-sharding-with-citus).
+
+## Choosing a Sharding Key
+
+Both systems depend on the same principle: the sharding key should be the column most queries filter on, and related rows should share it so they end up on the same shard. In most SaaS systems that column is the tenant or customer ID.
+
+### Vitess: vindexes and the VSchema
+
+In Vitess, sharding is described by the **VSchema**, a JSON document per keyspace. A **vindex** maps a column value to a keyspace ID, which determines the shard. Every table in a sharded keyspace needs a **primary vindex**.
+
+A typical VSchema for a `customer` keyspace:
+
+```json
+{
+  "sharded": true,
+  "vindexes": {
+    "hash": {
+      "type": "hash"
+    }
+  },
+  "tables": {
+    "customers": {
+      "column_vindexes": [
+        { "column": "customer_id", "name": "hash" }
+      ]
+    },
+    "orders": {
+      "column_vindexes": [
+        { "column": "customer_id", "name": "hash" }
+      ],
+      "auto_increment": {
+        "column": "order_id",
+        "sequence": "orders_seq"
+      }
+    }
+  }
+}
+```
+
+Both tables use the `hash` vindex on `customer_id`, so a customer and all of their orders land on the same shard. Common vindex types include `hash`, `xxhash`, `numeric`, and `unicode_loose_md5` for strings. **Lookup vindexes** such as `consistent_lookup_unique` maintain a separate mapping table, so queries on a secondary column (for example an order number) can be routed to one shard instead of all of them.
+
+MySQL `AUTO_INCREMENT` cannot produce unique IDs across shards, so Vitess provides **sequences** backed by a table in an unsharded keyspace:
+
+```sql
+-- In an unsharded keyspace, for example "commerce"
+CREATE TABLE orders_seq (
+  id BIGINT,
+  next_id BIGINT,
+  cache BIGINT,
+  PRIMARY KEY (id)
+) COMMENT 'vitess_sequence';
+
+INSERT INTO orders_seq (id, next_id, cache) VALUES (0, 1, 1000);
+```
+
+The unsharded keyspace's VSchema must list the table with `"type": "sequence"`. The sharded VSchema above is then applied with the admin CLI:
+
+```bash
+vtctldclient ApplyVSchema --vschema-file vschema_customer.json customer
+```
+
+### Citus: the distribution column
+
+In Citus, you create the table normally, then distribute it:
+
+```sql
+CREATE TABLE customers (
+  customer_id bigint PRIMARY KEY,
+  name        text NOT NULL,
+  created_at  timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE TABLE orders (
+  customer_id bigint NOT NULL,
+  order_id    bigint GENERATED ALWAYS AS IDENTITY,
+  total       numeric(12,2) NOT NULL,
+  created_at  timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY (customer_id, order_id)
+);
+
+SELECT create_distributed_table('customers', 'customer_id');
+SELECT create_distributed_table('orders', 'customer_id', colocate_with => 'customers');
+```
+
+A few details matter:
+
+- **Primary keys and unique constraints must include the distribution column.** That is why the `orders` primary key is `(customer_id, order_id)` instead of `order_id` alone.
+- **Co-location**: tables distributed on columns of the same type with the same shard count are co-located, meaning shards with the same hash range sit on the same node. The explicit `colocate_with` makes the intent clear. Co-located tables can be joined and can have foreign keys between them.
+- **Shard count** defaults to the value of `citus.shard_count` (32 unless changed) and can be set per table.
+
+Small lookup tables become reference tables:
+
+```sql
+CREATE TABLE countries (
+  code char(2) PRIMARY KEY,
+  name text NOT NULL
+);
+
+SELECT create_reference_table('countries');
+```
+
+### Comparing the two models
+
+The concepts map fairly directly: a Vitess primary vindex plays the role of a Citus distribution column, and a Vitess unsharded keyspace or reference table plays the role of a Citus reference table. The main differences:
+
+- Vitess keeps sharding metadata outside the database, in the VSchema. Citus keeps it inside PostgreSQL catalogs and exposes it through SQL functions.
+- Vitess has lookup vindexes for routing by secondary columns. In Citus, a query that does not filter on the distribution column is sent to all shards in parallel.
+- Vitess sequences replace auto-increment. Citus supports sequences and identity columns on distributed tables directly.
+
+## Resharding and Rebalancing
+
+Shard layouts rarely stay correct forever. Both systems can reshape a running cluster.
+
+### Vitess: VReplication workflows
+
+Vitess resharding is built on **VReplication**, which copies rows and then streams ongoing changes from the MySQL binary log. Splitting a single-shard keyspace into two shards looks like this, once target tablets for `-80` and `80-` are running:
+
+```bash
+vtctldclient Reshard --workflow cust2cust --target-keyspace customer \
+  create --source-shards '0' --target-shards '-80,80-'
+
+# Check progress and verify data consistency
+vtctldclient Reshard --workflow cust2cust --target-keyspace customer show
+vtctldclient VDiff --workflow cust2cust --target-keyspace customer create
+
+# Cut over reads and writes to the new shards
+vtctldclient Reshard --workflow cust2cust --target-keyspace customer switchtraffic
+
+# Clean up the workflow and source shard state
+vtctldclient Reshard --workflow cust2cust --target-keyspace customer complete
+```
+
+The `switchtraffic` step can be reversed with `reversetraffic` until the workflow is completed, which gives a rollback path. The related **MoveTables** workflow moves tables between keyspaces, and is also the usual way to import an existing MySQL database into Vitess.
+
+Resharding in Vitess changes the number of shards, splitting or merging keyspace ID ranges. The data stays on regular MySQL servers throughout.
+
+### Citus: adding nodes and moving shards
+
+In Citus, the number of shards is usually fixed at table creation, and capacity is added by moving shards to new nodes:
+
+```sql
+-- Register a new worker
+SELECT citus_add_node('worker-3.internal', 5432);
+
+-- Move shards in the background to balance data across nodes
+SELECT citus_rebalance_start();
+
+-- Watch progress
+SELECT * FROM citus_rebalance_status();
+```
+
+The rebalancer uses logical replication to move shards while the tables remain available for reads and writes, with a short blocking period at cutover for each shard group.
+
+To change the shard count or distribution column itself, Citus provides `alter_distributed_table`, which rewrites the table into a new layout:
+
+```sql
+SELECT alter_distributed_table('orders', shard_count => 64, cascade_to_colocated => true);
+```
+
+Because this rewrites the data, it is heavier than a rebalance and should be planned. A common practice is to start with more shards than nodes, so that growth can be handled by rebalancing alone.
+
+## Cross-Shard Queries
+
+### Vitess
+
+VTGate routes a query to a single shard when it can derive the keyspace ID from the `WHERE` clause. Otherwise it performs a **scatter** to all shards and merges the results, handling ordering, limits, and many aggregations at the VTGate layer. Vitess supports a large and growing portion of MySQL syntax across shards, including many joins and subqueries, but not every construct can be executed in a distributed way. Unsupported queries return an error rather than a silently wrong result. Checking the query plan is straightforward:
+
+```sql
+VEXPLAIN PLAN SELECT c.name, COUNT(*)
+FROM customers c JOIN orders o ON o.customer_id = c.customer_id
+GROUP BY c.name;
+```
+
+Joins between tables sharded on the same vindex and joined on that column can be pushed down to each shard. Other joins are executed by VTGate, which fetches rows from one side and issues queries for the other.
+
+### Citus
+
+Citus classifies queries in a similar way:
+
+- **Router queries** filter on the distribution column and go to one shard. They behave like normal PostgreSQL queries, with full SQL support.
+- **Multi-shard queries** run in parallel on all shards. Aggregates are split into partial aggregates on workers and a final step on the coordinator.
+- **Joins** between co-located tables on the distribution column, and joins with reference tables, are pushed down to workers. Joins between non-co-located tables can run as **repartition joins** when `citus.enable_repartition_joins` is on, at extra network cost.
+
+```sql
+EXPLAIN
+SELECT c.name, count(*)
+FROM customers c
+JOIN orders o ON o.customer_id = c.customer_id
+GROUP BY c.name;
+```
+
+Parallel multi-shard execution is one of the reasons Citus is also used for real-time analytics on large event tables, not only for transactional scale-out.
+
+## Cross-Shard Transactions
+
+This is where the two systems differ most in default behavior.
+
+**Vitess** executes a transaction that touches a single shard with full MySQL guarantees. For transactions that write to several shards, the default transaction mode commits on each shard in sequence. If one commit fails partway through, the others may already be committed, so the transaction is not atomic across shards. Vitess offers a two-phase commit mode (`TWOPC`) for atomic distributed commits, and it has been significantly reworked in recent releases; check the documentation for your version before relying on it. The common design approach is to choose vindexes so that nearly all transactions stay on one shard.
+
+**Citus** uses two-phase commit automatically when a transaction modifies data on multiple nodes, so multi-shard writes are atomic. It also runs distributed deadlock detection. What neither system provides by default is a single, globally consistent snapshot for reads that span shards: a multi-shard read can observe a concurrent multi-shard write as committed on some shards and not yet on others. For most applications that shard by tenant, this rarely matters, but it is worth knowing for reporting queries.
+
+## Operational Model
+
+### Running Vitess
+
+Vitess has many moving parts: VTGate, VTTablet, MySQL, the topology service, vtctld, and VTOrc. It is designed for automated environments. The **Vitess Operator for Kubernetes**, maintained by PlanetScale, is the most common way to run it, describing a whole cluster as a custom resource. Vitess can also be deployed on virtual machines with your own orchestration.
+
+**PlanetScale** is a managed database service built on Vitess. It adds features such as schema change workflows on top of Vitess online DDL, and removes the need to run the Vitess components yourself.
+
+### Running Citus
+
+A Citus cluster is a set of PostgreSQL servers, so it can be run with the same tooling as PostgreSQL: packages from the Citus repositories, Docker images, or Kubernetes operators that support installing extensions. High availability for each node is handled the way it is for PostgreSQL, with streaming replication and a failover manager.
+
+**Azure Cosmos DB for PostgreSQL**, formerly Hyperscale (Citus), is Microsoft's managed Citus service. Microsoft has also been adding Citus-based elastic clusters to Azure Database for PostgreSQL flexible server. Outside Azure, running Citus is a self-managed or third-party affair.
+
+### Day-to-day operations
+
+- **Schema changes**: Vitess applies DDL across shards and offers online DDL strategies. Citus propagates DDL on distributed tables from the coordinator to all shards.
+- **Backups**: Vitess tablets use Vitess backup tooling around MySQL. Citus nodes are backed up like PostgreSQL servers, and consistent cluster-wide restore points are available through `citus_create_restore_point`.
+- **Tools and drivers**: both expose standard wire protocols, so ordinary MySQL or PostgreSQL clients work. A client such as [Chat2DB](https://chat2db.ai/download) can connect to VTGate as a MySQL server or to the Citus coordinator as a PostgreSQL server, which is convenient for inspecting VSchema-driven routing results or running `citus_shards` queries while testing.
+
+## Decision Guide
+
+Choose **Vitess** when:
+
+- Your application is built on MySQL, and moving to PostgreSQL is not on the table.
+- You need to scale write-heavy OLTP beyond one primary, with a clear tenant or entity key.
+- You want the option of a managed service in PlanetScale, or you already run Kubernetes and are comfortable operating the Vitess components.
+- You need lookup vindexes to route efficiently by several different keys.
+
+Choose **Citus** when:
+
+- Your application is built on PostgreSQL and relies on its features, such as JSONB, rich indexing, or extensions.
+- You want sharding that feels like PostgreSQL, including SQL functions for managing distribution and atomic multi-node transactions by default.
+- Your workload mixes multi-tenant OLTP with parallel analytical queries over large tables.
+- Azure is your cloud, or you are comfortable running PostgreSQL clusters yourself.
+
+Consider **neither** yet when:
+
+- A single well-tuned server with replicas still has headroom.
+- Native partitioning or archiving would solve the size problem.
+- Your queries rarely filter on a single key, so almost everything would become a cross-shard scatter.
+
+## Summary
+
+Vitess and Citus solve the same problem from opposite directions. Vitess surrounds MySQL with a proxy, sidecars, and a topology service, and describes sharding in a VSchema of vindexes. Citus extends PostgreSQL from within, distributing tables by a column and managing shards through SQL. Vitess reshards by streaming data into new shard ranges; Citus rebalances fixed shards across nodes. Citus makes multi-node writes atomic by default, while Vitess encourages single-shard transactions and offers two-phase commit as an option.
+
+In practice the choice is usually made by the database you already run. MySQL shops that need to scale out look at Vitess; PostgreSQL shops look at Citus. Within that choice, the sharding key design matters far more than the tool: pick it carefully, keep related data together, and test your real query mix before committing.

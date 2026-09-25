@@ -1,0 +1,320 @@
+---
+title: "Postgres lock_timeout for Safe Migrations"
+description: "Use Postgres lock_timeout to stop migrations from queueing behind ACCESS EXCLUSIVE locks: SET LOCAL, retry loops, related timeouts and finding blockers."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: September 25, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# Postgres lock_timeout for Safe Migrations
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="September 25, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+A schema migration that should take milliseconds can take a production database down. The typical story: someone runs `ALTER TABLE orders ADD COLUMN note text`, which is a metadata-only change, yet the application suddenly stops responding and connection pools fill up. Nothing is wrong with the `ALTER TABLE` itself. The problem is that it is **waiting for a lock**, and while it waits, every other query on that table waits behind it.
+
+The defense is the `lock_timeout` setting. This guide explains why the pile-up happens, how to use postgres lock_timeout in migrations with `SET` and `SET LOCAL`, how to write retry loops, how lock_timeout differs from `statement_timeout`, `idle_in_transaction_session_timeout`, `deadlock_timeout` and the PostgreSQL 17 `transaction_timeout`, how to find the blocking session with `pg_locks` and `pg_blocking_pids()`, and how to set sensible per-role defaults.
+
+## Why one ALTER TABLE can block everything
+
+Most `ALTER TABLE` forms need an **ACCESS EXCLUSIVE** lock, the strongest table lock in PostgreSQL. It conflicts with every other lock mode, including the **ACCESS SHARE** lock that a plain `SELECT` takes. (The full conflict matrix is covered in [Postgres lock modes explained](/resources/blog/postgres-lock-table-lock-modes).)
+
+PostgreSQL grants heavyweight locks in a **fair queue**. When a new request conflicts with a request already waiting in the queue, the new request waits too, even if it would be compatible with the locks currently held. That rule prevents writers from being starved by an endless stream of readers, but it has a nasty side effect for DDL:
+
+1. A long-running query or an idle open transaction holds ACCESS SHARE on `orders`.
+2. Your migration requests ACCESS EXCLUSIVE on `orders` and waits for step 1 to finish.
+3. Every new `SELECT`, `INSERT` or `UPDATE` on `orders` requests a lock that conflicts with the *queued* ACCESS EXCLUSIVE request, so they queue behind the migration.
+
+The migration itself is not running; it is just standing in line. But because it is at the front of the line, the table is effectively offline until the original blocker finishes, which could be minutes or hours.
+
+### Reproducing the queue
+
+Create a table and open three psql sessions.
+
+```sql
+CREATE TABLE orders (
+    id         bigserial PRIMARY KEY,
+    customer   int NOT NULL,
+    created_at timestamptz NOT NULL DEFAULT now()
+);
+INSERT INTO orders (customer) SELECT g % 1000 FROM generate_series(1, 10000) g;
+```
+
+**Session A** holds an ACCESS SHARE lock by reading inside an open transaction:
+
+```sql
+BEGIN;
+SELECT count(*) FROM orders;
+-- leave the transaction open
+```
+
+**Session B** runs the migration. It hangs:
+
+```sql
+ALTER TABLE orders ADD COLUMN note text;
+```
+
+**Session C** runs an ordinary query. It also hangs, even though it is compatible with Session A:
+
+```sql
+SELECT * FROM orders WHERE id = 1;
+```
+
+As soon as Session A commits or rolls back, B runs, finishes almost instantly, and C proceeds. In production, Session C is your entire application.
+
+## The fix: set lock_timeout before DDL
+
+`lock_timeout` aborts any statement that waits longer than the given time to acquire a lock on a table, index, row or other object. The default is 0, which means wait forever. When it fires you get:
+
+```text
+ERROR:  canceling statement due to lock timeout
+```
+
+with SQLSTATE **55P03** (`lock_not_available`). Retry Session B from the demo with a timeout:
+
+```sql
+SET lock_timeout = '3s';
+ALTER TABLE orders ADD COLUMN note text;
+-- after 3 seconds, if Session A is still open:
+-- ERROR:  canceling statement due to lock timeout
+```
+
+The migration fails, but it gives up its place in the queue, and the application traffic stuck behind it proceeds immediately. A failed migration you can retry is far better than an outage.
+
+How long should the timeout be? It is a trade-off between the chance of acquiring the lock and the maximum stall your application can tolerate. Values from a few hundred milliseconds to a few seconds are common for busy OLTP tables; pick one that is shorter than your application's request timeouts, so that queued requests do not fail while the migration waits.
+
+### SET versus SET LOCAL
+
+`SET lock_timeout` changes the value for the rest of the session. In a migration tool that reuses connections, that can leak into later work. Inside a transaction block, `SET LOCAL` limits the change to the current transaction; it reverts automatically at `COMMIT` or `ROLLBACK`:
+
+```sql
+BEGIN;
+SET LOCAL lock_timeout = '2s';
+ALTER TABLE orders ADD COLUMN note text;
+ALTER TABLE orders ALTER COLUMN note SET DEFAULT '';
+COMMIT;
+```
+
+`SET LOCAL` outside a transaction block has no lasting effect and only emits a warning, so make sure your migration framework actually wraps the step in a transaction. You can also use the function form, which is convenient in scripts:
+
+```sql
+SELECT set_config('lock_timeout', '2s', true);  -- true = local to transaction
+```
+
+### Timeouts apply per lock wait, not per migration
+
+`lock_timeout` limits each individual lock wait. A transaction that runs five `ALTER TABLE` statements on five tables could wait up to five times the timeout in total. More importantly, once the first statement acquires ACCESS EXCLUSIVE on `orders`, that lock is held **until the transaction ends**. If the second statement then waits for a lock on `customers`, all traffic on `orders` is blocked during that wait too.
+
+Guidelines for multi-step migrations:
+
+1. Keep each transaction to the fewest possible locks, ideally one table.
+2. Order steps so that the ones most likely to wait come first, before you hold anything valuable.
+3. Do not mix slow work (data backfills, full table rewrites) with ACCESS EXCLUSIVE in the same transaction.
+
+## Retry loops for migrations
+
+With a short lock_timeout, some attempts will fail on a busy system. The answer is to retry automatically with a pause, so that the migration slips in during a gap between long queries.
+
+### Shell loop around psql
+
+```bash
+#!/usr/bin/env bash
+set -u
+
+for attempt in $(seq 1 20); do
+  if psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -q <<'SQL'
+BEGIN;
+SET LOCAL lock_timeout = '2s';
+ALTER TABLE orders ADD COLUMN IF NOT EXISTS note text;
+COMMIT;
+SQL
+  then
+    echo "migration applied on attempt $attempt"
+    exit 0
+  fi
+  echo "attempt $attempt failed, retrying"
+  sleep $(( attempt < 5 ? attempt : 5 ))
+done
+
+echo "giving up" >&2
+exit 1
+```
+
+`ADD COLUMN IF NOT EXISTS` makes the step idempotent, so a retry after an ambiguous failure (for example a lost connection after commit) is harmless. This script retries on any error; in a real tool, inspect the SQLSTATE and only retry on 55P03, so that a genuine error such as a type mismatch fails fast.
+
+### Retrying inside a DO block
+
+For a single statement you can also retry on the server. Each `BEGIN ... EXCEPTION` block is a subtransaction, and a failed subtransaction releases the locks it was waiting for:
+
+```sql
+DO $$
+DECLARE
+    attempt int := 0;
+BEGIN
+    PERFORM set_config('lock_timeout', '1s', true);
+    LOOP
+        attempt := attempt + 1;
+        BEGIN
+            ALTER TABLE orders ADD COLUMN IF NOT EXISTS note text;
+            RAISE NOTICE 'applied on attempt %', attempt;
+            EXIT;
+        EXCEPTION WHEN lock_not_available THEN
+            IF attempt >= 10 THEN
+                RAISE;
+            END IF;
+            PERFORM pg_sleep(least(attempt, 5));
+        END;
+    END LOOP;
+END
+$$;
+```
+
+The whole `DO` block is one transaction, so only use this pattern when nothing earlier in the transaction holds locks that matter. Otherwise those locks are held through all the sleeps. The client-side loop is the safer default.
+
+### Make the locked part as small as possible
+
+lock_timeout is most effective combined with migration patterns that minimize time spent holding strong locks:
+
+- `ADD COLUMN` with no default, or with a non-volatile default, is a metadata-only change in PostgreSQL 11 and later. Volatile defaults such as `clock_timestamp()` still rewrite the table.
+- Build indexes with `CREATE INDEX CONCURRENTLY`, which takes a SHARE UPDATE EXCLUSIVE lock and does not block reads or writes (it cannot run inside a transaction block).
+- Add foreign keys and check constraints as `NOT VALID` first, then run `ALTER TABLE ... VALIDATE CONSTRAINT` separately, which takes a weaker lock while scanning.
+- Watch out for autovacuum: a regular autovacuum yields to a conflicting lock request automatically, but an anti-wraparound autovacuum does not, so a migration may time out repeatedly while one is running on the table.
+
+## lock_timeout versus other timeouts
+
+PostgreSQL has several timeouts that are easy to confuse. They are complementary:
+
+| Setting | What it limits | What happens | SQLSTATE |
+| --- | --- | --- | --- |
+| `lock_timeout` | Time a statement waits for any single lock | Statement canceled, session stays | 55P03 |
+| `statement_timeout` | Total run time of a statement, including lock waits | Statement canceled, session stays | 57014 |
+| `idle_in_transaction_session_timeout` | Time a session sits idle inside an open transaction (9.6+) | Session terminated | 25P03 |
+| `transaction_timeout` | Total duration of a transaction (PostgreSQL 17+) | Session terminated | 25P04 |
+| `deadlock_timeout` | Wait before running the deadlock check | Deadlock check runs; may abort one transaction with 40P01 | 40P01 if a deadlock is found |
+
+### statement_timeout
+
+`statement_timeout` caps total execution time, and lock waits count toward it. It is a blunt instrument for migrations: an operation that legitimately takes a while once it has its lock would be killed, and a timeout long enough for the work allows a long queue. lock_timeout targets exactly the waiting phase. The documentation notes that setting lock_timeout to a value equal to or larger than a nonzero statement_timeout is pointless, since the statement timeout would always fire first. See [manage Postgres query timeouts](/resources/blog/manage-postgres-query-timeout) for statement_timeout in depth.
+
+### idle_in_transaction_session_timeout
+
+This setting attacks the most common *cause* of blocked migrations: a session that opened a transaction, took locks, and then went idle, like Session A in the demo. It terminates such sessions after the given time. It does not make your migration fail fast, but it caps how long anyone can block it by forgetting to commit. Details are in [idle in transaction](/resources/blog/idle-in-transaction).
+
+### deadlock_timeout
+
+Despite the name, `deadlock_timeout` (default 1s) does not cancel anything by itself. It is how long a backend waits on a lock before checking whether it is part of a deadlock, which is a relatively expensive check. It is also the threshold for `log_lock_waits`: when that is on, any lock wait longer than deadlock_timeout is logged, which is very useful for spotting migrations and queries that queue. Deadlocks are covered in [deadlock detected in Postgres](/resources/blog/postgres-deadlock-detected-fix).
+
+### transaction_timeout (PostgreSQL 17)
+
+PostgreSQL 17 added `transaction_timeout`, which terminates the session if any transaction (or a single statement outside an explicit transaction) runs longer than the given time, whether it is active or idle. It is a good safety net against runaway sessions but, because it ends the session, it is not a substitute for lock_timeout in migration code.
+
+## Finding the blocker
+
+When a migration times out repeatedly, find out who holds the conflicting lock.
+
+### pg_blocking_pids()
+
+`pg_blocking_pids(pid)` (PostgreSQL 9.6+) returns the array of process IDs blocking a given backend, including both sessions holding conflicting locks and sessions ahead of it in the queue with conflicting requests. Use it to list every waiting session and its blockers:
+
+```sql
+SELECT a.pid,
+       pg_blocking_pids(a.pid)      AS blocked_by,
+       a.wait_event_type,
+       a.wait_event,
+       now() - a.query_start        AS waiting_for,
+       left(a.query, 80)            AS query
+FROM pg_stat_activity a
+WHERE cardinality(pg_blocking_pids(a.pid)) > 0
+ORDER BY waiting_for DESC;
+```
+
+In the three-session demo, Session C lists Session B's PID (queued ahead with a conflicting request), and Session B lists Session A's PID. Then inspect the root blocker:
+
+```sql
+SELECT pid, usename, application_name, state,
+       now() - xact_start AS xact_age,
+       left(query, 80)    AS last_query
+FROM pg_stat_activity
+WHERE pid = 12345;   -- a PID from the blocked_by array
+```
+
+A state of `idle in transaction` with a large `xact_age` is the classic culprit.
+
+### pg_locks for one table
+
+To see every lock held or requested on a specific table:
+
+```sql
+SELECT l.pid,
+       l.mode,
+       l.granted,
+       a.state,
+       now() - a.xact_start AS xact_age,
+       left(a.query, 60)    AS query
+FROM pg_locks l
+JOIN pg_stat_activity a ON a.pid = l.pid
+WHERE l.locktype = 'relation'
+  AND l.relation = 'orders'::regclass
+ORDER BY l.granted DESC, xact_age DESC;
+```
+
+Rows with `granted = true` are current holders; `granted = false` are waiters. During the demo you would see Session A's granted AccessShareLock, Session B's waiting AccessExclusiveLock, and Session C's waiting AccessShareLock.
+
+Once you know the blocker, you can wait for it, ask its owner to finish, or end it with `pg_cancel_backend(pid)` or `pg_terminate_backend(pid)`. The differences are explained in [how to cancel or kill a Postgres query](/resources/blog/postgres-kill-query-cancel-terminate). A GUI client such as [Chat2DB](https://chat2db.ai/download) is handy here, because you can keep these diagnostic queries saved and rerun them against the production connection while the migration retries.
+
+## Per-role and per-database defaults
+
+Relying on every developer to remember `SET lock_timeout` is fragile. PostgreSQL lets you attach defaults to roles and databases, which apply to new sessions:
+
+```sql
+-- The role your migration tool connects as
+ALTER ROLE migrator SET lock_timeout = '3s';
+
+-- Only when that role connects to a specific database
+ALTER ROLE migrator IN DATABASE app SET lock_timeout = '3s';
+
+-- A database-wide default for every role
+ALTER DATABASE app SET lock_timeout = '10s';
+
+-- Check what is configured
+SELECT coalesce(r.rolname, 'ALL') AS role,
+       coalesce(d.datname, 'ALL') AS database,
+       s.setconfig
+FROM pg_db_role_setting s
+LEFT JOIN pg_roles    r ON r.oid = s.setrole
+LEFT JOIN pg_database d ON d.oid = s.setdatabase;
+```
+
+Precedence from highest to lowest is: an explicit `SET` in the session, role-in-database settings, role settings, database settings, then `postgresql.conf`. An explicit `SET LOCAL` in the migration always wins.
+
+You can also pass the value per connection without touching the catalog:
+
+```bash
+PGOPTIONS='-c lock_timeout=3s' psql "$DATABASE_URL" -f migration.sql
+```
+
+Setting a short lock_timeout globally in `postgresql.conf` is generally discouraged: it affects every session, including application transactions that are expected to wait briefly on row locks, and it would turn normal contention into errors. Apply it to migration roles and let application roles use a longer value or none.
+
+To remove a default:
+
+```sql
+ALTER ROLE migrator RESET lock_timeout;
+```
+
+## Migration checklist
+
+1. Connect as a role with a default `lock_timeout`, and still set `SET LOCAL lock_timeout` explicitly in each migration transaction.
+2. Keep each transaction to one table and the minimum number of ACCESS EXCLUSIVE statements.
+3. Wrap the step in a retry loop that only retries on SQLSTATE 55P03, with a bounded number of attempts and a short pause.
+4. Make steps idempotent with `IF NOT EXISTS` and `IF EXISTS`.
+5. Use `CREATE INDEX CONCURRENTLY` and `NOT VALID` constraints to avoid long strong locks.
+6. Set `idle_in_transaction_session_timeout` for application roles so forgotten transactions cannot block DDL indefinitely.
+7. Enable `log_lock_waits` so queued lock requests show up in the log.
+8. If retries keep failing, use `pg_blocking_pids()` and `pg_locks` to find and deal with the blocker.
+
+## Summary
+
+An `ALTER TABLE` waiting for ACCESS EXCLUSIVE does not just wait; it blocks every later query on the table because of PostgreSQL's fair lock queue. Setting postgres lock_timeout before DDL turns an unbounded outage into a quick, retryable failure. Combine `SET LOCAL lock_timeout` with retry loops and lock-light migration patterns, understand how it differs from statement, idle-in-transaction, deadlock and transaction timeouts, and set per-role defaults so every migration is protected by default.

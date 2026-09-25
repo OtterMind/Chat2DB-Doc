@@ -1,0 +1,307 @@
+---
+title: "Fix: Could Not Serialize Access in Postgres"
+description: "Why Postgres raises could not serialize access due to concurrent update (SQLSTATE 40001), two-session repros, safe retry loops, and how to reduce conflicts."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: September 25, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# Fix: Could Not Serialize Access in Postgres
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="September 25, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+If you run PostgreSQL transactions at `REPEATABLE READ` or `SERIALIZABLE`, sooner or later you will see one of these:
+
+```text
+ERROR:  could not serialize access due to concurrent update
+```
+
+```text
+ERROR:  could not serialize access due to read/write dependencies among transactions
+DETAIL:  Reason code: Canceled on identification as a pivot, during commit attempt.
+HINT:  The transaction might succeed if retried.
+```
+
+Both carry SQLSTATE **40001** (`serialization_failure`). Neither one is a bug in PostgreSQL or a sign of data corruption. They are PostgreSQL keeping its promise: at these isolation levels it guarantees that your transaction sees a stable view of the data, and when it cannot keep that promise it aborts the transaction instead of letting it commit a wrong result. The fix is almost never "turn it off"; it is to **retry** correctly and to design transactions so that conflicts are rare.
+
+This article explains exactly when each message appears, reproduces both in two psql sessions, shows retry patterns that are safe in production, lists the techniques that reduce postgres serialization failures, and contrasts them with deadlocks (SQLSTATE 40P01).
+
+## Background: snapshots and isolation levels
+
+PostgreSQL uses MVCC: each transaction reads from a **snapshot** describing which other transactions had committed. What changes between isolation levels is how long that snapshot lives:
+
+- **READ COMMITTED** (the default) takes a new snapshot for every statement. If an `UPDATE` finds a row that a concurrent transaction has changed and committed, it waits, then re-checks the newest version of the row and continues. It never raises 40001 for this situation.
+- **REPEATABLE READ** takes one snapshot at the first statement and uses it for the whole transaction. Reads are perfectly stable, but it cannot silently update a row version it cannot see.
+- **SERIALIZABLE** is REPEATABLE READ plus **Serializable Snapshot Isolation (SSI)**, which tracks read/write dependencies between concurrent transactions and aborts one if the combination could not have happened in any serial order.
+
+For a deeper walk-through of the levels, see [Postgres transaction isolation levels](/resources/blog/postgres-transaction-isolation-levels), and for the tuple versioning underneath, [Postgres MVCC explained](/resources/blog/postgres-mvcc-explained).
+
+## Error 1: could not serialize access due to concurrent update
+
+### When it happens
+
+This error occurs at REPEATABLE READ or SERIALIZABLE when your transaction runs `UPDATE`, `DELETE`, `MERGE`, or `SELECT ... FOR UPDATE / FOR SHARE` on a row that **another transaction modified (or locked for update) and committed after your snapshot was taken**. Your snapshot says the row looks one way, the latest committed version is different, and PostgreSQL refuses to overwrite a version you never saw. That would be a lost update.
+
+If the other transaction rolled back instead of committing, your statement proceeds normally. If it is still running, your statement waits for it to finish first.
+
+### Reproducing it
+
+Set up a table:
+
+```sql
+CREATE TABLE account (
+    id      int PRIMARY KEY,
+    balance numeric NOT NULL
+);
+INSERT INTO account VALUES (1, 100), (2, 100);
+```
+
+Now open two psql sessions and run the steps in order.
+
+**Session A:**
+
+```sql
+BEGIN ISOLATION LEVEL REPEATABLE READ;
+SELECT balance FROM account WHERE id = 1;   -- 100; snapshot taken here
+```
+
+**Session B:**
+
+```sql
+BEGIN;
+UPDATE account SET balance = balance - 30 WHERE id = 1;
+COMMIT;
+```
+
+**Session A:**
+
+```sql
+UPDATE account SET balance = balance + 10 WHERE id = 1;
+-- ERROR:  could not serialize access due to concurrent update
+ROLLBACK;
+```
+
+Session A's snapshot still shows 100. Had PostgreSQL allowed the update, it would have to choose between applying `+10` to a value A never saw (breaking repeatable read) or writing 110 and discarding B's change (a lost update). It chooses neither and aborts.
+
+Two things to notice:
+
+1. The snapshot is taken at the **first statement** of the transaction, not at `BEGIN`. If Session A had not run the `SELECT` before Session B committed, A's snapshot would include B's change and no error would occur.
+2. If Session B were still open (not yet committed) when A issued the `UPDATE`, A would block until B finished. Commit gives the error; rollback lets A continue.
+
+The same error appears with `DELETE`, and with `SELECT ... FOR UPDATE` on the changed row. If the other transaction deleted the row, the message becomes `could not serialize access due to concurrent delete`.
+
+## Error 2: could not serialize access due to read/write dependencies among transactions
+
+### When it happens
+
+This one only occurs at **SERIALIZABLE**. SSI records which rows (or pages, or whole relations) each serializable transaction has read using **predicate locks** (shown in `pg_locks` as `SIReadLock`). These locks never block anything; they are bookkeeping. When a transaction writes data that a concurrent serializable transaction read, PostgreSQL records a read/write dependency ("rw-conflict"). If it finds a transaction with both an incoming and an outgoing rw-conflict among concurrent transactions (a "pivot" in a dangerous structure), it aborts one of them with this error. The abort can happen on a read, a write, or at `COMMIT`.
+
+SSI is conservative. It can raise false positives, for example when predicate locks have been coarsened from rows to pages, so some aborted transactions would actually have been fine. It never produces false negatives: anything that commits is serializable.
+
+### Reproducing write skew
+
+The classic example is an on-call rule: at least one doctor must stay on call.
+
+```sql
+CREATE TABLE doctor (
+    name    text PRIMARY KEY,
+    on_call boolean NOT NULL
+);
+INSERT INTO doctor VALUES ('alice', true), ('bob', true);
+```
+
+**Session A:**
+
+```sql
+BEGIN ISOLATION LEVEL SERIALIZABLE;
+SELECT count(*) FROM doctor WHERE on_call;   -- 2, so Alice may leave
+```
+
+**Session B:**
+
+```sql
+BEGIN ISOLATION LEVEL SERIALIZABLE;
+SELECT count(*) FROM doctor WHERE on_call;   -- 2, so Bob may leave
+UPDATE doctor SET on_call = false WHERE name = 'bob';
+```
+
+**Session A:**
+
+```sql
+UPDATE doctor SET on_call = false WHERE name = 'alice';
+COMMIT;
+```
+
+**Session B:**
+
+```sql
+COMMIT;
+-- ERROR:  could not serialize access due to read/write dependencies among transactions
+-- DETAIL:  Reason code: Canceled on identification as a pivot, during commit attempt.
+-- HINT:  The transaction might succeed if retried.
+```
+
+Which session fails, and at which statement, depends on timing and the exact access paths, so your output may show a slightly different reason code or fail earlier. What is guaranteed is that both cannot commit. Repeat the same steps with `REPEATABLE READ` and both commit happily, leaving nobody on call. The two transactions updated *different* rows, so there is no concurrent-update conflict; only SSI's dependency tracking catches the anomaly.
+
+### Unique violations reported as 40001
+
+At SERIALIZABLE, if a transaction first checks that a key does not exist and then inserts it while a concurrent serializable transaction inserted the same key, PostgreSQL can report a serialization failure instead of a plain unique violation (SQLSTATE 23505). This is intentional: the retry will see the other row and take the "already exists" path in your code.
+
+## Retry logic: the actual fix
+
+The HINT says it plainly: *the transaction might succeed if retried*. Any application that uses REPEATABLE READ or SERIALIZABLE must be prepared to retry. The rules for doing it safely:
+
+1. **Retry the whole transaction, from `BEGIN`.** Re-running only the failed statement is useless, because the transaction is already aborted and the snapshot is stale. Every read that informed the transaction's decisions must be repeated.
+2. **Retry only on retryable errors**: SQLSTATE `40001` (serialization failure) and `40P01` (deadlock). Do not retry on constraint violations or syntax errors.
+3. **Bound the number of attempts** and use exponential backoff with jitter so that the same transactions do not collide again in lockstep.
+4. **Keep side effects out of the transaction body**, or make them idempotent. Sending an email, calling a payment API, or publishing a message inside the retry loop means it can happen several times.
+5. **Make sure the error is not swallowed.** Some ORMs wrap errors; check the underlying SQLSTATE, not the message text.
+
+### Python example with psycopg 3
+
+```python
+import random
+import time
+
+import psycopg
+from psycopg import errors
+
+RETRYABLE = (errors.SerializationFailure, errors.DeadlockDetected)
+
+def transfer(conn, src, dst, amount, max_attempts=5):
+    for attempt in range(1, max_attempts + 1):
+        try:
+            with conn.transaction():
+                conn.execute("SET TRANSACTION ISOLATION LEVEL SERIALIZABLE")
+                row = conn.execute(
+                    "SELECT balance FROM account WHERE id = %s", (src,)
+                ).fetchone()
+                if row is None or row[0] < amount:
+                    raise ValueError("insufficient funds")
+                conn.execute(
+                    "UPDATE account SET balance = balance - %s WHERE id = %s",
+                    (amount, src),
+                )
+                conn.execute(
+                    "UPDATE account SET balance = balance + %s WHERE id = %s",
+                    (amount, dst),
+                )
+            return  # committed
+        except RETRYABLE:
+            if attempt == max_attempts:
+                raise
+            # exponential backoff with full jitter
+            time.sleep(random.uniform(0, 0.05 * 2 ** attempt))
+
+with psycopg.connect("dbname=app", autocommit=True) as conn:
+    transfer(conn, 1, 2, 25)
+```
+
+The connection is opened in autocommit mode so that `conn.transaction()` issues a real `BEGIN` and `COMMIT`. `SET TRANSACTION` must be the first statement in the transaction. Note that `COMMIT` itself can raise 40001 at SERIALIZABLE, and the context manager surfaces that exception, so the loop handles it too.
+
+### Idempotency
+
+Retries are safe for the database because a failed attempt is rolled back completely. The risk is outside the database. Common patterns:
+
+- Store an **idempotency key** supplied by the client in a table with a unique constraint, inside the same transaction as the work. A replay after a lost network response then finds the key and returns the previous result.
+- Put outgoing messages in an **outbox table** within the transaction and have a separate process publish them after commit.
+- Only acknowledge a queue message after the transaction commits.
+
+### Retrying inside a function does not work
+
+You cannot catch a serialization failure inside a PL/pgSQL function and retry within the same top-level transaction, because the snapshot belongs to the outer transaction and a retry would see exactly the same data. Retries must be driven by the client, or by a procedure that commits between attempts.
+
+## Reducing conflicts
+
+Retries handle correctness; these techniques make retries rare.
+
+### Keep transactions short
+
+The window for conflict is the time between a transaction's snapshot and its commit. Do not hold a transaction open while waiting for user input, calling external services, or processing large batches in the application. Compute what you can before `BEGIN`, then do the reads and writes quickly. The [idle in transaction](/resources/blog/idle-in-transaction) article covers how to find sessions that break this rule.
+
+### Use indexes so predicate locks stay fine-grained
+
+At SERIALIZABLE, a sequential scan takes a predicate lock on the **whole relation**, which means any insert or update into that table by a concurrent serializable transaction registers a conflict. An index scan locks only the index pages and tuples it touched. Adding an index that matches your `WHERE` clause can dramatically reduce false-positive failures:
+
+```sql
+CREATE INDEX ON doctor (on_call);
+
+-- Inspect predicate locks held by open serializable transactions
+SELECT locktype, relation::regclass, page, tuple, pid
+FROM pg_locks
+WHERE mode = 'SIReadLock';
+```
+
+On tiny test tables the planner may still pick a sequential scan, so you will see relation-level `SIReadLock` entries until the table grows.
+
+### Lock explicitly with SELECT FOR UPDATE
+
+If a transaction reads a row and later updates it based on what it read, lock it at read time. At READ COMMITTED this alone prevents lost updates without any 40001 errors:
+
+```sql
+BEGIN;  -- READ COMMITTED
+SELECT balance FROM account WHERE id = 1 FOR UPDATE;
+UPDATE account SET balance = balance + 10 WHERE id = 1;
+COMMIT;
+```
+
+At REPEATABLE READ, `FOR UPDATE` still raises the concurrent-update error if the row changed after the snapshot, but taking the lock early means competing transactions queue up behind the first rather than all proceeding and failing at the end. For write skew like the doctor example, you can materialize the conflict by locking the rows the decision depends on (`SELECT ... FROM doctor WHERE on_call FOR UPDATE`), which turns an SSI abort into ordinary blocking.
+
+Even simpler: a single atomic statement such as `UPDATE account SET balance = balance - 30 WHERE id = 1 AND balance >= 30` often removes the read-then-write pattern entirely.
+
+### Declare read-only transactions
+
+Marking a transaction `READ ONLY` helps SSI rule out some conflicts. For long reports at SERIALIZABLE, use `DEFERRABLE`:
+
+```sql
+BEGIN ISOLATION LEVEL SERIALIZABLE READ ONLY DEFERRABLE;
+SELECT ...;  -- long-running report
+COMMIT;
+```
+
+A deferrable read-only transaction may wait at its first statement until it can obtain a snapshot that is guaranteed safe. After that it runs without taking predicate locks and cannot fail with a serialization error or cause others to fail. The trade-off is that start-up delay.
+
+### Use the lowest isolation level that is correct
+
+SERIALIZABLE is excellent when you have complex invariants spread across rows. Where a transaction touches one row, READ COMMITTED with atomic statements or row locks is simpler and never raises 40001. Mixing levels is fine, but remember that SSI only protects transactions that run at SERIALIZABLE; a READ COMMITTED writer does not participate in the dependency tracking.
+
+## max_pred_locks settings
+
+SSI stores predicate locks in shared memory. When a transaction accumulates too many fine-grained locks, PostgreSQL **promotes** them to coarser ones: many tuple locks on a page become a page lock, and many page locks on a relation become a relation lock. Coarser locks mean more false-positive conflicts. Three settings control this:
+
+| Setting | Default | Effect |
+| --- | --- | --- |
+| `max_pred_locks_per_transaction` | 64 | Sizes the shared predicate lock table (average per transaction); requires restart |
+| `max_pred_locks_per_relation` | -2 | Page/tuple locks on one relation before promotion to a relation lock; negative means `max_pred_locks_per_transaction` divided by its absolute value |
+| `max_pred_locks_per_page` | 2 | Tuple locks on one page before promotion to a page lock |
+
+If you see many failures on workloads touching many rows, or `out of shared memory` errors with a hint to increase `max_pred_locks_per_transaction`, raising these values can help. Check first with the `pg_locks` query above whether you see many relation-level `SIReadLock` entries where you would expect tuple-level ones.
+
+## 40001 versus 40P01 deadlocks
+
+A **deadlock** (`ERROR: deadlock detected`, SQLSTATE 40P01) is a different problem. Two transactions each hold a heavyweight lock the other one needs, so both would wait forever. After `deadlock_timeout` the deadlock detector aborts one of them. Deadlocks happen at any isolation level, including READ COMMITTED, and are caused by acquiring locks in inconsistent order.
+
+| | 40001 serialization failure | 40P01 deadlock |
+| --- | --- | --- |
+| Isolation levels | REPEATABLE READ, SERIALIZABLE | Any |
+| Cause | Snapshot conflict or SSI dependency cycle | Circular lock wait |
+| Involves waiting? | Not necessarily | Always |
+| Main prevention | Short transactions, indexes, explicit locking | Consistent lock ordering |
+| Retry safe? | Yes | Yes |
+
+Both are retryable with the same loop. For the deadlock side, see [how to fix deadlock detected in Postgres](/resources/blog/postgres-deadlock-detected-fix).
+
+## Monitoring serialization failures
+
+Serialization failures appear in the server log as errors. Recent PostgreSQL versions do not have a dedicated counter for them in `pg_stat_database`, so log-based monitoring is the practical approach: grep or parse for SQLSTATE 40001 with `log_line_prefix` including `%e`. Also track retry counts in your application; a sudden rise usually means a new hot row or a missing index. When investigating, being able to run the two-session repros side by side helps a lot, and [Chat2DB](https://app.chat2db.ai) makes it easy to open two consoles against the same database and step through them.
+
+## Summary
+
+- **Concurrent update** (40001): REPEATABLE READ or SERIALIZABLE transaction tried to modify or lock a row changed by a transaction that committed after its snapshot.
+- **Read/write dependencies** (40001): SERIALIZABLE only; SSI found a dependency pattern that could produce a non-serializable result.
+- Retry the **entire** transaction on 40001 and 40P01, with bounded attempts, backoff with jitter and idempotent side effects.
+- Reduce failures with short transactions, indexes that keep predicate locks fine-grained, `SELECT ... FOR UPDATE` or atomic statements, `READ ONLY DEFERRABLE` for reports, and appropriate `max_pred_locks_*` settings.

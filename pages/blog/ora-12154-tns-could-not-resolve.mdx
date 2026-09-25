@@ -1,0 +1,327 @@
+---
+title: "Fix ORA-12154: TNS Could Not Resolve Identifier"
+description: "Fix ORA-12154 TNS could not resolve the connect identifier specified: sqlnet.ora, TNS_ADMIN, tnsnames.ora syntax, EZConnect, tnsping, JDBC and Instant Client."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: September 25, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# Fix ORA-12154: TNS Could Not Resolve Identifier
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="September 25, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+`ORA-12154: TNS:could not resolve the connect identifier specified` is one of the most common Oracle errors, and one of the most misunderstood. It looks like a network problem, but in almost every case the network was never touched. The error is raised on the client, before any packet is sent to the database server, because the Oracle Net layer could not turn the name you typed (the "connect identifier") into a full connect descriptor with a host, port, and service name.
+
+That distinction is the key to fixing it quickly. If you remember one thing from this article, remember this: ORA-12154 is a name-resolution failure on the client machine. Firewalls, listeners, and database instances are not involved yet.
+
+This guide explains how Oracle Net resolves names, where it looks for configuration files, the syntax mistakes in `tnsnames.ora` that trigger the error, how to bypass the whole mechanism with EZConnect, and what changes when you use JDBC thin or Instant Client. It ends with a step-by-step checklist.
+
+## ORA-12154 vs ORA-12514 vs ORA-12541
+
+Three errors are regularly confused with each other. Knowing which one you have tells you which layer is failing.
+
+| Error | Message | What it means | Where to look |
+|-------|---------|---------------|---------------|
+| ORA-12154 | TNS:could not resolve the connect identifier specified | The client could not find the alias in any configured naming method | Client: `sqlnet.ora`, `tnsnames.ora`, `TNS_ADMIN` |
+| ORA-12541 | TNS:no listener | Name resolved, host reached, but nothing is listening on that port | Server: listener status, port, firewall |
+| ORA-12514 | TNS:listener does not currently know of service requested in connect descriptor | Name resolved, listener reached, but the service name is not registered with it | Server: `lsnrctl status`, `SERVICE_NAME` spelling, instance registration |
+
+A useful mental model: ORA-12154 happens before the connection attempt, ORA-12541 happens at the TCP level, and ORA-12514 happens inside the listener conversation. If you fix a 12154 and immediately get a 12541 or 12514, that is progress, not a new problem: the client now knows where to go, and you have moved on to the server side.
+
+Newer releases (Oracle Database 23ai clients) print more descriptive text for these errors, often naming the alias and the file that was searched. The error numbers remain the same, so everything below still applies.
+
+## How Oracle Net Resolves a Connect Identifier
+
+When you run something like:
+
+```bash
+sqlplus scott/tiger@SALESDB
+```
+
+the client takes `SALESDB` and tries to turn it into a connect descriptor such as:
+
+```text
+(DESCRIPTION=
+  (ADDRESS=(PROTOCOL=TCP)(HOST=db01.example.com)(PORT=1521))
+  (CONNECT_DATA=(SERVICE_NAME=salesdb.example.com)))
+```
+
+How it does that is controlled by the naming methods listed in `sqlnet.ora`.
+
+### NAMES.DIRECTORY_PATH in sqlnet.ora
+
+The `NAMES.DIRECTORY_PATH` parameter lists the naming methods in the order they are tried:
+
+```text
+# sqlnet.ora
+NAMES.DIRECTORY_PATH = (TNSNAMES, EZCONNECT)
+```
+
+Common values:
+
+- `TNSNAMES` – look the alias up in a local `tnsnames.ora` file.
+- `EZCONNECT` – interpret the identifier as `host:port/service_name`.
+- `LDAP` – look the alias up in a directory server (Oracle Internet Directory or Active Directory), configured through `ldap.ora`.
+
+If the parameter is not set, the Oracle documentation lists the default as `tnsnames, ldap, ezconnect`. If someone has set it to only `(LDAP)` or only `(EZCONNECT)`, a perfectly good `tnsnames.ora` will be ignored and every alias lookup will fail with ORA-12154. This is worth checking early, especially on machines configured by a central team.
+
+### Where the client looks for configuration files
+
+The client looks for `sqlnet.ora` and `tnsnames.ora` in a well-defined order:
+
+1. The directory named by the `TNS_ADMIN` environment variable, if it is set.
+2. On Windows, a `TNS_ADMIN` value in the registry under the Oracle home key (for example `HKEY_LOCAL_MACHINE\SOFTWARE\ORACLE\KEY_OraClient19Home1`).
+3. The default network admin directory of the Oracle home in use: `$ORACLE_HOME/network/admin`. For read-only Oracle homes (18c and later), this becomes `$ORACLE_BASE_HOME/network/admin`.
+4. For Instant Client 12.2 and later, the `network/admin` subdirectory of the Instant Client directory.
+
+The important consequence is that `TNS_ADMIN` wins. If a stale `TNS_ADMIN` points to an old share or an empty folder, the client never looks at the `tnsnames.ora` you have been carefully editing in `$ORACLE_HOME/network/admin`.
+
+### Multiple Oracle homes
+
+Developer workstations and application servers often have several Oracle clients installed: a full client, an Instant Client bundled with a tool, a 32-bit client for an old application, and a 64-bit client for everything else. Each one has its own `network/admin` directory.
+
+Which one is used depends on which Oracle binaries are loaded, which on Windows is usually determined by the `PATH` order, and on Linux by `ORACLE_HOME`, `PATH`, and `LD_LIBRARY_PATH`. A classic scenario:
+
+- You add an entry to `C:\oracle\product\19.0.0\client_1\network\admin\tnsnames.ora`.
+- `sqlplus` from that home connects fine.
+- A 32-bit application loads a different 32-bit client whose `tnsnames.ora` does not have the entry, and fails with ORA-12154.
+
+The simplest fix for multi-home machines is to keep one shared `tnsnames.ora` and point every client at it with a single system-wide `TNS_ADMIN`.
+
+## Finding Out Which Files Are Actually Used
+
+Before editing anything, confirm which files the client is reading.
+
+### Using tnsping
+
+`tnsping` ships with the full client and database installations (it is not included in the basic Instant Client package). It resolves an alias and then contacts the listener:
+
+```bash
+tnsping SALESDB
+```
+
+Typical output when resolution works:
+
+```text
+Used parameter files:
+/u01/app/oracle/product/19.0.0/client_1/network/admin/sqlnet.ora
+
+Used TNSNAMES adapter to resolve the alias
+Attempting to contact (DESCRIPTION = (ADDRESS = (PROTOCOL = TCP)(HOST = db01.example.com)(PORT = 1521)) (CONNECT_DATA = (SERVICE_NAME = salesdb.example.com)))
+OK (10 msec)
+```
+
+Read three things from this output:
+
+1. **Used parameter files** shows which `sqlnet.ora` was loaded, which tells you which directory the client is using.
+2. **Used ... adapter** tells you which naming method resolved the name.
+3. **Attempting to contact** shows the fully resolved descriptor, so you can check host, port, and service.
+
+If `tnsping` itself reports `TNS-03505: Failed to resolve name`, you have reproduced the ORA-12154 condition outside your application, which makes it much easier to iterate.
+
+Note that `tnsping` only proves the listener answered. It does not validate the service name, so a successful `tnsping` followed by ORA-12514 is entirely possible.
+
+### Tracing file access on Linux
+
+If `tnsping` is not available, you can see exactly which files a client opens:
+
+```bash
+strace -f -e trace=open,openat sqlplus -L scott/tiger@SALESDB 2>&1 | grep -E 'sqlnet.ora|tnsnames.ora|ldap.ora'
+```
+
+Lines ending in `ENOENT` show locations that were checked but did not contain the file. The last successful open of `tnsnames.ora` is the one that matters.
+
+On Windows, Process Monitor from Sysinternals gives the same information: filter on the process name and on paths containing `tnsnames`.
+
+## tnsnames.ora Syntax Pitfalls
+
+Once you know which file is being read, look for syntax problems. The parser is strict and its error reporting is minimal: a malformed entry usually just means the alias "does not exist", which surfaces as ORA-12154.
+
+### A correct entry
+
+```text
+SALESDB =
+  (DESCRIPTION =
+    (ADDRESS = (PROTOCOL = TCP)(HOST = db01.example.com)(PORT = 1521))
+    (CONNECT_DATA =
+      (SERVER = DEDICATED)
+      (SERVICE_NAME = salesdb.example.com)
+    )
+  )
+```
+
+### Pitfall 1: unbalanced parentheses
+
+Every `(` needs a matching `)`. A missing closing parenthesis in one entry can corrupt the parsing of that entry and every entry after it in the file, so an alias that looks perfect can fail because of a typo twenty lines above it. Editors with bracket matching help; so does keeping entries short and consistently formatted.
+
+### Pitfall 2: indentation and the first column
+
+The alias name must start in the first column. Continuation lines must be indented by at least one space. The parser treats any line that starts in column one as the beginning of a new entry, so this breaks the entry:
+
+```text
+SALESDB =
+(DESCRIPTION =
+  (ADDRESS = (PROTOCOL = TCP)(HOST = db01.example.com)(PORT = 1521))
+  (CONNECT_DATA = (SERVICE_NAME = salesdb.example.com))
+)
+```
+
+The line `(DESCRIPTION =` starts in column one, so it is read as a new, invalid entry. Indent it and the entry works. The reverse mistake, an alias that is accidentally indented by a space, has the same effect: the alias is treated as a continuation of the previous entry.
+
+### Pitfall 3: NAMES.DEFAULT_DOMAIN
+
+If `sqlnet.ora` contains:
+
+```text
+NAMES.DEFAULT_DOMAIN = example.com
+```
+
+then an unqualified alias such as `SALESDB` is looked up as `SALESDB.example.com`. If `tnsnames.ora` only contains `SALESDB =`, resolution fails. You have two consistent options:
+
+- Remove `NAMES.DEFAULT_DOMAIN` and use short aliases everywhere.
+- Keep it and name the entry `SALESDB.example.com =` in `tnsnames.ora`.
+
+This setting is often inherited from a template installation, so check for it even if you did not set it yourself.
+
+### Pitfall 4: duplicates, hidden characters, and IFILE
+
+- **Duplicate aliases**: if the same alias appears twice, behavior is hard to predict. Keep aliases unique.
+- **Hidden characters**: files copied from wikis, chat messages, or word processors can contain non-breaking spaces or smart quotes. Retype the entry or run `cat -A tnsnames.ora` on Linux to reveal unexpected bytes.
+- **IFILE**: `tnsnames.ora` can include other files with `IFILE = /path/to/other_tnsnames.ora`. If the included file is missing or unreadable by the OS user, the aliases defined there disappear.
+
+### Pitfall 5: a password containing @
+
+This is not a `tnsnames.ora` problem but it produces the same error. In:
+
+```bash
+sqlplus scott/Pa@ssw0rd@SALESDB
+```
+
+SQL*Plus treats everything after the first `@` as the connect identifier, so it tries to resolve `ssw0rd@SALESDB` and fails with ORA-12154. Quote the password:
+
+```bash
+sqlplus 'scott/"Pa@ssw0rd"@SALESDB'
+```
+
+Or connect without a password on the command line and let SQL*Plus prompt for it:
+
+```bash
+sqlplus scott@SALESDB
+```
+
+## Generating and Validating Entries
+
+Hand-written entries are where most of the syntax pitfalls above come from. Chat2DB has a free browser tool, the [Oracle tnsnames.ora generator](https://chat2db.ai/tools/oracle-tnsnames-generator), that builds correctly indented, balanced entries from host, port, and service name and can check an existing entry for common mistakes. It is handy when you need to produce entries for a team or sanity-check one that "looks right" but refuses to resolve.
+
+For a broader walkthrough of the file format itself, see [configuring tnsnames for easy database connections](/resources/blog/oracle-database-client-configuring-tns-names-for-easy-database-connection).
+
+## EZConnect: Skipping tnsnames.ora Entirely
+
+EZConnect (Easy Connect) lets you put the address directly in the connect string, so there is nothing to look up:
+
+```bash
+sqlplus scott@//db01.example.com:1521/salesdb.example.com
+```
+
+The general form is `//host:port/service_name`. Port defaults to 1521 if omitted. Starting with Oracle 19c, the Easy Connect Plus syntax also accepts protocol prefixes and parameters:
+
+```bash
+sqlplus scott@"tcps://db01.example.com:2484/salesdb.example.com?wallet_location=/opt/wallet"
+```
+
+EZConnect is an excellent diagnostic tool. If this works:
+
+```bash
+sqlplus scott@//db01.example.com:1521/salesdb.example.com
+```
+
+but this fails with ORA-12154:
+
+```bash
+sqlplus scott@SALESDB
+```
+
+then the network, listener, and service are fine and the problem is purely local configuration. For EZConnect to work, `EZCONNECT` must be allowed in `NAMES.DIRECTORY_PATH` (it is in the default list).
+
+Keep in mind that EZConnect uses `SERVICE_NAME`, not `SID`. If a legacy database is only reachable by SID, you need a `tnsnames.ora` entry with `(SID = ORCL)` in `CONNECT_DATA`, or a JDBC URL in the `host:port:SID` form.
+
+## JDBC Thin Driver Specifics
+
+The JDBC thin driver is pure Java and does not use the Oracle client libraries. That changes the rules:
+
+- It does not read `ORACLE_HOME`. It only finds `tnsnames.ora` if you tell it where the file is.
+- It does not honor `NAMES.DIRECTORY_PATH` in the same way a native client does.
+
+Three URL styles are common:
+
+```text
+# EZConnect style, no tnsnames.ora needed
+jdbc:oracle:thin:@//db01.example.com:1521/salesdb.example.com
+
+# Full descriptor inline
+jdbc:oracle:thin:@(DESCRIPTION=(ADDRESS=(PROTOCOL=TCP)(HOST=db01.example.com)(PORT=1521))(CONNECT_DATA=(SERVICE_NAME=salesdb.example.com)))
+
+# Alias, resolved from a tnsnames.ora
+jdbc:oracle:thin:@SALESDB
+```
+
+For the alias form, point the driver at the directory containing `tnsnames.ora`:
+
+```bash
+java -Doracle.net.tns_admin=/opt/oracle/network/admin -jar app.jar
+```
+
+Recent drivers (18.3 and later) also accept `TNS_ADMIN` as a URL parameter, which is convenient for tools that only let you edit the URL:
+
+```text
+jdbc:oracle:thin:@SALESDB?TNS_ADMIN=/opt/oracle/network/admin
+```
+
+If the driver cannot resolve the alias, it may report ORA-12154, or, depending on driver version, it may treat the alias as a hostname and report an unknown host error. Either way, the fix is the same: supply `tns_admin`, or use the EZConnect or full-descriptor URL.
+
+Oracle Cloud Autonomous Database wallets follow the same logic. The wallet zip contains `tnsnames.ora` and `sqlnet.ora`; unzip it and set `TNS_ADMIN` (or `oracle.net.tns_admin`) to that folder. Also check that `sqlnet.ora` inside the wallet has a `WALLET_LOCATION` pointing to the correct directory, because the default value uses a placeholder path.
+
+## Instant Client Specifics
+
+Instant Client has no `ORACLE_HOME`, which surprises people who move from a full client:
+
+- Put `tnsnames.ora` and `sqlnet.ora` in `instantclient_19_x/network/admin` (supported from 12.2), or set `TNS_ADMIN` to any directory you like.
+- The basic package does not include `tnsping`. Use EZConnect with `sqlplus` (from the SQL*Plus package) as your diagnostic instead.
+- Drivers built on Instant Client, such as python-oracledb in thick mode, node-oracledb, ODBC, and many GUI tools, inherit the same lookup rules. python-oracledb in its default thin mode behaves more like JDBC thin and accepts a `config_dir` parameter for the location of `tnsnames.ora`.
+
+```python
+import oracledb
+
+# Thin mode: tell the driver where tnsnames.ora lives
+conn = oracledb.connect(
+    user="scott",
+    password="tiger",
+    dsn="SALESDB",
+    config_dir="/opt/oracle/network/admin",
+)
+```
+
+## Troubleshooting Checklist
+
+Work through these steps in order. Each one rules out a layer.
+
+1. **Confirm the exact error number.** ORA-12154 is client-side resolution. If you actually have ORA-12541 or ORA-12514, go to the server side instead.
+2. **Test with EZConnect.** Run `sqlplus user@//host:port/service_name`. If it works, the server is fine and the problem is local configuration.
+3. **Check for an @ in the password.** Quote it or let the tool prompt for it.
+4. **Find the active configuration directory.** Check `echo $TNS_ADMIN` (Linux/macOS) or `echo %TNS_ADMIN%` (Windows), the registry on Windows, and `tnsping` output. Use `strace` or Process Monitor if needed.
+5. **Check for multiple Oracle homes.** Identify which client your application loads (32-bit vs 64-bit, full vs Instant Client) and make sure its `network/admin` has the entry, or point everything to one `TNS_ADMIN`.
+6. **Inspect sqlnet.ora.** Confirm `NAMES.DIRECTORY_PATH` includes `TNSNAMES`. Check whether `NAMES.DEFAULT_DOMAIN` requires a domain-qualified alias.
+7. **Validate tnsnames.ora syntax.** Alias in column one, continuation lines indented, parentheses balanced, no duplicates, no hidden characters, all `IFILE` targets present.
+8. **Check file permissions.** The OS user running the application must be able to read the file. Service accounts often cannot read files in a developer's home directory.
+9. **For JDBC thin, supply the location.** Set `-Doracle.net.tns_admin` or `?TNS_ADMIN=` in the URL, or switch to an EZConnect URL.
+10. **Restart the application.** Environment variables such as `TNS_ADMIN` are read at process start. An IDE, application server, or Windows service started before you changed the variable will not see the new value.
+
+## Summary
+
+ORA-12154 means the client could not translate a name into an address. The fix is almost always in one of four places: the `TNS_ADMIN` or Oracle home the client is really using, the naming methods in `sqlnet.ora`, the syntax of the `tnsnames.ora` entry, or the way the connect string is typed. EZConnect gives you a quick way to prove the server side is healthy, and `tnsping` tells you which files are in play.
+
+Once the connection works, you can save it in a SQL client so you do not have to repeat the exercise. [Chat2DB](https://chat2db.ai/download) supports Oracle connections by host, port, and service name as well as by TNS alias, and adds an AI-assisted SQL editor on top, which is useful when you move on from connecting to actually querying the database.

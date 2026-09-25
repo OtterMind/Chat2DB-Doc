@@ -1,0 +1,286 @@
+---
+title: "pgcrypto: Postgres Password Hash & Encryption"
+description: "Use PostgreSQL pgcrypto to hash passwords with crypt and bcrypt, compute digests and HMACs, encrypt columns with pgp_sym_encrypt, and keep keys out of logs."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: September 25, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# pgcrypto: Postgres Password Hash & Encryption
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="September 25, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+`pgcrypto` is the cryptography extension that ships with PostgreSQL's contrib modules. It gives SQL access to password hashing with salts, cryptographic digests, HMACs, random bytes, and OpenPGP-compatible symmetric and public-key encryption. With it you can hash a password or encrypt a column in a single SQL statement, without adding a library to your application.
+
+That convenience comes with a trade-off that many tutorials skip: when the database does the cryptography, the secret material (plaintext passwords and encryption keys) has to travel to the database server, where logs, monitoring views, and extensions may capture it. This guide covers how to use each part of `pgcrypto` correctly and then spends a full section on key management so you can decide where the encryption boundary should sit.
+
+## Installing the extension
+
+`pgcrypto` is part of the standard contrib package. On most Linux distributions it is installed together with the server (for example `postgresql-contrib` on older Debian and Ubuntu packages, or included in the main server package on newer ones). Enable it per database:
+
+```sql
+CREATE EXTENSION IF NOT EXISTS pgcrypto;
+
+-- Confirm the installed version
+SELECT extname, extversion FROM pg_extension WHERE extname = 'pgcrypto';
+```
+
+Since PostgreSQL 13, `pgcrypto` is marked as a **trusted** extension, which means a non-superuser who has `CREATE` privilege on the database can install it. Managed services such as Amazon RDS, Azure Database for PostgreSQL, and Google Cloud SQL generally allow it as well; some require you to allow-list the extension first in the service configuration.
+
+A good practice is to install extensions into a dedicated schema and grant usage explicitly:
+
+```sql
+CREATE SCHEMA IF NOT EXISTS crypto;
+CREATE EXTENSION IF NOT EXISTS pgcrypto WITH SCHEMA crypto;
+GRANT USAGE ON SCHEMA crypto TO app_user;
+```
+
+If you do this, call the functions with the schema prefix (`crypto.crypt(...)`) or add the schema to the role's `search_path`. The examples below assume the functions are on the search path.
+
+## A note on gen_random_uuid
+
+Older articles tell you to install `pgcrypto` to get `gen_random_uuid()`. That is no longer necessary: since **PostgreSQL 13**, `gen_random_uuid()` is a built-in core function. `pgcrypto` still provides a function with the same name for compatibility, but new schemas do not need the extension for UUID primary keys:
+
+```sql
+CREATE TABLE session (
+    id         uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    created_at timestamptz NOT NULL DEFAULT now()
+);
+```
+
+PostgreSQL 18 also adds a built-in `uuidv7()` function for time-ordered UUIDs, which is worth considering for large tables where insert locality matters.
+
+For raw random bytes, such as tokens or salts you manage yourself, `pgcrypto` offers `gen_random_bytes`, which draws from a cryptographically strong random source:
+
+```sql
+SELECT encode(gen_random_bytes(32), 'hex') AS api_token;
+```
+
+## Password hashing with crypt and gen_salt
+
+Passwords must never be stored in plaintext or encrypted with a reversible key. They should be run through a slow, salted, one-way hash. `pgcrypto` provides this through two functions:
+
+- `gen_salt(type [, iter_count])` generates a random salt string that also encodes the algorithm and cost.
+- `crypt(password, salt)` computes the hash. The output includes the algorithm, cost, and salt, so the hash is self-describing.
+
+The supported algorithms for `gen_salt` are `des`, `xdes`, `md5`, and `bf`. Use **`bf`** (Blowfish-based bcrypt). DES and MD5 variants exist for compatibility with old systems and are too fast to resist modern brute-force attacks.
+
+### Step 1: create the table
+
+```sql
+CREATE TABLE app_account (
+    id            bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    email         text NOT NULL UNIQUE,
+    password_hash text NOT NULL
+);
+```
+
+The hash is plain text of fixed format, so a `text` column is appropriate.
+
+### Step 2: hash on insert
+
+```sql
+INSERT INTO app_account (email, password_hash)
+VALUES ('ada@example.com', crypt('correct horse battery staple', gen_salt('bf', 10)));
+
+SELECT email, password_hash FROM app_account;
+```
+
+The stored value starts with `$2a$10$`, where `2a` identifies bcrypt and `10` is the cost factor. Each call to `gen_salt` produces a new random salt, so two users with the same password get different hashes.
+
+The second argument to `gen_salt('bf', n)` is the base-2 logarithm of the number of rounds. The allowed range for bcrypt in `pgcrypto` is 4 to 31, and the default is 6, which is low for current hardware. Each increment doubles the work. Choose the highest value that keeps a single login check acceptably fast on your server, and measure it yourself:
+
+```sql
+\timing on
+SELECT crypt('test-password', gen_salt('bf', 10));
+SELECT crypt('test-password', gen_salt('bf', 12));
+```
+
+### Step 3: verify a login
+
+To check a password, call `crypt` with the candidate password and the **stored hash as the salt**. `crypt` extracts the algorithm, cost, and salt from the hash and recomputes it; if the result equals the stored hash, the password is correct:
+
+```sql
+SELECT id
+FROM app_account
+WHERE email = 'ada@example.com'
+  AND password_hash = crypt('correct horse battery staple', password_hash);
+```
+
+A row means success; no row means either the email or the password is wrong. Return the same generic error in both cases so an attacker cannot enumerate valid emails.
+
+### Step 4: raise the cost over time
+
+Because the cost is embedded in each hash, you can raise it gradually. After a successful login, check the cost prefix and rehash if it is below your current target:
+
+```sql
+UPDATE app_account
+SET password_hash = crypt('correct horse battery staple', gen_salt('bf', 12))
+WHERE id = 1
+  AND substring(password_hash FROM 5 FOR 2)::int < 12;
+```
+
+### bcrypt limitations to know
+
+- bcrypt only uses the first 72 bytes of the password. Longer passphrases are truncated silently, which matters for multibyte UTF-8 text.
+- Hashing in the database means the plaintext password is sent to the server in the SQL statement. See the key management section for why this matters and when to hash in the application instead.
+
+## Digests and HMACs
+
+Digests are fast, unsalted, one-way hashes. They are **not** suitable for passwords, but they are the right tool for checksums, deduplication keys, and content fingerprints.
+
+```sql
+SELECT encode(digest('hello world', 'sha256'), 'hex');
+```
+
+`digest` accepts `text` or `bytea` and returns `bytea`. Supported algorithm names include `md5`, `sha1`, `sha224`, `sha256`, `sha384`, and `sha512`; with OpenSSL, other algorithms it supports may also be available. Wrap the result in `encode(..., 'hex')` or `encode(..., 'base64')` for display.
+
+A practical use is detecting duplicate documents:
+
+```sql
+CREATE TABLE document (
+    id   bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    body text NOT NULL
+);
+
+ALTER TABLE document ADD COLUMN content_sha256 bytea
+    GENERATED ALWAYS AS (digest(body, 'sha256')) STORED;
+
+CREATE UNIQUE INDEX document_content_uq ON document (content_sha256);
+```
+
+This works because `digest` is an immutable function, so it can be used in generated columns and index expressions.
+
+An **HMAC** is a keyed digest. Only someone who holds the key can compute or verify it:
+
+```sql
+SELECT encode(hmac('user_id=42&exp=1790000000', 'server-side-secret', 'sha256'), 'hex');
+```
+
+HMACs are useful for signing values, and they solve an important problem with encrypted columns: searching. You will see that below as a "blind index".
+
+## Column encryption with pgp_sym_encrypt
+
+`pgcrypto` implements the encryption part of the OpenPGP standard. The symmetric functions are the most common choice for encrypting individual columns:
+
+- `pgp_sym_encrypt(data text, key text [, options text])` returns `bytea`.
+- `pgp_sym_decrypt(msg bytea, key text [, options text])` returns `text`.
+- `pgp_sym_encrypt_bytea` and `pgp_sym_decrypt_bytea` do the same for binary data.
+
+Each call produces different ciphertext even for the same input, because OpenPGP uses a random session key and salt. The key you pass is a passphrase that is stretched with the OpenPGP S2K algorithm.
+
+### Step 1: store ciphertext in a bytea column
+
+```sql
+CREATE TABLE customer (
+    id        bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    name      text NOT NULL,
+    tax_id    bytea,           -- encrypted
+    tax_id_bi bytea            -- blind index, see below
+);
+```
+
+### Step 2: encrypt on write
+
+```sql
+INSERT INTO customer (name, tax_id)
+VALUES ('Ada Lovelace',
+        pgp_sym_encrypt('123-45-6789', 'demo-key-do-not-use', 'cipher-algo=aes256'));
+```
+
+The options string accepts comma-separated settings. `cipher-algo` selects the cipher (the default is `aes128`; `aes192` and `aes256` are available), `compress-algo` enables compression (`0` none, `1` ZIP, `2` ZLIB), and further options control the S2K key derivation. Compression before encryption can leak information about the plaintext through ciphertext length, so leave it off for short sensitive values.
+
+### Step 3: decrypt on read
+
+```sql
+SELECT name, pgp_sym_decrypt(tax_id, 'demo-key-do-not-use') AS tax_id
+FROM customer;
+```
+
+With the wrong key the function raises an error such as "Wrong key or corrupt data". Keep that in mind: an error means PostgreSQL may log the statement, including the key literal. The next section covers this.
+
+### Step 4: make encrypted values searchable with a blind index
+
+Encrypted values cannot be compared or indexed meaningfully, because the same plaintext produces different ciphertext each time. To support exact-match lookups, store an HMAC of the normalized plaintext next to the ciphertext, using a separate key:
+
+```sql
+UPDATE customer
+SET tax_id_bi = hmac('123-45-6789', 'separate-index-key', 'sha256')
+WHERE id = 1;
+
+CREATE INDEX customer_tax_id_bi_idx ON customer (tax_id_bi);
+
+SELECT id, name
+FROM customer
+WHERE tax_id_bi = hmac('123-45-6789', 'separate-index-key', 'sha256');
+```
+
+A blind index supports equality only. Range queries, sorting, and `LIKE` on encrypted data are not possible without decrypting every row, which defeats indexing. A blind index also reveals which rows share the same value, so do not use it for low-cardinality fields such as a yes/no flag.
+
+### Armored output and public-key encryption
+
+If you need to exchange ciphertext as text, `armor()` converts OpenPGP binary to the ASCII-armored format and `dearmor()` reverses it.
+
+For public-key encryption, the database can encrypt with a public key while only a separate system holding the private key can decrypt:
+
+```sql
+-- Encrypt with a public key (ASCII-armored key text passed through dearmor)
+SELECT pgp_pub_encrypt('sensitive note', dearmor(:'public_key_armored'));
+
+-- Decrypt elsewhere, with the secret key and its passphrase
+SELECT pgp_pub_decrypt(ciphertext, dearmor(:'secret_key_armored'), :'key_passphrase');
+```
+
+The `:'name'` syntax is psql variable interpolation. This pattern is useful for write-only data such as audit notes: an application server that can insert data never needs the private key.
+
+## Key management caveats
+
+`pgcrypto` encrypts data inside the database server. That means the **key must be present in the server process** while the query runs. Everything that can see query text, parameters, or backend memory may also see the key. Before you ship column encryption, walk through each of these exposure points.
+
+### Server logs
+
+- `log_statement = 'all'` or `'mod'` writes the full statement text to the server log, key literal included.
+- `log_min_duration_statement` logs slow statements with their text. If the key is passed as a bind parameter, the parameter values are included in the log detail as well, subject to `log_parameter_max_length`.
+- `log_min_error_statement` defaults to `error`, so any **failed** statement is logged with its text. A mistyped key that triggers "Wrong key or corrupt data" writes the correct-looking key literal straight into the log.
+- `auto_explain`, if enabled, logs query text for slow statements.
+
+Logs are typically less protected than the database: they are rotated to disk, shipped to log aggregators, and read by more people.
+
+### Monitoring views and extensions
+
+- `pg_stat_activity.query` shows the currently running statement text to superusers, the owning role, and members of `pg_read_all_stats`.
+- `pg_stat_statements` normalizes literal constants into placeholders such as `$1` when it records a statement, so a literal key usually does not end up in its view. Do not treat this as a guarantee: keys hard-coded into function bodies or view definitions are stored in the catalog, and some statements are not normalized in the way you might expect. Details of how normalization works are in the [pg_stat_statements guide](/resources/blog/postgres-pg-stat-statements-guide).
+
+### Mitigations
+
+1. **Use bind parameters, never string concatenation.** This avoids literals in statement text and SQL injection at the same time.
+2. **Reduce logging for the roles that handle keys.** A superuser can scope settings to one role, for example `ALTER ROLE crypto_app SET log_statement = 'none'` and `ALTER ROLE crypto_app SET log_min_error_statement = 'panic'`, and set `log_parameter_max_length` and `log_parameter_max_length_on_error` to 0 so parameter values are not logged. Test this carefully, because it also removes useful diagnostics.
+3. **Keep keys out of the database.** Do not store the key in a table or in a function body next to the data it protects. Fetch it at runtime from a secrets manager or KMS in the application and pass it per query.
+4. **Encrypt transport.** Require TLS (`hostssl` entries in `pg_hba.conf` and `sslmode=verify-full` on clients), because keys and plaintext cross the network on every call.
+5. **Plan for rotation.** Store a key version alongside each ciphertext, for example a `smallint` column, so you can re-encrypt in batches with `pgp_sym_encrypt(pgp_sym_decrypt(col, old_key), new_key)` while old and new keys coexist.
+
+### When to encrypt in the application instead
+
+If your threat model includes database administrators, log readers, or compromise of the database host, the cleanest option is often **application-side encryption**: the application encrypts before sending the value, and PostgreSQL only ever stores ciphertext in a `bytea` column. The same logic applies to passwords. Hashing with bcrypt or Argon2 in the application means the plaintext password never reaches the database at all. `pgcrypto` remains a good fit when the database is trusted and the goal is protecting data at rest in backups, replicas, and dumps, or for scripted maintenance where adding application code is impractical.
+
+`pgcrypto` also does not replace disk or volume encryption. Full-disk encryption protects against stolen disks; column encryption protects selected values from anyone who can read the table but lacks the key. Most production systems use both.
+
+## A practical checklist
+
+- Install `pgcrypto` only where needed, preferably in its own schema.
+- Use `gen_random_uuid()` from core for UUIDs; you do not need the extension for that.
+- Hash passwords with `crypt(password, gen_salt('bf', cost))`, choose a cost you have measured, and verify with `crypt(candidate, stored_hash)`.
+- Use `digest` for fingerprints and `hmac` for signatures and blind indexes, never for passwords.
+- Encrypt columns with `pgp_sym_encrypt(..., 'cipher-algo=aes256')` into `bytea`, and leave compression off for short secrets.
+- Pass keys and passwords as bind parameters, review every logging setting, and keep keys in a secrets manager.
+- Record a key version per row so rotation is possible.
+
+When you are experimenting with these functions, a client that shows `bytea` results clearly and keeps your scratch queries organized helps a lot; [Chat2DB](https://app.chat2db.ai/) lets you run the examples above against a test database and inspect hex-encoded output directly in the result grid. Use throwaway keys for experiments, since statements you type into any client may be kept in its history.
+
+## Summary
+
+`pgcrypto` brings solid cryptographic primitives into SQL: bcrypt password hashing through `crypt` and `gen_salt('bf')`, digests and HMACs through `digest` and `hmac`, and OpenPGP column encryption through `pgp_sym_encrypt` and `pgp_pub_encrypt`. The functions are easy to call. The hard part is the boundary: keys and plaintext pass through the server, and PostgreSQL's logging and monitoring features can record them. Use bind parameters, tighten logging for key-handling roles, keep keys outside the database, and move encryption into the application whenever the database itself is not fully trusted.
