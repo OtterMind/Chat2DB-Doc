@@ -1,0 +1,329 @@
+---
+title: "Postgres idle_session_timeout Explained"
+description: "Use idle_session_timeout (PG14+) and pg_terminate_backend to kill idle Postgres connections safely, with per-role settings, PgBouncer and TCP keepalives."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: September 26, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# Postgres idle_session_timeout Explained
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="September 26, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+Every PostgreSQL connection is a separate server process with its own memory. A connection that sits idle for hours still occupies a slot under `max_connections`, and enough of them will eventually produce the error every on-call engineer knows: `FATAL: sorry, too many clients already`. Idle sessions pile up for ordinary reasons: a developer leaves a GUI client open over the weekend, a batch job forgets to close its connection, or an application pool is sized far larger than it needs to be.
+
+PostgreSQL 14 introduced `idle_session_timeout` to deal with exactly this. This guide explains what the setting does and does not do, how to scope it to specific roles and databases, how to find and kill idle connections manually with `pg_stat_activity` and `pg_terminate_backend`, why you should not combine it with a connection pooler such as PgBouncer, and how TCP keepalives and `client_connection_check_interval` handle the related problem of connections whose client has disappeared.
+
+Idle sessions that are **inside an open transaction** are a different and more dangerous problem, because they hold locks and block vacuum. That case is handled by `idle_in_transaction_session_timeout`, covered in detail in our guide to [idle in transaction sessions](/resources/blog/idle-in-transaction). This article focuses on plain idle sessions.
+
+## Idle vs Idle in Transaction
+
+`pg_stat_activity.state` distinguishes several states for client backends:
+
+| State | Meaning | Relevant timeout |
+|-------|---------|------------------|
+| `active` | Executing a query | `statement_timeout` |
+| `idle` | Waiting for a new command, no transaction open | `idle_session_timeout` |
+| `idle in transaction` | Inside a transaction, waiting for the next command | `idle_in_transaction_session_timeout` |
+| `idle in transaction (aborted)` | Inside a failed transaction, waiting for `ROLLBACK` | `idle_in_transaction_session_timeout` |
+
+An `idle` session holds no locks on tables and does not stop vacuum from cleaning up dead rows. Its cost is the connection slot and the memory of the backend process. That is why terminating it is usually low risk for the database, but it can still surprise the client that owned it.
+
+## What idle_session_timeout Does
+
+`idle_session_timeout` terminates any session that has been idle, meaning waiting for a client query and **not** inside an open transaction, for longer than the specified time. Key facts:
+
+- Available in PostgreSQL 14 and later.
+- The value is in milliseconds if no unit is given. `0`, the default, disables it.
+- Any user can change it for their own session (it has `user` context), and it can be set per role, per database, or globally.
+- When it fires, the server closes the connection with the message `FATAL: terminating connection due to idle-session timeout` and SQLSTATE `57P05`.
+
+Check the current value and where it comes from:
+
+```sql
+SHOW idle_session_timeout;
+
+SELECT name, setting, unit, context, source
+FROM pg_settings
+WHERE name IN ('idle_session_timeout',
+               'idle_in_transaction_session_timeout');
+```
+
+Try it in a single session to see the behavior:
+
+```sql
+SET idle_session_timeout = '5s';
+-- wait more than five seconds, then run:
+SELECT 1;
+-- FATAL:  terminating connection due to idle-session timeout
+-- server closed the connection unexpectedly
+```
+
+Note that the client only notices when it next tries to use the connection. psql will usually try to reconnect automatically; application drivers will raise an error.
+
+## Setting It Globally, per Role, or per Database
+
+### Globally
+
+You can set it for the whole cluster with `ALTER SYSTEM` followed by a reload:
+
+```sql
+ALTER SYSTEM SET idle_session_timeout = '30min';
+SELECT pg_reload_conf();
+```
+
+A global setting is rarely the best choice, because it also applies to application pools, poolers, monitoring agents and replication tools that legitimately keep idle connections open. A per-role or per-database setting is usually safer.
+
+### Per role
+
+The common pattern is to apply a timeout to humans and ad-hoc tools, and leave services alone:
+
+```sql
+-- Analysts and developers connecting with GUI clients
+ALTER ROLE analyst SET idle_session_timeout = '30min';
+ALTER ROLE developer SET idle_session_timeout = '2h';
+
+-- Explicitly disable it for the pooled application role
+ALTER ROLE app_pool SET idle_session_timeout = 0;
+```
+
+If individual people log in as their own roles and are members of a group role, remember that role-level settings are **not inherited** through membership. `ALTER ROLE analyst SET ...` applies only to sessions that log in as `analyst`. Set the value on each login role, or have users log in with a role that carries the setting.
+
+### Per database, and per role in one database
+
+```sql
+ALTER DATABASE reporting SET idle_session_timeout = '1h';
+
+ALTER ROLE analyst IN DATABASE reporting SET idle_session_timeout = '15min';
+```
+
+When several levels are set, the most specific wins: role-in-database overrides role, which overrides database, which overrides the server configuration. A session can still override all of them with its own `SET`, since the parameter is user-settable. It is a guardrail against forgotten connections, not an enforcement mechanism against users who deliberately want to stay connected.
+
+These settings apply to **new sessions**. Existing connections keep the value they started with.
+
+To list per-role and per-database settings:
+
+```sql
+SELECT r.rolname,
+       d.datname,
+       s.setconfig
+FROM pg_db_role_setting s
+LEFT JOIN pg_roles    r ON r.oid = s.setrole
+LEFT JOIN pg_database d ON d.oid = s.setdatabase
+ORDER BY r.rolname NULLS FIRST, d.datname NULLS FIRST;
+```
+
+To remove a setting:
+
+```sql
+ALTER ROLE analyst RESET idle_session_timeout;
+```
+
+## Finding Idle Connections
+
+Before setting any timeout, look at what is actually idle. `pg_stat_activity` shows one row per backend, and `state_change` records when the current state began:
+
+```sql
+SELECT pid,
+       usename,
+       datname,
+       application_name,
+       client_addr,
+       state,
+       now() - state_change AS idle_for,
+       backend_start
+FROM pg_stat_activity
+WHERE backend_type = 'client backend'
+  AND state = 'idle'
+ORDER BY state_change;
+```
+
+Filtering on `backend_type = 'client backend'` excludes background workers, autovacuum, WAL senders and other internal processes.
+
+A summary by user and application is more useful for deciding on policy:
+
+```sql
+SELECT usename,
+       application_name,
+       count(*)                          AS idle_sessions,
+       max(now() - state_change)         AS longest_idle
+FROM pg_stat_activity
+WHERE backend_type = 'client backend'
+  AND state = 'idle'
+GROUP BY usename, application_name
+ORDER BY idle_sessions DESC;
+```
+
+Compare the total against capacity:
+
+```sql
+SELECT count(*) FILTER (WHERE state = 'idle')   AS idle,
+       count(*) FILTER (WHERE state = 'active') AS active,
+       count(*)                                 AS total_client_backends,
+       current_setting('max_connections')::int  AS max_connections
+FROM pg_stat_activity
+WHERE backend_type = 'client backend';
+```
+
+Running these three queries in a SQL client such as [Chat2DB](https://chat2db.ai/download) and saving them as snippets gives you a quick connection health check you can rerun whenever the connection count climbs.
+
+## Postgres Kill Idle Connections with pg_terminate_backend
+
+When you need to free slots right now, or on a version older than 14, terminate sessions yourself. `pg_terminate_backend(pid)` sends SIGTERM to the backend, which closes the connection cleanly.
+
+### Step 1: preview what would be killed
+
+Always run the selection as a plain `SELECT` first:
+
+```sql
+SELECT pid, usename, application_name, client_addr,
+       now() - state_change AS idle_for
+FROM pg_stat_activity
+WHERE backend_type = 'client backend'
+  AND state = 'idle'
+  AND state_change < now() - interval '30 minutes'
+  AND pid <> pg_backend_pid()
+  AND usename NOT IN ('replicator', 'pgbouncer', 'monitoring')
+ORDER BY state_change;
+```
+
+The conditions matter:
+
+- `state = 'idle'` excludes active queries and idle-in-transaction sessions.
+- `state_change < now() - interval '30 minutes'` selects only sessions idle for a long time.
+- `pid <> pg_backend_pid()` keeps your own session alive.
+- The `usename` exclusion list protects service accounts. Adjust it for your environment.
+
+### Step 2: terminate
+
+```sql
+SELECT pid,
+       usename,
+       pg_terminate_backend(pid) AS terminated
+FROM pg_stat_activity
+WHERE backend_type = 'client backend'
+  AND state = 'idle'
+  AND state_change < now() - interval '30 minutes'
+  AND pid <> pg_backend_pid()
+  AND usename NOT IN ('replicator', 'pgbouncer', 'monitoring');
+```
+
+Since PostgreSQL 14, `pg_terminate_backend` also accepts a timeout in milliseconds. With `pg_terminate_backend(pid, 5000)`, the function waits up to five seconds for the process to exit and returns true only if it did, which is useful in scripts that need confirmation.
+
+There is a small race in this approach: a session can become active between the moment `pg_stat_activity` is read and the moment the signal arrives. For idle sessions that have been untouched for 30 minutes this is unlikely, but it is one reason the built-in timeout is cleaner than a script.
+
+### Permissions
+
+A superuser can terminate any backend. A regular role can terminate backends of roles it is a member of, and members of the predefined role `pg_signal_backend` can terminate any non-superuser backend:
+
+```sql
+GRANT pg_signal_backend TO ops_admin;
+```
+
+### Scheduling the cleanup
+
+If you cannot use `idle_session_timeout` (for example on PostgreSQL 13 or older) you can run the terminate query on a schedule, with cron and psql, or with the `pg_cron` extension if it is installed:
+
+```sql
+SELECT cron.schedule(
+  'kill-idle-sessions',
+  '*/10 * * * *',
+  $$SELECT pg_terminate_backend(pid)
+    FROM pg_stat_activity
+    WHERE backend_type = 'client backend'
+      AND state = 'idle'
+      AND state_change < now() - interval '30 minutes'
+      AND usename IN ('analyst', 'developer')$$
+);
+```
+
+Here the query uses an allow list (`usename IN`) rather than an exclusion list, which is safer for an unattended job.
+
+## Poolers: Do Not Set idle_session_timeout for Pooled Connections
+
+The PostgreSQL documentation warns against enabling `idle_session_timeout` for connections made through connection-pooling software. The reason is simple. A pooler such as PgBouncer deliberately keeps server connections open and idle so that the next client request can reuse them. If PostgreSQL kills those connections, the pooler may hand a dead connection to a client, which then gets an error on its first query.
+
+Let the pooler manage its own idle connections instead. PgBouncer has several relevant settings in `pgbouncer.ini`:
+
+```ini
+[pgbouncer]
+pool_mode = transaction
+
+; Close server connections that have been idle in the pool this long (seconds)
+server_idle_timeout = 600
+
+; Close server connections after this total lifetime (seconds)
+server_lifetime = 3600
+
+; Close client connections that have been idle this long (seconds, 0 = disabled)
+client_idle_timeout = 0
+
+; Close client connections idle inside a transaction this long (seconds, 0 = disabled)
+idle_transaction_timeout = 0
+```
+
+- `server_idle_timeout` controls how long an unused server connection stays in the pool before PgBouncer closes it. This is the pooler's equivalent of an idle timeout on the PostgreSQL side, but it is done by the component that knows the connection is unused.
+- `server_lifetime` recycles server connections periodically, even if they are in use regularly.
+- `client_idle_timeout` disconnects idle clients from PgBouncer. Use it carefully: application pools often keep client connections open on purpose, and they will get errors if PgBouncer closes them underneath.
+
+The same logic applies to application-side pools (HikariCP, the Go `database/sql` pool, SQLAlchemy and others). They maintain idle connections intentionally. Configure their own idle timeout and maximum lifetime settings, and make sure any server-side timeout you do apply is longer than the pool's maximum connection lifetime, so the pool always retires a connection before the server kills it.
+
+The safest setup is therefore:
+
+```sql
+ALTER ROLE pgbouncer_app SET idle_session_timeout = 0;
+ALTER ROLE analyst       SET idle_session_timeout = '30min';
+```
+
+Pooled service accounts are managed by the pooler; interactive human accounts get a server-side timeout.
+
+## Dead Clients: TCP Keepalives
+
+`idle_session_timeout` targets connections whose client is alive but not doing anything. A different problem is a connection whose client has **vanished**: a laptop closed its lid, a NAT gateway or firewall dropped the connection state, or a container was killed. The server process may not notice for a very long time, because an idle TCP connection exchanges no packets.
+
+TCP keepalives solve this by sending probe packets on idle connections. PostgreSQL exposes the operating system settings as server parameters:
+
+```sql
+ALTER SYSTEM SET tcp_keepalives_idle = 60;      -- seconds of idleness before the first probe
+ALTER SYSTEM SET tcp_keepalives_interval = 10;  -- seconds between probes
+ALTER SYSTEM SET tcp_keepalives_count = 6;      -- unanswered probes before the connection is dropped
+SELECT pg_reload_conf();
+```
+
+A value of `0` for any of them means "use the operating system default". These settings only apply to TCP connections, not Unix-domain sockets, and support depends on the operating system. With the example values, a connection whose peer has disappeared is detected after roughly the idle time plus interval times count. A healthy client simply answers the probes, so keepalives never disconnect a live idle session.
+
+A related parameter, `tcp_user_timeout`, limits how long transmitted data can remain unacknowledged before the connection is closed. It helps when the server is trying to send to a dead peer, and is also OS-dependent.
+
+Keepalives have a second benefit: the periodic probes keep NAT and firewall state alive, so middleboxes are less likely to silently drop long-lived idle connections. Clients can enable keepalives from their side too; libpq supports `keepalives`, `keepalives_idle`, `keepalives_interval` and `keepalives_count` connection parameters.
+
+## Dead Clients During Long Queries: client_connection_check_interval
+
+Keepalives detect dead peers only when the connection is otherwise quiet on the socket. When a backend is busy running a long query, it does not read from the socket until the query finishes. If the client disconnects, perhaps because the user pressed cancel in a tool that just closed the connection, the server keeps running the query, possibly for a long time, and throws the result away.
+
+PostgreSQL 14 added `client_connection_check_interval` for this case:
+
+```sql
+ALTER SYSTEM SET client_connection_check_interval = '10s';
+SELECT pg_reload_conf();
+```
+
+While a query runs, the server checks the socket at this interval and aborts the query if the client has gone. It is disabled by default (`0`), and the check relies on operating system support that is not available everywhere; the documentation notes it currently works on Linux and some other systems. Combining it with TCP keepalives improves detection, because keepalive failures mark the socket as broken, which the check then observes.
+
+## Choosing Values
+
+There are no universally correct numbers. Base the values on how connections are used:
+
+1. **Measure first.** Use the `pg_stat_activity` queries above to see which roles and applications hold idle sessions and for how long.
+2. **Protect services.** Set `idle_session_timeout = 0` explicitly for pooler and application roles, so a future global change does not break them.
+3. **Timeout humans generously.** Choose a value for interactive roles that is long enough for normal work breaks, so people are not disconnected mid-task, but short enough to reclaim connections left open overnight.
+4. **Enable keepalives** with values that detect dead peers in minutes rather than hours.
+5. **Enable client_connection_check_interval** on Linux if users often abandon long queries.
+6. **Keep reserved slots.** `superuser_reserved_connections`, and on PostgreSQL 16 and later `reserved_connections` for members of `pg_use_reserved_connections`, ensure administrators can still connect to fix things when regular slots are exhausted.
+
+## Summary
+
+To handle postgres idle connections, use the right tool for each case. `idle_session_timeout`, available since PostgreSQL 14, disconnects sessions that sit idle outside a transaction; scope it with `ALTER ROLE ... SET` and `ALTER DATABASE ... SET` so it applies to interactive users rather than pooled services. When you need to kill idle Postgres connections immediately, select them from `pg_stat_activity` by `state = 'idle'` and `state_change`, preview the list, then call `pg_terminate_backend`. Leave pooled connections to PgBouncer's `server_idle_timeout` and related settings, and use `tcp_keepalives_*` and `client_connection_check_interval` to clean up connections whose client has disappeared. For sessions that stay open inside a transaction, pair all of this with `idle_in_transaction_session_timeout`.

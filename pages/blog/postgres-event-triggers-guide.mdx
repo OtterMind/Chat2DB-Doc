@@ -1,0 +1,474 @@
+---
+title: "Postgres Event Trigger Guide: Audit and Guard DDL"
+description: "Learn how to create event trigger functions in Postgres: ddl_command_end audit logs, blocking DROP TABLE, table_rewrite warnings, login triggers and pitfalls."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: September 26, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# Postgres Event Trigger Guide: Audit and Guard DDL
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="September 26, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+Ordinary PostgreSQL triggers react to data changes: an `INSERT`, `UPDATE`, `DELETE` or `TRUNCATE` on one table. They cannot see schema changes. If you want to know who ran `ALTER TABLE orders DROP COLUMN note`, or you want to stop anyone from running `DROP TABLE` on a production database, you need a different tool: the **postgres event trigger**.
+
+Event triggers are database-wide. They fire on events such as "a DDL command is about to run" or "an object was dropped", and they run a function you write in PL/pgSQL (or any procedural language that supports them). This guide explains every event type, the special functions you can call inside an event trigger, and the `CREATE EVENT TRIGGER` syntax with its `WHEN TAG IN` filter. It then walks through three practical examples: a DDL audit log, a guard that blocks `DROP TABLE`, and a warning on table rewrites. It finishes with the superuser requirement, how to disable event triggers safely, and the pitfalls that catch people in production.
+
+All examples work on PostgreSQL 16, 17 and 18, except the `login` event and the `event_triggers` setting, which need PostgreSQL 17 or later.
+
+## How Event Triggers Differ from Regular Triggers
+
+A regular trigger is attached to one table and fires for row or statement level data changes. An event trigger is attached to a whole database and fires for a class of commands, mostly DDL. The differences matter when you design one:
+
+| Aspect | Regular trigger | Event trigger |
+|--------|-----------------|---------------|
+| Scope | One table (or view, foreign table) | Current database |
+| Fires on | `INSERT`, `UPDATE`, `DELETE`, `TRUNCATE` | DDL commands, drops, table rewrites, logins |
+| Function return type | `trigger` | `event_trigger` |
+| Who can create it | Table owner (with privileges) | Superuser only |
+| Catalog | `pg_trigger` | `pg_event_trigger` |
+
+Event triggers are per database. If you have ten databases on one cluster and want to audit DDL in all of them, you must create the function and the event trigger in each one (or put them in `template1` so new databases inherit them).
+
+## The Five Event Types
+
+PostgreSQL supports the following events.
+
+### ddl_command_start
+
+Fires just **before** a DDL command executes, for commands such as `CREATE`, `ALTER`, `DROP`, `SECURITY LABEL`, `COMMENT`, `GRANT` and `REVOKE`. At this point, no catalog change has been made and PostgreSQL does not even check whether the target object exists. That makes it a good place to reject a command outright, but you get very little information: only the event name and the command tag.
+
+### ddl_command_end
+
+Fires just **after** a DDL command finishes, but before the transaction commits. The catalog changes are already visible inside the transaction, and the function `pg_event_trigger_ddl_commands()` returns one row per object that was created or altered. This is the event to use for auditing.
+
+### sql_drop
+
+Fires just before `ddl_command_end` for any command that drops database objects. That includes obvious commands like `DROP TABLE`, but also `ALTER TABLE ... DROP COLUMN`, `DROP SCHEMA ... CASCADE` and any command whose side effect removes a dependent object. Inside it, `pg_event_trigger_dropped_objects()` lists every object that was dropped.
+
+### table_rewrite
+
+Fires just before a table is rewritten by `ALTER TABLE` or `ALTER TYPE`. For example, changing a column type from `integer` to `bigint` or adding a column with a volatile default forces PostgreSQL to rewrite every row, and it holds an `ACCESS EXCLUSIVE` lock while it does. Note that `CLUSTER` and `VACUUM FULL` also rewrite tables but do **not** fire this event.
+
+### login (PostgreSQL 17 and later)
+
+Fires when a user connects to the database. This is useful for things like logging connections to a table or initializing session state. It is also the most dangerous event, because an error in the function blocks logins. We cover the safety measures later.
+
+### Commands that are not covered
+
+Event triggers do not fire for DDL on **shared objects**: databases, roles and tablespaces. `CREATE ROLE`, `ALTER DATABASE` and `DROP TABLESPACE` are invisible to them. They also do not fire for commands that target event triggers themselves, which is what lets you drop a broken event trigger.
+
+## Writing an Event Trigger Function
+
+An event trigger function takes no arguments and is declared as `RETURNS event_trigger`. In PL/pgSQL, two special variables are available:
+
+- `TG_EVENT`: the event name, for example `ddl_command_start`
+- `TG_TAG`: the command tag, for example `CREATE TABLE` or `ALTER TABLE`
+
+The simplest possible function just logs what happened:
+
+```sql
+CREATE OR REPLACE FUNCTION log_ddl_event()
+RETURNS event_trigger
+LANGUAGE plpgsql
+AS $$
+BEGIN
+  RAISE NOTICE 'event: %, tag: %', TG_EVENT, TG_TAG;
+END;
+$$;
+```
+
+The function body cannot return a value. Anything you want to record has to be written to a table or raised as a message.
+
+## CREATE EVENT TRIGGER Syntax
+
+The full syntax is:
+
+```sql
+CREATE EVENT TRIGGER name
+    ON event
+    [ WHEN filter_variable IN (filter_value [, ... ]) [ AND ... ] ]
+    EXECUTE { FUNCTION | PROCEDURE } function_name();
+```
+
+The only supported `filter_variable` is `TAG`. Filtering by tag is cheaper and clearer than checking `TG_TAG` inside the function, because PostgreSQL does not even call the function for other commands.
+
+Attach the logging function to `ddl_command_start`:
+
+```sql
+CREATE EVENT TRIGGER trg_log_ddl
+    ON ddl_command_start
+    EXECUTE FUNCTION log_ddl_event();
+```
+
+Now any DDL prints a notice:
+
+```sql
+CREATE TABLE demo (id int);
+-- NOTICE:  event: ddl_command_start, tag: CREATE TABLE
+```
+
+To restrict it to a few commands, add a `WHEN TAG IN` filter:
+
+```sql
+DROP EVENT TRIGGER trg_log_ddl;
+
+CREATE EVENT TRIGGER trg_log_ddl
+    ON ddl_command_start
+    WHEN TAG IN ('CREATE TABLE', 'ALTER TABLE', 'DROP TABLE')
+    EXECUTE FUNCTION log_ddl_event();
+```
+
+The tag values must be valid command tags written in the same form PostgreSQL reports them, for example `'CREATE INDEX'` or `'ALTER FUNCTION'`. An unknown tag produces an error at creation time.
+
+When several event triggers exist for the same event, they fire in alphabetical order by trigger name. If ordering matters, name them accordingly.
+
+## The Helper Functions
+
+Three built-in functions give event triggers real information about what happened.
+
+### pg_event_trigger_ddl_commands()
+
+Callable only in a `ddl_command_end` trigger. It returns one row per command executed, with columns including:
+
+- `classid`, `objid`, `objsubid`: the catalog address of the object
+- `command_tag`: for example `CREATE INDEX`
+- `object_type`: for example `table`, `index`, `function`
+- `schema_name`: the schema, or NULL for objects without one
+- `object_identity`: a fully qualified, quoted name such as `public.orders`
+- `in_extension`: true if the command is part of an extension script
+- `command`: an internal `pg_ddl_command` value, only usable from C code
+
+One DDL statement can produce several rows. `CREATE TABLE` with a `SERIAL` column, for example, also creates a sequence and may create an index for the primary key.
+
+### pg_event_trigger_dropped_objects()
+
+Callable only in a `sql_drop` trigger. It returns one row per dropped object with columns such as `object_type`, `schema_name`, `object_name`, `object_identity`, `original` (true if the object was named directly in the command, false if it was dropped as a dependency), `normal`, and `is_temporary`.
+
+### pg_event_trigger_table_rewrite_oid()
+
+Callable only in a `table_rewrite` trigger. It returns the OID of the table about to be rewritten. Its companion, `pg_event_trigger_table_rewrite_reason()`, returns an integer bitmap that encodes why the rewrite happens (for example a column type change or a persistence change).
+
+## Example 1: A DDL Audit Log Table
+
+The most common use of a postgres event trigger is recording every schema change. Start with a table:
+
+```sql
+CREATE TABLE public.ddl_audit (
+    id              bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    executed_at     timestamptz NOT NULL DEFAULT now(),
+    session_user_name text NOT NULL,
+    event           text NOT NULL,
+    command_tag     text NOT NULL,
+    object_type     text,
+    schema_name     text,
+    object_identity text,
+    query           text
+);
+```
+
+Next, write the function. It reads `pg_event_trigger_ddl_commands()` and inserts one row per object:
+
+```sql
+CREATE OR REPLACE FUNCTION public.audit_ddl_end()
+RETURNS event_trigger
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, public
+AS $$
+DECLARE
+  r record;
+BEGIN
+  FOR r IN SELECT * FROM pg_event_trigger_ddl_commands()
+  LOOP
+    IF r.in_extension THEN
+      CONTINUE;  -- skip objects created by CREATE EXTENSION scripts
+    END IF;
+
+    INSERT INTO public.ddl_audit
+      (session_user_name, event, command_tag, object_type,
+       schema_name, object_identity, query)
+    VALUES
+      (session_user, TG_EVENT, r.command_tag, r.object_type,
+       r.schema_name, r.object_identity, current_query());
+  END LOOP;
+END;
+$$;
+```
+
+A few details in this function deserve explanation:
+
+1. **`SECURITY DEFINER`**: event trigger functions normally run with the privileges of the user who issued the DDL. A regular application role may not have `INSERT` permission on `ddl_audit`, so without `SECURITY DEFINER` its DDL would fail. With it, the function runs as its owner (a superuser).
+2. **`session_user` instead of `current_user`**: inside a `SECURITY DEFINER` function, `current_user` returns the function owner, not the person who ran the command. `session_user` returns the role that logged in.
+3. **`SET search_path`**: pinning the search path is standard hygiene for `SECURITY DEFINER` functions, so a user cannot shadow `ddl_audit` or built-in functions with objects in their own schema.
+4. **`current_query()`**: returns the full text of the top-level statement. If the client sent several statements in one query string, you will see all of them.
+
+Now create the trigger:
+
+```sql
+CREATE EVENT TRIGGER trg_audit_ddl_end
+    ON ddl_command_end
+    EXECUTE FUNCTION public.audit_ddl_end();
+```
+
+`ddl_command_end` does not report drops through `pg_event_trigger_ddl_commands()`, so add a second function for `sql_drop`:
+
+```sql
+CREATE OR REPLACE FUNCTION public.audit_ddl_drop()
+RETURNS event_trigger
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, public
+AS $$
+DECLARE
+  r record;
+BEGIN
+  FOR r IN SELECT * FROM pg_event_trigger_dropped_objects()
+  LOOP
+    INSERT INTO public.ddl_audit
+      (session_user_name, event, command_tag, object_type,
+       schema_name, object_identity, query)
+    VALUES
+      (session_user, TG_EVENT, TG_TAG, r.object_type,
+       r.schema_name, r.object_identity, current_query());
+  END LOOP;
+END;
+$$;
+
+CREATE EVENT TRIGGER trg_audit_ddl_drop
+    ON sql_drop
+    EXECUTE FUNCTION public.audit_ddl_drop();
+```
+
+Test it:
+
+```sql
+CREATE TABLE audit_test (id int PRIMARY KEY, name text);
+ALTER TABLE audit_test ADD COLUMN created_at timestamptz;
+DROP TABLE audit_test;
+
+SELECT executed_at, session_user_name, event, command_tag,
+       object_type, object_identity
+FROM public.ddl_audit
+ORDER BY id;
+```
+
+You should see rows for the table, its primary key index, the `ALTER TABLE`, and one row per object removed by the `DROP` (the table, its index, its row type and so on). Because the audit insert runs in the same transaction as the DDL, a rolled back migration also rolls back its audit rows. That is usually what you want: the log reflects what actually happened.
+
+Browsing this table in a SQL client such as [Chat2DB](https://chat2db.ai/download) makes review easy: filter by `session_user_name` or `object_identity`, and export the result when an auditor asks for a list of schema changes.
+
+## Example 2: Block DROP TABLE in Production
+
+A `ddl_command_start` trigger that raises an exception aborts the command before anything happens. This is a simple safety net against accidental drops:
+
+```sql
+CREATE OR REPLACE FUNCTION public.forbid_drop_table()
+RETURNS event_trigger
+LANGUAGE plpgsql
+AS $$
+BEGIN
+  IF current_setting('app.allow_drop', true) IS DISTINCT FROM 'on' THEN
+    RAISE EXCEPTION 'DROP TABLE is disabled on this database (command: %)', TG_TAG
+      USING HINT = 'Run SET app.allow_drop = on in this session if the drop is intended.';
+  END IF;
+END;
+$$;
+
+CREATE EVENT TRIGGER trg_forbid_drop_table
+    ON ddl_command_start
+    WHEN TAG IN ('DROP TABLE')
+    EXECUTE FUNCTION public.forbid_drop_table();
+```
+
+The custom setting `app.allow_drop` provides an escape hatch. `current_setting('app.allow_drop', true)` returns NULL instead of erroring when the setting does not exist. A deliberate drop then looks like this:
+
+```sql
+BEGIN;
+SET LOCAL app.allow_drop = on;
+DROP TABLE old_import_2024;
+COMMIT;
+```
+
+This guard has a gap: `DROP SCHEMA sales CASCADE` removes every table in the schema, but its tag is `DROP SCHEMA`, not `DROP TABLE`. To catch every table removal, regardless of the command that caused it, use `sql_drop`, which fires after the objects are dropped but still inside the transaction. Raising an error there rolls the whole command back:
+
+```sql
+CREATE OR REPLACE FUNCTION public.forbid_any_table_drop()
+RETURNS event_trigger
+LANGUAGE plpgsql
+AS $$
+DECLARE
+  r record;
+BEGIN
+  IF current_setting('app.allow_drop', true) IS NOT DISTINCT FROM 'on' THEN
+    RETURN;
+  END IF;
+
+  FOR r IN SELECT * FROM pg_event_trigger_dropped_objects()
+  LOOP
+    IF r.object_type = 'table' AND NOT r.is_temporary THEN
+      RAISE EXCEPTION 'dropping table % is not allowed (command: %)',
+        r.object_identity, TG_TAG;
+    END IF;
+  END LOOP;
+END;
+$$;
+
+CREATE EVENT TRIGGER trg_forbid_any_table_drop
+    ON sql_drop
+    EXECUTE FUNCTION public.forbid_any_table_drop();
+```
+
+The check on `is_temporary` lets sessions drop their own temporary tables. The downside of `sql_drop` compared to `ddl_command_start` is that the drop work has already been done before being rolled back, but for a guard that should almost never fire, that cost is irrelevant.
+
+Keep in mind that a superuser can always disable or drop the event trigger. This is a guard against mistakes, not a security boundary against administrators.
+
+## Example 3: Warn on Table Rewrites
+
+Table rewrites during business hours are a classic cause of outages, because they hold an `ACCESS EXCLUSIVE` lock for the duration of the rewrite. A `table_rewrite` trigger can warn, or refuse, before the rewrite begins:
+
+```sql
+CREATE OR REPLACE FUNCTION public.warn_table_rewrite()
+RETURNS event_trigger
+LANGUAGE plpgsql
+AS $$
+DECLARE
+  tbl        regclass := pg_event_trigger_table_rewrite_oid();
+  table_size text     := pg_size_pretty(pg_total_relation_size(tbl));
+BEGIN
+  RAISE WARNING 'command % will rewrite table % (current size %), reason code %',
+    TG_TAG, tbl, table_size, pg_event_trigger_table_rewrite_reason();
+
+  IF current_setting('app.allow_rewrite', true) IS DISTINCT FROM 'on'
+     AND pg_total_relation_size(tbl) > 1024 * 1024 * 1024 THEN
+    RAISE EXCEPTION 'refusing to rewrite % (larger than 1 GB) without app.allow_rewrite = on', tbl;
+  END IF;
+END;
+$$;
+
+CREATE EVENT TRIGGER trg_warn_table_rewrite
+    ON table_rewrite
+    EXECUTE FUNCTION public.warn_table_rewrite();
+```
+
+Try it on a small table:
+
+```sql
+CREATE TABLE rewrite_demo (id int);
+INSERT INTO rewrite_demo SELECT generate_series(1, 1000);
+
+ALTER TABLE rewrite_demo ALTER COLUMN id TYPE bigint;
+-- WARNING:  command ALTER TABLE will rewrite table rewrite_demo (current size ...), reason code ...
+
+ALTER TABLE rewrite_demo ADD COLUMN note text;
+-- no warning: adding a nullable column without a default is metadata only
+```
+
+The 1 GB threshold is just an example; pick whatever matches your maintenance policy. The value of this trigger is that engineers learn about rewrites in development and staging, where the warning is cheap, instead of discovering them from a production lock queue.
+
+## Login Event Triggers (PostgreSQL 17+)
+
+PostgreSQL 17 added the `login` event. A typical use is recording connections:
+
+```sql
+CREATE TABLE public.login_log (
+    logged_at  timestamptz NOT NULL DEFAULT now(),
+    role_name  text NOT NULL,
+    client_ip  inet
+);
+
+CREATE OR REPLACE FUNCTION public.on_login()
+RETURNS event_trigger
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, public
+AS $$
+BEGIN
+  -- Standbys are read-only; skip writes there.
+  IF pg_is_in_recovery() THEN
+    RETURN;
+  END IF;
+
+  INSERT INTO public.login_log (role_name, client_ip)
+  VALUES (session_user, inet_client_addr());
+END;
+$$;
+
+CREATE EVENT TRIGGER trg_on_login
+    ON login
+    EXECUTE FUNCTION public.on_login();
+```
+
+Two cautions apply:
+
+1. If the function raises an error, the login fails. A bug in a login trigger can lock everyone out of the database, including you.
+2. Every connection now performs a write. With high connection churn this adds load and table bloat. Test carefully before enabling it on a busy system.
+
+If a login trigger does lock you out, see the next section.
+
+## Superuser Requirement and Ownership
+
+Only superusers can create event triggers, and the function they call is executed with the privileges of the user running the command unless it is `SECURITY DEFINER`. There is no grantable privilege for creating event triggers. On managed services where you do not have a real superuser, event trigger support depends on the provider; some expose it through their own admin role or extension, others do not support it. Check your provider's documentation before designing around event triggers.
+
+Ownership can be changed with `ALTER EVENT TRIGGER name OWNER TO new_owner`, but the new owner must also be a superuser.
+
+## Disabling Event Triggers
+
+To inspect what exists, query the catalog (or use `\dy` in psql):
+
+```sql
+SELECT evtname, evtevent, evtenabled, evtfoid::regproc AS function, evttags
+FROM pg_event_trigger
+ORDER BY evtname;
+```
+
+The `evtenabled` column is `O` (fires in origin and local mode), `D` (disabled), `R` (replica only) or `A` (always).
+
+### ALTER EVENT TRIGGER ... DISABLE
+
+To turn one trigger off without dropping it:
+
+```sql
+ALTER EVENT TRIGGER trg_forbid_drop_table DISABLE;
+-- do the intended maintenance
+ALTER EVENT TRIGGER trg_forbid_drop_table ENABLE;
+```
+
+`ENABLE REPLICA` and `ENABLE ALWAYS` interact with `session_replication_role`, just like regular triggers. Logical replication apply workers run with `session_replication_role = replica`, so a trigger in the default mode does not fire for changes they apply.
+
+### The event_triggers setting (PostgreSQL 17+)
+
+PostgreSQL 17 added a superuser-only parameter, `event_triggers`, which disables all event triggers when set to `off`. This is the recovery path for a broken login trigger:
+
+```bash
+PGOPTIONS="-c event_triggers=off" psql -U postgres -d appdb
+```
+
+```sql
+ALTER EVENT TRIGGER trg_on_login DISABLE;
+```
+
+For DDL triggers you rarely need it, because commands that target event triggers never fire them: you can always run `ALTER EVENT TRIGGER ... DISABLE` or `DROP EVENT TRIGGER` from a normal session. The other fallback is starting the server in single-user mode, where event triggers do not fire, but that requires stopping the server.
+
+## Common Pitfalls
+
+**Forgetting that event triggers are per database.** Creating an audit trigger in `appdb` does nothing for `reportingdb`. Install it everywhere you need it.
+
+**Using current_user in SECURITY DEFINER functions.** It reports the function owner. Use `session_user` to see who actually connected.
+
+**Calling helper functions from the wrong event.** `pg_event_trigger_ddl_commands()` raises an error outside `ddl_command_end`, and `pg_event_trigger_dropped_objects()` raises an error outside `sql_drop`.
+
+**Expecting coverage of roles, databases and tablespaces.** Those are shared objects and are not visible to event triggers. Use `log_statement = 'ddl'` in the server log if you need a record of them.
+
+**Slow trigger functions.** The function runs synchronously inside every DDL statement. Heavy logic, external calls through extensions, or large inserts slow down migrations and hold locks longer.
+
+**Breaking extension installs and upgrades.** `CREATE EXTENSION` and `ALTER EXTENSION ... UPDATE` run DDL, so guards like the `DROP TABLE` blocker can make them fail. Use `in_extension` to skip audit rows, and make sure guards have an escape hatch.
+
+**pg_dump and restore.** `pg_dump` includes event triggers in the dump. During a restore, an audit trigger that is created early will log every object restored after it. PostgreSQL's dump ordering places event triggers near the end, which avoids most of this, but guards on `DROP` can still interfere with scripts that use `--clean`. Disable guards before restores that drop objects.
+
+## Summary
+
+A postgres event trigger lets you react to schema changes the way ordinary triggers react to data changes. Use `ddl_command_start` to reject commands before they run, `ddl_command_end` with `pg_event_trigger_ddl_commands()` to audit what changed, `sql_drop` with `pg_event_trigger_dropped_objects()` to catch every dropped object, `table_rewrite` to flag expensive rewrites, and, on PostgreSQL 17 and later, `login` to act on new connections. Create event trigger functions that return `event_trigger`, filter with `WHEN TAG IN`, keep the functions fast, and always keep a way to switch them off: `ALTER EVENT TRIGGER ... DISABLE` for individual triggers and `event_triggers = off` as the emergency switch on PostgreSQL 17 and later.

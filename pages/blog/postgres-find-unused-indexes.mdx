@@ -1,0 +1,319 @@
+---
+title: "Postgres Unused Indexes: Find and Drop Them"
+description: "Find postgres unused indexes with pg_stat_user_indexes, skip unique and constraint indexes, check every replica, spot duplicates, and drop them concurrently."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: September 26, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# Postgres Unused Indexes: Find and Drop Them
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="September 26, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+Indexes are not free. Every `INSERT`, and every `UPDATE` that cannot use a HOT update, has to maintain every index on the table. Each index takes disk space, occupies room in `shared_buffers`, adds WAL volume, makes `VACUUM` slower, and gives the planner one more option to consider. An index that no query uses pays all of those costs and returns nothing.
+
+Over the years most databases collect such indexes: an index added for a report that was later retired, a second index created by a migration that did not notice an existing one, or a multi-column index that makes a single-column one redundant. This guide shows how to find postgres unused indexes with `pg_stat_user_indexes`, how to exclude indexes you must keep, why statistics resets and replicas can mislead you, how to detect duplicate and overlapping indexes, and how to drop unused index postgres objects safely with `DROP INDEX CONCURRENTLY`.
+
+## Where index usage is recorded
+
+PostgreSQL's cumulative statistics system counts how often each index is used. The view for user tables is `pg_stat_user_indexes`:
+
+```sql
+SELECT schemaname,
+       relname       AS table_name,
+       indexrelname  AS index_name,
+       idx_scan,
+       idx_tup_read,
+       idx_tup_fetch
+FROM pg_stat_user_indexes
+ORDER BY idx_scan
+LIMIT 5;
+```
+
+The columns that matter:
+
+- **`idx_scan`**: number of index scans initiated on this index. Plain index scans, index-only scans and bitmap index scans all count.
+- **`idx_tup_read`**: index entries returned by scans of this index.
+- **`idx_tup_fetch`**: live table rows fetched by simple index scans using this index.
+- **`last_idx_scan`** (PostgreSQL 16 and later): the time of the last scan of this index, based on the time the transaction that did it ended.
+
+An index with `idx_scan = 0` has not been used for a scan since statistics were last reset. That last clause is where most mistakes come from, so we will return to it.
+
+## Step 1: list candidate unused indexes
+
+Not every index with zero scans can be dropped. Unique indexes and primary keys enforce constraints even if no query ever reads through them, and exclusion constraints work the same way. Indexes that back a constraint cannot be dropped with `DROP INDEX` at all. The query below joins `pg_stat_user_indexes` with `pg_index` and `pg_constraint` to exclude all of them:
+
+```sql
+SELECT s.schemaname,
+       s.relname                                   AS table_name,
+       s.indexrelname                              AS index_name,
+       s.idx_scan,
+       pg_size_pretty(pg_relation_size(s.indexrelid)) AS index_size,
+       pg_relation_size(s.indexrelid)              AS index_bytes
+FROM pg_stat_user_indexes s
+JOIN pg_index i ON i.indexrelid = s.indexrelid
+WHERE s.idx_scan = 0
+  AND NOT i.indisunique
+  AND NOT i.indisprimary
+  AND NOT i.indisexclusion
+  AND i.indisvalid
+  AND NOT EXISTS (
+        SELECT 1
+        FROM pg_constraint c
+        WHERE c.conindid = s.indexrelid
+      )
+ORDER BY pg_relation_size(s.indexrelid) DESC;
+```
+
+Example output:
+
+```text
+ schemaname | table_name |        index_name         | idx_scan | index_size | index_bytes
+------------+------------+---------------------------+----------+------------+-------------
+ public     | orders     | orders_status_created_idx |        0 | 214 MB     |   224395264
+ public     | events     | events_legacy_type_idx    |        0 | 88 MB      |    92274688
+ public     | users      | users_last_login_idx      |        0 | 12 MB      |    12582912
+```
+
+The names and sizes above are illustrative. What each filter does:
+
+1. `idx_scan = 0`: no scans recorded in the current statistics window.
+2. `NOT i.indisunique`, `NOT i.indisprimary`, `NOT i.indisexclusion`: keep uniqueness, primary key and exclusion enforcement.
+3. `i.indisvalid`: skip invalid indexes, such as leftovers from a failed `CREATE INDEX CONCURRENTLY`. Those deserve separate attention because they are maintained on writes but never used.
+4. The `pg_constraint.conindid` check: skip any index a constraint depends on, including one used by a foreign key that references it.
+
+Sorting by size puts the biggest wins first. On PostgreSQL 16 or later, add `s.last_idx_scan` to the select list and consider indexes that have not been scanned for months, not just those with exactly zero scans.
+
+### Finding invalid indexes
+
+While you are here, list invalid indexes too:
+
+```sql
+SELECT indexrelid::regclass AS index_name,
+       indrelid::regclass   AS table_name
+FROM pg_index
+WHERE NOT indisvalid;
+```
+
+An invalid index left behind by a failed concurrent build should be dropped and, if still needed, rebuilt.
+
+## Step 2: make sure the statistics window is long enough
+
+`idx_scan = 0` only means "not used since the counters were last reset". If the counters were reset yesterday, a monthly billing job or a quarterly report may not have run yet.
+
+### When were stats last reset?
+
+```sql
+SELECT datname, stats_reset
+FROM pg_stat_database
+WHERE datname = current_database();
+```
+
+```text
+ datname |          stats_reset
+---------+-------------------------------
+ appdb   | 2026-06-02 03:14:07.51843+00
+```
+
+A `NULL` value means the database-wide counters have not been reset since the statistics were created. Your timestamp will differ.
+
+### What resets the counters
+
+- **`pg_stat_reset()`** resets all statistics counters for the current database, including index usage. Anyone troubleshooting with it also erases your unused-index evidence.
+- **`pg_stat_reset_single_table_counters(oid)`** resets counters for one table or index. After such a targeted reset, that object's history can be shorter than you would assume from looking only at the rest of the database, so ask whether anyone has used it.
+- **Crash recovery**: cumulative statistics are saved on a clean shutdown and discarded when the server goes through crash recovery, including an immediate shutdown.
+- **Major version upgrades**: `pg_upgrade` does not carry the cumulative activity counters over to the new cluster.
+- **Recreated indexes**: `REINDEX CONCURRENTLY` and drop-and-recreate produce a new index with fresh counters.
+
+A practical rule: only trust `idx_scan = 0` once the window covers at least one full business cycle, including month-end and any quarterly or yearly jobs you know about.
+
+### Snapshot the counters instead of resetting
+
+To measure usage over a defined period without resetting anything, save snapshots and compare them:
+
+```sql
+CREATE TABLE IF NOT EXISTS index_usage_snapshot (
+    taken_at     timestamptz NOT NULL DEFAULT now(),
+    indexrelid   oid         NOT NULL,
+    index_name   text        NOT NULL,
+    idx_scan     bigint      NOT NULL
+);
+
+INSERT INTO index_usage_snapshot (indexrelid, index_name, idx_scan)
+SELECT indexrelid, schemaname || '.' || indexrelname, idx_scan
+FROM pg_stat_user_indexes;
+```
+
+Run the insert on a schedule, then compare the first and latest snapshots:
+
+```sql
+SELECT cur.index_name,
+       cur.idx_scan - old.idx_scan AS scans_in_window
+FROM index_usage_snapshot cur
+JOIN index_usage_snapshot old USING (indexrelid)
+WHERE cur.taken_at = (SELECT max(taken_at) FROM index_usage_snapshot)
+  AND old.taken_at = (SELECT min(taken_at) FROM index_usage_snapshot)
+ORDER BY scans_in_window, cur.index_name;
+```
+
+A negative difference means the counters were reset between the snapshots, and the window for that index is not reliable.
+
+## Step 3: check every replica
+
+This is the most common way to drop an index that is in use. Statistics are **local to each server**. On a streaming replication setup, queries executed on a hot standby increment `idx_scan` only on that standby. The primary's `pg_stat_user_indexes` knows nothing about them.
+
+If your read replicas serve reporting, search or API reads, an index can show `idx_scan = 0` on the primary while being essential on a replica. Because the physical standby is a copy of the primary, dropping the index on the primary drops it on every standby too.
+
+So run the candidate query on **the primary and every standby**, and only treat an index as unused if it has zero (or negligible) scans everywhere. Also check each standby's own reset history, since a standby that was rebuilt or restarted after a crash starts with a fresh statistics window. A client such as [Chat2DB](https://chat2db.ai/download) that keeps connections to the primary and replicas side by side makes it quick to run the same query on each node and compare the results.
+
+## Step 4: look for duplicate and overlapping indexes
+
+Unused indexes are one kind of waste; indexes that duplicate each other are another. A duplicate may show scans simply because the planner picks one of two identical options, so the zero-scan query will not find it.
+
+### Exact duplicates
+
+Two indexes are exact duplicates if they are on the same table with the same columns or expressions, the same operator classes and collations, and the same predicate:
+
+```sql
+SELECT indrelid::regclass AS table_name,
+       array_agg(indexrelid::regclass ORDER BY indexrelid) AS duplicate_indexes,
+       pg_size_pretty(sum(pg_relation_size(indexrelid))) AS total_size
+FROM pg_index
+GROUP BY indrelid,
+         indkey::text,
+         indclass::text,
+         indcollation::text,
+         coalesce(indexprs::text, ''),
+         coalesce(indpred::text, '')
+HAVING count(*) > 1
+ORDER BY sum(pg_relation_size(indexrelid)) DESC;
+```
+
+From each group, keep one index, preferring the one that backs a constraint or is unique. If one is unique and the other is not, the non-unique one is the redundant copy. The access method is not part of the grouping above, but operator classes are specific to an access method, so indexes of different types do not end up in the same group.
+
+### Overlapping (left-prefix) indexes
+
+A B-tree index on `(customer_id, created_at)` can serve most queries that an index on `(customer_id)` alone would serve, because the leading column is the same. The single-column index is often redundant:
+
+```sql
+SELECT a.indrelid::regclass   AS table_name,
+       a.indexrelid::regclass AS covered_index,
+       b.indexrelid::regclass AS covering_index,
+       pg_size_pretty(pg_relation_size(a.indexrelid)) AS covered_size
+FROM pg_index a
+JOIN pg_index b
+  ON a.indrelid = b.indrelid
+ AND a.indexrelid <> b.indexrelid
+JOIN pg_class ca ON ca.oid = a.indexrelid
+JOIN pg_class cb ON cb.oid = b.indexrelid
+JOIN pg_am am    ON am.oid = ca.relam
+WHERE am.amname = 'btree'
+  AND cb.relam = ca.relam
+  AND b.indkey::text LIKE a.indkey::text || ' %'
+  AND a.indexprs IS NULL AND b.indexprs IS NULL
+  AND a.indpred  IS NULL AND b.indpred  IS NULL
+  AND NOT a.indisunique
+ORDER BY pg_relation_size(a.indexrelid) DESC;
+```
+
+`indkey` holds the column numbers as a space-separated list, so `'3 7'` is a prefix of `'3 7 2'`. Treat the result as a review list rather than a drop list:
+
+- The shorter index is smaller, so scans on it read fewer pages. For very hot queries this can matter.
+- The query does not compare operator classes or collations. Verify them with `pg_get_indexdef()` before deciding.
+- Columns in an `INCLUDE` clause are also stored in `indkey`, so check the definitions of any covering indexes found this way.
+
+```sql
+SELECT pg_get_indexdef('orders_customer_id_idx'::regclass);
+```
+
+## Step 5: know the non-obvious reasons to keep an index
+
+Before dropping a zero-scan index, rule out these cases:
+
+- **Expression index statistics.** `ANALYZE` collects statistics on the expressions of expression indexes, and the planner uses them for row estimates. An index on `lower(email)` can improve estimates for `WHERE lower(email) = ...` even when the plan never scans it. Dropping it can change plans elsewhere. On PostgreSQL 14 and later, extended statistics on expressions (`CREATE STATISTICS`) can replace this role.
+- **Rare but critical jobs.** Year-end closing, disaster recovery scripts, or an admin tool used during incidents.
+- **Recently created indexes.** An index built last week for an upcoming feature has had no chance to be used.
+- **Workload on another server**, as covered in the replica section.
+
+## Step 6: test the impact before dropping
+
+PostgreSQL does not have a native way to make an index invisible to the planner while keeping it maintained. There is no `ALTER INDEX ... INVISIBLE` as in some other databases. That leaves a few options:
+
+### Test inside a rolled-back transaction
+
+`DROP INDEX` is transactional, so you can see what plans would look like without the index:
+
+```sql
+BEGIN;
+DROP INDEX orders_status_created_idx;
+EXPLAIN SELECT * FROM orders WHERE status = 'pending' ORDER BY created_at LIMIT 50;
+ROLLBACK;
+```
+
+The catch is locking: `DROP INDEX` takes an ACCESS EXCLUSIVE lock on the table, held until `ROLLBACK`. Every other query on `orders` waits in the meantime. Only do this on a copy of the database, or on production with a short `lock_timeout` and a transaction that lasts a second or two.
+
+### Use HypoPG
+
+The HypoPG extension works with hypothetical indexes for the planner, and recent versions can also hide an existing index for the current session with `hypopg_hide_index()`, which lets you run `EXPLAIN` as if it did not exist without locking the table. See the [HypoPG guide](/resources/blog/postgres-hypopg-index-advisor) for installation and usage. It is a third-party extension, so check that it is available on your platform.
+
+### Avoid catalog hacks
+
+You may see advice to set `pg_index.indisvalid` to false by hand. Updating system catalogs directly is unsupported and can leave the index in an inconsistent state. Do not rely on it.
+
+## Step 7: drop the index safely
+
+### Save the definition first
+
+```sql
+SELECT format('%s;', pg_get_indexdef(indexrelid)) AS recreate_sql
+FROM pg_index
+WHERE indexrelid = 'public.orders_status_created_idx'::regclass;
+```
+
+```text
+                                        recreate_sql
+---------------------------------------------------------------------------------------------
+ CREATE INDEX orders_status_created_idx ON public.orders USING btree (status, created_at);
+```
+
+Keep that statement in your migration or runbook, so rolling back is one command (use `CREATE INDEX CONCURRENTLY` when you recreate it on a busy table).
+
+### DROP INDEX CONCURRENTLY
+
+A plain `DROP INDEX` takes an ACCESS EXCLUSIVE lock on the table. On a busy table, even a brief wait for that lock can queue all traffic behind it. `DROP INDEX CONCURRENTLY` avoids blocking reads and writes:
+
+```sql
+SET lock_timeout = '5s';
+DROP INDEX CONCURRENTLY IF EXISTS public.orders_status_created_idx;
+```
+
+Its rules:
+
+- It cannot run inside a transaction block, so it must be its own statement outside `BEGIN ... COMMIT`. Many migration tools need a flag to disable their wrapping transaction.
+- It drops exactly one index per statement and does not support `CASCADE`.
+- It waits for transactions that might be using the index to finish, so a long-running transaction delays it.
+- It cannot drop an index that backs a constraint; drop the constraint with `ALTER TABLE ... DROP CONSTRAINT` instead.
+- If it fails partway, the index can be left in an invalid state. Run the same `DROP INDEX CONCURRENTLY` again to finish the job.
+
+### Watch after the drop
+
+After dropping, watch the slow query log or `pg_stat_statements` for queries on the affected table whose mean time increased. Keep the recreate statement at hand for a while, at least one more business cycle.
+
+## Checklist
+
+1. Query `pg_stat_user_indexes` for `idx_scan = 0`, excluding unique, primary key, exclusion and constraint-backing indexes.
+2. Check `pg_stat_database.stats_reset` and remember crashes, upgrades and single-object resets.
+3. Run the same query on every standby.
+4. On PostgreSQL 16 or later, use `last_idx_scan` to see when each index was last used.
+5. Find exact duplicates and left-prefix overlaps with `pg_index`.
+6. Rule out expression-index statistics and rare jobs.
+7. Test with `EXPLAIN` on a copy or with HypoPG.
+8. Save `pg_get_indexdef()`, then `DROP INDEX CONCURRENTLY` with a `lock_timeout`.
+
+## Summary
+
+Unused indexes slow down writes, bloat storage and waste cache. `pg_stat_user_indexes` shows which indexes have not been scanned, but only since the last statistics reset and only on the server you are connected to. Filter out indexes that enforce constraints, confirm the statistics window, check every replica, look for duplicate and overlapping indexes, and test plans before removing anything. When you are sure, save the definition and drop unused index postgres objects with `DROP INDEX CONCURRENTLY` so the cleanup never blocks production traffic.

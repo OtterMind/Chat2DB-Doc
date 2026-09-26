@@ -1,0 +1,320 @@
+---
+title: "pg_prewarm: Warm the Postgres Cache After Restart"
+description: "Use pg_prewarm to warm the Postgres cache after restart: buffer, read and prefetch modes, autoprewarm setup, dump and reload, and checks with pg_buffercache."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: September 26, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# pg_prewarm: Warm the Postgres Cache After Restart
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="September 26, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+A freshly restarted PostgreSQL server is slow in a very specific way. Queries that ran in a few milliseconds yesterday now take much longer, and disk read activity spikes. Nothing is broken: `shared_buffers` is empty after a restart, and every page a query touches has to be read from the operating system or from disk again. Depending on the working set and the storage, it can take a long time for the cache to fill up through normal traffic, and users feel every miss.
+
+The `pg_prewarm` extension, shipped with PostgreSQL as a contrib module, lets you load relation data into the cache on purpose. This guide covers the `pg_prewarm()` function and its modes, the autoprewarm background worker that saves and restores the buffer contents automatically, the `autoprewarm.blocks` file, the helper functions `autoprewarm_start_worker()` and `autoprewarm_dump_now()`, how to verify results with `pg_buffercache`, and how to size prewarming against `shared_buffers`. It is the practical answer to the question of how to make postgres warm cache after restart.
+
+## Two caches: shared_buffers and the OS page cache
+
+PostgreSQL reads data through two layers of caching:
+
+1. **`shared_buffers`**: PostgreSQL's own buffer pool in shared memory. A page found here needs no system call at all.
+2. **The operating system page cache**: PostgreSQL reads data files through normal file I/O, so the kernel caches pages too. A miss in `shared_buffers` that hits the OS cache still costs a system call and a memory copy, but no disk access.
+
+A PostgreSQL-only restart empties `shared_buffers` but usually leaves the OS page cache intact. A reboot of the machine, or a failover to another host, empties both. `pg_prewarm` can target either layer, which is why it has several modes.
+
+## Installing the extension
+
+`pg_prewarm` is part of the standard contrib modules, so most packaged PostgreSQL installations already include it. Create it in each database where you want to call the function:
+
+```sql
+CREATE EXTENSION IF NOT EXISTS pg_prewarm;
+```
+
+Check the installed version and functions:
+
+```sql
+SELECT extname, extversion FROM pg_extension WHERE extname = 'pg_prewarm';
+
+SELECT p.proname, pg_get_function_arguments(p.oid) AS args
+FROM pg_proc p
+JOIN pg_depend d ON d.objid = p.oid AND d.deptype = 'e'
+JOIN pg_extension e ON e.oid = d.refobjid
+WHERE e.extname = 'pg_prewarm';
+```
+
+You should see `pg_prewarm`, `autoprewarm_start_worker` and `autoprewarm_dump_now`.
+
+## The pg_prewarm() function
+
+The signature is:
+
+```sql
+pg_prewarm(regclass,
+           mode text default 'buffer',
+           fork text default 'main',
+           first_block int8 default null,
+           last_block int8 default null) RETURNS int8
+```
+
+- **`regclass`**: the table, index, materialized view or sequence to load. You can pass a name such as `'orders'` or `'public.orders_pkey'`.
+- **`mode`**: how to load it (explained below).
+- **`fork`**: which relation fork to read. Normally `'main'`; the others are `'fsm'` (free space map), `'vm'` (visibility map) and `'init'` (for unlogged relations).
+- **`first_block`, `last_block`**: an optional block range. `NULL` means the first or last block of the relation, and block numbers start at 0.
+
+The return value is the number of blocks processed.
+
+### Mode 'buffer'
+
+```sql
+SELECT pg_prewarm('orders');
+```
+
+```text
+ pg_prewarm
+------------
+      10812
+```
+
+This is the default. It reads the requested blocks into `shared_buffers`, so later queries find them without touching the OS. It is synchronous: the function returns when the blocks are loaded. The number returned is the relation's size in blocks, which you can cross-check with `pg_relation_size('orders') / current_setting('block_size')::int`. Your number will differ.
+
+If the relation is larger than the free space in `shared_buffers`, loading continues by evicting other pages, including pages loaded earlier in the same call. Prewarming a relation bigger than the buffer pool in `buffer` mode wastes work.
+
+### Mode 'read'
+
+```sql
+SELECT pg_prewarm('orders', 'read');
+```
+
+This reads the blocks synchronously but does not keep them in `shared_buffers`. The effect is to populate the OS page cache. It is useful after a machine reboot for relations that are too large to fit in `shared_buffers` but can fit in RAM, and it works on every platform.
+
+### Mode 'prefetch'
+
+```sql
+SELECT pg_prewarm('orders', 'prefetch');
+```
+
+This issues asynchronous prefetch requests to the operating system (using `posix_fadvise` where available) and returns quickly. The kernel may load the data in the background, or may ignore the hint under memory pressure. On platforms without prefetch support, this mode raises an error, and you should fall back to `read`.
+
+### Prewarming indexes and block ranges
+
+Indexes are relations too, and they are often more valuable to keep hot than the table itself, because every index scan starts by walking the index:
+
+```sql
+SELECT pg_prewarm('orders_pkey');
+SELECT pg_prewarm('orders_customer_id_idx');
+```
+
+To load only part of a table, for example the most recent pages of an append-mostly table, pass a block range:
+
+```sql
+SELECT pg_prewarm(
+    'events',
+    'buffer',
+    'main',
+    greatest(pg_relation_size('events') / current_setting('block_size')::int - 5000, 0),
+    NULL
+);
+```
+
+This loads the last 5000 blocks. For an append-only table, new rows are usually at the end of the heap, but after updates and vacuum that ordering is only approximate.
+
+### Prewarming a set of relations
+
+To warm the largest tables and indexes of a schema, drive `pg_prewarm` from a query:
+
+```sql
+WITH targets AS MATERIALIZED (
+    SELECT c.oid, pg_relation_size(c.oid) AS bytes
+    FROM pg_class c
+    JOIN pg_namespace n ON n.oid = c.relnamespace
+    WHERE n.nspname = 'public'
+      AND c.relkind IN ('r', 'i', 'm')
+      AND c.relpersistence <> 't'
+    ORDER BY pg_relation_size(c.oid) DESC
+    LIMIT 10
+)
+SELECT oid::regclass        AS relation,
+       pg_size_pretty(bytes) AS size,
+       pg_prewarm(oid)       AS blocks_loaded
+FROM targets;
+```
+
+The materialized CTE picks the ten relations first, so `pg_prewarm()` is only called for those rows.
+
+Check the total size of the selected relations before running this. If the total exceeds `shared_buffers`, later relations will push out earlier ones.
+
+## Autoprewarm: automatic warm cache after restart
+
+Manual calls to `pg_prewarm()` require you to know which relations matter. Autoprewarm takes a different approach: it periodically records **which blocks are in `shared_buffers`** and reloads exactly those blocks after a restart. The cache comes back close to its state before the shutdown.
+
+### Enabling autoprewarm
+
+Autoprewarm runs as a background worker, so the library must be loaded at server start. In `postgresql.conf`:
+
+```ini
+shared_preload_libraries = 'pg_prewarm'
+pg_prewarm.autoprewarm = on
+pg_prewarm.autoprewarm_interval = 300s
+```
+
+If `shared_preload_libraries` already contains other modules, append to the list rather than replacing it, for example `'pg_stat_statements,pg_prewarm'`. Changing `shared_preload_libraries` requires a restart.
+
+The two settings:
+
+- **`pg_prewarm.autoprewarm`** (default `on`): whether the autoprewarm worker starts with the server. It only has an effect when the library is in `shared_preload_libraries`.
+- **`pg_prewarm.autoprewarm_interval`** (default `300s`): how often the worker writes the list of cached blocks to disk. With `0`, it does not dump at regular intervals and only writes the list at shutdown.
+
+You do not need `CREATE EXTENSION` for autoprewarm itself; the extension is only needed to call the SQL functions.
+
+### What happens at startup and shutdown
+
+1. At server start, the autoprewarm leader worker reads the saved block list and launches a worker to load the blocks, one database at a time. The list is sorted so that reads are as sequential as possible.
+2. Loading stops early if there are no free buffers left, so it does not evict pages that queries have already brought in.
+3. While the server runs, the worker writes the current buffer list every `autoprewarm_interval`.
+4. At a clean shutdown, it writes the list one last time.
+
+Confirm the worker is running:
+
+```sql
+SELECT pid, backend_type, state
+FROM pg_stat_activity
+WHERE backend_type LIKE 'autoprewarm%';
+```
+
+```text
+  pid  |    backend_type    | state
+-------+--------------------+-------
+ 41022 | autoprewarm leader |
+```
+
+The PID will differ on your system. You may also see an `autoprewarm worker` entry briefly while blocks are being loaded after startup.
+
+### The autoprewarm.blocks file
+
+The block list is stored in a file named `autoprewarm.blocks` in the data directory. It records block identifiers (database, tablespace, relation file, fork and block number), not the data itself, so it is small compared with `shared_buffers`.
+
+A few consequences follow:
+
+- After a **crash**, the most recent list is whatever was written at the last interval, so a short interval gives a fresher list after a crash, at the cost of more frequent writes.
+- A **physical standby** has its own data directory and its own buffer pool, so its list reflects the standby's workload.
+- The list refers to relation files, so blocks of relations that were dropped or rewritten (for example by `VACUUM FULL` or `CLUSTER`) since the dump are simply not found and are skipped.
+
+### autoprewarm_dump_now()
+
+To write the block list immediately, for example right before a planned maintenance restart:
+
+```sql
+SELECT autoprewarm_dump_now();
+```
+
+```text
+ autoprewarm_dump_now
+----------------------
+               131072
+```
+
+The return value is the number of block records written. Your number depends on how many buffers are in use.
+
+### autoprewarm_start_worker()
+
+If the library is preloaded but `pg_prewarm.autoprewarm` was `off` at startup, you can start the leader worker by hand:
+
+```sql
+SELECT autoprewarm_start_worker();
+```
+
+This only works when `pg_prewarm` is in `shared_preload_libraries`, and it raises an error if a leader worker is already running. Once started, the worker dumps the buffer list on the configured interval and at shutdown, so the next restart can be prewarmed automatically.
+
+## Checking results with pg_buffercache
+
+The `pg_buffercache` extension shows what is in `shared_buffers` right now, which makes it the natural way to verify prewarming. (See the [pg_buffercache guide](/resources/blog/postgres-pg-buffercache-guide) for more queries.)
+
+```sql
+CREATE EXTENSION IF NOT EXISTS pg_buffercache;
+```
+
+How much of each relation is cached:
+
+```sql
+SELECT c.relname,
+       count(*) AS buffers,
+       pg_size_pretty(count(*) * current_setting('block_size')::bigint) AS cached,
+       round(100.0 * count(*) /
+             greatest(pg_relation_size(c.oid) / current_setting('block_size')::int, 1), 1)
+         AS pct_of_relation
+FROM pg_buffercache b
+JOIN pg_class c ON b.relfilenode = pg_relation_filenode(c.oid)
+WHERE b.reldatabase = (SELECT oid FROM pg_database WHERE datname = current_database())
+GROUP BY c.oid, c.relname
+ORDER BY buffers DESC
+LIMIT 10;
+```
+
+Run it before and after `SELECT pg_prewarm('orders')`. After prewarming a relation that fits in the buffer pool, `pct_of_relation` for it should be close to 100.
+
+Overall buffer usage:
+
+```sql
+SELECT count(*) FILTER (WHERE relfilenode IS NOT NULL) AS used,
+       count(*) FILTER (WHERE relfilenode IS NULL)     AS unused,
+       count(*)                                        AS total
+FROM pg_buffercache;
+```
+
+On PostgreSQL 16 and later, `pg_buffercache_summary()` returns similar totals more cheaply:
+
+```sql
+SELECT buffers_used, buffers_unused, buffers_dirty
+FROM pg_buffercache_summary();
+```
+
+Scanning `pg_buffercache` on a very large buffer pool is not free, so avoid running the per-relation query in a tight loop on production. Tools like [Chat2DB](https://app.chat2db.ai/) let you keep these checks as saved queries and compare the results before and after a restart.
+
+## Sizing prewarming against shared_buffers
+
+Prewarming cannot create memory. A few rules keep it useful:
+
+### Know your buffer pool
+
+```sql
+SHOW shared_buffers;
+
+SELECT setting::bigint * current_setting('block_size')::bigint AS bytes,
+       pg_size_pretty(setting::bigint * current_setting('block_size')::bigint) AS pretty
+FROM pg_settings
+WHERE name = 'shared_buffers';
+```
+
+### Choose the mode by size
+
+- **Hot set smaller than `shared_buffers`**: `buffer` mode, or autoprewarm, loads it straight into the buffer pool.
+- **Hot set larger than `shared_buffers` but smaller than RAM**: load the most important relations with `buffer` and the rest with `read` or `prefetch`, so the OS cache holds them.
+- **Hot set larger than RAM**: prewarm only the hottest indexes and the recent end of large tables. Loading more just evicts itself.
+
+### Prioritise indexes and small hot tables
+
+A lookup-heavy workload spends most of its buffer accesses on index pages and on a few small, frequently joined tables. Prewarming those first gives the largest reduction in cache misses per block loaded. Autoprewarm handles this automatically because it restores whatever was actually in the cache.
+
+### Mind the I/O at startup
+
+Prewarming reads data as fast as the storage allows. On shared or throttled cloud volumes, a large prewarm right after startup competes with real queries. Autoprewarm limits itself to free buffers, but a manual script calling `pg_prewarm()` on many large relations can saturate I/O. Run manual prewarm scripts before sending traffic to the server, for example before re-adding a node to a load balancer.
+
+## A restart runbook
+
+Putting it together for a planned restart:
+
+1. Make sure `pg_prewarm` is in `shared_preload_libraries` and `pg_prewarm.autoprewarm` is `on`.
+2. Right before the restart, run `SELECT autoprewarm_dump_now();` so the list is current.
+3. Restart PostgreSQL with a clean shutdown.
+4. Check `pg_stat_activity` for the autoprewarm workers and wait for the loading worker to finish.
+5. Verify with `pg_buffercache` that key tables and indexes are cached.
+6. If critical relations are missing, for example after a failover to a host with a different cache history, call `pg_prewarm()` on them explicitly.
+
+## Summary
+
+`pg_prewarm` solves the cold-cache problem after a restart. Use `pg_prewarm(regclass)` in `buffer` mode to load relations into `shared_buffers`, `read` or `prefetch` to fill the OS page cache, and block ranges to target the hot end of large tables. Add `pg_prewarm` to `shared_preload_libraries` so autoprewarm dumps the buffer list to `autoprewarm.blocks` every `pg_prewarm.autoprewarm_interval` and restores it at startup, use `autoprewarm_dump_now()` before planned restarts, and confirm the result with `pg_buffercache`. Size everything against `shared_buffers` and available RAM, because anything larger than the cache only evicts itself.

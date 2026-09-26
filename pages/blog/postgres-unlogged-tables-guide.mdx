@@ -1,0 +1,343 @@
+---
+title: "Postgres Unlogged Table: When and How to Use"
+description: "How a Postgres unlogged table skips WAL, why it is truncated after a crash, how to create unlogged table and ALTER TABLE SET LOGGED, and safe use cases."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: September 26, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# Postgres Unlogged Table: When and How to Use
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="September 26, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+Every change to a normal PostgreSQL table is written twice: once to the write-ahead log (WAL) and later to the table's data files. The WAL is what makes the table crash-safe and what streaming replication ships to standbys. For some data, though, that durability is more than you need. A staging table that you reload from a CSV every night, or a cache you can rebuild from the source of truth, does not have to survive a power failure.
+
+That is what a **postgres unlogged table** is for. This guide explains what skipping WAL really means, what happens to the data after a crash, why unlogged tables never reach your standbys, how to create unlogged table objects and convert them with `ALTER TABLE ... SET LOGGED`, what that conversion costs, and the catalog queries you need to audit persistence across a database.
+
+## What "unlogged" actually means
+
+When you create a table with the `UNLOGGED` keyword, PostgreSQL does not write WAL records for changes to its data. Inserts, updates and deletes still go through shared buffers and are eventually written to the table's data files, but no WAL record describes them. Indexes created on an unlogged table are unlogged as well.
+
+Skipping WAL has three consequences that you should treat as a single package:
+
+1. **Writes are cheaper.** There is less WAL to generate, flush and archive, so bulk loads and heavy update traffic put less pressure on disk I/O and on `max_wal_size`.
+2. **The table is not crash-safe.** Without WAL there is nothing to replay after a crash, so PostgreSQL cannot know whether the data files are consistent. Its answer is to empty the table.
+3. **The data is not replicated.** Physical replication works by replaying WAL. No WAL means no data on the standby.
+
+Everything else behaves like a normal table: MVCC, transactions, constraints, triggers, `VACUUM`, and query planning all work the same way. An unlogged table is not a temporary table. It is visible to all sessions, it survives disconnects, and it survives a clean restart.
+
+## Create unlogged table: the basic syntax
+
+The syntax is the regular `CREATE TABLE` with one extra keyword:
+
+```sql
+CREATE UNLOGGED TABLE import_orders (
+    id          bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    external_id text        NOT NULL,
+    customer    text        NOT NULL,
+    amount      numeric(12,2),
+    loaded_at   timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE INDEX ON import_orders (external_id);
+```
+
+The same keyword works with `CREATE TABLE AS` and `SELECT INTO`:
+
+```sql
+CREATE UNLOGGED TABLE daily_sales_snapshot AS
+SELECT order_date, sum(amount) AS total
+FROM orders
+GROUP BY order_date;
+```
+
+In `psql`, `\d import_orders` shows the persistence in the header line:
+
+```text
+              Unlogged table "public.import_orders"
+```
+
+For auditing many tables at once, the catalog is easier to query, which we cover later in this guide.
+
+### Measuring the WAL difference yourself
+
+Rather than trust a number from a blog post, measure the effect on your own hardware. `pg_current_wal_lsn()` and `pg_wal_lsn_diff()` let you compare how much WAL a load produces:
+
+```sql
+CREATE TABLE logged_test   (id int, payload text);
+CREATE UNLOGGED TABLE unlogged_test (id int, payload text);
+
+SELECT pg_current_wal_lsn() AS start_lsn \gset
+INSERT INTO logged_test
+SELECT g, md5(g::text) FROM generate_series(1, 1000000) AS g;
+SELECT pg_size_pretty(pg_wal_lsn_diff(pg_current_wal_lsn(), :'start_lsn')) AS wal_logged;
+
+SELECT pg_current_wal_lsn() AS start_lsn \gset
+INSERT INTO unlogged_test
+SELECT g, md5(g::text) FROM generate_series(1, 1000000) AS g;
+SELECT pg_size_pretty(pg_wal_lsn_diff(pg_current_wal_lsn(), :'start_lsn')) AS wal_unlogged;
+```
+
+The logged insert produces WAL roughly in proportion to the data volume, while the unlogged insert produces almost none (a small amount remains for things such as transaction commit records and catalog activity). Run the test on a quiet instance, because the LSN is cluster-wide and other sessions add to it. The `\gset` meta-command is specific to `psql`.
+
+## Crash truncation behaviour
+
+This is the part that surprises people. The PostgreSQL documentation states it plainly: an unlogged table is automatically truncated after a crash or unclean shutdown.
+
+### Clean shutdown vs crash
+
+- **Clean shutdown** (`pg_ctl stop` in the default `fast` mode, or `smart`): PostgreSQL runs a shutdown checkpoint that writes all dirty buffers, including those of unlogged tables. After the restart, the data is still there.
+- **Crash or immediate shutdown** (`pg_ctl stop -m immediate`, an OOM kill of the postmaster, a kernel panic, a power loss, a backend crash that forces a restart of all processes): during crash recovery PostgreSQL resets every unlogged relation to empty.
+
+An important detail: a crash of a *single backend* that causes the postmaster to restart all processes counts as a crash. So an unrelated segfault in an extension can wipe your unlogged tables, even though the server was never stopped.
+
+Ordinary checkpoints do not write dirty pages of unlogged tables, only the shutdown checkpoint does. That is one more reason the data files of an unlogged table cannot be trusted after a crash.
+
+### How the reset works: the init fork
+
+Each unlogged table and index has an extra file on disk called the **init fork**, stored next to the main data file with an `_init` suffix. It contains an empty version of the relation. During crash recovery PostgreSQL removes the other forks and copies the init fork over the main fork, which is why the table comes back empty rather than corrupted.
+
+You can see the files:
+
+```sql
+SELECT pg_relation_filepath('import_orders');
+```
+
+```text
+ pg_relation_filepath
+----------------------
+ base/16384/24601
+```
+
+In the data directory you would find `base/16384/24601` and `base/16384/24601_init`. The OIDs in your output will differ.
+
+### Reproducing it safely
+
+On a disposable test instance only:
+
+```sql
+INSERT INTO unlogged_test VALUES (1, 'will vanish');
+SELECT count(*) FROM unlogged_test;   -- returns 1
+```
+
+```bash
+pg_ctl -D "$PGDATA" stop -m immediate
+pg_ctl -D "$PGDATA" start
+```
+
+```sql
+SELECT count(*) FROM unlogged_test;   -- returns 0
+```
+
+The table definition, indexes and privileges survive; only the rows are gone. Your application therefore needs a way to detect an empty table and reload it.
+
+## Not replicated to standbys
+
+Streaming replication and log shipping replay WAL on the standby. Because an unlogged table produces no WAL for its data, the standby only knows the table's definition (the catalog changes are logged) and its empty init fork.
+
+Querying it on a hot standby fails:
+
+```sql
+-- on the standby
+SELECT count(*) FROM import_orders;
+```
+
+```text
+ERROR:  cannot access temporary or unlogged relations during recovery
+```
+
+After a failover, the promoted standby has the table, but it is empty. Treat that as another form of the crash case: anything stored only in unlogged tables is lost on failover.
+
+A few more tools behave differently for unlogged tables:
+
+- **Logical replication**: unlogged tables cannot be added to a publication.
+- **`pg_basebackup`**: the data of unlogged relations is excluded from base backups; only the init forks are copied, so restored tables are empty.
+- **`pg_dump`**: dumps unlogged table data by default. Use `--no-unlogged-table-data` to skip it.
+
+If you rely on read replicas for reporting, do not put report inputs in unlogged tables.
+
+## Checking persistence with pg_class
+
+`pg_class.relpersistence` records the persistence of every relation:
+
+| Value | Meaning |
+|-------|---------|
+| `p` | permanent (normal logged table) |
+| `u` | unlogged |
+| `t` | temporary |
+
+List every unlogged relation outside the system schemas, with its size:
+
+```sql
+SELECT n.nspname AS schema,
+       c.relname AS name,
+       CASE c.relkind
+            WHEN 'r' THEN 'table'
+            WHEN 'i' THEN 'index'
+            WHEN 'S' THEN 'sequence'
+            WHEN 'p' THEN 'partitioned table'
+            WHEN 'm' THEN 'materialized view'
+            ELSE c.relkind::text
+       END AS kind,
+       pg_size_pretty(pg_relation_size(c.oid)) AS size
+FROM pg_class c
+JOIN pg_namespace n ON n.oid = c.relnamespace
+WHERE c.relpersistence = 'u'
+  AND n.nspname NOT IN ('pg_catalog', 'information_schema')
+ORDER BY pg_relation_size(c.oid) DESC;
+```
+
+Example output:
+
+```text
+ schema |             name              |   kind   |    size
+--------+-------------------------------+----------+------------
+ public | import_orders                 | table    | 42 MB
+ public | import_orders_external_id_idx | index    | 16 MB
+ public | import_orders_pkey            | index    | 11 MB
+ public | import_orders_id_seq          | sequence | 8192 bytes
+```
+
+The sizes are illustrative; yours depend on the data.
+
+Running this query periodically is a cheap safeguard: an unlogged table that holds data somebody considers permanent is a data-loss incident waiting for the next crash. A visual client such as [Chat2DB](https://chat2db.ai/download) makes it easy to save this as a snippet and run it against every database you manage.
+
+## ALTER TABLE SET LOGGED and SET UNLOGGED
+
+You can change persistence after creation:
+
+```sql
+ALTER TABLE import_orders SET LOGGED;
+ALTER TABLE import_orders SET UNLOGGED;
+```
+
+### What the conversion costs
+
+Neither form is a catalog flag flip. Both **rewrite the table** and its indexes into new files, and both take an **ACCESS EXCLUSIVE** lock for the duration, which blocks reads and writes on the table.
+
+`ALTER TABLE ... SET LOGGED` has an extra cost: unless `wal_level` is `minimal`, the entire contents of the table are written to WAL, because standbys and archives need a full copy of the data from that point on. For a large table this means:
+
+- a burst of WAL roughly the size of the table plus its indexes,
+- extra load on WAL archiving and on replication, with possible replica lag,
+- a lock held for as long as the rewrite takes.
+
+A common pattern is "load unlogged, then switch to logged". That is only a win if the load involves many passes over the data (repeated updates, deduplication, several index builds). For a single `COPY` followed by `SET LOGGED`, you write the data once into the table and then again into WAL during the rewrite, so the saving can vanish. Measure with the WAL query shown earlier before adopting it.
+
+Because of the lock, run the conversion with a short `lock_timeout` so it fails fast instead of queuing behind long queries:
+
+```sql
+BEGIN;
+SET LOCAL lock_timeout = '3s';
+ALTER TABLE import_orders SET LOGGED;
+COMMIT;
+```
+
+### Foreign key restrictions
+
+Persistence and foreign keys interact:
+
+- A permanent table cannot have a foreign key that references an unlogged table.
+- An unlogged table may reference a permanent table.
+
+So `SET LOGGED` fails if the table references another unlogged table, and `SET UNLOGGED` fails if a permanent table references it. Convert in dependency order.
+
+## Unlogged sequences (PostgreSQL 15+)
+
+PostgreSQL 15 added unlogged sequences. You can create one directly or convert an existing sequence:
+
+```sql
+CREATE UNLOGGED SEQUENCE import_batch_seq;
+
+ALTER SEQUENCE import_batch_seq SET LOGGED;
+ALTER SEQUENCE import_batch_seq SET UNLOGGED;
+```
+
+An unlogged sequence is reset after a crash just like an unlogged table, so it restarts from its start value. Since PostgreSQL 15, identity and serial sequences created together with an unlogged table are also unlogged, which keeps the table and its ID generator consistent: after a crash both start over. Check with the `relpersistence` query above, where sequences show up with `relkind = 'S'`.
+
+Never use an unlogged sequence to generate IDs that are stored in permanent tables. After a crash it would hand out values that were already used.
+
+## Partitioned tables caveats
+
+Persistence belongs to each physical table, so on a partitioned table what matters is the persistence of each **partition**. The parent has no storage of its own.
+
+Behaviour for the parent has changed across versions:
+
+- In PostgreSQL 17 and earlier, `CREATE UNLOGGED TABLE ... PARTITION BY` was accepted, but it did not make new partitions unlogged, and `ALTER TABLE ... SET LOGGED` or `SET UNLOGGED` on the parent did not change its partitions.
+- PostgreSQL 18 rejects unlogged partitioned tables, removing that misleading behaviour.
+
+The portable approach is to set persistence on individual partitions:
+
+```sql
+CREATE TABLE events (
+    id         bigint,
+    created_at timestamptz NOT NULL,
+    payload    jsonb
+) PARTITION BY RANGE (created_at);
+
+CREATE UNLOGGED TABLE events_2026_09 PARTITION OF events
+    FOR VALUES FROM ('2026-09-01') TO ('2026-10-01');
+
+ALTER TABLE events_2026_09 SET LOGGED;
+```
+
+Then check every partition, not the parent:
+
+```sql
+SELECT c.relname, c.relpersistence
+FROM pg_inherits i
+JOIN pg_class c ON c.oid = i.inhrelid
+WHERE i.inhparent = 'events'::regclass
+ORDER BY c.relname;
+```
+
+Mixing persistence inside one partitioned table is legal but confusing: a crash empties some partitions and not others, which is rarely what a reader of the data expects.
+
+## Good use cases
+
+Unlogged tables fit data that is **derived, reproducible or disposable**:
+
+- **Staging tables for ETL.** Load raw files, clean and deduplicate, then `INSERT ... SELECT` into the permanent target. If the server crashes, rerun the job.
+- **Intermediate results of batch jobs.** Multi-step transformations that write and rewrite the same rows many times benefit most from skipping WAL.
+- **Caches and materialized lookups.** Precomputed aggregates that can be rebuilt from permanent tables. The application must handle an empty cache.
+- **Test and CI databases.** Fast fixtures where durability does not matter.
+- **Session-like or queue-like data that is acceptable to lose**, as long as the loss is an explicit, documented decision.
+
+### When not to use them
+
+- Anything that is the only copy of business data.
+- Data that must be readable on replicas or survive a failover.
+- Tables you want to publish with logical replication.
+- Workloads where the real bottleneck is not WAL. If the time goes into index maintenance or CPU, `UNLOGGED` will not help much.
+
+## A safe ETL pattern
+
+Put it together with a job that assumes the staging table can be empty at any time:
+
+```sql
+CREATE UNLOGGED TABLE IF NOT EXISTS stage_customers (
+    external_id text PRIMARY KEY,
+    name        text,
+    email       text
+);
+
+TRUNCATE stage_customers;
+
+COPY stage_customers FROM '/data/customers.csv' WITH (FORMAT csv, HEADER true);
+
+INSERT INTO customers (external_id, name, email)
+SELECT external_id, name, lower(email)
+FROM stage_customers
+ON CONFLICT (external_id) DO UPDATE
+SET name  = EXCLUDED.name,
+    email = EXCLUDED.email;
+```
+
+The staging table does the heavy lifting without WAL, while the final write into `customers` is fully logged, replicated and crash-safe. Server-side `COPY ... FROM` a file requires superuser or the `pg_read_server_files` role; from a client use `psql`'s `\copy` instead.
+
+## Summary
+
+A postgres unlogged table trades durability for cheaper writes. Its data skips WAL, it is truncated after any crash or immediate shutdown, it is empty on standbys and after failover, and it cannot be published for logical replication. Use `CREATE UNLOGGED TABLE` for staging, ETL intermediates and rebuildable caches, audit persistence with `pg_class.relpersistence`, remember that `ALTER TABLE SET LOGGED` rewrites the table under an ACCESS EXCLUSIVE lock and writes it all to WAL, use unlogged sequences (PostgreSQL 15+) only for disposable data, and set persistence per partition rather than on the partitioned parent.

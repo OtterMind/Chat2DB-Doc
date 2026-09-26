@@ -1,0 +1,309 @@
+---
+title: "MySQL Error 1062: Duplicate Entry for Key Fixes"
+description: "Fix MySQL error 1062 duplicate entry for key PRIMARY: find duplicates, INSERT IGNORE vs ON DUPLICATE KEY UPDATE vs REPLACE, AUTO_INCREMENT, and replicas."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: September 26, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# MySQL Error 1062: Duplicate Entry for Key Fixes
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="September 26, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+`ERROR 1062 (23000): Duplicate entry '...' for key '...'` means a statement tried to write a value that already exists in a `PRIMARY KEY` or `UNIQUE` index. MySQL refuses the row because accepting it would break the uniqueness guarantee the index exists to provide.
+
+The immediate fix is usually obvious once you know which key was hit and which value collided. The harder cases are the ones where the "duplicate" does not look like a duplicate: a collation that treats `é` as `e`, an `AUTO_INCREMENT` column that ran out of range, or a replica that diverged from its source. This guide covers all of them on MySQL 8.0 and 8.4.
+
+If you work with PostgreSQL as well, the equivalent error there is covered in [duplicate key value violates unique constraint](/resources/blog/postgres-duplicate-key-value-violates-unique-constraint).
+
+## Reproducing MySQL Error 1062
+
+```sql
+CREATE TABLE users (
+  id    INT UNSIGNED NOT NULL AUTO_INCREMENT,
+  email VARCHAR(255) NOT NULL,
+  name  VARCHAR(100) NOT NULL,
+  PRIMARY KEY (id),
+  UNIQUE KEY uq_users_email (email)
+) ENGINE=InnoDB;
+
+INSERT INTO users (id, email, name) VALUES (1, 'alice@example.com', 'Alice');
+```
+
+A collision on the primary key:
+
+```sql
+INSERT INTO users (id, email, name) VALUES (1, 'bob@example.com', 'Bob');
+```
+
+```text
+ERROR 1062 (23000): Duplicate entry '1' for key 'users.PRIMARY'
+```
+
+A collision on the secondary unique index:
+
+```sql
+INSERT INTO users (email, name) VALUES ('alice@example.com', 'Alice 2');
+```
+
+```text
+ERROR 1062 (23000): Duplicate entry 'alice@example.com' for key 'users.uq_users_email'
+```
+
+## Reading the Message: Which Key and Which Value
+
+The message has two parts you need.
+
+**The value.** `Duplicate entry '1'` is the value that collided. For a composite unique key, the column values are joined with a hyphen, so a key on `(tenant_id, email)` produces something like `Duplicate entry '7-alice@example.com'`. Very long values may be truncated in the message.
+
+**The key.** In current MySQL 8.0 releases and in 8.4, the key name is qualified with the table name: `'users.PRIMARY'` or `'users.uq_users_email'`. Older versions print only `'PRIMARY'` or the index name, which is ambiguous when a statement touches several tables (triggers, multi-table updates, `INSERT ... SELECT`). If you see an unqualified name, check triggers on the target table as well.
+
+List the unique indexes on a table to map the name to columns:
+
+```sql
+SHOW INDEX FROM users WHERE Non_unique = 0;
+```
+
+If the key is `PRIMARY`, the conflict is on the row identity. If it is a secondary unique index, the conflict is on business data such as an email or SKU, and the right response is usually different.
+
+## Find Existing Duplicates with GROUP BY HAVING
+
+When error 1062 comes from a batch (`INSERT ... SELECT`, `LOAD DATA`, or a migration), find every colliding value before retrying. Duplicates inside the source data:
+
+```sql
+SELECT email, COUNT(*) AS copies
+FROM   users_staging
+GROUP BY email
+HAVING COUNT(*) > 1
+ORDER BY copies DESC;
+```
+
+Source rows that collide with rows already in the target:
+
+```sql
+SELECT s.email
+FROM   users_staging AS s
+JOIN   users AS u ON u.email = s.email;
+```
+
+For a composite key, group by all key columns: `GROUP BY tenant_id, email`.
+
+Note that these queries compare values using the column's collation, which is exactly what the unique index does. That is important in the collation section below.
+
+## INSERT IGNORE vs ON DUPLICATE KEY UPDATE vs REPLACE
+
+MySQL offers three ways to handle an expected conflict in a single statement. They behave very differently.
+
+### INSERT IGNORE
+
+```sql
+INSERT IGNORE INTO users (email, name)
+VALUES ('alice@example.com', 'Alice 2');
+-- Query OK, 0 rows affected, 1 warning
+SHOW WARNINGS;
+```
+
+The conflicting row is skipped and error 1062 becomes a warning. The problem is that `IGNORE` also downgrades other errors, for example values truncated to fit a column or `NULL` in a `NOT NULL` column, which then get stored with adjusted values. Use it only when "skip if already present" is truly the intended behavior and the input is otherwise trusted.
+
+### INSERT ... ON DUPLICATE KEY UPDATE
+
+This is the MySQL upsert. On conflict, it updates the existing row instead:
+
+```sql
+INSERT INTO users (email, name)
+VALUES ('alice@example.com', 'Alice Smith') AS new
+ON DUPLICATE KEY UPDATE name = new.name;
+```
+
+The row alias syntax (`AS new`) is available from MySQL 8.0.19. The older form, `name = VALUES(name)`, still works but has been deprecated since 8.0.20 and produces a warning, so new code should use the alias. You can also alias columns: `VALUES (...) AS new(e, n) ON DUPLICATE KEY UPDATE name = n`.
+
+The affected-rows count tells you what happened: 1 for a new row, 2 for an update of an existing row, and 0 if the existing row already had the same values (unless the client sets the `CLIENT_FOUND_ROWS` flag, in which case it reports 1).
+
+Two caveats:
+
+- If the table has more than one unique index and the new row conflicts with different rows on different keys, only one existing row is updated. Avoid upserts on tables with multiple unique keys unless you have reasoned through that case.
+- A failed insert still consumes an `AUTO_INCREMENT` value, so upsert-heavy tables show gaps in `id`.
+
+### REPLACE
+
+```sql
+REPLACE INTO users (email, name) VALUES ('alice@example.com', 'Alice Smith');
+```
+
+`REPLACE` deletes the conflicting row and inserts a new one. That has side effects an update does not:
+
+- The deleted row gets a new `AUTO_INCREMENT` id if you did not supply `id`, breaking references to the old id.
+- `DELETE` triggers fire, and foreign keys with `ON DELETE CASCADE` delete child rows.
+- Columns not listed in the statement revert to their defaults instead of keeping their old values.
+
+In most applications, `ON DUPLICATE KEY UPDATE` is the safer choice.
+
+## AUTO_INCREMENT and Error 1062 on PRIMARY
+
+When the primary key is `AUTO_INCREMENT` and you never supply `id`, a duplicate on `PRIMARY` is surprising. The usual causes follow.
+
+### The column ran out of range
+
+When the counter reaches the maximum value of the column type, the next insert tries to reuse that maximum and fails. The telltale sign is a value at a type boundary:
+
+```text
+ERROR 1062 (23000): Duplicate entry '2147483647' for key 'orders.PRIMARY'
+```
+
+`2147483647` is the maximum signed `INT`; `4294967295` is the maximum `INT UNSIGNED`, and `127` or `255` point to a `TINYINT`. The fix is to widen the column:
+
+```sql
+ALTER TABLE orders MODIFY id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT;
+```
+
+This rebuilds the table, so plan it for large tables. Also widen every foreign key column that references it.
+
+### Explicit ids from an import or application code
+
+Imports that carry their own ids, or applications that compute `MAX(id) + 1` themselves, collide with rows that already hold those ids. Compare the counter with the data:
+
+```sql
+SHOW CREATE TABLE users;          -- look for AUTO_INCREMENT=... in the output
+SELECT MAX(id) FROM users;
+```
+
+Avoid `information_schema.TABLES.AUTO_INCREMENT` for this check in MySQL 8.0 and later: it is cached according to `information_schema_stats_expiry` and can be stale. If needed, move the counter forward:
+
+```sql
+ALTER TABLE users AUTO_INCREMENT = 100000;
+```
+
+InnoDB does not let you set the counter to a value at or below the current maximum; it adjusts it to the next valid value. Never generate ids with `MAX(id) + 1` in application code: two concurrent sessions read the same maximum and one of them hits 1062.
+
+### Explicit zero in the id
+
+If `sql_mode` includes `NO_AUTO_VALUE_ON_ZERO`, inserting `id = 0` stores a literal `0` instead of generating a value, and the second such insert fails with `Duplicate entry '0'`. This mode is set in `mysqldump` output; send `NULL` or omit the column to get a generated value.
+
+### Gaps are normal
+
+`innodb_autoinc_lock_mode` controls how InnoDB allocates values. The default in MySQL 8.0 and 8.4 is 2 (interleaved), which gives the best concurrency but allows gaps and non-consecutive values for bulk inserts. Rolled-back transactions, `INSERT IGNORE`, and upserts also consume values. Since MySQL 8.0, the counter is persisted across restarts. Gaps do not cause error 1062; do not try to "fill" them.
+
+## Collations, Case, Accents, and Trailing Spaces
+
+A unique index compares values using the column collation. With the MySQL 8.0 default, `utf8mb4_0900_ai_ci`, comparisons are accent-insensitive (`ai`) and case-insensitive (`ci`). So these are duplicates:
+
+```sql
+CREATE TABLE tags (
+  name VARCHAR(50) NOT NULL,
+  UNIQUE KEY uq_tags_name (name)
+) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
+
+INSERT INTO tags VALUES ('Resume');
+INSERT INTO tags VALUES ('résumé');
+-- ERROR 1062 (23000): Duplicate entry 'résumé' for key 'tags.uq_tags_name'
+```
+
+Trailing spaces behave differently by collation. The `0900` collations are `NO PAD`, so `'abc'` and `'abc '` are distinct. Older `PAD SPACE` collations such as `utf8mb4_general_ci` and `utf8mb4_unicode_ci` ignore trailing spaces, so those two values collide.
+
+Confirm what the index sees:
+
+```sql
+SELECT 'Resume' = 'résumé' COLLATE utf8mb4_0900_ai_ci AS ai_ci,
+       'Resume' = 'résumé' COLLATE utf8mb4_0900_as_cs AS as_cs;
+-- ai_ci = 1, as_cs = 0
+```
+
+If the values really must be distinct, change the column collation to an accent- and case-sensitive one such as `utf8mb4_0900_as_cs`, or to `utf8mb4_bin`:
+
+```sql
+ALTER TABLE tags MODIFY name VARCHAR(50) NOT NULL COLLATE utf8mb4_0900_as_cs;
+```
+
+Often the opposite is true: case-insensitive uniqueness is exactly what you want for emails and usernames, and the fix is in the application, which should check for an existing row before inserting or use an upsert.
+
+## Adding a UNIQUE Index to a Table with Duplicates
+
+Adding a unique key fails if duplicates already exist:
+
+```sql
+ALTER TABLE customers ADD UNIQUE KEY uq_customers_email (email);
+-- ERROR 1062 (23000): Duplicate entry 'bob@example.com' for key 'customers.uq_customers_email'
+```
+
+The message shows only the first duplicate found. Follow these steps:
+
+1. List all duplicates with `GROUP BY ... HAVING COUNT(*) > 1`.
+2. Decide which row wins in each group, for example the lowest `id` or the most recently updated.
+3. Merge or reassign any child rows that reference the losing rows.
+4. Delete the losers.
+5. Add the index.
+
+Deleting all but the lowest `id` in each group, using a window function (MySQL 8.0 and later):
+
+```sql
+DELETE c
+FROM   customers AS c
+JOIN  (
+        SELECT id,
+               ROW_NUMBER() OVER (PARTITION BY email ORDER BY id) AS rn
+        FROM   customers
+      ) AS d ON d.id = c.id
+WHERE  d.rn > 1;
+```
+
+Run the inner `SELECT` alone first and review the rows with `rn > 1` before deleting. Then add the index. If new duplicates can arrive between cleanup and `ALTER TABLE`, the online DDL will fail again, so pause the writing process or repeat the cleanup.
+
+## Error 1062 on a Replica
+
+On a replica, 1062 stops the SQL (applier) thread:
+
+```sql
+SHOW REPLICA STATUS\G
+-- Last_SQL_Errno: 1062
+-- Last_SQL_Error: ... Duplicate entry '1234' for key 'orders.PRIMARY' ...
+```
+
+`SHOW REPLICA STATUS` is the syntax from MySQL 8.0.22; older releases use `SHOW SLAVE STATUS`.
+
+This error means the replica's data already differs from the source: the row the source just inserted already exists on the replica. Common causes are writes made directly on the replica, a replica restored from an inconsistent backup, or a replication position that was set too early so events are applied twice.
+
+Do not blindly skip the event. Skipping hides the symptom, and the replica stays inconsistent. Instead:
+
+1. Compare the row on source and replica. If they are identical (for example, an event applied twice), skipping that one event is reasonable.
+2. If they differ, the replica is diverged; rebuild it from a fresh, consistent backup or use a checksum tool to find and fix the differences.
+3. Prevent recurrence with `super_read_only = ON` on replicas.
+
+If you do decide to skip a single event, the method depends on GTID mode. Without GTIDs:
+
+```sql
+STOP REPLICA SQL_THREAD;
+SET GLOBAL sql_replica_skip_counter = 1;
+START REPLICA SQL_THREAD;
+```
+
+`sql_replica_skip_counter` is the name from MySQL 8.0.26 (`sql_slave_skip_counter` before). It skips event groups, not single rows, and it cannot be used when `gtid_mode = ON`. With GTIDs, commit an empty transaction with the failing GTID shown in the status output:
+
+```sql
+STOP REPLICA;
+SET GTID_NEXT = '3e11fa47-71ca-11e1-9e33-c80aa9429562:1234';
+BEGIN; COMMIT;
+SET GTID_NEXT = 'AUTOMATIC';
+START REPLICA;
+```
+
+Replace the UUID and sequence number with the values from your replica's error. Avoid setting `replica_skip_errors = 1062` in the configuration: it silently skips every future duplicate as well, letting the replica drift further from the source.
+
+## Checklist for MySQL Error 1062
+
+1. Read the key name and the value from the message; map the key to columns with `SHOW INDEX`.
+2. For batch loads, list duplicates with `GROUP BY ... HAVING COUNT(*) > 1` and against the target with a join.
+3. Choose the conflict strategy deliberately: `ON DUPLICATE KEY UPDATE` for upserts, `INSERT IGNORE` only for trusted "skip existing" logic, `REPLACE` rarely.
+4. For `PRIMARY` on `AUTO_INCREMENT`, check for type overflow, explicit ids, and `id = 0`.
+5. For unexpected string duplicates, check the collation: case, accents, and trailing spaces.
+6. Before adding a unique index, deduplicate with `ROW_NUMBER()`.
+7. On replicas, investigate before skipping, and use the GTID-aware method when GTIDs are on.
+
+Tracking down duplicates is quicker when you can run the grouping queries and edit rows in one place. [Chat2DB](https://chat2db.ai/download) lets you run the `GROUP BY ... HAVING` checks against MySQL 8.0 and 8.4, inspect indexes and collations in the table designer, and ask its AI assistant to write the deduplication query for your table.
+
+## Summary
+
+MySQL error 1062 means a value already exists in a primary or unique key. The message tells you which key and which value; `GROUP BY ... HAVING` tells you how many more there are. Pick the right conflict handling (usually `ON DUPLICATE KEY UPDATE` with the `AS new` row alias), watch for `AUTO_INCREMENT` overflow and hand-generated ids, remember that collations define what counts as a duplicate, and on replicas treat 1062 as a sign of divergence rather than something to skip.
