@@ -1,0 +1,364 @@
+---
+title: "MySQL Error 1055: Fix only_full_group_by"
+description: "Fix MySQL error 1055 only_full_group_by: functional dependence, GROUP BY vs aggregates vs ANY_VALUE, latest row per group with ROW_NUMBER, and sql_mode risks."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: September 27, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# MySQL Error 1055: Fix only_full_group_by
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="September 27, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+MySQL error 1055 appears when a query with `GROUP BY` selects a column that is neither grouped nor aggregated, and MySQL cannot prove that the column has a single value per group. It is extremely common after upgrading an application from MySQL 5.6 or MariaDB to MySQL 5.7 or 8.0, because queries that "worked" for years suddenly fail. The quickest fix you will find online is to remove `ONLY_FULL_GROUP_BY` from `sql_mode`. That makes the error disappear, but it usually leaves a real bug in the query.
+
+This article explains what the error actually protects you from, walks through the correct fixes in order of preference, and then shows how to change `sql_mode` properly if you really have to, on MySQL 8.0 and 8.4 with notes for MariaDB.
+
+## The error message
+
+Take a simple orders schema:
+
+```sql
+CREATE TABLE customers (
+  id    INT PRIMARY KEY,
+  name  VARCHAR(100) NOT NULL,
+  email VARCHAR(255) NOT NULL
+);
+
+CREATE TABLE orders (
+  id          INT AUTO_INCREMENT PRIMARY KEY,
+  customer_id INT NOT NULL,
+  status      VARCHAR(20) NOT NULL,
+  total       DECIMAL(10,2) NOT NULL,
+  created_at  DATETIME NOT NULL,
+  KEY idx_customer_created (customer_id, created_at)
+);
+
+INSERT INTO customers VALUES
+  (1, 'Ada',   'ada@example.com'),
+  (2, 'Linus', 'linus@example.com');
+
+INSERT INTO orders (customer_id, status, total, created_at) VALUES
+  (1, 'paid',     120.00, '2026-09-01 10:00:00'),
+  (1, 'refunded',  35.50, '2026-09-10 14:30:00'),
+  (2, 'paid',      80.00, '2026-09-05 09:15:00');
+```
+
+Now ask for the total per customer, and also the status:
+
+```sql
+SELECT customer_id, status, SUM(total) AS revenue
+FROM orders
+GROUP BY customer_id;
+```
+
+```text
+ERROR 1055 (42000): Expression #2 of SELECT list is not in GROUP BY clause and contains nonaggregated column 'shop.orders.status' which is not functionally dependent on columns in GROUP BY clause; this is incompatible with sql_mode=only_full_group_by
+```
+
+The message is precise once you know how to read it:
+
+- **Expression #2 of SELECT list** is the second item after `SELECT`, here `status`.
+- **not in GROUP BY clause** and **nonaggregated**: it is not grouped and not inside `SUM`, `MAX`, `COUNT` and so on.
+- **not functionally dependent on columns in GROUP BY clause**: MySQL cannot prove there is only one `status` per `customer_id`.
+
+Customer 1 has two orders, one `paid` and one `refunded`. Which status should the single output row for customer 1 show? There is no correct answer. Before MySQL 5.7.5, MySQL simply picked one, from whichever row it happened to read, and the result could change with an index, a data change or a version upgrade. `ONLY_FULL_GROUP_BY` turns that silent nondeterminism into an error.
+
+Two closely related errors come from the same mode:
+
+```sql
+SELECT customer_id, SUM(total) FROM orders;
+```
+
+```text
+ERROR 1140 (42000): In aggregated query without GROUP BY, expression #1 of SELECT list contains nonaggregated column 'shop.orders.customer_id'; this is incompatible with sql_mode=only_full_group_by
+```
+
+The same rule also applies to columns referenced in `HAVING` and `ORDER BY` of a grouped query, so an `ORDER BY created_at` on a query grouped by `customer_id` fails with 1055 too, just with a different expression position in the message.
+
+## What functional dependence means
+
+A column B is functionally dependent on a set of columns A when every combination of A values determines exactly one B value. If you group by A, B is guaranteed to be the same for all rows in each group, so it is safe to select.
+
+MySQL (since 5.7.5) detects several kinds of functional dependence, which is why some queries with "extra" columns are allowed:
+
+- **Primary key or unique NOT NULL key.** If you group by `customers.id`, every other column of `customers` is determined by it.
+- **Equality in WHERE or join conditions.** `WHERE o.status = 'paid'` makes `status` a constant, so it can be selected in a query grouped by `customer_id`.
+- **Join through a key.** Grouping by `c.id` and joining `orders` on `o.customer_id = c.id` lets you select `c.name` and `c.email`.
+- **Derived tables and views**, in many cases, where the dependency can be traced through.
+
+This query is therefore valid even though `name` and `email` are not in the `GROUP BY`:
+
+```sql
+SELECT c.id, c.name, c.email, SUM(o.total) AS revenue
+FROM customers c
+JOIN orders o ON o.customer_id = c.id
+GROUP BY c.id;
+```
+
+```text
++----+-------+-------------------+---------+
+| id | name  | email             | revenue |
++----+-------+-------------------+---------+
+|  1 | Ada   | ada@example.com   |  155.50 |
+|  2 | Linus | linus@example.com |   80.00 |
++----+-------+-------------------+---------+
+```
+
+With an inner join, MySQL can also derive the dependency through the equality `o.customer_id = c.id`, but with outer joins the direction of the join matters and the inference is more limited. The simplest rule that always works: group by the primary key of the table whose columns you want to display.
+
+## Fixes in order of preference
+
+Before choosing a fix, decide what the query is supposed to return. Error 1055 is almost always a question the query did not answer: "which value do you want?"
+
+### 1. Add the column to GROUP BY
+
+If you actually want one row per combination, group by both:
+
+```sql
+SELECT customer_id, status, SUM(total) AS revenue
+FROM orders
+GROUP BY customer_id, status;
+```
+
+```text
++-------------+----------+---------+
+| customer_id | status   | revenue |
++-------------+----------+---------+
+|           1 | paid     |  120.00 |
+|           1 | refunded |   35.50 |
+|           2 | paid     |   80.00 |
++-------------+----------+---------+
+```
+
+This changes the result shape, which is the point: the old query was hiding the fact that customer 1 had two statuses.
+
+### 2. Aggregate the column
+
+If you want one row per customer, say how the extra column should be summarized:
+
+```sql
+SELECT customer_id,
+       SUM(total)                                    AS revenue,
+       MAX(created_at)                               AS last_order_at,
+       COUNT(*)                                      AS orders,
+       GROUP_CONCAT(DISTINCT status ORDER BY status) AS statuses,
+       SUM(status = 'refunded')                      AS refunds
+FROM orders
+GROUP BY customer_id;
+```
+
+`MIN`, `MAX`, `COUNT(DISTINCT ...)`, `GROUP_CONCAT` and conditional sums cover most reporting needs. Note that `GROUP_CONCAT` output is truncated at `group_concat_max_len` (1024 bytes by default).
+
+### 3. ANY_VALUE() when every value really is the same
+
+Sometimes you know a column is constant per group but MySQL cannot prove it, for example a denormalized `customer_name` column copied onto every order:
+
+```sql
+SELECT customer_id,
+       ANY_VALUE(customer_name) AS customer_name,
+       SUM(total)               AS revenue
+FROM orders_denormalized
+GROUP BY customer_id;
+```
+
+`ANY_VALUE()` tells MySQL "I accept any value from the group". It disables the check for that one expression and nothing else, which is much safer than turning off the mode for the whole server. Use it only when the values are genuinely identical; if they are not, you are back to an arbitrary result, just an explicit one.
+
+### 4. Group by the primary key
+
+As shown above, if the extra columns come from a table whose primary key you can group by, change the `GROUP BY` to that key. This is the cleanest fix for the very common pattern of "list each customer with their order count":
+
+```sql
+SELECT c.id, c.name, COUNT(o.id) AS orders
+FROM customers c
+LEFT JOIN orders o ON o.customer_id = c.id
+GROUP BY c.id;
+```
+
+### 5. Window functions for the latest row per group
+
+The most frequent real cause of error 1055 is an attempt to get "the latest order for each customer" like this:
+
+```sql
+-- Wrong: status and total are NOT guaranteed to come from the latest row
+SELECT customer_id, MAX(created_at), status, total
+FROM orders
+GROUP BY customer_id;
+```
+
+Even with `ONLY_FULL_GROUP_BY` off, this query does not do what it appears to do. `MAX(created_at)` is correct, but `status` and `total` come from an arbitrary row in the group, not necessarily the row that has the maximum date. The error is catching a real bug.
+
+On MySQL 8.0 and later, use `ROW_NUMBER()`:
+
+```sql
+SELECT customer_id, id AS order_id, status, total, created_at
+FROM (
+  SELECT o.*,
+         ROW_NUMBER() OVER (
+           PARTITION BY customer_id
+           ORDER BY created_at DESC, id DESC
+         ) AS rn
+  FROM orders o
+) ranked
+WHERE rn = 1;
+```
+
+```text
++-------------+----------+----------+--------+---------------------+
+| customer_id | order_id | status   | total  | created_at          |
++-------------+----------+----------+--------+---------------------+
+|           1 |        2 | refunded |  35.50 | 2026-09-10 14:30:00 |
+|           2 |        3 | paid     |  80.00 | 2026-09-05 09:15:00 |
++-------------+----------+----------+--------+---------------------+
+```
+
+The `id DESC` tie-breaker makes the result deterministic when two orders share a timestamp. Use `RANK()` instead of `ROW_NUMBER()` if you want all tied rows. Window functions are covered in more depth in [MySQL Window Functions](/resources/blog/mysql-window-functions).
+
+On MySQL 5.7, which has no window functions, join back to the aggregated keys:
+
+```sql
+SELECT o.*
+FROM orders o
+JOIN (
+  SELECT customer_id, MAX(created_at) AS max_created
+  FROM orders
+  GROUP BY customer_id
+) latest
+  ON latest.customer_id = o.customer_id
+ AND latest.max_created = o.created_at;
+```
+
+This returns multiple rows per customer if timestamps tie, so add a further tie-break if that matters. The composite index `(customer_id, created_at)` makes both versions efficient.
+
+### DISTINCT with ORDER BY
+
+A cousin of this error shows up with `SELECT DISTINCT` plus an `ORDER BY` on a column that is not selected:
+
+```sql
+SELECT DISTINCT customer_id FROM orders ORDER BY created_at;
+```
+
+```text
+ERROR 3065 (HY000): Expression #1 of ORDER BY clause is not in SELECT list, references column 'shop.orders.created_at' which is not in SELECT list; this is incompatible with DISTINCT
+```
+
+The logic is the same: each distinct `customer_id` has several `created_at` values, so the sort order is undefined. Rewrite it as a `GROUP BY` with an aggregate in the `ORDER BY`:
+
+```sql
+SELECT customer_id
+FROM orders
+GROUP BY customer_id
+ORDER BY MIN(created_at);
+```
+
+## Removing ONLY_FULL_GROUP_BY from sql_mode
+
+Sometimes you inherit a large legacy application and need it running before you can rewrite every query. In that case you can remove the mode, but understand the scope of each option and treat it as temporary.
+
+First, check the current value:
+
+```sql
+SELECT @@GLOBAL.sql_mode, @@SESSION.sql_mode;
+```
+
+The MySQL 8 default is:
+
+```text
+ONLY_FULL_GROUP_BY,STRICT_TRANS_TABLES,NO_ZERO_IN_DATE,NO_ZERO_DATE,ERROR_FOR_DIVISION_BY_ZERO,NO_ENGINE_SUBSTITUTION
+```
+
+### Session only (safest)
+
+Affects only the current connection, so it can be set by the legacy application right after it connects:
+
+```sql
+SET SESSION sql_mode = sys.list_drop(@@SESSION.sql_mode, 'ONLY_FULL_GROUP_BY');
+```
+
+`sys.list_drop` is a helper in the MySQL `sys` schema that removes one item from a comma-separated list, which avoids retyping the other modes and accidentally dropping `STRICT_TRANS_TABLES`. If the `sys` schema is not available, write the list out explicitly:
+
+```sql
+SET SESSION sql_mode = 'STRICT_TRANS_TABLES,NO_ZERO_IN_DATE,NO_ZERO_DATE,ERROR_FOR_DIVISION_BY_ZERO,NO_ENGINE_SUBSTITUTION';
+```
+
+Many frameworks expose this. For example, Laravel has a `strict` and `modes` option per connection, and JDBC accepts `sessionVariables=sql_mode='...'` in the URL.
+
+### Global (runtime only)
+
+```sql
+SET GLOBAL sql_mode = sys.list_drop(@@GLOBAL.sql_mode, 'ONLY_FULL_GROUP_BY');
+```
+
+Two details trip people up here. `SET GLOBAL` affects only connections opened after the statement; your current session and existing pooled connections keep the old value until they reconnect. And `SET GLOBAL` is lost when the server restarts.
+
+### Persisted across restarts
+
+On MySQL 8.0 and later, `SET PERSIST` both changes the global value and writes it to `mysqld-auto.cnf` in the data directory, so it survives a restart:
+
+```sql
+SET PERSIST sql_mode = 'STRICT_TRANS_TABLES,NO_ZERO_IN_DATE,NO_ZERO_DATE,ERROR_FOR_DIVISION_BY_ZERO,NO_ENGINE_SUBSTITUTION';
+```
+
+To undo it later:
+
+```sql
+RESET PERSIST sql_mode;
+```
+
+The traditional alternative is the option file:
+
+```ini
+[mysqld]
+sql_mode = STRICT_TRANS_TABLES,NO_ZERO_IN_DATE,NO_ZERO_DATE,ERROR_FOR_DIVISION_BY_ZERO,NO_ENGINE_SUBSTITUTION
+```
+
+It takes effect after a restart. Values in `mysqld-auto.cnf` are read after the regular option files, so a persisted setting wins over `my.cnf`. If you change `my.cnf` and nothing happens, check `performance_schema.persisted_variables`:
+
+```sql
+SELECT * FROM performance_schema.persisted_variables WHERE VARIABLE_NAME = 'sql_mode';
+```
+
+On managed services such as Amazon RDS, Aurora, Azure Database for MySQL or Cloud SQL, you change `sql_mode` in the parameter group or server flags instead.
+
+### Why not to do it
+
+- Queries that pick arbitrary values keep returning arbitrary values. Reports can show the wrong status, the wrong price or the wrong owner, and nobody notices because there is no error.
+- Results can change after an index is added or the optimizer picks a different plan.
+- A future upgrade or a new replica with default settings brings the errors back, usually at an inconvenient time.
+- Removing the mode globally also affects every other application on the server.
+
+A reasonable plan is to disable the mode per session for the legacy application only, log or collect the failing queries in a test environment with the mode on, and fix them using the patterns above. Running the queries against a test database in a SQL client such as [Chat2DB](https://app.chat2db.ai/) lets you compare the old and the rewritten result side by side before switching the mode back on.
+
+## MariaDB differences
+
+- MariaDB does not include `ONLY_FULL_GROUP_BY` in its default `sql_mode`, which is why applications developed on MariaDB often break when moved to MySQL.
+- When enabled on MariaDB, the check is simpler and more strict: it does not perform the same functional-dependency analysis, so grouping by a primary key and selecting other columns of that table can still be rejected. Add those columns to `GROUP BY` or aggregate them.
+- `ANY_VALUE()` is a MySQL function. On MariaDB use `MIN()` or `MAX()` for the same effect on values that are known to be identical.
+- `SET PERSIST` is MySQL-only; on MariaDB, edit the option file.
+- Window functions, including `ROW_NUMBER()`, are available in MariaDB 10.2 and later, so the latest-row pattern works on both.
+
+## Summary
+
+Error 1055 means the query asks for a value that is not uniquely defined per group. Decide what the value should be, then express it: group by it, aggregate it, use `ANY_VALUE()` when it is truly constant, group by a primary key, or use `ROW_NUMBER()` for the latest row. Turn off `ONLY_FULL_GROUP_BY` only per session and only as a stopgap. If you meet a different code along the way, you can look up any MySQL error number with the free [MySQL error code lookup tool](https://chat2db.ai/tools/mysql-error-code-lookup).
+
+## FAQ
+
+### Why did my query work on MySQL 5.6 but fail on 8.0?
+
+`ONLY_FULL_GROUP_BY` became part of the default `sql_mode` in MySQL 5.7.5 and has stayed on since. MySQL 5.6 did not enable it by default and returned an arbitrary value for nonaggregated columns. The query was always ambiguous; the newer versions report it.
+
+### Is ANY_VALUE() the same as turning off ONLY_FULL_GROUP_BY?
+
+For that one expression, yes: MySQL returns a value from some row in the group without checking. The difference is scope. `ANY_VALUE()` documents the intent in the query and leaves the check active for every other column and every other query.
+
+### Why does SET GLOBAL sql_mode not seem to work?
+
+It only affects new connections, so your current session and pooled connections keep the old value. It is also lost at restart. Use `SET SESSION` for the current connection and `SET PERSIST` or the option file for a permanent change.
+
+### Can I group by a column and select columns from a joined table?
+
+Yes, if you group by that table's primary key or a unique NOT NULL column, MySQL recognizes the functional dependency. Grouping by `c.id` when you want to select `c.name` is the most reliable form, especially with outer joins.

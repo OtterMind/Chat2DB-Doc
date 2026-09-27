@@ -1,0 +1,332 @@
+---
+title: "pg_stat_progress_vacuum and Other Progress Views"
+description: "Monitor vacuum progress, CREATE INDEX progress, COPY, CLUSTER and base backups in Postgres with pg_stat_progress views and ready-to-run percent queries."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: September 27, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# pg_stat_progress_vacuum and Other Progress Views
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="September 27, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+A `VACUUM` on a large table has been running for forty minutes. Is it nearly done, stuck waiting, or on its third pass over the indexes? A `CREATE INDEX CONCURRENTLY` shows no sign of life. Is it building, or waiting for some old transaction to finish? PostgreSQL answers these questions through a family of **progress reporting views**, starting with `pg_stat_progress_vacuum` and extended over several releases to index builds, `CLUSTER`, `ANALYZE`, `COPY` and base backups.
+
+This guide lists each view with the PostgreSQL version that introduced it, gives ready-to-run queries that compute percent complete and join to `pg_stat_activity`, explains what each phase means, and covers what the views cannot tell you.
+
+## The progress views at a glance
+
+| View | Reports on | Added in |
+|---|---|---|
+| `pg_stat_progress_vacuum` | `VACUUM` and autovacuum (not `VACUUM FULL`) | PostgreSQL 9.6 |
+| `pg_stat_progress_cluster` | `CLUSTER` and `VACUUM FULL` | PostgreSQL 12 |
+| `pg_stat_progress_create_index` | `CREATE INDEX`, `REINDEX`, including `CONCURRENTLY` | PostgreSQL 12 |
+| `pg_stat_progress_analyze` | `ANALYZE` and autoanalyze | PostgreSQL 13 |
+| `pg_stat_progress_basebackup` | Base backups streamed by walsender (`pg_basebackup`) | PostgreSQL 13 |
+| `pg_stat_progress_copy` | `COPY FROM` / `COPY TO` | PostgreSQL 14 |
+
+All of them share a few traits:
+
+- One row per backend currently running the command. When the command finishes, the row disappears. There is no history.
+- They have a `pid` column that joins to `pg_stat_activity.pid`, which gives you start time, the query text, wait events and the user.
+- Values are sampled counters, not transactional data. Reading them is cheap and does not block the command.
+- To see full details for other users' sessions you need superuser, membership in `pg_read_all_stats` (included in `pg_monitor`), or the same role as the session. Otherwise most columns come back NULL.
+
+```sql
+GRANT pg_monitor TO monitoring_user;
+```
+
+## Monitor vacuum progress with pg_stat_progress_vacuum
+
+This is the view most people are looking for. Its key columns:
+
+- `relid`: the table being vacuumed.
+- `phase`: the current phase (below).
+- `heap_blks_total`: table size in blocks when the scan started.
+- `heap_blks_scanned`: blocks scanned so far. Blocks skipped thanks to the visibility map are counted too, so this reaches `heap_blks_total` at the end of the scan.
+- `heap_blks_vacuumed`: blocks processed in the second heap pass.
+- `index_vacuum_count`: completed index-vacuum cycles.
+- `max_dead_tuple_bytes`, `dead_tuple_bytes`, `num_dead_item_ids`: dead-tuple storage limit and usage (PostgreSQL 17+).
+- `indexes_total`, `indexes_processed`: index progress within the current index phase (PostgreSQL 17+).
+- `delay_time`: time spent sleeping for cost-based vacuum delay, in milliseconds (PostgreSQL 18+, populated only when `track_cost_delay_timing` is on).
+
+In PostgreSQL 9.6 to 16, the memory columns were instead `max_dead_tuples` and `num_dead_tuples` (counted in tuples), and there were no `indexes_total` / `indexes_processed` columns.
+
+### Ready-to-run vacuum progress query (PostgreSQL 17+)
+
+```sql
+SELECT
+    p.pid,
+    a.backend_type,
+    p.datname,
+    p.relid::regclass                                        AS table_name,
+    p.phase,
+    pg_size_pretty(p.heap_blks_total * current_setting('block_size')::bigint) AS table_size,
+    round(100.0 * p.heap_blks_scanned  / nullif(p.heap_blks_total, 0), 1) AS scanned_pct,
+    round(100.0 * p.heap_blks_vacuumed / nullif(p.heap_blks_total, 0), 1) AS vacuumed_pct,
+    p.index_vacuum_count,
+    p.indexes_processed || '/' || p.indexes_total            AS indexes,
+    pg_size_pretty(p.dead_tuple_bytes)                       AS dead_tuple_mem,
+    pg_size_pretty(p.max_dead_tuple_bytes)                   AS dead_tuple_mem_limit,
+    now() - a.xact_start                                     AS running_for,
+    a.wait_event_type,
+    a.wait_event
+FROM pg_stat_progress_vacuum p
+JOIN pg_stat_activity a USING (pid)
+ORDER BY running_for DESC;
+```
+
+On PostgreSQL 16 or older, replace the three memory/index lines with:
+
+```sql
+    round(100.0 * p.num_dead_tuples / nullif(p.max_dead_tuples, 0), 1) AS dead_tuple_mem_pct
+```
+
+`relid::regclass` resolves names only for tables in the database you are connected to; for vacuums in other databases you will see a bare OID. Add `WHERE p.datname = current_database()` if that is confusing.
+
+In psql, append `\watch 5` to re-run the query every five seconds while you observe.
+
+### Interpreting vacuum phases
+
+| Phase | What is happening | Progress indicator |
+|---|---|---|
+| initializing | Preparing to scan the heap; brief | none |
+| scanning heap | First pass: pruning pages, collecting dead tuple IDs, freezing | `heap_blks_scanned` vs `heap_blks_total` |
+| vacuuming indexes | Removing collected dead tuple IDs from every index | `indexes_processed` (17+) |
+| vacuuming heap | Second heap pass marking dead line pointers unused | `heap_blks_vacuumed` |
+| cleaning up indexes | Final index cleanup after the heap is done | `indexes_processed` (17+) |
+| truncating heap | Returning empty pages at the end of the table to the OS | none |
+| performing final cleanup | Updating free space map and `pg_class` statistics | none |
+
+Two patterns are worth spotting:
+
+1. **`index_vacuum_count` greater than 0 while still in "scanning heap".** The dead tuple storage filled up (`maintenance_work_mem` or `autovacuum_work_mem`), so vacuum had to stop, clean all indexes, then resume the heap scan. Each extra cycle is a full pass over every index. On large tables with many indexes, raising the memory limit shortens vacuum considerably. PostgreSQL 17 stores dead tuple IDs much more compactly, so this happens far less often after upgrading.
+2. **Long time in "truncating heap"**, especially with `wait_event` showing lock waits. Truncation needs an `ACCESS EXCLUSIVE` lock on the table and gives up if others want the table. It can also cause query cancellations on hot standbys.
+
+If a vacuum seems frozen with `scanned_pct` not moving, check `wait_event`. `VacuumDelay` (event type `Timeout`) means cost-based throttling is doing its job; autovacuum is deliberately slow by default. Tuning cost limits is covered in the [vacuum and autovacuum tuning guide](/resources/blog/postgres-vacuum-and-autovacuum-tuning).
+
+Autovacuum workers appear here too, with `backend_type = 'autovacuum worker'` and a `query` like `autovacuum: VACUUM public.orders` (or `... (to prevent wraparound)` for anti-wraparound runs).
+
+## Postgres CREATE INDEX progress with pg_stat_progress_create_index
+
+Index builds are where progress reporting saves the most guesswork, because `CREATE INDEX CONCURRENTLY` spends much of its time waiting rather than working.
+
+Key columns:
+
+- `command`: `CREATE INDEX`, `CREATE INDEX CONCURRENTLY`, `REINDEX` or `REINDEX CONCURRENTLY`.
+- `index_relid`: the index being built. It is 0 during a non-concurrent `CREATE INDEX`.
+- `lockers_total`, `lockers_done`, `current_locker_pid`: during waiting phases, how many transactions must finish and which one is being waited on.
+- `blocks_total`, `blocks_done`: block-level progress of table or index scans.
+- `tuples_total`, `tuples_done`: tuple-level progress, used in sort/load and validation phases.
+- `partitions_total`, `partitions_done`: for indexes on partitioned tables.
+
+### Ready-to-run index build progress query
+
+```sql
+SELECT
+    p.pid,
+    p.datname,
+    p.relid::regclass        AS table_name,
+    nullif(p.index_relid, 0)::regclass AS index_name,
+    p.command,
+    p.phase,
+    CASE
+        WHEN p.blocks_total > 0
+            THEN round(100.0 * p.blocks_done / p.blocks_total, 1)
+    END                      AS blocks_pct,
+    CASE
+        WHEN p.tuples_total > 0
+            THEN round(100.0 * p.tuples_done / p.tuples_total, 1)
+    END                      AS tuples_pct,
+    p.lockers_done || '/' || p.lockers_total AS lockers,
+    p.current_locker_pid,
+    p.partitions_done || '/' || p.partitions_total AS partitions,
+    now() - a.query_start    AS running_for,
+    a.query
+FROM pg_stat_progress_create_index p
+JOIN pg_stat_activity a USING (pid);
+```
+
+### Interpreting CREATE INDEX phases
+
+For a concurrent build, you will typically see this sequence:
+
+1. **initializing**: brief setup.
+2. **waiting for writers before build**: `CONCURRENTLY` must wait for every transaction that might write to the table with the old index list. `current_locker_pid` shows who you are waiting for.
+3. **building index**: the actual build. For B-tree the phase is shown with a sub-phase, such as `building index: scanning table`, `building index: sorting live tuples` and `building index: loading tuples in tree`. `blocks_done`/`blocks_total` tracks the table scan; `tuples_done`/`tuples_total` tracks loading.
+4. **waiting for writers before validation**: another wait for transactions that started before the index became visible to writers.
+5. **index validation: scanning index**, **index validation: sorting tuples**, **index validation: scanning table**: the second pass that picks up rows inserted during the build.
+6. **waiting for old snapshots**: waiting for any transaction whose snapshot might not see the new index to finish. This is the phase where builds seem to "hang" because of a long-running or idle-in-transaction session anywhere in the database.
+7. **waiting for readers before marking dead** and **waiting for readers before dropping**: only for `REINDEX CONCURRENTLY`, when the old index is retired.
+
+A non-concurrent `CREATE INDEX` goes straight from initializing to building index and is done.
+
+When a concurrent build is stuck in a waiting phase, find the blocker:
+
+```sql
+SELECT a.pid, a.usename, a.state, a.xact_start, now() - a.xact_start AS xact_age, a.query
+FROM pg_stat_progress_create_index p
+JOIN pg_stat_activity a ON a.pid = p.current_locker_pid;
+```
+
+For waits in "waiting for old snapshots", `current_locker_pid` also identifies the session holding the old snapshot. Terminating or finishing that session lets the build continue. More background is in [Postgres CREATE INDEX CONCURRENTLY](/resources/blog/postgres-create-index-concurrently).
+
+## pg_stat_progress_analyze
+
+`ANALYZE` is usually fast, but on big tables with large `default_statistics_target` values or extended statistics it can take minutes.
+
+```sql
+SELECT
+    p.pid,
+    p.relid::regclass AS table_name,
+    p.phase,
+    round(100.0 * p.sample_blks_scanned / nullif(p.sample_blks_total, 0), 1) AS sample_pct,
+    p.ext_stats_computed || '/' || p.ext_stats_total AS ext_stats,
+    p.child_tables_done  || '/' || p.child_tables_total AS child_tables,
+    p.current_child_table_relid::regclass AS current_child,
+    now() - a.query_start AS running_for
+FROM pg_stat_progress_analyze p
+JOIN pg_stat_activity a USING (pid);
+```
+
+Phases are: `initializing`, `acquiring sample rows`, `acquiring inherited sample rows` (for inheritance and partitioned parents), `computing statistics`, `computing extended statistics`, and `finalizing analyze`. The sampling phases are where `sample_blks_scanned` moves; the computing phases have no counter.
+
+## pg_stat_progress_cluster: CLUSTER and VACUUM FULL
+
+`VACUUM FULL` rewrites the entire table and is reported here, not in `pg_stat_progress_vacuum`. The `command` column says `CLUSTER` or `VACUUM FULL`.
+
+```sql
+SELECT
+    p.pid,
+    p.relid::regclass AS table_name,
+    p.command,
+    p.phase,
+    round(100.0 * p.heap_blks_scanned / nullif(p.heap_blks_total, 0), 1) AS heap_scanned_pct,
+    p.heap_tuples_scanned,
+    p.heap_tuples_written,
+    c.reltuples::bigint AS estimated_rows,
+    round(100.0 * p.heap_tuples_written / nullif(greatest(c.reltuples, 0), 0)::numeric, 1) AS written_pct_estimate,
+    p.index_rebuild_count,
+    now() - a.query_start AS running_for
+FROM pg_stat_progress_cluster p
+JOIN pg_stat_activity a USING (pid)
+LEFT JOIN pg_class c ON c.oid = p.relid;
+```
+
+Phases: `initializing`, `seq scanning heap` (tracked by `heap_blks_scanned`), `index scanning heap` (when `CLUSTER` reads through the index; only tuple counts are available), `sorting tuples`, `writing new heap`, `swapping relation files`, `rebuilding index` (counted by `index_rebuild_count`), and `performing final cleanup`.
+
+The `written_pct_estimate` column divides by `pg_class.reltuples`, which is only an estimate from the last `ANALYZE` or vacuum, and it includes dead rows the rewrite discards. Treat it as a rough guide, not a precise percentage. Since `VACUUM FULL` holds an `ACCESS EXCLUSIVE` lock for the entire run, consider the alternatives in [VACUUM FULL vs VACUUM](/resources/blog/postgres-vacuum-full-vs-vacuum) and [pg_repack](/resources/blog/pg-repack-online-bloat-removal).
+
+## pg_stat_progress_copy
+
+`COPY` progress is useful for large imports and exports, including those issued by `pg_dump` (which uses `COPY ... TO STDOUT`) and `pg_restore` (which uses `COPY ... FROM STDIN` for data).
+
+```sql
+SELECT
+    p.pid,
+    p.datname,
+    nullif(p.relid, 0)::regclass AS table_name,
+    p.command,
+    p.type,
+    pg_size_pretty(p.bytes_processed) AS processed,
+    CASE WHEN p.bytes_total > 0
+         THEN round(100.0 * p.bytes_processed / p.bytes_total, 1)
+    END AS bytes_pct,
+    p.tuples_processed,
+    p.tuples_excluded,
+    now() - a.query_start AS running_for
+FROM pg_stat_progress_copy p
+JOIN pg_stat_activity a USING (pid);
+```
+
+Notes:
+
+- `type` is `FILE`, `PROGRAM`, `PIPE` (client `STDIN`/`STDOUT`) or `CALLBACK` (used by logical replication initial sync).
+- `bytes_total` is known only for `COPY FROM` a server-side file. For `COPY FROM STDIN` it is 0, so percent complete is not available; compare `tuples_processed` against the expected row count instead.
+- `relid` is 0 for `COPY (query) TO`.
+- `tuples_excluded` counts rows filtered out by a `WHERE` clause. PostgreSQL 17 adds `tuples_skipped` for rows skipped with `ON_ERROR ignore`.
+
+## pg_stat_progress_basebackup
+
+Run this on the server being backed up while `pg_basebackup` is running:
+
+```sql
+SELECT
+    pid,
+    phase,
+    pg_size_pretty(backup_streamed) AS streamed,
+    pg_size_pretty(backup_total)    AS total,
+    round(100.0 * backup_streamed / nullif(backup_total, 0), 1) AS pct,
+    tablespaces_streamed || '/' || tablespaces_total AS tablespaces
+FROM pg_stat_progress_basebackup;
+```
+
+Phases: `initializing`, `waiting for checkpoint to finish`, `estimating backup size`, `streaming database files`, `waiting for wal archiving to finish`, `transferring wal files`.
+
+A backup stuck in `waiting for checkpoint to finish` is waiting for a spread checkpoint; `pg_basebackup --checkpoint=fast` requests an immediate one instead. `backup_total` is NULL if size estimation was disabled with `--no-estimate-size`. The total is an estimate, so the percentage can slightly overshoot or stop short of 100 if files change during the backup.
+
+```bash
+pg_basebackup -h primary.internal -U replicator -D /var/lib/postgresql/17/replica \
+  --checkpoint=fast --wal-method=stream --progress
+```
+
+## One query for all running maintenance
+
+For a dashboard or on-call runbook, a single query that lists every progress-reporting operation is handy:
+
+```sql
+SELECT 'vacuum' AS operation, pid, relid::regclass::text AS target, phase
+FROM pg_stat_progress_vacuum
+UNION ALL
+SELECT 'analyze', pid, relid::regclass::text, phase
+FROM pg_stat_progress_analyze
+UNION ALL
+SELECT lower(command), pid, relid::regclass::text, phase
+FROM pg_stat_progress_create_index
+UNION ALL
+SELECT lower(command), pid, relid::regclass::text, phase
+FROM pg_stat_progress_cluster
+UNION ALL
+SELECT lower(command), pid, nullif(relid, 0)::regclass::text, type
+FROM pg_stat_progress_copy
+UNION ALL
+SELECT 'basebackup', pid, NULL, phase
+FROM pg_stat_progress_basebackup
+ORDER BY operation, pid;
+```
+
+This requires PostgreSQL 14 or later because of the `COPY` view; remove that branch on 13. Tools like [Chat2DB](https://chat2db.ai/download) make it easy to save a query like this and re-run it against several servers when you are chasing a slow maintenance window.
+
+## Limitations
+
+The progress views are valuable, but they do not cover everything:
+
+- **No view for table rewrites by `ALTER TABLE`.** `ALTER TABLE ... ALTER COLUMN ... TYPE`, adding a column with a volatile default, or `SET TABLESPACE` report nothing. You can only watch the new relation file grow on disk, or the session's wait events in `pg_stat_activity`.
+- **No view for ordinary queries**, `REFRESH MATERIALIZED VIEW`, `CREATE TABLE AS` or `INSERT ... SELECT`. `EXPLAIN ANALYZE` does not help for a statement that is already running.
+- **Some phases have no counter.** Truncation, final cleanup, sorting and the waiting phases show only the phase name. Measure duration via `pg_stat_activity.query_start` or `xact_start`.
+- **Parallel workers are summarized in the leader's row.** Parallel index builds and parallel index vacuuming do not add separate rows per worker.
+- **Totals can be estimates.** `heap_blks_total` is the size when the scan started; `reltuples` and `backup_total` are estimates. Percentages are guides, not guarantees.
+- **No history.** When the command ends, its row vanishes. For historical durations, enable `log_autovacuum_min_duration` (autovacuum and autoanalyze) and check server logs, or sample the views into a table on a schedule.
+- **Waiting is not progress.** A command blocked on a lock still shows its last phase with unchanged counters. Always look at `wait_event_type` and `wait_event`, and set a `lock_timeout` on DDL so it cannot queue indefinitely; see the [lock timeout guide](/resources/blog/postgres-lock-timeout-guide).
+
+## FAQ
+
+### Why does VACUUM FULL not appear in pg_stat_progress_vacuum?
+
+`VACUUM FULL` rewrites the table like `CLUSTER` does, so it is reported in `pg_stat_progress_cluster` with `command = 'VACUUM FULL'`. Only regular (lazy) `VACUUM` and autovacuum appear in `pg_stat_progress_vacuum`.
+
+### How do I estimate how long a vacuum has left?
+
+During "scanning heap", sample `heap_blks_scanned` twice a few minutes apart, compute blocks per second, and divide the remaining blocks by that rate. Remember that index vacuuming and the second heap pass come afterwards, and each extra `index_vacuum_count` cycle adds another pass over all indexes.
+
+### Why is my CREATE INDEX CONCURRENTLY stuck in a waiting phase?
+
+It is waiting for other transactions to finish, usually a long-running query or a session left idle in transaction. Join `current_locker_pid` to `pg_stat_activity` to find it, then let it finish or terminate it.
+
+### Can I see the progress of pg_dump or pg_restore?
+
+Partially. The data portions run as `COPY` statements, so they show up in `pg_stat_progress_copy` with `tuples_processed`. Index builds during `pg_restore` show up in `pg_stat_progress_create_index`. There is no overall progress view for the whole dump or restore.

@@ -1,0 +1,375 @@
+---
+title: "Postgres Deferrable Constraints Explained"
+description: "How Postgres deferrable constraints work: DEFERRABLE vs INITIALLY DEFERRED, SET CONSTRAINTS ALL DEFERRED, which constraints qualify, use cases, and gotchas."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: September 27, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# Postgres Deferrable Constraints Explained
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="September 27, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+Most of the time you want a constraint to fire the moment a row breaks it. But some perfectly valid operations pass through an invalid intermediate state: swapping two rows' positions in a sorted list, inserting two rows that reference each other, or loading a batch of tables in whatever order the files arrive. For those cases PostgreSQL lets you postpone the check until the end of the statement or the end of the transaction. That is what **Postgres deferrable constraints** are for.
+
+This guide covers what `DEFERRABLE`, `INITIALLY DEFERRED` and `INITIALLY IMMEDIATE` actually mean, which constraint types can be deferred, how `SET CONSTRAINTS ALL DEFERRED` behaves inside a transaction, the practical use cases, and the less obvious restrictions (ON CONFLICT arbiters, foreign key targets, planner optimizations) that should make you think twice before marking everything deferrable.
+
+## The three timing modes
+
+Every constraint in PostgreSQL has a *deferrability* and, if deferrable, an *initial timing*. Combined, you get three possible behaviours:
+
+| Declaration | When is it checked? | Can SET CONSTRAINTS change it? |
+|---|---|---|
+| `NOT DEFERRABLE` (the default) | Immediately (see note below) | No |
+| `DEFERRABLE INITIALLY IMMEDIATE` | At the end of each statement | Yes |
+| `DEFERRABLE INITIALLY DEFERRED` | At transaction commit | Yes |
+
+A few details matter here:
+
+- `NOT DEFERRABLE` is the default. If you write nothing, you get it.
+- `INITIALLY IMMEDIATE` is the default initial timing once you say `DEFERRABLE`. So `DEFERRABLE` alone means "checked at end of statement, but a transaction may choose to defer it".
+- `INITIALLY DEFERRED` implies `DEFERRABLE`. Writing `INITIALLY DEFERRED` on its own is accepted.
+
+### The "immediately" subtlety for UNIQUE and PRIMARY KEY
+
+For non-deferrable `UNIQUE` and `PRIMARY KEY` constraints, PostgreSQL checks uniqueness **row by row** as each index entry is inserted, not at the end of the statement. The SQL standard says the check should happen at the end of the statement, and the PostgreSQL documentation calls out this difference explicitly. The practical consequence is the classic "shift everything down by one" failure:
+
+```sql
+CREATE TABLE menu_item (
+    id       int PRIMARY KEY,
+    position int NOT NULL,
+    label    text NOT NULL,
+    CONSTRAINT menu_item_position_key UNIQUE (position)
+);
+
+INSERT INTO menu_item VALUES
+    (1, 1, 'Home'),
+    (2, 2, 'Docs'),
+    (3, 3, 'Pricing');
+
+-- Make room at position 1
+UPDATE menu_item SET position = position + 1;
+```
+
+Whether this fails depends on the physical order in which rows are visited. If the row at position 1 is updated first, it becomes 2 while the old row with position 2 still exists, and you get:
+
+```text
+ERROR:  duplicate key value violates unique constraint "menu_item_position_key"
+DETAIL:  Key ("position")=(2) already exists.
+```
+
+Declaring the constraint `DEFERRABLE INITIALLY IMMEDIATE` fixes this without changing any application code, because conflicts are now re-checked when the statement finishes, by which time every row has moved:
+
+```sql
+ALTER TABLE menu_item DROP CONSTRAINT menu_item_position_key;
+ALTER TABLE menu_item
+    ADD CONSTRAINT menu_item_position_key UNIQUE (position)
+    DEFERRABLE INITIALLY IMMEDIATE;
+
+UPDATE menu_item SET position = position + 1;  -- succeeds
+```
+
+This is the single most common reason to reach for a deferrable constraint, and it does not even require deferring to commit.
+
+## Which constraints can be deferred
+
+Only four constraint types accept the `DEFERRABLE` clause:
+
+- `UNIQUE`
+- `PRIMARY KEY`
+- `EXCLUDE` (exclusion constraints)
+- `FOREIGN KEY` (`REFERENCES`)
+
+`NOT NULL` and `CHECK` constraints are **always** checked immediately, row by row. Trying to declare them deferrable is an error:
+
+```sql
+CREATE TABLE t (
+    qty int CHECK (qty > 0) DEFERRABLE
+);
+-- ERROR:  misplaced DEFERRABLE clause
+```
+
+If you need a deferred check on arbitrary logic (for example, "every order must have at least one line item at commit time"), the tool is a *constraint trigger*: `CREATE CONSTRAINT TRIGGER ... DEFERRABLE INITIALLY DEFERRED`. Constraint triggers participate in `SET CONSTRAINTS` exactly like built-in deferrable constraints.
+
+Exclusion constraints are covered in more depth in our [Postgres exclusion constraints guide](/resources/blog/postgres-exclusion-constraints-guide); everything in this article about deferral applies to them too.
+
+## Declaring deferrable constraints
+
+The clause goes after the constraint definition, both inline and in table constraints:
+
+```sql
+CREATE TABLE department (
+    id         int PRIMARY KEY,
+    name       text NOT NULL,
+    manager_id int
+);
+
+CREATE TABLE employee (
+    id            int PRIMARY KEY,
+    name          text NOT NULL,
+    department_id int NOT NULL
+        REFERENCES department (id) DEFERRABLE INITIALLY DEFERRED
+);
+
+ALTER TABLE department
+    ADD CONSTRAINT department_manager_fk
+    FOREIGN KEY (manager_id) REFERENCES employee (id)
+    DEFERRABLE INITIALLY DEFERRED;
+```
+
+For a unique constraint on existing data:
+
+```sql
+ALTER TABLE menu_item
+    ADD CONSTRAINT menu_item_label_key UNIQUE (label)
+    DEFERRABLE INITIALLY IMMEDIATE;
+```
+
+## SET CONSTRAINTS inside a transaction
+
+`SET CONSTRAINTS` changes the timing of deferrable constraints for the **current transaction only**:
+
+```sql
+SET CONSTRAINTS ALL DEFERRED;
+SET CONSTRAINTS ALL IMMEDIATE;
+SET CONSTRAINTS menu_item_position_key DEFERRED;
+SET CONSTRAINTS public.department_manager_fk, employee_department_id_fkey IMMEDIATE;
+```
+
+Rules worth memorizing:
+
+1. It only affects constraints declared `DEFERRABLE`. `SET CONSTRAINTS ALL DEFERRED` silently leaves `NOT DEFERRABLE` constraints, `NOT NULL` and `CHECK` alone.
+2. Naming a non-deferrable constraint explicitly raises an error: `constraint "..." is not deferrable`.
+3. Run outside a transaction block, it only emits a warning (`SET CONSTRAINTS can only be used in transaction blocks`) and has no lasting effect, because each statement is its own transaction.
+4. When you switch a constraint from `DEFERRED` to `IMMEDIATE` mid-transaction, every pending check for it is executed right then. This is a handy way to surface an error before `COMMIT`.
+5. The setting disappears at `COMMIT` or `ROLLBACK`; the next transaction starts with the declared initial timing again.
+
+### Walkthrough: swapping two positions
+
+Swapping two rows in separate statements needs deferral to commit, because after the first `UPDATE` there really are two rows with the same position:
+
+```sql
+BEGIN;
+SET CONSTRAINTS menu_item_position_key DEFERRED;
+
+-- after the shift above: id 1 -> position 2, id 2 -> position 3
+UPDATE menu_item SET position = 3 WHERE id = 1;  -- temporarily duplicates 3
+UPDATE menu_item SET position = 2 WHERE id = 2;  -- conflict resolved
+
+COMMIT;  -- uniqueness verified here
+```
+
+Step by step:
+
+1. `SET CONSTRAINTS ... DEFERRED` postpones the uniqueness check for this transaction.
+2. The first `UPDATE` inserts an index entry for position 3 that collides with row `id = 2`. Instead of raising an error, PostgreSQL queues a recheck.
+3. The second `UPDATE` moves row 2 to position 2, the slot row 1 just vacated.
+4. At `COMMIT`, the queued recheck finds exactly one live row for each position, so the commit succeeds.
+
+If the data is still invalid at commit, the `COMMIT` itself fails and the entire transaction is rolled back:
+
+```text
+ERROR:  duplicate key value violates unique constraint "menu_item_position_key"
+DETAIL:  Key ("position")=(3) already exists.
+```
+
+Application code must therefore treat `COMMIT` as a statement that can fail with a constraint violation. Many ORMs assume commit only fails on connectivity problems; check yours.
+
+### Surfacing the error early
+
+If you would rather fail while you still have control, force the checks before committing:
+
+```sql
+BEGIN;
+SET CONSTRAINTS ALL DEFERRED;
+-- ... many statements ...
+SAVEPOINT before_check;
+SET CONSTRAINTS ALL IMMEDIATE;  -- runs pending checks now
+-- if this errors: ROLLBACK TO SAVEPOINT before_check; fix data; retry
+COMMIT;
+```
+
+## Use case: circular foreign keys
+
+With the `department` / `employee` schema above, each table references the other. Without deferral you cannot insert the first row of either table (unless you make a column nullable and do an insert-then-update dance). With both foreign keys `INITIALLY DEFERRED`:
+
+```sql
+BEGIN;
+INSERT INTO department (id, name, manager_id) VALUES (10, 'Platform', 100);
+INSERT INTO employee (id, name, department_id) VALUES (100, 'Ada', 10);
+COMMIT;
+```
+
+Both inserts reference rows that do not exist yet at the moment they run. The foreign key checks are queued and executed at `COMMIT`, when both rows exist.
+
+Note what is **not** deferred: referential *actions*. `ON DELETE CASCADE`, `ON DELETE SET NULL`, `ON UPDATE CASCADE` and friends always execute immediately, even when the constraint is deferrable. Only the `NO ACTION` check can be postponed. `RESTRICT` is specifically the non-deferrable variant of `NO ACTION`: it raises its error immediately regardless of deferral settings. For more on choosing actions, see the [PostgreSQL foreign keys guide](/resources/blog/postgresql-foreign-keys-guide).
+
+## Use case: bulk loads in arbitrary order
+
+When you restore or sync several related tables, you may not control the order of the files. Deferring foreign keys lets you load children before parents inside one transaction:
+
+```sql
+BEGIN;
+SET CONSTRAINTS ALL DEFERRED;
+
+COPY employee   FROM '/data/employee.csv'   WITH (FORMAT csv, HEADER true);
+COPY department FROM '/data/department.csv' WITH (FORMAT csv, HEADER true);
+
+COMMIT;
+```
+
+`COPY ... FROM` a server-side file requires superuser or membership in `pg_read_server_files`; from a client, use psql's `\copy` instead.
+
+Be aware of the memory cost. Foreign key checks are implemented as internal `AFTER` triggers, and deferred trigger events are held in a per-transaction queue in backend memory until commit. For very large loads, that queue can grow significantly. Alternatives for huge loads are dropping and recreating the foreign keys (adding them back with `NOT VALID` and then `VALIDATE CONSTRAINT`), or loading in dependency order in batches.
+
+## Changing deferrability of an existing constraint
+
+For **foreign keys**, you can change deferrability in place, with no table rewrite and no revalidation:
+
+```sql
+ALTER TABLE employee
+    ALTER CONSTRAINT employee_department_id_fkey
+    DEFERRABLE INITIALLY IMMEDIATE;
+
+ALTER TABLE employee
+    ALTER CONSTRAINT employee_department_id_fkey
+    NOT DEFERRABLE;
+```
+
+`ALTER CONSTRAINT` does not support changing the deferrability of `UNIQUE`, `PRIMARY KEY` or `EXCLUDE` constraints. For those you drop and re-add the constraint. To avoid holding a long lock while a new index builds, build the index concurrently first and then attach it:
+
+```sql
+CREATE UNIQUE INDEX CONCURRENTLY menu_item_position_key_new
+    ON menu_item (position);
+
+BEGIN;
+ALTER TABLE menu_item DROP CONSTRAINT menu_item_position_key;
+ALTER TABLE menu_item
+    ADD CONSTRAINT menu_item_position_key
+    UNIQUE USING INDEX menu_item_position_key_new
+    DEFERRABLE INITIALLY IMMEDIATE;
+COMMIT;
+```
+
+`ADD CONSTRAINT ... USING INDEX` renames the index to match the constraint name. The transaction takes an `ACCESS EXCLUSIVE` lock briefly, so set a `lock_timeout` first in production; the [lock timeout guide](/resources/blog/postgres-lock-timeout-guide) explains why. The concurrent build itself is covered in [CREATE INDEX CONCURRENTLY](/resources/blog/postgres-create-index-concurrently).
+
+## Restrictions you must know about
+
+### Deferrable unique constraints cannot be ON CONFLICT arbiters
+
+`INSERT ... ON CONFLICT` needs to detect conflicts immediately to decide whether to insert or update. It therefore refuses deferrable constraints as arbiters:
+
+```sql
+INSERT INTO menu_item (id, position, label)
+VALUES (4, 1, 'Blog')
+ON CONFLICT (position) DO NOTHING;
+-- ERROR:  ON CONFLICT does not support deferrable unique constraints/exclusion constraints as arbiters
+```
+
+If you rely on upserts against a column, keep a non-deferrable unique constraint or unique index on it. Our [ON CONFLICT DO UPDATE guide](/resources/blog/postgres-on-conflict-do-update-guide) goes deeper into arbiter inference.
+
+### A deferrable key cannot be a foreign key target
+
+The referenced columns of a foreign key must be covered by a **non-deferrable** unique or primary key constraint:
+
+```sql
+CREATE TABLE tag (
+    code text,
+    CONSTRAINT tag_code_key UNIQUE (code) DEFERRABLE
+);
+
+CREATE TABLE article_tag (
+    article_id int,
+    tag_code   text REFERENCES tag (code)
+);
+-- ERROR:  cannot use a deferrable unique constraint for referenced table "tag"
+```
+
+The same applies to a deferrable primary key. This is a strong reason never to make primary keys deferrable "just in case": you lose the ability to point foreign keys at them.
+
+### The planner does not trust deferrable unique indexes
+
+Because a deferrable unique index can temporarily contain duplicates, the planner does not use it to prove uniqueness. Optimizations that depend on that proof, such as removing an unnecessary `LEFT JOIN` to a table joined on its unique key, will not apply. In `pg_index`, such indexes have `indimmediate = false`.
+
+## Performance notes
+
+- **Deferrable unique and exclusion constraints**: the index still exists and is maintained normally. When an insert finds a potential conflict, PostgreSQL records a recheck event instead of erroring. If conflicts are rare, overhead is small; if a statement creates many temporary duplicates, each generates a queued recheck.
+- **Deferred foreign keys**: the per-row check work is roughly the same as immediate (it is already an after-trigger); what changes is that events accumulate until commit rather than until statement end, which raises memory usage for long transactions.
+- **Errors arrive late**: a failure at commit throws away all of the transaction's work. For long batch jobs, periodically running `SET CONSTRAINTS ALL IMMEDIATE` limits how much you lose.
+- **Lock duration is unaffected**: deferral changes *when checks run*, not which locks are taken. Foreign key checks still take `FOR KEY SHARE` locks on referenced rows, which can contribute to lock waits; see [deadlock detected fixes](/resources/blog/postgres-deadlock-detected-fix) if you run into them.
+
+## Inspecting deferrability in pg_constraint
+
+The catalog columns `condeferrable` and `condeferred` tell you each constraint's settings:
+
+```sql
+SELECT
+    conrelid::regclass AS table_name,
+    conname,
+    CASE contype
+        WHEN 'p' THEN 'PRIMARY KEY'
+        WHEN 'u' THEN 'UNIQUE'
+        WHEN 'f' THEN 'FOREIGN KEY'
+        WHEN 'x' THEN 'EXCLUDE'
+        WHEN 'c' THEN 'CHECK'
+        WHEN 'n' THEN 'NOT NULL'
+        WHEN 't' THEN 'CONSTRAINT TRIGGER'
+    END AS constraint_type,
+    CASE
+        WHEN NOT condeferrable THEN 'NOT DEFERRABLE'
+        WHEN condeferred       THEN 'DEFERRABLE INITIALLY DEFERRED'
+        ELSE                        'DEFERRABLE INITIALLY IMMEDIATE'
+    END AS timing
+FROM pg_constraint
+WHERE connamespace = 'public'::regnamespace
+ORDER BY 1, 2;
+```
+
+(`contype = 'n'` rows appear in PostgreSQL 18, which began storing `NOT NULL` constraints in `pg_constraint`; earlier versions simply return none.)
+
+To find only the deferrable ones, which are the constraints that can surprise you at commit time:
+
+```sql
+SELECT conrelid::regclass, conname, condeferred
+FROM pg_constraint
+WHERE condeferrable
+ORDER BY 1, 2;
+```
+
+And `pg_get_constraintdef()` shows the full definition including the timing clause:
+
+```sql
+SELECT conname, pg_get_constraintdef(oid)
+FROM pg_constraint
+WHERE conrelid = 'employee'::regclass;
+```
+
+If you prefer browsing this visually, [Chat2DB](https://chat2db.ai/download) shows constraint definitions per table and lets you run these catalog queries side by side with your schema.
+
+## When to use which mode
+
+- **Default (`NOT DEFERRABLE`)**: primary keys, anything used as a foreign key target or an `ON CONFLICT` arbiter, and most everyday constraints.
+- **`DEFERRABLE INITIALLY IMMEDIATE`**: unique columns updated in bulk with shifts (positions, sort orders, version numbers). You get standard statement-level checking, plus the option to defer when needed.
+- **`DEFERRABLE INITIALLY DEFERRED`**: circular foreign keys and relationships where rows are routinely inserted in "wrong" order. Remember that every transaction touching these tables will now only find out about violations at commit.
+
+## FAQ
+
+### What is the difference between DEFERRABLE and INITIALLY DEFERRED?
+
+`DEFERRABLE` means the constraint *may* be postponed; by default it is still checked at the end of each statement. `INITIALLY DEFERRED` means it *is* postponed to commit unless a transaction runs `SET CONSTRAINTS ... IMMEDIATE`.
+
+### Does SET CONSTRAINTS ALL DEFERRED affect NOT NULL or CHECK constraints?
+
+No. `NOT NULL` and `CHECK` constraints cannot be deferrable, so they are always checked immediately. `SET CONSTRAINTS ALL` only touches constraints declared `DEFERRABLE` (including constraint triggers).
+
+### Can I make an existing unique constraint deferrable with ALTER CONSTRAINT?
+
+No. `ALTER TABLE ... ALTER CONSTRAINT` can change deferrability only for foreign keys. For unique, primary key and exclusion constraints, drop and re-create the constraint, ideally attaching an index built with `CREATE UNIQUE INDEX CONCURRENTLY` via `ADD CONSTRAINT ... USING INDEX`.
+
+### Why does my upsert fail after I made a constraint deferrable?
+
+`INSERT ... ON CONFLICT` cannot use deferrable unique or exclusion constraints as arbiters. Keep a non-deferrable unique index on the conflict target columns, or rewrite the logic without `ON CONFLICT`.

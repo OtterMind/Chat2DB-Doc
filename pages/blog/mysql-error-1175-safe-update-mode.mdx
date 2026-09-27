@@ -1,0 +1,347 @@
+---
+title: "MySQL Error 1175: You Are Using Safe Update Mode"
+description: "Fix MySQL error 1175 safe update mode: what sql_safe_updates checks, Workbench and --safe-updates settings, key-based WHERE clauses and batched bulk deletes."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: September 27, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# MySQL Error 1175: You Are Using Safe Update Mode
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="September 27, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+MySQL error 1175 is a guard rail, not a bug. It appears when the `sql_safe_updates` setting is on and you run an `UPDATE` or `DELETE` that MySQL considers too broad: one that does not restrict rows through a key and has no `LIMIT`. Most people meet it for the first time in MySQL Workbench, which enables safe updates by default, while running a perfectly intentional statement such as clearing a staging table.
+
+The quick answer is `SET SQL_SAFE_UPDATES = 0;`. This article explains what the check actually looks at, where the setting comes from (Workbench, the `mysql` client, option files), how to turn it off for just one statement's worth of work and back on, and how to write updates and bulk deletes that pass the check without disabling it. Examples are for MySQL 8.0 and 8.4; MariaDB behaves the same unless noted.
+
+## The error message
+
+```sql
+CREATE TABLE sessions (
+  id         BIGINT AUTO_INCREMENT PRIMARY KEY,
+  user_id    INT NOT NULL,
+  token      CHAR(64) NOT NULL,
+  expires_at DATETIME NOT NULL,
+  status     VARCHAR(20) NOT NULL DEFAULT 'active',
+  KEY idx_expires (expires_at),
+  KEY idx_user (user_id)
+);
+
+SET SQL_SAFE_UPDATES = 1;
+
+DELETE FROM sessions WHERE status = 'revoked';
+```
+
+```text
+ERROR 1175 (HY000): You are using safe update mode and you tried to update a table without a WHERE that uses a KEY column. To disable safe mode, toggle the option in Preferences -> SQL Editor and reconnect.
+```
+
+In MySQL Workbench the same message appears in the Output panel as `Error Code: 1175`. The hint about "Preferences -> SQL Editor" is part of the server's message text, which is why it shows up even in the command-line client where there is no Preferences menu.
+
+The statement above is rejected because `status` has no index. MySQL would have to scan the whole table to find matching rows, and that is exactly the pattern safe update mode is designed to stop.
+
+## What sql_safe_updates actually checks
+
+With `sql_safe_updates = 1`, an `UPDATE` or `DELETE` statement is allowed only if at least one of these is true:
+
+1. The `WHERE` clause restricts rows through a key (an indexed column) that the optimizer can actually use to find the rows.
+2. The statement has a `LIMIT` clause.
+
+Some examples against the `sessions` table:
+
+```sql
+-- Allowed: primary key in WHERE
+DELETE FROM sessions WHERE id = 42;
+
+-- Allowed: range on an indexed column
+DELETE FROM sessions WHERE expires_at < '2026-09-01';
+
+-- Allowed: LIMIT, even without a key
+UPDATE sessions SET status = 'revoked' WHERE status = 'suspicious' LIMIT 1000;
+
+-- Rejected: no WHERE, no LIMIT
+DELETE FROM sessions;
+
+-- Rejected: WHERE on a non-indexed column, no LIMIT
+UPDATE sessions SET status = 'expired' WHERE status = 'active';
+```
+
+A few subtleties are worth knowing.
+
+**The key must be usable.** The check is about whether rows are located through an index, not whether an indexed column appears somewhere in the text. Wrapping the column in a function prevents index use, so this can still be rejected:
+
+```sql
+-- Can be rejected: DATE() on the column prevents a range scan on idx_expires
+DELETE FROM sessions WHERE DATE(expires_at) < '2026-09-01';
+```
+
+Rewrite it as a plain range, which is also faster:
+
+```sql
+DELETE FROM sessions WHERE expires_at < '2026-09-01 00:00:00';
+```
+
+The same applies to comparisons that force a type conversion, for example comparing an indexed `VARCHAR` column to a number.
+
+**OR with a non-indexed column** can also turn a key lookup into a full scan and trigger the error:
+
+```sql
+-- Can be rejected: the second condition has no index
+DELETE FROM sessions WHERE user_id = 7 OR status = 'revoked';
+```
+
+**TRUNCATE is not affected.** `TRUNCATE TABLE sessions;` is a DDL statement and is not checked by `sql_safe_updates`. It also cannot be rolled back and resets `AUTO_INCREMENT`, so safe update mode does not make it any less dangerous.
+
+**Multi-table statements** follow the same idea: the rows in the tables being modified must be found through keys.
+
+## Where safe update mode comes from
+
+`sql_safe_updates` defaults to `OFF` on the server. If you are seeing error 1175, something switched it on for your session. There are three usual sources.
+
+### MySQL Workbench
+
+Workbench turns on safe updates for its SQL editor by default. To change it:
+
+1. Open **Edit > Preferences** (on macOS: **MySQLWorkbench > Settings** or **Preferences**, depending on the version).
+2. Go to **SQL Editor**.
+3. Uncheck **Safe Updates (rejects UPDATEs and DELETEs with no restrictions)**.
+4. Click **OK**, then reconnect with **Query > Reconnect to Server** or by closing and reopening the connection tab.
+
+The reconnect step is required. Workbench applies the setting when it opens the session, so changing the checkbox does not affect the connection you already have open. This is the most common reason people report that "unchecking the box didn't work".
+
+### The mysql client with --safe-updates
+
+The command-line client has an option that turns on safe updates for the session:
+
+```bash
+mysql --safe-updates -u app -p shop
+# identical, with a memorable name:
+mysql --i-am-a-dummy -u app -p shop
+```
+
+It can also be set in an option file, which is easy to forget about:
+
+```ini
+[mysql]
+safe-updates
+```
+
+`--safe-updates` does more than set `sql_safe_updates`. When the client connects, it runs the equivalent of:
+
+```sql
+SET sql_safe_updates = 1, sql_select_limit = 1000, max_join_size = 1000000;
+```
+
+- `sql_select_limit = 1000` caps `SELECT` results at 1,000 rows unless the statement has its own `LIMIT`. This is the source of "why does my query only return 1000 rows?" in sessions started with this option.
+- `max_join_size = 1000000` rejects `SELECT` statements the optimizer estimates will examine more than a million row combinations, with error 1104 ("The SELECT would examine more than MAX_JOIN_SIZE rows").
+
+Both values can be changed with the client options `--select-limit` and `--max-join-size`:
+
+```bash
+mysql --safe-updates --select-limit=5000 --max-join-size=10000000 -u app -p shop
+```
+
+To find out whether an option file is enabling it, print the options the client would use:
+
+```bash
+mysql --print-defaults
+```
+
+### Application or connection pool settings
+
+Some tools and pools run initialization SQL on each connection. Search for `sql_safe_updates` in your application configuration, connection pool `initSql` settings, or JDBC `sessionVariables`. A server-wide `SET GLOBAL sql_safe_updates = 1` or a `sql_safe_updates` line under `[mysqld]` in `my.cnf` also enables it for every new session:
+
+```sql
+SELECT @@GLOBAL.sql_safe_updates, @@SESSION.sql_safe_updates;
+```
+
+## Turning it off for a session, then back on
+
+When you have a legitimate statement that cannot use a key, disable the check for your session, run the statement, and turn it back on:
+
+```sql
+SET SQL_SAFE_UPDATES = 0;
+
+UPDATE sessions SET status = 'expired' WHERE status = 'active' AND expires_at < NOW();
+
+SET SQL_SAFE_UPDATES = 1;
+```
+
+`SET SQL_SAFE_UPDATES = 0` without `GLOBAL` affects only the current connection. Other users and other Workbench tabs are unaffected. Avoid `SET GLOBAL sql_safe_updates = 0`: it changes the default for every new connection on the server, and if it was enabled globally, someone chose that on purpose.
+
+Wrapping the change in a transaction adds a second safety net, because you can check the affected row count before committing:
+
+```sql
+SET SQL_SAFE_UPDATES = 0;
+START TRANSACTION;
+
+DELETE FROM sessions WHERE status = 'revoked';
+-- Query OK, 18234 rows affected
+
+SELECT ROW_COUNT();   -- run immediately after the DELETE
+-- If the number looks wrong:
+ROLLBACK;
+-- If it looks right:
+COMMIT;
+
+SET SQL_SAFE_UPDATES = 1;
+```
+
+This works for InnoDB tables. Tables using MyISAM or other non-transactional engines cannot be rolled back.
+
+## Writing statements that pass the check
+
+Turning the check off is fine for one-off maintenance, but for code that runs repeatedly it is better to write statements that pass it. That usually also makes them faster.
+
+### Use the primary key
+
+The most robust pattern is to find the rows first, then modify them by primary key:
+
+```sql
+SELECT id FROM sessions WHERE status = 'revoked';
+
+DELETE FROM sessions WHERE id IN (101, 102, 250);
+```
+
+For larger sets, collect the IDs in a temporary table and join on the primary key, so the rows of `sessions` are located through `PRIMARY`:
+
+```sql
+CREATE TEMPORARY TABLE doomed (id BIGINT PRIMARY KEY);
+
+INSERT INTO doomed (id)
+SELECT id FROM sessions WHERE status = 'revoked';
+
+DELETE s
+FROM sessions s
+JOIN doomed d ON d.id = s.id;
+
+DROP TEMPORARY TABLE doomed;
+```
+
+Whether safe update mode accepts a particular multi-table form depends on the plan the optimizer picks; if it is still rejected, the batching patterns below always work.
+
+A common shortcut is `WHERE id > 0` to satisfy the check while updating the whole table. It works, since it is a range on the primary key, but it only defeats the protection. If you really mean the whole table, say so explicitly by disabling the check for the session.
+
+### Add the index the WHERE clause needs
+
+If a query like `UPDATE ... WHERE status = ...` runs regularly, the error is a hint that it does a full table scan every time. An index fixes both problems:
+
+```sql
+ALTER TABLE sessions ADD INDEX idx_status (status);
+```
+
+Low-selectivity columns such as `status` are not always good index candidates; a composite index that matches the actual filter, such as `(status, expires_at)`, is often better.
+
+### Use LIMIT
+
+`LIMIT` alone satisfies the check, and it is the foundation of safe bulk changes. Remember that `LIMIT` without `ORDER BY` in an `UPDATE` or `DELETE` removes an unspecified subset of rows. That is fine when you repeat the statement until nothing matches, but not when you mean "the oldest 1,000 rows".
+
+## Safe bulk deletes in batches
+
+Deleting millions of rows in one statement holds locks for a long time, generates a huge undo log, and can cause replication lag. Deleting in batches is kinder to the server and naturally compatible with safe update mode.
+
+### Batch by LIMIT
+
+```sql
+DELETE FROM sessions
+WHERE expires_at < '2026-09-01'
+ORDER BY id
+LIMIT 5000;
+```
+
+Repeat until the statement reports `0 rows affected`. A shell loop does that for you:
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+
+while true; do
+  deleted=$(mysql --safe-updates -N -u app -p"$DB_PASSWORD" shop -e "
+    DELETE FROM sessions
+    WHERE expires_at < '2026-09-01'
+    ORDER BY id
+    LIMIT 5000;
+    SELECT ROW_COUNT();")
+  echo "deleted: $deleted"
+  [ "$deleted" -eq 0 ] && break
+  sleep 0.5
+done
+```
+
+`ROW_COUNT()` must run in the same session right after the `DELETE`, which is why both statements are in one `-e` string. The short sleep gives replicas time to catch up. Passing the password on the command line is shown for brevity; in practice use an option file or `mysql_config_editor`.
+
+### Batch by primary key range
+
+For very large tables, `ORDER BY id LIMIT n` has to skip over already-deleted ranges less and less efficiently as rows are purged from the middle. Walking the primary key in ranges avoids that:
+
+```sql
+SELECT MIN(id), MAX(id) FROM sessions WHERE expires_at < '2026-09-01';
+-- 1, 48210000
+```
+
+```sql
+DELETE FROM sessions
+WHERE id BETWEEN 1 AND 10000
+  AND expires_at < '2026-09-01';
+
+DELETE FROM sessions
+WHERE id BETWEEN 10001 AND 20000
+  AND expires_at < '2026-09-01';
+-- ... continue up to MAX(id)
+```
+
+Each statement uses the primary key, so it passes safe update mode, touches a bounded number of rows, and holds locks briefly. The same idea as a stored procedure:
+
+```sql
+DELIMITER //
+CREATE PROCEDURE purge_sessions(IN cutoff DATETIME, IN step INT)
+BEGIN
+  DECLARE lo BIGINT;
+  DECLARE hi BIGINT;
+  SELECT MIN(id), MAX(id) INTO lo, hi FROM sessions WHERE expires_at < cutoff;
+  WHILE lo IS NOT NULL AND lo <= hi DO
+    DELETE FROM sessions
+    WHERE id BETWEEN lo AND lo + step - 1
+      AND expires_at < cutoff;
+    COMMIT;
+    SET lo = lo + step;
+  END WHILE;
+END //
+DELIMITER ;
+
+CALL purge_sessions('2026-09-01 00:00:00', 10000);
+```
+
+The same batching applies to bulk `UPDATE`s. When child tables reference the rows you delete, make sure the foreign key has `ON DELETE CASCADE` or delete children first; otherwise the batches fail with the errors described in [MySQL Error 1452: Foreign Key Constraint Fails](/resources/blog/mysql-error-1452-foreign-key-constraint-fails).
+
+If you prefer to run maintenance statements from a GUI, [Chat2DB](https://chat2db.ai/download) shows the affected row count for every statement and lets you keep a transaction open while you check it, which pairs well with batch deletes.
+
+## MariaDB differences
+
+MariaDB supports the same `sql_safe_updates` variable, the same error 1175, and the same `--safe-updates` and `--i-am-a-dummy` client options with the same `sql_select_limit` and `max_join_size` defaults. The exact wording of error messages can differ slightly between MariaDB and MySQL versions, so match on the error number rather than the text in scripts. `TRUNCATE` is likewise not covered by the check.
+
+## When the error number is different
+
+Safe update mode only produces error 1175 (and error 1104 from `max_join_size` in client sessions started with `--safe-updates`). If your `UPDATE` fails with another code, such as a duplicate key error or an access denied error, see [MySQL Error 1062](/resources/blog/mysql-error-1062-duplicate-entry) or [MySQL Error 1045](/resources/blog/mysql-error-1045). You can also look up any MySQL error number and its meaning with the free [MySQL error code lookup tool](https://chat2db.ai/tools/mysql-error-code-lookup).
+
+## FAQ
+
+### How do I fix error 1175 in MySQL Workbench permanently?
+
+Go to Edit > Preferences > SQL Editor, uncheck Safe Updates, click OK, and reconnect to the server. The change applies only to new connections, so the reconnect is required. For a one-off statement, `SET SQL_SAFE_UPDATES = 0;` in the editor is enough.
+
+### Is it safe to run SET SQL_SAFE_UPDATES = 0?
+
+It affects only your current session, so it does not change anything for other users. The risk is that your own next statement is no longer checked. Turn it back on with `SET SQL_SAFE_UPDATES = 1;` after the maintenance statement, and use a transaction so you can roll back if the row count is wrong.
+
+### Why is my UPDATE rejected even though the WHERE uses an indexed column?
+
+Because the optimizer could not use the index to find the rows. Functions on the column, type conversions, and `OR` conditions on non-indexed columns all force a full scan. Rewrite the condition as a plain comparison or range on the indexed column, or add `LIMIT`.
+
+### Why does my SELECT only return 1000 rows?
+
+The session was started with `mysql --safe-updates` (or `safe-updates` in an option file), which also sets `sql_select_limit = 1000`. Add an explicit `LIMIT`, run `SET sql_select_limit = DEFAULT;`, or start the client with `--select-limit` set to a larger value.

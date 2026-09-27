@@ -1,0 +1,361 @@
+---
+title: "MySQL Error 1071: Specified Key Was Too Long"
+description: "Fix MySQL error 1071 specified key was too long (767 or 3072 bytes): utf8mb4 byte math, row formats, prefix indexes, hash columns, Laravel and Django tips."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: September 27, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# MySQL Error 1071: Specified Key Was Too Long
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="September 27, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+```text
+ERROR 1071 (42000): Specified key was too long; max key length is 767 bytes
+ERROR 1071 (42000): Specified key was too long; max key length is 3072 bytes
+```
+
+MySQL raises error 1071 when an index would need more bytes per entry than the storage engine allows. The limit is measured in bytes, not characters, and the number in the message tells you which limit you hit. With utf8mb4 now the default character set, a `VARCHAR(255)` that indexed fine under latin1 can suddenly be four times too big.
+
+This guide explains the byte math, why you see 767 on some tables and 3072 on others, and the practical fixes: row format changes, shorter columns, prefix indexes, and hash columns. It targets MySQL 8.0 and 8.4, with notes on MariaDB and on older 5.x servers you may still be migrating from. All error output was produced on MySQL 8.0.
+
+## The Byte Math
+
+InnoDB sizes an index key by the maximum possible length of each column, which is the declared character length multiplied by the maximum bytes per character of the column's character set:
+
+| Character set | Max bytes per char | Largest VARCHAR under 767 bytes | Largest VARCHAR under 3072 bytes |
+|---------------|--------------------|---------------------------------|----------------------------------|
+| latin1 | 1 | 767 | 3072 |
+| utf8mb3 (old `utf8`) | 3 | 255 | 1024 |
+| utf8mb4 | 4 | 191 | 768 |
+
+That is where the famous `VARCHAR(191)` comes from: 191 × 4 = 764 bytes, the largest utf8mb4 length that fits in 767. And 768 × 4 = 3072 exactly, the largest that fits under the modern limit. MySQL 8.0 defaults to utf8mb4, so these are the numbers to remember.
+
+You can check what MySQL computes for any column:
+
+```sql
+SELECT COLUMN_NAME, CHARACTER_MAXIMUM_LENGTH, CHARACTER_OCTET_LENGTH
+FROM information_schema.COLUMNS
+WHERE TABLE_SCHEMA = 'demo' AND TABLE_NAME = 'u4';
+```
+
+```text
++-------------+--------------------------+------------------------+
+| COLUMN_NAME | CHARACTER_MAXIMUM_LENGTH | CHARACTER_OCTET_LENGTH |
++-------------+--------------------------+------------------------+
+| url         |                      768 |                   3072 |
++-------------+--------------------------+------------------------+
+```
+
+`CHARACTER_OCTET_LENGTH` is the number that counts against the index limit. The small length prefix that `VARCHAR` stores on disk does not count.
+
+### Reproducing Both Limits
+
+```sql
+CREATE TABLE u5 (url VARCHAR(769), UNIQUE KEY (url)) CHARSET=utf8mb4;
+```
+
+```text
+ERROR 1071 (42000): Specified key was too long; max key length is 3072 bytes
+```
+
+```sql
+CREATE TABLE u4 (url VARCHAR(768), UNIQUE KEY (url)) CHARSET=utf8mb4;
+-- Query OK
+```
+
+One character more is enough to fail, because 769 × 4 = 3076 bytes.
+
+## Why the Limit Is 767 or 3072: Row Formats
+
+The limit depends on the InnoDB row format of the table:
+
+| Row format | Max index key prefix (16 KB pages) |
+|------------|------------------------------------|
+| REDUNDANT | 767 bytes |
+| COMPACT | 767 bytes |
+| DYNAMIC | 3072 bytes |
+| COMPRESSED | 3072 bytes |
+
+The 3072-byte limit applies to the default 16 KB `innodb_page_size`. With 8 KB pages the limit is 1536 bytes, and with 4 KB pages it is 768 bytes. MyISAM has its own limit of 1000 bytes:
+
+```sql
+CREATE TABLE u15 (u VARCHAR(1024) CHARSET utf8mb4, UNIQUE KEY (u)) ENGINE=MyISAM;
+```
+
+```text
+ERROR 1071 (42000): Specified key was too long; max key length is 1000 bytes
+```
+
+On MySQL 8.0 and 8.4 new tables use `DYNAMIC` by default (controlled by `innodb_default_row_format`), so a fresh table reports the 3072-byte limit. If you see 767, the table is almost always an old `COMPACT` or `REDUNDANT` table carried over from MySQL 5.6 or earlier, or the `CREATE TABLE` statement names `ROW_FORMAT=COMPACT` explicitly (common in old dumps).
+
+```sql
+CREATE TABLE u1 (email VARCHAR(255)) ROW_FORMAT=COMPACT CHARSET=utf8mb4;
+CREATE INDEX ix ON u1 (email);
+```
+
+```text
+ERROR 1071 (42000): Specified key was too long; max key length is 767 bytes
+```
+
+Check the row format of your tables:
+
+```sql
+SELECT TABLE_NAME, ROW_FORMAT
+FROM information_schema.TABLES
+WHERE TABLE_SCHEMA = DATABASE()
+  AND ENGINE = 'InnoDB'
+  AND ROW_FORMAT IN ('Compact', 'Redundant');
+
+SELECT @@innodb_default_row_format;
+```
+
+### The innodb_large_prefix History
+
+Many older answers tell you to set `innodb_large_prefix`. Here is what happened to it:
+
+- MySQL 5.5 and 5.6: the limit was 767 bytes unless you enabled `innodb_large_prefix`, set `innodb_file_format=Barracuda`, and used `DYNAMIC` or `COMPRESSED` tables.
+- MySQL 5.7.7: `innodb_large_prefix` became enabled by default and was deprecated. `innodb_default_row_format` (added in 5.7.9) defaults to `DYNAMIC`.
+- MySQL 8.0: `innodb_large_prefix` and `innodb_file_format` were removed. Large prefixes are always available on `DYNAMIC` and `COMPRESSED` tables.
+
+On 8.0 the variable no longer exists:
+
+```sql
+SET GLOBAL innodb_large_prefix = ON;
+```
+
+```text
+ERROR 1193 (HY000): Unknown system variable 'innodb_large_prefix'
+```
+
+Leaving it in `my.cnf` is worse: the server refuses to start with an unknown variable error. Remove it (and `innodb_file_format`) when upgrading. MariaDB followed a similar path: `DYNAMIC` became the default in 10.2, and the old variables were deprecated and later removed.
+
+## Fix 1: Convert the Table to DYNAMIC
+
+If the error says 767 and the table is `COMPACT`, converting the row format raises the limit to 3072 and usually solves the problem without touching the column:
+
+```sql
+ALTER TABLE u12 ROW_FORMAT=DYNAMIC, ADD UNIQUE KEY (u);
+```
+
+The table here has a `VARCHAR(255)` utf8mb4 column (1020 bytes), which fails under `COMPACT` and succeeds under `DYNAMIC`. `ALTER TABLE ... ROW_FORMAT` rebuilds the table, so on large tables plan it like any other rebuild: during low traffic, or with an online schema change tool. The same rebuild is the time to fix a failing `ALTER TABLE ... CONVERT TO CHARACTER SET utf8mb4`, which is a very common source of 767-byte errors on legacy tables.
+
+## Fix 2: Shorten the Column
+
+Ask whether the column really needs its declared length. Email addresses are limited to 254 characters by the relevant RFCs, most slugs and usernames are far shorter, and ISO codes are fixed-length. If the data allows it, shrinking the column is the cleanest fix because the index still covers the full value:
+
+```sql
+-- Check the longest value first
+SELECT MAX(CHAR_LENGTH(email)) FROM users;
+
+ALTER TABLE users MODIFY email VARCHAR(191) NOT NULL;
+ALTER TABLE users ADD UNIQUE KEY uq_users_email (email);
+```
+
+Under `DYNAMIC` you rarely need to go as low as 191; `VARCHAR(255)` already fits comfortably in 3072 bytes. The 191 number only matters for `COMPACT` tables or composite indexes.
+
+Choosing a narrower character set for columns that only contain ASCII (hashes, codes, tokens) also works: `VARCHAR(255) CHARACTER SET ascii` costs 255 bytes in an index.
+
+## Fix 3: Prefix Indexes
+
+A prefix index indexes only the first N characters of a column:
+
+```sql
+CREATE TABLE pages (
+  id  BIGINT AUTO_INCREMENT PRIMARY KEY,
+  url VARCHAR(2000) NOT NULL,
+  KEY idx_pages_url (url(191))
+) CHARSET=utf8mb4;
+```
+
+This is fine for lookups and range scans, as long as the prefix is selective. Measure how selective a candidate length would be before choosing:
+
+```sql
+SELECT
+  COUNT(DISTINCT LEFT(url, 50))  / COUNT(*) AS sel_50,
+  COUNT(DISTINCT LEFT(url, 100)) / COUNT(*) AS sel_100,
+  COUNT(DISTINCT LEFT(url, 191)) / COUNT(*) AS sel_191,
+  COUNT(DISTINCT url)            / COUNT(*) AS sel_full
+FROM pages;
+```
+
+Pick the shortest length whose selectivity is close to `sel_full`.
+
+### Prefix Indexes Cannot Enforce Full-Value Uniqueness
+
+A `UNIQUE` prefix index is allowed, but it enforces uniqueness of the prefix, not of the value. Two different URLs that share their first 768 characters are rejected as duplicates:
+
+```sql
+CREATE TABLE u9 (url VARCHAR(2000), UNIQUE KEY (url(768))) CHARSET=utf8mb4;
+INSERT INTO u9 VALUES
+  (CONCAT(REPEAT('a', 768), 'x')),
+  (CONCAT(REPEAT('a', 768), 'y'));
+```
+
+```text
+ERROR 1062 (23000): Duplicate entry 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' for key 'u9.url'
+```
+
+That is a false duplicate. If you need true uniqueness on a long value, use a hash column (Fix 4). For more on this error, see [MySQL Error 1062: Duplicate Entry](/resources/blog/mysql-error-1062-duplicate-entry).
+
+Other prefix index limitations:
+
+- They cannot be used as covering indexes, because the index does not contain the full value.
+- They cannot satisfy `ORDER BY url` or `GROUP BY url` on their own.
+- A foreign key cannot reference a prefix-indexed column. For related errors see [MySQL Error 1452](/resources/blog/mysql-error-1452-foreign-key-constraint-fails).
+- `TEXT` and `BLOB` columns can only be indexed with a prefix. Without one you get `ERROR 1170 (42000): BLOB/TEXT column 'url' used in key specification without a key length`.
+
+### Watch Out for Non-Strict Mode
+
+In strict mode (the default `sql_mode` in 8.0), a too-long non-unique index fails with 1071. Without strict mode, MySQL silently turns it into a prefix index and only raises a warning:
+
+```sql
+SET SESSION sql_mode = '';
+CREATE TABLE u8 (url VARCHAR(2000), KEY (url)) CHARSET=utf8mb4;
+SHOW WARNINGS;
+```
+
+```text
++---------+------+---------------------------------------------------------+
+| Level   | Code | Message                                                 |
++---------+------+---------------------------------------------------------+
+| Warning | 1071 | Specified key was too long; max key length is 3072 bytes |
++---------+------+---------------------------------------------------------+
+```
+
+`SHOW CREATE TABLE u8` then shows `KEY url (url(768))`. That can surprise you later when the index behaves like a prefix index. `UNIQUE` and primary keys are never silently truncated.
+
+## Fix 4: A Generated Hash Column With a Unique Index
+
+To enforce uniqueness on long strings such as URLs, file paths, or document fingerprints, store a fixed-length hash in a generated column and put the unique index on that:
+
+```sql
+CREATE TABLE links (
+  id       BIGINT AUTO_INCREMENT PRIMARY KEY,
+  url      VARCHAR(2000) NOT NULL,
+  url_hash BINARY(32) AS (UNHEX(SHA2(url, 256))) STORED,
+  UNIQUE KEY uq_links_url_hash (url_hash)
+) CHARSET=utf8mb4;
+```
+
+The index is only 32 bytes per entry, regardless of URL length, and MySQL keeps the hash in sync automatically. Inserting the same URL twice is rejected:
+
+```sql
+INSERT INTO links (url) VALUES ('https://example.com/a');
+INSERT INTO links (url) VALUES ('https://example.com/a');
+```
+
+```text
+ERROR 1062 (23000): Duplicate entry '-\xCE\x0ALPD...' for key 'links.uq_links_url_hash'
+```
+
+To look up by URL through the index, query the hash, and optionally re-check the full value:
+
+```sql
+SELECT id, url
+FROM links
+WHERE url_hash = UNHEX(SHA2('https://example.com/a', 256))
+  AND url = 'https://example.com/a';
+```
+
+Some notes on this pattern:
+
+- SHA-256 collisions are not a practical concern. A shorter hash such as `MD5` (16 bytes) is also acceptable for uniqueness of non-adversarial data.
+- The hash is computed over the exact bytes, so it is case and accent sensitive, unlike a regular index with an `_ai_ci` collation. If `Example.com` and `example.com` must count as duplicates, hash a normalized expression such as `LOWER(url)`.
+- You can also use a `VIRTUAL` generated column; InnoDB supports secondary indexes on virtual columns. `STORED` is simpler to reason about and works with more tools.
+
+MariaDB 10.4 and later can do this for you: a `UNIQUE` key on a long column or on `TEXT` is implemented with a hidden hash automatically instead of raising 1071. MySQL has no equivalent, so the explicit hash column is the portable approach.
+
+## Composite Indexes: The Total Counts
+
+The limit applies to the whole index entry, so the lengths of all key parts are added together:
+
+```sql
+CREATE TABLE u6 (a VARCHAR(500), b VARCHAR(500), KEY (a, b)) CHARSET=utf8mb4;
+```
+
+```text
+ERROR 1071 (42000): Specified key was too long; max key length is 3072 bytes
+```
+
+(500 + 500) × 4 = 4000 bytes, which is over 3072. Either shorten a column or index prefixes of each part:
+
+```sql
+CREATE TABLE u7 (a VARCHAR(500), b VARCHAR(500), KEY (a(300), b(300))) CHARSET=utf8mb4;
+-- (300 + 300) x 4 = 2400 bytes: Query OK
+```
+
+Integer and date columns in a composite index count too (an `INT` is 4 bytes, a `DATETIME` 5 bytes plus fractional seconds), but they are small compared with string columns. Individual key parts in a composite index are each subject to the same per-column limit as well.
+
+## Framework Notes
+
+### Laravel
+
+Laravel uses utf8mb4 and `VARCHAR(255)` for `$table->string()` by default. On MySQL older than 5.7.7, or on MariaDB older than 10.2.2, running migrations fails with:
+
+```text
+SQLSTATE[42000]: Syntax error or access violation: 1071 Specified key was too long;
+max key length is 767 bytes
+```
+
+The documented workaround is to limit the default string length in `App\Providers\AppServiceProvider`:
+
+```php
+use Illuminate\Support\Facades\Schema;
+
+public function boot(): void
+{
+    Schema::defaultStringLength(191);
+}
+```
+
+On MySQL 8.0 and 8.4 with `DYNAMIC` tables, you do not need this, and it needlessly caps every string column at 191 characters. Prefer upgrading the server or converting old tables to `DYNAMIC`. If one specific column needs to be long and unique, give that column an explicit length or add a hash column in a raw migration.
+
+### Django
+
+Django's `CharField(max_length=255, unique=True)` or `db_index=True` creates a `VARCHAR(255)` index. On utf8mb4 that is 1020 bytes, which works on `DYNAMIC` tables and fails with 1071 on `COMPACT` tables. Current Django releases require MySQL 8.0 or later, so the problem mostly appears with legacy tables or with very long fields: a unique `CharField(max_length=1000)` needs 4000 bytes and fails everywhere. For those, index a hash of the value or reduce `max_length`. Also note that `URLField` defaults to `max_length=200`, so a unique `URLField` fits under 3072 bytes but not under 767 bytes in utf8mb4.
+
+## Finding Risky Indexes Before They Fail
+
+Before converting a legacy schema to utf8mb4, list string columns that are part of an index and would exceed 767 bytes after conversion:
+
+```sql
+SELECT s.TABLE_NAME, s.INDEX_NAME, s.COLUMN_NAME, s.SUB_PART,
+       c.CHARACTER_MAXIMUM_LENGTH * 4 AS bytes_as_utf8mb4, t.ROW_FORMAT
+FROM information_schema.STATISTICS s
+JOIN information_schema.COLUMNS c
+  ON c.TABLE_SCHEMA = s.TABLE_SCHEMA
+ AND c.TABLE_NAME = s.TABLE_NAME
+ AND c.COLUMN_NAME = s.COLUMN_NAME
+JOIN information_schema.TABLES t
+  ON t.TABLE_SCHEMA = s.TABLE_SCHEMA
+ AND t.TABLE_NAME = s.TABLE_NAME
+WHERE s.TABLE_SCHEMA = DATABASE()
+  AND c.CHARACTER_MAXIMUM_LENGTH * 4 > 767
+  AND s.SUB_PART IS NULL
+ORDER BY s.TABLE_NAME, s.INDEX_NAME;
+```
+
+Any row with `ROW_FORMAT` of `Compact` or `Redundant` needs attention first. Running this kind of inventory query and reviewing the DDL side by side is easier in a SQL client like [Chat2DB](https://chat2db.ai/download), where you can keep the query results and each table's DDL open together and check row formats and key definitions before running the migration.
+
+## FAQ
+
+### Why do I get 767 bytes on one server and 3072 bytes on another?
+
+The limit comes from the table's row format, not the server version alone. `COMPACT` and `REDUNDANT` tables allow 767 bytes; `DYNAMIC` and `COMPRESSED` tables allow 3072 bytes with 16 KB pages. Check `ROW_FORMAT` in `information_schema.TABLES` and `@@innodb_default_row_format` on both servers.
+
+### Should I still use VARCHAR(191) on MySQL 8.0?
+
+Only if the table must stay `COMPACT` or the column is part of a wide composite index. On `DYNAMIC` tables a `VARCHAR(255)` utf8mb4 index needs 1020 bytes and fits easily, and a single-column index can go up to `VARCHAR(768)`.
+
+### Can I set innodb_large_prefix on MySQL 8.0?
+
+No. The variable was removed in 8.0 and setting it returns `ERROR 1193 Unknown system variable`. Large index prefixes are always enabled for `DYNAMIC` and `COMPRESSED` tables, so convert the table's row format instead.
+
+### How do I enforce uniqueness on a column longer than 768 characters?
+
+Add a generated column that stores `UNHEX(SHA2(col, 256))` as `BINARY(32)` and create the `UNIQUE` index on it. A unique prefix index would reject different values that happen to share the same prefix.

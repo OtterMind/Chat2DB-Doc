@@ -1,0 +1,393 @@
+---
+title: "MySQL Error 2002: Can't Connect Through Socket"
+description: "Fix MySQL error 2002 can't connect through socket mysqld.sock: 2002 vs 2003, localhost vs 127.0.0.1, server down, socket paths, Docker, WSL, Homebrew, PHP."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: September 27, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# MySQL Error 2002: Can't Connect Through Socket
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="September 27, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+```text
+ERROR 2002 (HY000): Can't connect to local MySQL server through socket '/var/run/mysqld/mysqld.sock' (2)
+```
+
+This error comes from the client library, not from the server. It means the client tried to open a Unix domain socket file on the local machine and failed. The server never saw a login attempt, so your username, password, and grants are irrelevant at this stage.
+
+There are really only two questions to answer: is a MySQL server running on this machine, and is the client looking for its socket at the path where the server actually created it? This guide shows how to answer both on MySQL 8.0 and 8.4, with notes for MariaDB, Homebrew, Docker, WSL, and PHP.
+
+## Error 2002 vs Error 2003
+
+Both are client-side connection errors, but they refer to different transports:
+
+| Error | Transport | Typical message |
+|-------|-----------|-----------------|
+| 2002 | Unix socket file (local only) | `Can't connect to local MySQL server through socket '...' (2)` |
+| 2003 | TCP/IP (host and port) | `Can't connect to MySQL server on '127.0.0.1:3306' (111)` |
+
+For example:
+
+```bash
+mysql -u root -p -h localhost -S /tmp/nope.sock
+# ERROR 2002 (HY000): Can't connect to local MySQL server through socket '/tmp/nope.sock' (2)
+
+mysql -u root -p -h 127.0.0.1 -P 3307
+# ERROR 2003 (HY000): Can't connect to MySQL server on '127.0.0.1:3307' (111)
+```
+
+If you see 2003, the problem is networking: the port, `bind-address`, a firewall, or a server that is down. If you see 2002, the problem is local: the socket file or the server process on this host. For TCP timeouts and dropped connections, see [MySQL Timeout Fix](/resources/blog/mysql-timeout-fix).
+
+### The Number in Parentheses
+
+The trailing number is the operating system errno, and it narrows things down immediately:
+
+- `(2)` means "No such file or directory". The socket file does not exist at that path. Either the server is not running, or it put the socket somewhere else.
+- `(111)` on Linux (`(61)` on macOS) means "Connection refused". The file exists but no process is listening on it. This is a stale socket left behind by a crashed server.
+- `(13)` means "Permission denied". The file exists but the client user cannot access it or the directory containing it.
+
+## Why localhost Means Socket but 127.0.0.1 Means TCP
+
+The MySQL client library treats the host name `localhost` specially on Unix-like systems. It does not resolve it to an IP address. Instead it connects through the Unix socket file. The host `127.0.0.1` forces a TCP connection to the loopback interface.
+
+```bash
+mysql -u root -p -h localhost   # Unix socket
+mysql -u root -p -h 127.0.0.1   # TCP to port 3306
+mysql -u root -p                 # no host given: defaults to localhost, so socket
+mysql -u root -p -h localhost --protocol=TCP   # forces TCP even with localhost
+```
+
+You can confirm which transport a session uses:
+
+```sql
+\s
+```
+
+The `Connection:` line shows either `Localhost via UNIX socket` or `127.0.0.1 via TCP/IP`.
+
+This leads to a quick diagnostic. Run both:
+
+```bash
+mysql -u root -p -h 127.0.0.1 -e "SELECT VERSION();"
+mysql -u root -p -h localhost -e "SELECT VERSION();"
+```
+
+- Both fail: the server is most likely not running. Go to the next section.
+- TCP works, socket fails: the server is running, and the socket path is the problem.
+- Socket works, TCP fails with 2003: the server has `skip-networking` or a restrictive `bind-address`, which is a different issue.
+
+Switching to `127.0.0.1` is a valid permanent fix for many applications. Just remember that MySQL treats `'root'@'localhost'` and `'root'@'127.0.0.1'` as different accounts for authentication, so a TCP login can fail with a 1045 even when the socket login worked. See [MySQL Error 1045: Access Denied](/resources/blog/mysql-error-1045) if that happens.
+
+## Step 1: Check Whether the Server Is Running
+
+Most 2002 errors with `(2)` simply mean mysqld is not running. The service name depends on the distribution:
+
+```bash
+# Ubuntu / Debian with Oracle MySQL packages
+sudo systemctl status mysql
+
+# RHEL, Rocky, Oracle Linux, Fedora
+sudo systemctl status mysqld
+
+# MariaDB
+sudo systemctl status mariadb
+```
+
+Look for `Active: active (running)`. If it says `failed` or `inactive`, start it and watch what happens:
+
+```bash
+sudo systemctl start mysql
+sudo systemctl status mysql
+```
+
+Independently of the service manager, check for a process:
+
+```bash
+ps aux | grep [m]ysqld
+```
+
+### Read the Error Log When It Will Not Start
+
+If the server fails to start, the reason is in the error log, never in the 2002 message. Find the log location:
+
+```bash
+# systemd journal
+sudo journalctl -u mysql --since "1 hour ago" --no-pager
+
+# Common file locations
+sudo tail -n 100 /var/log/mysql/error.log      # Debian / Ubuntu
+sudo tail -n 100 /var/log/mysqld.log           # RHEL family with Oracle MySQL RPMs
+```
+
+If the server is up enough to query, `SELECT @@log_error;` prints the path. Frequent startup failures include:
+
+- A typo or an option removed in 8.0 in `my.cnf` (for example `query_cache_size` or `innodb_large_prefix`), reported as `unknown variable`.
+- Another mysqld already holding the data directory lock or port 3306.
+- An upgrade from 5.7 that was interrupted, or a downgrade attempt (8.0 data directories cannot be opened by 5.7).
+- InnoDB unable to allocate the configured `innodb_buffer_pool_size` on a small VM.
+- A full disk (covered below).
+
+Fix the reported problem, start the service again, and the 2002 disappears.
+
+## Step 2: Compare the Server and Client Socket Paths
+
+If TCP works but the socket does not, the server created its socket somewhere other than where the client looks. Ask the server where it is:
+
+```bash
+mysql -u root -p -h 127.0.0.1 -e "SELECT @@socket;"
+```
+
+```text
++-----------------------------+
+| @@socket                    |
++-----------------------------+
+| /var/run/mysqld/mysqld.sock |
++-----------------------------+
+```
+
+Then check where the client looks. `mysql --help` prints the option files it reads, and `my_print_defaults` shows the values it will use:
+
+```bash
+mysql --help | grep -A1 "Default options"
+my_print_defaults client mysql
+my_print_defaults mysqld
+```
+
+The server reads `socket` from the `[mysqld]` group. The client reads it from `[client]` or `[mysql]`. A common mistake is changing only one of them:
+
+```ini
+# /etc/mysql/my.cnf  (broken: client and server disagree)
+[mysqld]
+socket = /data/mysql/mysql.sock
+
+[client]
+socket = /var/run/mysqld/mysqld.sock
+```
+
+Set the same path in both groups:
+
+```ini
+[mysqld]
+socket = /data/mysql/mysql.sock
+
+[client]
+socket = /data/mysql/mysql.sock
+```
+
+Restart the server after changing `[mysqld]`. For a one-off connection, pass the path directly:
+
+```bash
+mysql -u root -p -S /data/mysql/mysql.sock
+```
+
+To find any socket file on the system:
+
+```bash
+sudo find / -type s -name "*.sock" 2>/dev/null | grep -i mysql
+```
+
+Common default locations are `/var/run/mysqld/mysqld.sock` (Debian, Ubuntu, and the official Docker image), `/var/lib/mysql/mysql.sock` (RHEL family), `/run/mysqld/mysqld.sock` (MariaDB on many distributions; `/var/run` is usually a symlink to `/run`), and `/tmp/mysql.sock` (macOS installer and Homebrew).
+
+## Step 3: Stale Socket Files and the (111) Error
+
+When mysqld crashes or is killed with `SIGKILL`, the socket file can remain on disk. The client then finds the file but gets `Connection refused`:
+
+```text
+ERROR 2002 (HY000): Can't connect to local MySQL server through socket '/var/run/mysqld/mysqld.sock' (111)
+```
+
+Confirm no server is running, then start it normally. MySQL 8.0 uses a `mysqld.sock.lock` file next to the socket to detect stale sockets and will normally clean them up on startup. If it refuses to start because of the lock file, make sure no mysqld process exists, remove `mysqld.sock` and `mysqld.sock.lock`, and start the service again.
+
+## Step 4: Permissions on /var/run/mysqld
+
+The socket directory must exist and be writable by the `mysql` user. On modern systems `/run` is a tmpfs, so its contents vanish on every reboot. The systemd unit recreates `/run/mysqld` automatically, but if you start mysqld by hand (for example `mysqld_safe` or `mysqld --skip-grant-tables` during password recovery), the directory may be missing and the server cannot create its socket. Recreate it:
+
+```bash
+sudo mkdir -p /var/run/mysqld
+sudo chown mysql:mysql /var/run/mysqld
+sudo chmod 755 /var/run/mysqld
+```
+
+For `(13) Permission denied`, check every directory in the path, not just the socket file:
+
+```bash
+namei -l /var/run/mysqld/mysqld.sock
+```
+
+The client user needs execute (`x`) permission on each directory and write permission on the socket itself. This is the usual problem when the socket is moved into the data directory, which is typically mode `750` and owned by `mysql`, so ordinary users and the web server user cannot traverse it.
+
+## Step 5: AppArmor and SELinux
+
+If you moved the data directory or socket to a custom path, the security module may block mysqld from creating the socket there, or block the client from reading it, even though Unix permissions look correct.
+
+### AppArmor (Ubuntu, Debian)
+
+Look for denials:
+
+```bash
+sudo dmesg | grep -i apparmor | grep -i mysql
+sudo journalctl -k | grep DENIED | grep mysqld
+```
+
+Add the new paths to the local override file rather than editing the packaged profile:
+
+```bash
+sudo tee -a /etc/apparmor.d/local/usr.sbin.mysqld <<'EOF'
+/data/mysql/ r,
+/data/mysql/** rwk,
+EOF
+sudo apparmor_parser -r /etc/apparmor.d/usr.sbin.mysqld
+sudo systemctl restart mysql
+```
+
+### SELinux (RHEL family)
+
+Check for denials and label the custom directory with the MySQL types:
+
+```bash
+sudo ausearch -m AVC -c mysqld --start recent
+sudo semanage fcontext -a -t mysqld_db_t "/data/mysql(/.*)?"
+sudo restorecon -Rv /data/mysql
+```
+
+If only the socket moved, the type for its runtime directory is `mysqld_var_run_t`. Avoid disabling SELinux to "fix" this; labeling the path is a two-command change.
+
+## Step 6: Disk Full
+
+A full disk stops MySQL in several ways: InnoDB cannot write redo logs, the server cannot create its PID or socket file at startup, and the error log itself may stop growing. Check both the data directory and the filesystem holding `/run` or `/tmp`:
+
+```bash
+df -h /var/lib/mysql /var/run/mysqld /tmp
+df -i /var/lib/mysql
+```
+
+`df -i` checks inodes, which can run out even when space remains. Free space (old binary logs are a frequent culprit; purge them with `PURGE BINARY LOGS BEFORE NOW() - INTERVAL 3 DAY;` once the server is up, rather than deleting files by hand), then restart the service.
+
+## Platform Specifics
+
+### Homebrew on macOS
+
+Homebrew's MySQL uses `/tmp/mysql.sock`. The server does not start automatically after installation:
+
+```bash
+brew services list
+brew services start mysql        # or mysql@8.4, mariadb
+```
+
+The error log is in the Homebrew data directory, named after your host:
+
+```bash
+tail -n 50 "$(brew --prefix)/var/mysql/$(hostname).err"
+```
+
+If you have both the Oracle macOS installer and Homebrew MySQL installed, two servers may compete for port 3306 and `/tmp/mysql.sock`. Stop one of them. Also note that `/tmp` is cleaned periodically on macOS, and removing the socket file there while the server is running produces a 2002 until the server restarts.
+
+### Docker
+
+The socket lives inside the container's filesystem. A `mysql` client on the host cannot see `/var/run/mysqld/mysqld.sock` inside a container, so `mysql -h localhost` on the host fails with 2002 even though the container is healthy. Connect over TCP to the published port:
+
+```bash
+docker run -d --name mysql8 -e MYSQL_ROOT_PASSWORD=secret -p 3306:3306 mysql:8.4
+mysql -u root -p -h 127.0.0.1 -P 3306
+```
+
+Or run the client inside the container, where the socket does exist:
+
+```bash
+docker exec -it mysql8 mysql -u root -p
+```
+
+Right after `docker run`, the server spends some seconds initializing, and connections fail until it is ready. In Compose, add a healthcheck (for example `mysqladmin ping -h 127.0.0.1`) and make dependent services wait on it. Between containers, always use the service name as the host, never `localhost`, which would refer to the application container itself.
+
+### WSL
+
+Two situations are common. First, MySQL is installed inside the WSL distribution, but the service is not running because WSL was started without systemd. Start it manually or enable systemd in `/etc/wsl.conf`:
+
+```bash
+sudo service mysql start
+```
+
+```ini
+# /etc/wsl.conf
+[boot]
+systemd=true
+```
+
+Run `wsl --shutdown` from Windows after changing `wsl.conf`. Second, MySQL runs on Windows and the client runs in WSL. There is no socket in WSL for that server, so use TCP: `127.0.0.1` works with WSL's mirrored networking mode, while the default NAT mode needs the Windows host IP (the `nameserver` entry in `/etc/resolv.conf` is usually it) plus a firewall rule and a matching `bind-address` on the Windows server.
+
+## PHP: pdo_mysql and mysqli
+
+PHP applications show the same error in their own words:
+
+```text
+SQLSTATE[HY000] [2002] No such file or directory
+mysqli_sql_exception: No such file or directory
+```
+
+"No such file or directory" is errno 2 again. The fix is either to use TCP or to point PHP at the right socket.
+
+Use TCP by setting the host to `127.0.0.1`:
+
+```php
+$pdo = new PDO('mysql:host=127.0.0.1;port=3306;dbname=app;charset=utf8mb4', 'app', 'secret');
+```
+
+Or specify the socket explicitly:
+
+```php
+$pdo = new PDO('mysql:unix_socket=/var/run/mysqld/mysqld.sock;dbname=app;charset=utf8mb4', 'app', 'secret');
+$mysqli = new mysqli('localhost', 'app', 'secret', 'app', 0, '/var/run/mysqld/mysqld.sock');
+```
+
+When PHP connects to `localhost` without a socket argument, it uses the defaults from `php.ini`:
+
+```ini
+pdo_mysql.default_socket = /var/run/mysqld/mysqld.sock
+mysqli.default_socket = /var/run/mysqld/mysqld.sock
+```
+
+Check with `php -i | grep default_socket`, and remember that PHP-FPM and the CLI often load different `php.ini` files. In Laravel, set `DB_HOST=127.0.0.1` or `DB_SOCKET=/path/to/mysqld.sock` in `.env`.
+
+One PHP quirk worth knowing: the mysqlnd driver reports failed TCP connections with code 2002 as well, as in `SQLSTATE[HY000] [2002] Connection refused`. In that case the message text, not the number, tells you it was TCP, so check that the server is up and listening on the configured port.
+
+## Other Clients
+
+- Node.js `mysql2`: pass `socketPath: '/var/run/mysqld/mysqld.sock'` or use `host: '127.0.0.1'`.
+- Python `mysqlclient` and PyMySQL: pass `unix_socket='/var/run/mysqld/mysqld.sock'` or use `host='127.0.0.1'`.
+- Java Connector/J uses TCP by default, so Java applications report a communications link failure (the 2003 family) rather than 2002.
+
+GUI clients usually connect over TCP. In [Chat2DB](https://app.chat2db.ai), entering host `127.0.0.1` and port `3306` avoids the socket entirely, which is also a quick way to prove whether the server is up when the command-line client reports 2002. If another numeric code appears once you get past the connection, you can look up any MySQL error number with the free [MySQL error code lookup tool](https://chat2db.ai/tools/mysql-error-code-lookup).
+
+## Quick Checklist
+
+1. Run `systemctl status mysql` (or `mysqld`, `mariadb`). Start the server and read the error log if it is down.
+2. Try `mysql -h 127.0.0.1`. If TCP works, the socket path is the issue.
+3. Compare `SELECT @@socket;` with the `[client]` socket and the application setting.
+4. Check the errno: `(2)` missing file, `(111)` stale socket, `(13)` permissions.
+5. Verify `/var/run/mysqld` exists and is owned by `mysql`.
+6. Check AppArmor or SELinux denials if you use custom paths.
+7. Check `df -h` and `df -i`.
+8. In Docker or WSL, use TCP to the published port or run the client where the socket lives.
+
+## FAQ
+
+### Why does mysql -h localhost fail but mysql -h 127.0.0.1 works?
+
+Because `localhost` makes the client use the Unix socket file, and `127.0.0.1` makes it use TCP. The server is running and listening on TCP, but the client's socket path does not match the server's `@@socket` value. Align the `socket` option in `[mysqld]` and `[client]`, or keep using `127.0.0.1`.
+
+### Is error 2002 a login or password problem?
+
+No. It happens before authentication. The client could not open a connection at all. Password problems produce error 1045 once a connection succeeds.
+
+### What does the (2) at the end of the error mean?
+
+It is the operating system errno. `2` means the socket file does not exist at that path, which usually means the server is stopped or configured with a different socket path. `111` (61 on macOS) means a stale socket with no listener, and `13` means permission denied.
+
+### Does MariaDB use the same error?
+
+Yes. MariaDB clients report the same 2002 code and message. On many distributions MariaDB's socket is `/run/mysqld/mysqld.sock` and the service is called `mariadb`, so adjust the commands above accordingly.
