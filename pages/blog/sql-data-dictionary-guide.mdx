@@ -1,0 +1,523 @@
+---
+title: "How to Build a SQL Data Dictionary"
+description: "Build a SQL data dictionary from information_schema, pg_catalog, MySQL COLUMN_COMMENT and SQL Server extended properties, export to Markdown, keep it in sync."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: September 28, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# How to Build a SQL Data Dictionary
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="September 28, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+A data dictionary is a reference that lists every table and column in a database together with its type, constraints and, most importantly, its meaning. It answers the questions a schema alone does not: what `status = 3` means, whether `total` includes tax, which timezone `placed_at` is in, and which table is the source of truth for a customer email.
+
+Most teams already have half a data dictionary without realizing it. The database catalog knows every column name, type, default and foreign key. What is missing is the human description. This guide shows how to store those descriptions inside the database itself, then generate the dictionary with plain SQL on PostgreSQL, MySQL and SQL Server, export it to Markdown, and keep it from going stale.
+
+The PostgreSQL queries were run on PostgreSQL 17 and the MySQL queries on MySQL 8.4.
+
+## What Goes Into a Data Dictionary
+
+A useful dictionary has one section per table, and one row per column. The minimum set of fields:
+
+| Field | Source |
+|---|---|
+| Table name and description | catalog plus table comment |
+| Column name | catalog |
+| Data type with length or precision | catalog |
+| Nullable | catalog |
+| Default value | catalog |
+| Key role (primary, unique, foreign key and target) | constraint views |
+| Description | column comment |
+
+Optional but valuable fields include allowed values for coded columns, the unit of measure, whether the column holds personal data, and the owning team. Those can live in the description text or in a separate table, as shown later.
+
+### Why Keep Descriptions in the Database
+
+You can maintain a dictionary in a wiki or a spreadsheet, but it drifts from the schema within weeks because nobody updates two places. Storing descriptions as database comments has three advantages:
+
+- They travel with the schema. `pg_dump`, `mysqldump` and SQL Server scripting tools include them.
+- They can be changed in the same migration that changes the column.
+- Every client and generator can read them back, so the dictionary is always regenerated from one source.
+
+## Step 1: Add Comments to Tables and Columns
+
+Each database has its own syntax for comments. The examples use a small `customers` and `orders` schema.
+
+### PostgreSQL: COMMENT ON
+
+```sql
+CREATE TABLE customers (
+  id         bigint PRIMARY KEY,
+  email      text NOT NULL UNIQUE,
+  status     varchar(20) DEFAULT 'active',
+  created_at timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE TABLE orders (
+  id          bigint PRIMARY KEY,
+  customer_id bigint NOT NULL REFERENCES customers(id),
+  total       numeric(10,2),
+  placed_at   timestamptz
+);
+
+COMMENT ON TABLE customers IS 'One row per registered customer account';
+COMMENT ON COLUMN customers.email IS 'Login email, lower-cased, unique';
+COMMENT ON COLUMN customers.status IS 'active | suspended | closed';
+COMMENT ON COLUMN orders.total IS 'Order total in USD incl. tax';
+```
+
+Running `COMMENT ON` again replaces the previous text, and `COMMENT ON COLUMN customers.status IS NULL` removes it. `COMMENT ON` also works for views, materialized views, functions, schemas and most other objects.
+
+In `psql`, `\d+ customers` shows column comments in the `Description` column, and `\dt+` shows table comments.
+
+### MySQL: COMMENT Clauses
+
+MySQL stores comments as part of the column and table definitions:
+
+```sql
+CREATE TABLE customers (
+  id         BIGINT PRIMARY KEY AUTO_INCREMENT COMMENT 'Surrogate key',
+  email      VARCHAR(255) NOT NULL COMMENT 'Login email, lower-cased, unique',
+  status     ENUM('active','suspended','closed') NOT NULL DEFAULT 'active',
+  created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  UNIQUE KEY uk_email (email)
+) COMMENT = 'One row per registered customer account';
+
+ALTER TABLE orders COMMENT = 'Checkout orders, one row per order';
+```
+
+There is no `COMMENT ON` statement in MySQL. To add or change a column comment later, you have to restate the full column definition:
+
+```sql
+ALTER TABLE customers
+  MODIFY status ENUM('active','suspended','closed') NOT NULL DEFAULT 'active'
+  COMMENT 'Account lifecycle state';
+```
+
+This has a trap. `MODIFY` replaces the entire column definition, so a later migration that changes only the type silently deletes the comment:
+
+```sql
+ALTER TABLE customers MODIFY email VARCHAR(320) NOT NULL;
+
+SELECT COLUMN_NAME, COLUMN_TYPE, COLUMN_COMMENT
+FROM information_schema.COLUMNS
+WHERE TABLE_SCHEMA = 'shop' AND TABLE_NAME = 'customers';
+```
+
+```text
++-------------+-------------------------------------+-------------------------+
+| COLUMN_NAME | COLUMN_TYPE                         | COLUMN_COMMENT          |
++-------------+-------------------------------------+-------------------------+
+| id          | bigint                              | Surrogate key           |
+| email       | varchar(320)                        |                         |
+| status      | enum('active','suspended','closed') | Account lifecycle state |
+| created_at  | datetime                            |                         |
++-------------+-------------------------------------+-------------------------+
+```
+
+The email comment is gone. Always copy the existing `COMMENT` into any `MODIFY` or `CHANGE` statement; `SHOW CREATE TABLE` gives you the current definition to start from. `RENAME COLUMN` does keep the comment.
+
+Column comments are limited to 1024 characters. A longer one fails with:
+
+```text
+ERROR 1629 (HY000): Comment for field 'id' is too long (max = 1024)
+```
+
+### SQL Server: Extended Properties
+
+SQL Server has no `COMMENT` syntax. Descriptions are stored as extended properties, and the name `MS_Description` is the convention that SSMS and most tools read:
+
+```sql
+EXEC sys.sp_addextendedproperty
+  @name = N'MS_Description',
+  @value = N'One row per registered customer account',
+  @level0type = N'SCHEMA', @level0name = N'dbo',
+  @level1type = N'TABLE',  @level1name = N'customers';
+
+EXEC sys.sp_addextendedproperty
+  @name = N'MS_Description',
+  @value = N'Login email, lower-cased, unique',
+  @level0type = N'SCHEMA', @level0name = N'dbo',
+  @level1type = N'TABLE',  @level1name = N'customers',
+  @level2type = N'COLUMN', @level2name = N'email';
+```
+
+Adding a property that already exists fails with error 15233, so use `sys.sp_updateextendedproperty` to change a description and `sys.sp_dropextendedproperty` to remove it. For migrations that must run repeatedly, check first:
+
+```sql
+IF EXISTS (
+  SELECT 1
+  FROM sys.extended_properties
+  WHERE major_id = OBJECT_ID(N'dbo.customers')
+    AND minor_id = COLUMNPROPERTY(OBJECT_ID(N'dbo.customers'), 'email', 'ColumnId')
+    AND class = 1
+    AND name = N'MS_Description'
+)
+  EXEC sys.sp_updateextendedproperty
+    @name = N'MS_Description', @value = N'Login email, lower-cased, unique',
+    @level0type = N'SCHEMA', @level0name = N'dbo',
+    @level1type = N'TABLE',  @level1name = N'customers',
+    @level2type = N'COLUMN', @level2name = N'email';
+ELSE
+  EXEC sys.sp_addextendedproperty
+    @name = N'MS_Description', @value = N'Login email, lower-cased, unique',
+    @level0type = N'SCHEMA', @level0name = N'dbo',
+    @level1type = N'TABLE',  @level1name = N'customers',
+    @level2type = N'COLUMN', @level2name = N'email';
+```
+
+### Writing Good Descriptions
+
+A comment that repeats the column name (`customer_id: the customer id`) adds nothing. Aim to answer the question a new analyst would ask:
+
+- Units and currency: "Order total in USD, including tax, excluding shipping".
+- Coded values: "1 = pending, 2 = paid, 3 = refunded".
+- Time semantics: "UTC; set when payment is captured, not when the cart is created".
+- Nullability meaning: "NULL until the first login".
+- Provenance: "Copied nightly from billing.invoices; do not update directly".
+
+## Step 2: Query the Dictionary on PostgreSQL
+
+PostgreSQL exposes comments through `col_description(table_oid, column_number)` and `obj_description(oid, 'pg_class')`. The catalog query below returns one row per column, with the exact declared type (`numeric(10,2)` rather than `numeric`):
+
+```sql
+SELECT c.relname                           AS table_name,
+       a.attnum                            AS pos,
+       a.attname                           AS column_name,
+       format_type(a.atttypid, a.atttypmod) AS data_type,
+       NOT a.attnotnull                    AS nullable,
+       pg_get_expr(d.adbin, d.adrelid)     AS default_value,
+       col_description(a.attrelid, a.attnum) AS description
+FROM pg_attribute a
+JOIN pg_class c      ON c.oid = a.attrelid
+JOIN pg_namespace n  ON n.oid = c.relnamespace
+LEFT JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum
+WHERE n.nspname = 'public'
+  AND c.relkind IN ('r', 'p')
+  AND a.attnum > 0
+  AND NOT a.attisdropped
+ORDER BY c.relname, a.attnum;
+```
+
+Output for the sample schema:
+
+```text
+ table_name | pos | column_name |        data_type         | nullable |        default_value        |           description
+------------+-----+-------------+--------------------------+----------+-----------------------------+----------------------------------
+ customers  |   1 | id          | bigint                   | f        |                             |
+ customers  |   2 | email       | text                     | f        |                             | Login email, lower-cased, unique
+ customers  |   3 | status      | character varying(20)    | t        | 'active'::character varying | active | suspended | closed
+ customers  |   4 | created_at  | timestamp with time zone | f        | now()                       |
+ orders     |   1 | id          | bigint                   | f        |                             |
+ orders     |   2 | customer_id | bigint                   | f        |                             |
+ orders     |   3 | total       | numeric(10,2)            | t        |                             | Order total in USD incl. tax
+ orders     |   4 | placed_at   | timestamp with time zone | t        |                             |
+```
+
+The filters matter: `attnum > 0` hides system columns such as `ctid`, `NOT attisdropped` hides dropped columns that still occupy a slot, and `relkind IN ('r','p')` keeps ordinary and partitioned tables. Add `'v'` and `'m'` to include views and materialized views.
+
+If you prefer the portable `information_schema`, you can still call `col_description`:
+
+```sql
+SELECT c.table_name, c.column_name, c.data_type, c.is_nullable, c.column_default,
+       col_description(format('%I.%I', c.table_schema, c.table_name)::regclass,
+                       c.ordinal_position) AS description
+FROM information_schema.columns c
+WHERE c.table_schema = 'public'
+ORDER BY c.table_name, c.ordinal_position;
+```
+
+Note that `information_schema.columns.data_type` reports `numeric` without precision; you need `numeric_precision` and `numeric_scale`, or `character_maximum_length` for strings, to rebuild the full type. More `information_schema` patterns are collected in [PostgreSQL information_schema queries](/resources/blog/postgres-information-schema-queries).
+
+Table descriptions come from `obj_description`:
+
+```sql
+SELECT c.relname AS table_name,
+       obj_description(c.oid, 'pg_class') AS description
+FROM pg_class c
+JOIN pg_namespace n ON n.oid = c.relnamespace
+WHERE n.nspname = 'public' AND c.relkind IN ('r', 'p')
+ORDER BY 1;
+```
+
+## Step 3: Query the Dictionary on MySQL
+
+MySQL puts everything in `information_schema.COLUMNS`, including the comment:
+
+```sql
+SELECT c.TABLE_NAME, c.ORDINAL_POSITION AS pos, c.COLUMN_NAME, c.COLUMN_TYPE,
+       c.IS_NULLABLE, c.COLUMN_DEFAULT, c.COLUMN_KEY, c.EXTRA, c.COLUMN_COMMENT
+FROM information_schema.COLUMNS c
+WHERE c.TABLE_SCHEMA = 'shop'
+ORDER BY c.TABLE_NAME, c.ORDINAL_POSITION;
+```
+
+```text
++------------+-----+-------------+-------------------------------------+-------------+-------------------+------------+-------------------+----------------------------------+
+| TABLE_NAME | pos | COLUMN_NAME | COLUMN_TYPE                         | IS_NULLABLE | COLUMN_DEFAULT    | COLUMN_KEY | EXTRA             | COLUMN_COMMENT                   |
++------------+-----+-------------+-------------------------------------+-------------+-------------------+------------+-------------------+----------------------------------+
+| customers  |   1 | id          | bigint                              | NO          | NULL              | PRI        | auto_increment    | Surrogate key                    |
+| customers  |   2 | email       | varchar(255)                        | NO          | NULL              | UNI        |                   | Login email, lower-cased, unique |
+| customers  |   3 | status      | enum('active','suspended','closed') | NO          | active            |            |                   | Account lifecycle state          |
+| customers  |   4 | created_at  | datetime                            | NO          | CURRENT_TIMESTAMP |            | DEFAULT_GENERATED |                                  |
+| orders     |   1 | id          | bigint                              | NO          | NULL              | PRI        |                   |                                  |
+| orders     |   2 | customer_id | bigint                              | NO          | NULL              | MUL        |                   |                                  |
+| orders     |   3 | total       | decimal(10,2)                       | YES         | NULL              |            |                   |                                  |
++------------+-----+-------------+-------------------------------------+-------------+-------------------+------------+-------------------+----------------------------------+
+```
+
+Use `COLUMN_TYPE` rather than `DATA_TYPE`: it includes length, precision, `unsigned` and the full ENUM member list, which is often the best documentation of a coded column. Empty comments are returned as an empty string, not `NULL`.
+
+Table comments are in `information_schema.TABLES.TABLE_COMMENT`. Leave out `TABLE_ROWS` or label it as an estimate; for InnoDB it is approximate.
+
+## Step 4: Query the Dictionary on SQL Server
+
+On SQL Server, join the catalog views to `sys.extended_properties`. Column-level properties have `class = 1` and `minor_id` equal to the column id; table-level properties have `minor_id = 0`.
+
+```sql
+SELECT s.name  AS schema_name,
+       t.name  AS table_name,
+       c.column_id,
+       c.name  AS column_name,
+       ty.name AS data_type,
+       CASE
+         WHEN ty.name IN ('varchar','char','varbinary','binary')
+           THEN CASE WHEN c.max_length = -1 THEN 'max' ELSE CAST(c.max_length AS varchar(10)) END
+         WHEN ty.name IN ('nvarchar','nchar')
+           THEN CASE WHEN c.max_length = -1 THEN 'max' ELSE CAST(c.max_length / 2 AS varchar(10)) END
+         WHEN ty.name IN ('decimal','numeric')
+           THEN CAST(c.precision AS varchar(10)) + ',' + CAST(c.scale AS varchar(10))
+       END AS type_size,
+       c.is_nullable,
+       dc.definition AS default_value,
+       CAST(ep.value AS nvarchar(4000)) AS description
+FROM sys.tables t
+JOIN sys.schemas s  ON s.schema_id = t.schema_id
+JOIN sys.columns c  ON c.object_id = t.object_id
+JOIN sys.types ty   ON ty.user_type_id = c.user_type_id
+LEFT JOIN sys.default_constraints dc ON dc.object_id = c.default_object_id
+LEFT JOIN sys.extended_properties ep
+       ON ep.class = 1
+      AND ep.major_id = c.object_id
+      AND ep.minor_id = c.column_id
+      AND ep.name = N'MS_Description'
+ORDER BY s.name, t.name, c.column_id;
+```
+
+Two details trip people up. `sys.columns.max_length` is in bytes, so an `nvarchar(100)` column reports 200, and `-1` means `max`; the `CASE` expression converts it back to the declared size. And `ep.value` is a `sql_variant`, so cast it before concatenating or exporting.
+
+For table descriptions, use the same join with `ep.minor_id = 0` and `ep.major_id = t.object_id`. The built-in function `sys.fn_listextendedproperty` returns the same data for a single object if you prefer not to write joins. For more catalog queries, see [querying the database schema in SQL Server](/resources/blog/how-to-write-efficient-queries-to-get-database-schema-in-sql-server).
+
+## Step 5: Add Keys and Relationships
+
+Column types alone do not show how tables connect. Add a key column to each row from the constraint views. This works on PostgreSQL:
+
+```sql
+SELECT tc.table_name, kcu.column_name, tc.constraint_type,
+       ccu.table_name  AS ref_table,
+       ccu.column_name AS ref_column
+FROM information_schema.table_constraints tc
+JOIN information_schema.key_column_usage kcu
+  ON kcu.constraint_name = tc.constraint_name
+ AND kcu.table_schema   = tc.table_schema
+LEFT JOIN information_schema.constraint_column_usage ccu
+  ON ccu.constraint_name = tc.constraint_name
+ AND tc.constraint_type  = 'FOREIGN KEY'
+WHERE tc.table_schema = 'public'
+ORDER BY 1, 2;
+```
+
+```text
+ table_name | column_name | constraint_type | ref_table | ref_column
+------------+-------------+-----------------+-----------+------------
+ customers  | email       | UNIQUE          |           |
+ customers  | id          | PRIMARY KEY     |           |
+ orders     | customer_id | FOREIGN KEY     | customers | id
+ orders     | id          | PRIMARY KEY     |           |
+```
+
+On MySQL, `information_schema.KEY_COLUMN_USAGE` already carries `REFERENCED_TABLE_NAME` and `REFERENCED_COLUMN_NAME`:
+
+```sql
+SELECT TABLE_NAME, COLUMN_NAME, CONSTRAINT_NAME,
+       REFERENCED_TABLE_NAME, REFERENCED_COLUMN_NAME
+FROM information_schema.KEY_COLUMN_USAGE
+WHERE TABLE_SCHEMA = 'shop'
+  AND REFERENCED_TABLE_NAME IS NOT NULL;
+```
+
+On SQL Server, use `sys.foreign_keys` joined to `sys.foreign_key_columns`.
+
+The constraint query on PostgreSQL is fine for single-column keys. For composite foreign keys, `constraint_column_usage` does not pair columns by position, so use `pg_constraint` with `conkey` and `confkey` instead.
+
+## Step 6: Export to Markdown
+
+Markdown is a good target format: it renders in GitHub, GitLab and most wikis, and diffs cleanly in pull requests. You can generate it entirely in SQL.
+
+### PostgreSQL to Markdown
+
+`psql` has no Markdown output format (the allowed formats are aligned, asciidoc, csv, html, latex, latex-longtable, troff-ms, unaligned and wrapped), so build the text in the query:
+
+```sql
+SELECT string_agg(line, E'\n' ORDER BY tbl, ord) FROM (
+  SELECT c.relname AS tbl, 0 AS ord,
+         E'\n## ' || c.relname || E'\n\n'
+         || coalesce(obj_description(c.oid, 'pg_class'), '_No description._')
+         || E'\n\n| Column | Type | Nullable | Default | Description |\n|---|---|---|---|---|' AS line
+  FROM pg_class c
+  JOIN pg_namespace n ON n.oid = c.relnamespace
+  WHERE n.nspname = 'public' AND c.relkind IN ('r', 'p')
+  UNION ALL
+  SELECT c.relname, a.attnum,
+         format('| %s | %s | %s | %s | %s |',
+                a.attname,
+                format_type(a.atttypid, a.atttypmod),
+                CASE WHEN a.attnotnull THEN 'NO' ELSE 'YES' END,
+                coalesce(pg_get_expr(d.adbin, d.adrelid), ''),
+                replace(coalesce(col_description(a.attrelid, a.attnum), ''), '|', '\|'))
+  FROM pg_attribute a
+  JOIN pg_class c     ON c.oid = a.attrelid
+  JOIN pg_namespace n ON n.oid = c.relnamespace
+  LEFT JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum
+  WHERE n.nspname = 'public' AND c.relkind IN ('r', 'p')
+    AND a.attnum > 0 AND NOT a.attisdropped
+) s;
+```
+
+Save the query as `dictionary.sql` and run it with unaligned, tuples-only output:
+
+```bash
+psql -At -d shop -f dictionary.sql > docs/data-dictionary.md
+```
+
+The result:
+
+```markdown
+## customers
+
+One row per registered customer account
+
+| Column | Type | Nullable | Default | Description |
+|---|---|---|---|---|
+| id | bigint | NO |  |  |
+| email | text | NO |  | Login email, lower-cased, unique |
+| status | character varying(20) | YES | 'active'::character varying | active \| suspended \| closed |
+| created_at | timestamp with time zone | NO | now() |  |
+```
+
+The `replace(..., '|', '\|')` call escapes pipe characters inside descriptions, which would otherwise break the table.
+
+### MySQL to Markdown
+
+`GROUP_CONCAT` builds one Markdown block per table. Raise `group_concat_max_len` first, because its default of 1024 bytes cuts long tables off silently:
+
+```sql
+SET SESSION group_concat_max_len = 1000000;
+
+SELECT CONCAT(
+  '## ', t.TABLE_NAME, '\n\n',
+  IF(t.TABLE_COMMENT = '', '_No description._', t.TABLE_COMMENT), '\n\n',
+  '| Column | Type | Nullable | Default | Key | Description |\n',
+  '|---|---|---|---|---|---|\n',
+  GROUP_CONCAT(
+    CONCAT('| ', c.COLUMN_NAME, ' | ', c.COLUMN_TYPE, ' | ', c.IS_NULLABLE, ' | ',
+           IFNULL(c.COLUMN_DEFAULT, ''), ' | ', c.COLUMN_KEY, ' | ',
+           REPLACE(c.COLUMN_COMMENT, '|', '\\|'), ' |')
+    ORDER BY c.ORDINAL_POSITION SEPARATOR '\n'),
+  '\n') AS md
+FROM information_schema.TABLES t
+JOIN information_schema.COLUMNS c
+  ON c.TABLE_SCHEMA = t.TABLE_SCHEMA AND c.TABLE_NAME = t.TABLE_NAME
+WHERE t.TABLE_SCHEMA = 'shop' AND t.TABLE_TYPE = 'BASE TABLE'
+GROUP BY t.TABLE_NAME, t.TABLE_COMMENT
+ORDER BY t.TABLE_NAME;
+```
+
+Run it in batch mode with raw output, so the client neither draws table borders nor escapes the newlines:
+
+```bash
+mysql -N -r -B shop < dictionary.sql > docs/data-dictionary.md
+```
+
+If you would rather not maintain these queries, the [SQL data dictionary generator](https://chat2db.ai/tools/sql-data-dictionary-generator) turns a pasted `CREATE TABLE` script into a formatted dictionary, including the comments.
+
+## Step 7: Keep the Dictionary in Sync
+
+A dictionary generated from the catalog cannot drift in structure, but descriptions still go missing when new columns are added without comments. Three habits close the gap.
+
+### Find Undocumented Columns
+
+On PostgreSQL:
+
+```sql
+SELECT a.attrelid::regclass AS table_name, a.attname AS column_name
+FROM pg_attribute a
+JOIN pg_class c     ON c.oid = a.attrelid
+JOIN pg_namespace n ON n.oid = c.relnamespace
+WHERE n.nspname = 'public' AND c.relkind IN ('r', 'p')
+  AND a.attnum > 0 AND NOT a.attisdropped
+  AND col_description(a.attrelid, a.attnum) IS NULL
+ORDER BY 1, 2;
+```
+
+On MySQL:
+
+```sql
+SELECT TABLE_NAME, COLUMN_NAME
+FROM information_schema.COLUMNS
+WHERE TABLE_SCHEMA = 'shop' AND COLUMN_COMMENT = ''
+ORDER BY TABLE_NAME, ORDINAL_POSITION;
+```
+
+Track the count over time, or fail a CI job when a migration introduces a new undocumented column. Many teams exempt obvious columns like `id`, `created_at` and `updated_at` with a `NOT IN` filter.
+
+### Put Comments in Migrations
+
+Treat the comment as part of the column. The migration that adds `orders.refunded_at` should also contain its `COMMENT ON COLUMN` (PostgreSQL), its `COMMENT` clause (MySQL) or its `sp_addextendedproperty` call (SQL Server). Code review then catches missing descriptions at the same time as the schema change. On MySQL, reviewers should also check that every `MODIFY` repeats the existing comment.
+
+### Regenerate in CI
+
+Commit the generated Markdown next to the migrations and regenerate it in CI against a database built from those migrations:
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+psql -At -d "$DATABASE_URL" -f dictionary.sql > docs/data-dictionary.md
+git diff --exit-code docs/data-dictionary.md || {
+  echo "Data dictionary is out of date. Regenerate and commit docs/data-dictionary.md."
+  exit 1
+}
+```
+
+Because the output is sorted by table name and column position, the diff shows exactly which columns changed.
+
+### Extra Metadata Beyond Comments
+
+Comments hold one free-text string. If you need structured attributes such as "contains personal data" or "owner team", keep a small metadata table keyed by schema, table and column, and join it into the dictionary query. SQL Server can store these as additional named extended properties, since `MS_Description` is just one property name among any you define.
+
+## Browsing the Dictionary Interactively
+
+Generated Markdown suits reviews and onboarding documents. For day-to-day lookups, a database client that shows comments next to columns is quicker. [Chat2DB](https://chat2db.ai/download) connects to PostgreSQL, MySQL and SQL Server from one app, so you can open a table's structure, including its comments, beside the query you are writing instead of switching to a separate document.
+
+## FAQ
+
+### What is the difference between a data dictionary and a data catalog?
+
+A data dictionary documents the structure and meaning of one database's tables and columns. A data catalog is a broader inventory across many systems, usually with search, lineage and ownership. A dictionary is often the first input into a catalog.
+
+### Do comments affect query performance?
+
+No. Comments are metadata stored in the system catalog and are not read during query execution.
+
+### Are comments included in backups and dumps?
+
+Yes. `pg_dump` writes `COMMENT ON` statements, `mysqldump` keeps the `COMMENT` clauses in the table definitions, and SQL Server backups include extended properties. Check any schema migration or diff tool you use, since some can be configured to ignore comments.
+
+### How do I document views?
+
+On PostgreSQL, use `COMMENT ON VIEW` and include `relkind = 'v'` in the queries. On MySQL, `CREATE VIEW` has no comment clause: `information_schema.TABLES` reports the literal text `VIEW` as the comment, and a view column that maps directly to a table column shows that column's comment (our test on 8.4 returned `Surrogate key` for a view's `id`). Document anything else about the view in the Markdown file or a metadata table. On SQL Server, `sp_addextendedproperty` accepts `@level1type = N'VIEW'`.

@@ -1,0 +1,370 @@
+---
+title: "PostgreSQL 18 B-tree Skip Scan Explained"
+description: "Learn how PostgreSQL 18 B-tree skip scan uses a multicolumn index when the leading column is not filtered, how to spot it in EXPLAIN, and when it helps."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: September 28, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# PostgreSQL 18 B-tree Skip Scan Explained
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="September 28, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+For years the first rule of multicolumn B-tree indexes in PostgreSQL was simple: an index on `(a, b)` is efficient for queries that filter on `a`, or on `a` and `b`, but not for queries that filter only on `b`. The index is sorted by `a` first, so values of `b` are scattered throughout it.
+
+PostgreSQL 18 relaxes that rule with **B-tree skip scan**. When the leading column has few distinct values, the executor can jump from one value of `a` to the next, and inside each group do a normal targeted lookup on `b`. Instead of scanning the whole index, it performs a small number of index searches, one per distinct leading value.
+
+This article shows exactly what that looks like, how to recognise it in `EXPLAIN` output, when the planner chooses it and when it does not, and what it changes about index design. All plans below come from a PostgreSQL 18.6 server, copied as printed. Timings and buffer counts are from a small test container and are only meant to show the shape of the plan, not to serve as a benchmark.
+
+## How Skip Scan Works
+
+Picture an index on `(tenant_id, created_at)` where `tenant_id` has 20 distinct values. Logically, the index is 20 sorted runs of `created_at`, one per tenant:
+
+```text
+tenant 0:  created_at ... sorted ...
+tenant 1:  created_at ... sorted ...
+...
+tenant 19: created_at ... sorted ...
+```
+
+A query such as `WHERE created_at >= X AND created_at < Y` has no condition on `tenant_id`. Before PostgreSQL 18, a B-tree scan could only use the columns that form a prefix of the index to position the scan, so a condition on `created_at` alone meant reading the entire index and checking each entry.
+
+With skip scan, PostgreSQL treats the missing leading condition as if it were `tenant_id = ANY (every value present)`. It descends the tree to the first tenant, reads the matching `created_at` range, then descends again to the next tenant, and so on. It does not need to know the tenant values in advance; it discovers the next one from the index itself.
+
+The work is roughly proportional to the number of distinct leading values, not to the size of the index. That is why skip scan is a big win when the leading column has low cardinality and useless when it has high cardinality.
+
+## Step 1: Build a Test Table
+
+Create a table with 2 million rows, 20 tenants, 4 statuses, and one row per second of `created_at`:
+
+```sql
+CREATE TABLE events (
+  id bigint GENERATED ALWAYS AS IDENTITY,
+  tenant_id int NOT NULL,
+  status text NOT NULL,
+  created_at timestamptz NOT NULL,
+  payload text
+);
+
+INSERT INTO events (tenant_id, status, created_at, payload)
+SELECT g % 20,
+       (ARRAY['new','paid','shipped','cancelled'])[1 + g % 4],
+       timestamptz '2026-01-01' + (g || ' seconds')::interval,
+       repeat('x', 50)
+FROM generate_series(1, 2000000) g;
+
+CREATE INDEX events_tenant_created ON events (tenant_id, created_at);
+VACUUM ANALYZE events;
+```
+
+Check the statistics the planner will rely on:
+
+```sql
+SELECT attname, n_distinct
+FROM pg_stats
+WHERE tablename = 'events'
+  AND attname IN ('tenant_id', 'status', 'created_at');
+```
+
+```text
+ n_distinct |  attname
+------------+------------
+         20 | tenant_id
+          4 | status
+         -1 | created_at
+```
+
+`n_distinct = -1` means every row has a distinct value. The leading index column, `tenant_id`, has only 20 values, which is the ideal case for skip scan.
+
+## Step 2: Query Without the Leading Column
+
+Now filter only on the second index column:
+
+```sql
+EXPLAIN (ANALYZE, BUFFERS, COSTS OFF, TIMING OFF)
+SELECT count(*)
+FROM events
+WHERE created_at >= '2026-01-10' AND created_at < '2026-01-10 01:00';
+```
+
+```text
+ Aggregate (actual rows=1.00 loops=1)
+   Buffers: shared hit=26 read=72 written=72
+   ->  Index Only Scan using events_tenant_created on events (actual rows=3600.00 loops=1)
+         Index Cond: ((created_at >= '2026-01-10 00:00:00+00'::timestamp with time zone) AND (created_at < '2026-01-10 01:00:00+00'::timestamp with time zone))
+         Heap Fetches: 0
+         Index Searches: 22
+         Buffers: shared hit=26 read=72 written=72
+ Planning Time: 0.348 ms
+ Execution Time: 0.922 ms
+```
+
+The index was used even though the query never mentions `tenant_id`, and the scan touched fewer than 100 buffers.
+
+For comparison, disable index access in the session so the planner has to fall back:
+
+```sql
+SET enable_indexscan = off;
+SET enable_bitmapscan = off;
+SET enable_indexonlyscan = off;
+
+EXPLAIN (ANALYZE, BUFFERS, COSTS OFF, TIMING OFF)
+SELECT count(*)
+FROM events
+WHERE created_at >= '2026-01-10' AND created_at < '2026-01-10 01:00';
+
+RESET ALL;
+```
+
+```text
+ Finalize Aggregate (actual rows=1.00 loops=1)
+   Buffers: shared hit=15884 read=12286 written=64
+   ->  Gather (actual rows=3.00 loops=1)
+         Workers Planned: 2
+         Workers Launched: 2
+         ->  Partial Aggregate (actual rows=1.00 loops=3)
+               ->  Parallel Seq Scan on events (actual rows=1200.00 loops=3)
+                     Filter: ((created_at >= '2026-01-10 00:00:00+00'::timestamp with time zone) AND (created_at < '2026-01-10 01:00:00+00'::timestamp with time zone))
+                     Rows Removed by Filter: 665467
+```
+
+The sequential scan read about 28,000 buffers to find the same 3,600 rows. The skip scan read under 100.
+
+## Step 3: Recognise Skip Scan in EXPLAIN
+
+There is no plan node called "Skip Scan". The node is still `Index Scan`, `Index Only Scan`, or `Bitmap Index Scan`. You identify skip scan from two clues together:
+
+1. The `Index Cond` does **not** include the leading index column, yet the scan is an index scan rather than a `Filter` on a full scan.
+2. With `EXPLAIN ANALYZE`, the new PostgreSQL 18 line `Index Searches` is greater than 1.
+
+`Index Searches` counts how many times the executor descended the B-tree from the root. A plain range scan on the leading column shows `Index Searches: 1`. In the plan above, 22 searches is roughly one per tenant plus a little extra to find where each tenant group starts and ends.
+
+Plain `EXPLAIN` without `ANALYZE` does not show `Index Searches`, so from the estimated plan alone you only see the first clue:
+
+```text
+ Aggregate  (cost=172.96..172.97 rows=1 width=8)
+   ->  Index Only Scan using events_tenant_created on events  (cost=0.43..164.06 rows=3559 width=0)
+         Index Cond: ((created_at >= '2026-01-10 00:00:00+00'::timestamp with time zone) AND (created_at < '2026-01-10 01:00:00+00'::timestamp with time zone))
+```
+
+Keep in mind that `Index Searches` greater than 1 has other causes too. An `IN` list or `= ANY (array)` also produces one search per array element:
+
+```sql
+EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF)
+SELECT * FROM events
+WHERE tenant_id IN (3, 4)
+  AND created_at >= '2026-01-10' AND created_at < '2026-01-10 01:00';
+```
+
+```text
+   ->  Bitmap Index Scan on events_tenant_created (actual rows=360.00 loops=1)
+         Index Cond: ((tenant_id = ANY ('{3,4}'::integer[])) AND ...)
+         Index Searches: 2
+```
+
+Skip scan and `= ANY` share the same machinery internally, which is why they report the same counter. For long plans, pasting the output into the [EXPLAIN plan visualizer](https://chat2db.ai/tools/explain-plan-visualizer) makes it easier to spot index nodes with a high search count.
+
+### Skip Scan Works With Bitmap Scans Too
+
+When the query needs columns that are not in the index, PostgreSQL may pick a bitmap scan. Skip scan still applies to the index part:
+
+```sql
+EXPLAIN (ANALYZE, BUFFERS, COSTS OFF, TIMING OFF)
+SELECT id, tenant_id
+FROM events
+WHERE created_at >= '2026-01-10' AND created_at < '2026-01-10 01:00';
+```
+
+```text
+ Bitmap Heap Scan on events (actual rows=3600.00 loops=1)
+   Recheck Cond: ((created_at >= '2026-01-10 00:00:00+00'::timestamp with time zone) AND (created_at < '2026-01-10 01:00:00+00'::timestamp with time zone))
+   Heap Blocks: exact=51
+   ->  Bitmap Index Scan on events_tenant_created (actual rows=3600.00 loops=1)
+         Index Cond: ((created_at >= '2026-01-10 00:00:00+00'::timestamp with time zone) AND (created_at < '2026-01-10 01:00:00+00'::timestamp with time zone))
+         Index Searches: 22
+```
+
+## Step 4: Skipping a Middle Column
+
+Skip scan is not limited to the first column. It can skip any index column that lacks an equality condition, as long as a later column has one. Replace the index with a three-column one:
+
+```sql
+DROP INDEX events_tenant_created;
+CREATE INDEX events_tsc ON events (tenant_id, status, created_at);
+ANALYZE events;
+```
+
+Filter on the first and third columns, leaving out `status`:
+
+```sql
+EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF)
+SELECT count(*) FROM events
+WHERE tenant_id = 5
+  AND created_at >= '2026-01-10' AND created_at < '2026-01-10 01:00';
+```
+
+```text
+   ->  Index Only Scan using events_tsc on events (actual rows=180.00 loops=1)
+         Index Cond: ((tenant_id = 5) AND (created_at >= '2026-01-10 00:00:00+00'::timestamp with time zone) AND (created_at < '2026-01-10 01:00:00+00'::timestamp with time zone))
+         Heap Fetches: 0
+         Index Searches: 3
+```
+
+Filter only on the third column, skipping both `tenant_id` and `status`:
+
+```sql
+EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF)
+SELECT count(*) FROM events
+WHERE created_at >= '2026-01-10' AND created_at < '2026-01-10 01:00';
+```
+
+```text
+   ->  Index Only Scan using events_tsc on events (actual rows=3600.00 loops=1)
+         Index Cond: ((created_at >= '2026-01-10 00:00:00+00'::timestamp with time zone) AND (created_at < '2026-01-10 01:00:00+00'::timestamp with time zone))
+         Heap Fetches: 0
+         Index Searches: 41
+```
+
+The search count went up from 22 to 41 because there are now more combinations of skipped prefix values to step through. It is still a tiny fraction of the index.
+
+### A Range on the Leading Column
+
+A range condition on the leading column also works with skipping the next column:
+
+```sql
+EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF)
+SELECT count(*) FROM events
+WHERE tenant_id BETWEEN 3 AND 6
+  AND created_at >= '2026-01-10' AND created_at < '2026-01-10 01:00';
+```
+
+```text
+   ->  Index Only Scan using events_tsc on events (actual rows=720.00 loops=1)
+         Index Cond: ((tenant_id >= 3) AND (tenant_id <= 6) AND (created_at >= '2026-01-10 00:00:00+00'::timestamp with time zone) AND (created_at < '2026-01-10 01:00:00+00'::timestamp with time zone))
+         Heap Fetches: 0
+         Index Searches: 9
+```
+
+Before skip scan, only the `tenant_id` range would have positioned the scan, and `created_at` would have been checked on every entry for tenants 3 through 6.
+
+## Step 5: When Skip Scan Does Not Help
+
+Skip scan is chosen by cost, like any other plan. The planner estimates how many distinct prefix values it must skip through and compares that with other options.
+
+### High-Cardinality Leading Column
+
+Replace the index with one that leads with `id`, which is unique:
+
+```sql
+DROP INDEX events_tsc;
+CREATE INDEX events_id_created ON events (id, created_at);
+ANALYZE events;
+
+EXPLAIN (ANALYZE, BUFFERS, COSTS OFF, TIMING OFF)
+SELECT count(*) FROM events
+WHERE created_at >= '2026-01-10' AND created_at < '2026-01-10 01:00';
+```
+
+```text
+               ->  Parallel Seq Scan on events (actual rows=1200.00 loops=3)
+                     Filter: ((created_at >= '2026-01-10 00:00:00+00'::timestamp with time zone) AND (created_at < '2026-01-10 01:00:00+00'::timestamp with time zone))
+                     Rows Removed by Filter: 665467
+```
+
+With 2 million distinct leading values, skipping would mean 2 million index descents. The planner correctly ignores the index and scans the table.
+
+### Other Cases
+
+Skip scan is less useful, or not applicable, when:
+
+- The skipped column has many distinct values relative to the rows returned, as above.
+- The query has no condition on any column after the skipped one. There is nothing to seek to inside each group, so skipping gains nothing.
+- The index is not a B-tree. Skip scan is a B-tree feature in PostgreSQL 18; GIN, GiST, BRIN, and hash indexes do not use it.
+- Statistics are stale. If `n_distinct` for the leading column is badly wrong, the cost estimate will be too. Run `ANALYZE` after bulk loads.
+
+There is no dedicated setting to turn skip scan on or off. If you want to compare against the old behaviour, compare the plan against a query that uses a different index or a sequential scan, as in Step 2.
+
+## Step 6: Watch Index Statistics Change
+
+PostgreSQL 18 counts each index search in `pg_stat_user_indexes.idx_scan`, not each scan node. In testing, running the three-column skip scan query once (with `Index Searches: 41` in its plan) raised `idx_scan` for the index by exactly 41:
+
+```sql
+SELECT indexrelname, idx_scan, idx_tup_read
+FROM pg_stat_user_indexes
+WHERE relname = 'events';
+```
+
+This matters for monitoring. After upgrading, indexes that are used through skip scan or `IN` lists will show higher `idx_scan` numbers than before, even if query volume did not change. If you rely on `idx_scan` to decide which indexes are unused, re-baseline after the upgrade. The article on [finding unused indexes in PostgreSQL](/resources/blog/postgres-find-unused-indexes) covers the full process.
+
+## Step 7: What Changes for Index Design
+
+Skip scan does not replace thoughtful index design, but it shifts a few trade-offs.
+
+### You May Be Able to Drop a Redundant Index
+
+A common pattern is to keep both `(tenant_id, created_at)` and a separate `(created_at)` index so that cross-tenant reports can use an index. If the leading column has low cardinality, the composite index alone may now serve both query shapes well enough. Test with `EXPLAIN (ANALYZE, BUFFERS)` on real query parameters before dropping anything, and compare buffers, not just time.
+
+Fewer indexes means faster writes, less WAL, and less vacuum work. The article on [PostgreSQL index types](/resources/blog/postgres-index-types-explained) explains the write cost of each index.
+
+### Column Order Still Matters
+
+Skip scan is fastest when the columns you skip have few distinct values. So when you choose column order for a new composite index:
+
+- Put columns that are always filtered with equality first, as before.
+- If a column is sometimes omitted from queries, and it has low cardinality (status, region, tenant in a small multi-tenant app), putting it early is now less costly than it used to be.
+- Never rely on skip scan to rescue an index whose leading column is nearly unique.
+
+### Partial Indexes Remain the Sharper Tool
+
+If most queries filter on one specific low-cardinality value (for example `status = 'new'`), a [partial index](/resources/blog/postgres-partial-and-covering-indexes) on the other columns is still smaller and faster than skip scan over a larger index.
+
+### Parallel Scans
+
+Skip scan also works inside parallel index scans. With the three-column index, a query filtering only on `status` produced this:
+
+```text
+               ->  Parallel Index Only Scan using events_tsc on events (actual rows=250000.00 loops=2)
+                     Index Cond: (status = 'paid'::text)
+                     Heap Fetches: 0
+                     Index Searches: 11
+```
+
+The planner still picked an index scan here because the index is much narrower than the table and the query could be answered from the index alone.
+
+## A Practical Review Checklist
+
+When reviewing slow queries on PostgreSQL 18, run through these steps:
+
+1. Run `EXPLAIN (ANALYZE, BUFFERS)` and look for index nodes whose `Index Cond` omits the leading column.
+2. Read `Index Searches`. A small number relative to the rows returned is healthy. A number close to the row count means skip scan is working against you.
+3. Check `n_distinct` for skipped columns in `pg_stats`.
+4. If the plan is a sequential scan and the leading column has low cardinality, verify that a composite index with the filtered column in second position exists.
+5. After changing indexes, compare buffers, not only execution time, because warm caches hide I/O differences.
+
+Tools that keep query history and plans side by side speed this up. In [Chat2DB](https://app.chat2db.ai), you can run the same query with different parameters against a PostgreSQL 18 database and compare the `EXPLAIN ANALYZE` results in adjacent tabs.
+
+## FAQ
+
+### Which PostgreSQL version added B-tree skip scan?
+
+PostgreSQL 18. On PostgreSQL 17 and earlier, a condition only on a non-leading column cannot be used to position a B-tree scan; at best the planner scans the whole index.
+
+### Is there a SET parameter to disable skip scan?
+
+No user-facing parameter exists for it in PostgreSQL 18. It is a costing decision made by the planner. You can influence it through statistics and index choice.
+
+### Why is Index Searches higher than the number of distinct leading values?
+
+The executor sometimes needs an extra descent to find where a group starts or to confirm that no more groups exist. Small differences like 22 searches for 20 tenants are normal.
+
+### Does skip scan work with ORDER BY?
+
+The output of a skip scan is ordered by the full index key, which means ordered by the leading column first. A query that skips the leading column and orders by the second column still needs a sort step. In testing, `ORDER BY created_at LIMIT 10` on the example table produced a `Limit` over a `Sort` over a `Bitmap Heap Scan`, with the skip scan inside the `Bitmap Index Scan`.
+
+### Should I reorder existing indexes after upgrading?
+
+Not automatically. Measure first. Skip scan helps some queries that previously could not use an index, but it does not make a poor column order optimal. Rebuild only when `EXPLAIN` shows a clear gain on real workloads.

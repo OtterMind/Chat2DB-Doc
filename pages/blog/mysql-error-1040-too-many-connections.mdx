@@ -1,0 +1,328 @@
+---
+title: "MySQL Error 1040: Too Many Connections Fix"
+description: "Fix MySQL ERROR 1040 Too many connections: log in via the reserved admin slot or admin_port, find who holds connections, stop leaks, size max_connections."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: September 28, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# MySQL Error 1040: Too Many Connections Fix
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="September 28, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+`ERROR 1040 (HY000): Too many connections` means the MySQL server already has as many client connections open as `max_connections` allows, and it refused yours. Nothing is wrong with your credentials or your query. The server is simply full.
+
+The instinctive fix is to raise `max_connections`. Sometimes that is right, but more often the real problem is an application that opens connections faster than it closes them, a pool sized far beyond what the database can use, or a slow query that makes every request hold its connection longer. Raising the limit without finding the cause usually just moves the failure, and each extra connection costs server memory.
+
+This guide covers how to get into a full server, how to find who is holding the connections, and how to fix the cause. All errors, defaults, and query output below were reproduced on MySQL 8.4.11 in Docker, with `max_connections` lowered to 3 so the limit is easy to hit.
+
+## What the Error Looks Like
+
+When a normal account connects to a server that is at its limit, the client gets:
+
+```text
+ERROR 1040 (08004): Too many connections
+```
+
+In our tests the SQLSTATE depended on how full the server was. With exactly `max_connections` clients connected, a regular account got `08004` after authenticating (a wrong password at that point still returned `1045 Access denied`). Once the extra administrative slot described below was also taken, every new connection, including root over the local socket and even attempts with a wrong password, was refused with:
+
+```text
+ERROR 1040 (HY000): Too many connections
+```
+
+Either way the number is 1040 and the meaning is the same. Application logs usually show it wrapped in a driver exception, such as `SQLNonTransientConnectionException` in Java or `OperationalError: (1040, 'Too many connections')` in Python.
+
+## Step 1: Get Into the Server
+
+You need a session to diagnose the problem, and the server is refusing sessions. MySQL has two ways around that.
+
+### The Reserved Extra Connection
+
+MySQL permits `max_connections + 1` client connections. The extra one is reserved for accounts that have the `CONNECTION_ADMIN` privilege (or the deprecated `SUPER` privilege). In our test with `max_connections = 3`, three connections from the application user filled the server; the application user's fourth attempt failed with 1040, but root still got in:
+
+```sql
+SELECT CURRENT_USER(), @@max_connections;
+```
+
+```text
+CURRENT_USER()  @@max_connections
+root@%          3
+```
+
+Two consequences follow:
+
+1. There is only one extra slot. If a monitoring agent or a second administrator already holds it, you get 1040 too. That is exactly what we saw: a second root connection was rejected.
+2. The slot only helps if application accounts do not have `CONNECTION_ADMIN` or `SUPER`. If your application connects as root, it can consume the reserved slot itself, and you lose your way in. Give applications their own least-privilege accounts.
+
+### The Administrative Interface (admin_port)
+
+Since MySQL 8.0.14 the server can listen on a separate administrative network interface whose connections are not limited by `max_connections`. It is disabled until you set `admin_address`, and that variable is read-only at runtime. We tried `SET PERSIST_ONLY admin_address = '127.0.0.1'` and got:
+
+```text
+ERROR 1238 (HY000): Variable 'admin_address' is a non persistent read only variable
+```
+
+So configure it in the option file (or on the command line) and restart once, ahead of time:
+
+```ini
+[mysqld]
+admin_address = 127.0.0.1
+admin_port    = 33062
+```
+
+On startup the error log confirms it:
+
+```text
+[System] [MY-013292] [Server] Admin interface ready for connections, address: '127.0.0.1'  port: 33062
+```
+
+With `max_connections = 3`, three application connections and root holding the extra slot, a normal root login over port 3306 failed with 1040. The same root login on the admin port succeeded:
+
+```bash
+mysql -h 127.0.0.1 -P 33062 -u root -p
+```
+
+Accounts need the `SERVICE_CONNECTION_ADMIN` privilege to use it. Our application account was rejected:
+
+```text
+ERROR 1227 (42000): Access denied; you need (at least one of) the SERVICE_CONNECTION_ADMIN privilege(s) for this operation
+```
+
+`admin_port` defaults to 33062. Binding `admin_address` to `127.0.0.1` means it is only reachable from the database host itself, which is a sensible default. Set this up before you need it: during an incident, a restart to enable it disconnects everyone.
+
+## Step 2: Find Out Who Holds the Connections
+
+Once you are in, look at the current state:
+
+```sql
+SHOW GLOBAL STATUS WHERE Variable_name IN (
+  'Threads_connected', 'Threads_running',
+  'Max_used_connections', 'Max_used_connections_time',
+  'Connection_errors_max_connections'
+);
+```
+
+- `Threads_connected` is the number of open connections right now.
+- `Threads_running` is how many of them are actually executing something.
+- `Max_used_connections` and `Max_used_connections_time` show the peak since startup and when it happened.
+- `Connection_errors_max_connections` counts refused connections since startup. If it keeps growing, applications are hitting the limit even when you are not looking.
+
+A large gap between `Threads_connected` and `Threads_running` is the most useful signal. If hundreds of connections are open but only a handful are running, the connections are idle: a leak or an oversized pool. If most of them are running, the database is slow and requests are piling up.
+
+### Group Connections by User and Host
+
+The processlist includes the client host and port. Grouping by user and client host shows which application server owns the connections:
+
+```sql
+SELECT user,
+       SUBSTRING_INDEX(host, ':', 1) AS client,
+       command,
+       COUNT(*)  AS conns,
+       MAX(time) AS max_seconds
+FROM information_schema.PROCESSLIST
+GROUP BY user, client, command
+ORDER BY conns DESC;
+```
+
+In our reproduction, this immediately showed three `app` connections from the same client address, all in `Query` state running `SELECT SLEEP(...)`.
+
+In MySQL 8.0 and 8.4 you can also read `performance_schema.processlist`, which avoids the global lock that the legacy `information_schema.PROCESSLIST` implementation can take on busy servers. For cumulative counts per account, `performance_schema.accounts` keeps both current and total connections:
+
+```sql
+SELECT user, host, current_connections, total_connections
+FROM performance_schema.accounts
+WHERE user IS NOT NULL
+ORDER BY current_connections DESC;
+```
+
+And the `sys` schema summarizes it per user:
+
+```sql
+SELECT user, current_connections, total_connections
+FROM sys.user_summary
+ORDER BY current_connections DESC;
+```
+
+A very high `total_connections` relative to uptime for one account means that application opens a new connection for every request instead of reusing pooled ones.
+
+### Look at Long Idle and Long Running Sessions
+
+```sql
+SELECT id, user, host, db, command, time, state, LEFT(info, 80) AS query
+FROM information_schema.PROCESSLIST
+WHERE command <> 'Daemon'
+ORDER BY time DESC
+LIMIT 30;
+```
+
+Many connections in `Sleep` with large `time` values point to leaks or oversized pools. Many connections in `Query` with a state such as `Waiting for table metadata lock` or long-running statements point to a blocking problem: one slow statement or lock holder is making everything else wait, and each waiting request keeps its connection. To track down row lock waits, see [MySQL Lock Wait Timeout Exceeded](/resources/blog/mysql-lock-wait-timeout-exceeded).
+
+## Step 3: Relieve the Immediate Pressure
+
+These actions buy time. They do not fix the cause.
+
+### Kill Idle Connections
+
+Generate `KILL` statements for sessions that have been sleeping for a long time, review the list, then run it:
+
+```sql
+SELECT CONCAT('KILL ', id, ';') AS stmt
+FROM information_schema.PROCESSLIST
+WHERE command = 'Sleep'
+  AND time > 300
+  AND user NOT IN ('system user', 'event_scheduler');
+```
+
+Killing a pooled connection is usually safe: the pool notices it is dead and opens a new one. Killing a connection in the middle of a transaction rolls that transaction back, so avoid killing `Query` sessions unless you know what they are doing.
+
+### Raise max_connections Temporarily
+
+`max_connections` is dynamic:
+
+```sql
+SET GLOBAL max_connections = 300;
+```
+
+This takes effect immediately and does not require a restart. `SET PERSIST max_connections = 300` also writes it to `mysqld-auto.cnf` so it survives restarts. Only do this if the server has memory to spare (see the sizing section below), and treat it as a stopgap.
+
+### Lower wait_timeout for Abandoned Connections
+
+The default `wait_timeout` is 28800 seconds (8 hours). A leaked connection can sit in `Sleep` for that long, occupying a slot. Lowering it makes the server close abandoned connections sooner:
+
+```sql
+SET GLOBAL wait_timeout = 600;
+```
+
+The new value applies to connections opened afterwards. Make sure every connection pool retires its connections before this timeout, otherwise the pool will hand out connections the server has already closed. Since MySQL 8.0.24, clients then receive `ERROR 4031 (HY000): The client was disconnected by the server because of inactivity`, and older drivers report a lost connection. If you see that after changing the timeout, see [MySQL Error 2013: Lost Connection During Query](/resources/blog/mysql-error-2013-lost-connection).
+
+## Step 4: Fix the Cause
+
+### Connection Leaks
+
+A leak is code that opens or borrows a connection and does not close or return it on every path, typically when an exception is thrown between getting and closing the connection. The signature is a steadily growing number of `Sleep` connections from one application, which only drops when the application restarts.
+
+Fixes by language:
+
+- Java: always use try-with-resources for `Connection`, `Statement`, and `ResultSet`. HikariCP's `leakDetectionThreshold` logs a stack trace for any connection held longer than the threshold, which points at the leaking code.
+- Python: use context managers (`with engine.connect() as conn:`), and in SQLAlchemy make sure sessions are closed or scoped per request.
+- Node.js: with `mysql2` pools, call `connection.release()` in a `finally` block after `pool.getConnection()`, or use `pool.query()`, which releases automatically.
+- PHP: persistent connections (`PDO::ATTR_PERSISTENT`, `mysqli` with the `p:` host prefix) keep one connection per worker process; with many PHP-FPM workers that can add up quickly.
+
+### No Pool, or a Pool Per Process
+
+Applications that open a new connection for every request suffer from connection churn, and under a traffic spike they open as many connections as there are concurrent requests. Use a connection pool.
+
+The opposite mistake is common too: every process, container, or serverless function instance has its own pool. Ten pods with a pool size of 50 is 500 potential connections, regardless of how few queries they actually run. When you scale horizontally, the total across all instances is what counts:
+
+```text
+total connections = instances x pool size per instance
+```
+
+Keep that total below `max_connections`, leaving headroom for administrators, monitoring, replication, and batch jobs. For serverless workloads or large fleets, a proxy such as ProxySQL or a managed database proxy multiplexes many client connections onto fewer server connections.
+
+### Slow Queries Holding Connections
+
+If `Threads_running` is high when 1040 appears, the pool is not the problem. Requests hold connections because queries take longer than usual, often due to a missing index, a lock, or a sudden plan change. More connections will make this worse, because more concurrent queries compete for the same CPU, disk, and locks. Find the slow statements:
+
+```sql
+SELECT DIGEST_TEXT, COUNT_STAR,
+       ROUND(SUM_TIMER_WAIT / 1e12, 2) AS total_seconds,
+       ROUND(AVG_TIMER_WAIT / 1e12, 4) AS avg_seconds
+FROM performance_schema.events_statements_summary_by_digest
+ORDER BY SUM_TIMER_WAIT DESC
+LIMIT 10;
+```
+
+Fixing the top few statements often ends the connection pile-up by itself.
+
+### Per-Account Limits
+
+To stop one application from starving everything else, cap it per account:
+
+```sql
+ALTER USER 'app'@'%' WITH MAX_USER_CONNECTIONS 2;
+```
+
+When the cap is hit, only that account is refused, with a different error:
+
+```text
+ERROR 1226 (42000): User 'app' has exceeded the 'max_user_connections' resource (current value: 2)
+```
+
+There is also a global `max_user_connections` variable (default 0, meaning unlimited) that applies to every account without its own limit. When it is exceeded the error is:
+
+```text
+ERROR 1203 (42000): User app already has more than 'max_user_connections' active connections
+```
+
+Both are easier to diagnose than a server-wide 1040, because the error names the offending account.
+
+## Sizing max_connections and Pools
+
+The 8.4 default for `max_connections` is 151. Two constraints decide how high you can go.
+
+### Memory
+
+Each connection has a thread and buffers. Most per-session buffers such as `sort_buffer_size`, `join_buffer_size`, and `read_rnd_buffer_size` are allocated only when a query needs them, so idle connections are cheap, but a burst of concurrent complex queries is not. A rough upper bound for planning:
+
+```text
+innodb_buffer_pool_size
++ max_connections x (sort_buffer_size + join_buffer_size + read_buffer_size + read_rnd_buffer_size + thread_stack + binlog_cache_size)
++ other global buffers
+```
+
+This worst case is rarely reached, but if it is far beyond the RAM of the host, a spike can get the server killed by the operating system, which turns a 1040 into a full outage.
+
+### Useful Concurrency
+
+A database can only run as many queries in parallel as it has CPU cores and I/O capacity. Past that point, extra concurrent queries just queue inside the server. That is why well-tuned pools are usually small: a common starting heuristic, popularized by the HikariCP documentation, is about twice the number of CPU cores of the database server, then adjusted by measurement. Use the [connection pool size calculator](https://chat2db.ai/tools/connection-pool-size-calculator) to work out a per-instance pool size from your core count, instance count, and headroom, and see the [HikariCP connection pool size guide](/resources/blog/hikaricp-connection-pool-size-guide) for the reasoning behind the numbers.
+
+### File Descriptor Limits
+
+Each connection uses a file descriptor. If the operating system limit for the `mysqld` process is too low, MySQL may start with a lower effective `max_connections` than you configured and write a warning to the error log. After changing the setting, always check the effective value:
+
+```sql
+SELECT @@max_connections, @@open_files_limit;
+```
+
+On systemd hosts, raise `LimitNOFILE` in the MySQL service unit if `open_files_limit` is lower than you expect.
+
+### X Protocol Has Its Own Limit
+
+If you use MySQL Shell or connectors over the X Protocol (port 33060), those connections are governed by `mysqlx_max_connections`, which defaults to 100, not by `max_connections`.
+
+## A Checklist for the Next Incident
+
+1. Configure `admin_address` now, so you can always get in on port 33062.
+2. Make sure applications do not connect with accounts that have `CONNECTION_ADMIN` or `SUPER`.
+3. When 1040 appears, compare `Threads_connected` with `Threads_running`.
+4. Group the processlist by user and client host to find the owner.
+5. Mostly `Sleep`: look for leaks and oversized or duplicated pools. Mostly `Query`: look for slow statements and locks.
+6. Kill long idle sessions and raise `max_connections` only as a stopgap.
+7. Size pools so that instances times pool size stays below `max_connections` with headroom.
+
+A GUI helps a lot during step 4, when you want to sort and filter a few hundred processlist rows quickly. In [Chat2DB](https://app.chat2db.ai/) you can run the grouping queries above, sort the result grid by any column, and save the diagnostic queries for the next incident. For other connection errors you encounter, like 1203, 1226, or 1227, the free [MySQL error code lookup tool](https://chat2db.ai/tools/mysql-error-code-lookup) explains each code.
+
+If you also run PostgreSQL, its equivalent error is covered in [PostgreSQL Too Many Clients Already](/resources/blog/postgres-too-many-clients-already-fix).
+
+## FAQ
+
+### What is the default max_connections in MySQL?
+
+In MySQL 8.0 and 8.4 the default is 151. The server actually allows one more connection than that, reserved for accounts with `CONNECTION_ADMIN` or `SUPER`. Connections on the administrative interface (`admin_port`) are not counted against the limit.
+
+### Can I change max_connections without restarting MySQL?
+
+Yes. `SET GLOBAL max_connections = N` takes effect immediately. Use `SET PERSIST` to keep it across restarts, or put it in the `[mysqld]` section of the option file. Existing connections are not affected.
+
+### Why do I get too many connections when my pool is small?
+
+Count every pool, not one. Multiply the pool size by the number of application instances, workers, or serverless function instances, then add cron jobs, BI tools, and admin sessions. If that total can exceed `max_connections`, you will hit 1040 under load even though each individual pool looks reasonable.
+
+### Why can root not log in when the server has too many connections?
+
+The reserved extra connection is shared by all accounts with `CONNECTION_ADMIN` or `SUPER`, and only one such connection can use it. If a monitoring agent, another administrator, or an application connected as root already holds it, root gets 1040 as well. Use the administrative interface on `admin_port` as a reliable way in.
