@@ -1,0 +1,421 @@
+---
+title: "SQL Server Error 18456: Login Failed for User"
+description: "Fix SQL Server error 18456 Login failed for user: what each State code means, how to read the real state from the error log, and fixes for sa, orphans, Docker."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: September 29, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# SQL Server Error 18456: Login Failed for User
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="September 29, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+`Login failed for user 'x'. (Microsoft SQL Server, Error: 18456)` is the most common SQL Server connection error, and the least informative one. The server deliberately tells the client almost nothing, so that an attacker probing logins cannot tell a wrong password from a missing account. The real reason is written to the SQL Server error log as a **State** number, and each state points to a different fix.
+
+This guide shows how to find that state, lists what the common states mean, and walks through the fixes: wrong or changed passwords, missing logins, disabled `sa`, authentication mode, default databases that no longer exist, orphaned users after a restore, password policy, contained databases and Docker containers on a Mac.
+
+The log lines and messages below were captured from SQL Server 2022 (RTM-CU27, 16.0.4295.3) running in the `mcr.microsoft.com/mssql/server:2022-latest` Docker image, using `sqlcmd` with ODBC Driver 18.
+
+## Why the Client Message Is Not Enough
+
+Here are four different failures as the client sees them:
+
+```text
+Sqlcmd: Error: Microsoft ODBC Driver 18 for SQL Server : Login failed for user 'sa'..
+Sqlcmd: Error: Microsoft ODBC Driver 18 for SQL Server : Login failed for user 'ghost'..
+Sqlcmd: Error: Microsoft ODBC Driver 18 for SQL Server : Login failed for user 'deny_user'..
+Sqlcmd: Error: Microsoft ODBC Driver 18 for SQL Server : Login failed for user 'app_user'..
+```
+
+The first was a wrong password, the second a login that does not exist, the third a login that was denied the `CONNECT SQL` permission, and the fourth an empty password. From the client side they are identical. SSMS shows the same text in its dialog, and when it shows a state at all, it is typically `State: 1`, which is the generic value sent to clients and means nothing.
+
+A few failures do add a reason or an extra line on the client:
+
+```text
+Login failed for user 'off_user'. Reason: The account is disabled..
+Login failed for user 'chg_user'.  Reason: The password of the account must be changed..
+Cannot open user default database. Login failed..
+Cannot open database "Sales" requested by the login. The login failed..
+```
+
+For everything else, go to the server log.
+
+## Find the Real State in the Error Log
+
+Every failed login writes two lines to the SQL Server error log: the error number with severity and state, and a message with a `Reason:` and the client IP address.
+
+```text
+2026-09-29 08:21:42.01 Logon       Error: 18456, Severity: 14, State: 8.
+2026-09-29 08:21:42.01 Logon       Login failed for user 'sa'. Reason: Password did not match that for the login provided. [CLIENT: 172.17.0.5]
+```
+
+You need access with another working login (or to the server's file system) to read it. There are several ways.
+
+### Option 1: xp_readerrorlog
+
+`xp_readerrorlog` reads the current log (`0`) of the SQL Server error log type (`1`) and can filter on a string. Filtering on `Login failed` returns only the reason lines, so load the log into a temp table to see both lines of each failure together:
+
+```sql
+CREATE TABLE #log (LogDate datetime, ProcessInfo nvarchar(50), Text nvarchar(max));
+INSERT #log EXEC xp_readerrorlog 0, 1;
+
+SELECT LogDate, Text
+FROM #log
+WHERE ProcessInfo = 'Logon'
+  AND (Text LIKE 'Error: 18%' OR Text LIKE 'Login failed%')
+  AND LogDate > DATEADD(hour, -1, GETDATE())
+ORDER BY LogDate;
+```
+
+The `Error: 18%` pattern is intentional: a disabled account and a password that must be changed are logged as 18470 and 18488, not 18456. Here is real output from our test server after a series of failed logins:
+
+```text
+LogDate                 Text
+2026-09-29 08:21:42.010 Error: 18456, Severity: 14, State: 8.
+2026-09-29 08:21:42.010 Login failed for user 'sa'. Reason: Password did not match that for the login provided. [CLIENT: 172.17.0.5]
+2026-09-29 08:21:42.340 Error: 18470, Severity: 14, State: 1.
+2026-09-29 08:21:42.340 Login failed for user 'off_user'. Reason: The account is disabled. [CLIENT: 172.17.0.5]
+2026-09-29 08:21:42.500 Error: 18456, Severity: 14, State: 7.
+2026-09-29 08:21:42.500 Login failed for user 'off_user'. Reason: An error occurred while evaluating the password. [CLIENT: 172.17.0.5]
+2026-09-29 08:21:42.660 Error: 18456, Severity: 14, State: 40.
+2026-09-29 08:21:42.660 Login failed for user 'nodb_user'. Reason: Failed to open the database 'tempdb2' specified in the login properties. [CLIENT: 172.17.0.5]
+2026-09-29 08:21:42.830 Error: 18488, Severity: 14, State: 1.
+2026-09-29 08:21:42.830 Login failed for user 'chg_user'.  Reason: The password of the account must be changed. [CLIENT: 172.17.0.5]
+2026-09-29 08:21:43.000 Error: 18456, Severity: 14, State: 147.
+2026-09-29 08:21:43.000 Login failed for user 'deny_user'. Reason: Login-based server access validation failed with an infrastructure error. Login lacks Connect SQL permission. [CLIENT: 172.17.0.5]
+2026-09-29 08:21:43.140 Error: 18456, Severity: 14, State: 38.
+2026-09-29 08:21:43.140 Login failed for user 'app_user'. Reason: Failed to open the explicitly specified database 'Sales'. [CLIENT: 172.17.0.5]
+```
+
+The `[CLIENT: ...]` address is useful on its own: it tells you which machine is sending the bad credentials, which is how you track down an old service or scheduled job still using a rotated password.
+
+### Option 2: The Connectivity Ring Buffer
+
+SQL Server also keeps recent connection errors in memory, in `sys.dm_os_ring_buffers`. The `RING_BUFFER_CONNECTIVITY` records include the error number and the state as separate XML elements, so you can query them without parsing log text:
+
+```sql
+SELECT TOP (10)
+  x.value('(Record/ConnectivityTraceRecord/RecordTime)[1]', 'varchar(30)') AS record_time,
+  x.value('(Record/ConnectivityTraceRecord/SniConsumerError)[1]', 'int')   AS error_number,
+  x.value('(Record/ConnectivityTraceRecord/State)[1]', 'int')              AS state,
+  x.value('(Record/ConnectivityTraceRecord/RemoteHost)[1]', 'varchar(50)') AS remote_host
+FROM sys.dm_os_ring_buffers AS rb
+CROSS APPLY (SELECT CAST(rb.record AS xml)) AS r(x)
+WHERE rb.ring_buffer_type = N'RING_BUFFER_CONNECTIVITY'
+  AND x.value('(Record/ConnectivityTraceRecord/RecordType)[1]', 'varchar(30)') = 'Error'
+ORDER BY rb.[timestamp] DESC;
+```
+
+```text
+record_time           error_number state remote_host
+9/29/2026 8:21:43.474 18456        8     172.17.0.5
+9/29/2026 8:21:43.310 18456        38    172.17.0.5
+9/29/2026 8:21:43.146 18456        38    172.17.0.5
+9/29/2026 8:21:43.2   18456        147   172.17.0.5
+9/29/2026 8:21:42.840 18488        1     172.17.0.5
+```
+
+If `sqlcmd` returns `Msg 1934 ... 'QUOTED_IDENTIFIER'` for this query, run it with `sqlcmd -I`, because XML methods require `QUOTED_IDENTIFIER ON`. The ring buffer is small and cleared on restart, so use it for recent failures only.
+
+### Option 3: docker logs or the Log File
+
+On Linux and in containers, the error log is a plain text file at `/var/opt/mssql/log/errorlog`, and the container image also writes it to standard output. So from the host:
+
+```bash
+docker logs sql1 2>&1 | grep -A1 -E 'Error: 18(456|470|488)'
+```
+
+On Windows, the file is `ERRORLOG` in the instance's `MSSQL\Log` folder, and SSMS shows it under **Management, SQL Server Logs**.
+
+## SQL Server 18456 State Codes
+
+The table lists the states you are most likely to see. Rows marked "captured" were reproduced on SQL Server 2022 for this article; the others are documented meanings that could not be reproduced in a Linux container.
+
+| State | Meaning | Typical fix | Verified |
+|---|---|---|---|
+| 1 | Generic state sent to the client; the real state is in the log | Read the error log | Client side |
+| 2, 5 | The login name does not exist (`Could not find a login matching the name provided`) | Check the spelling and the instance; create the login | 5 captured |
+| 6 | A Windows account name was used with SQL Server authentication | Use Windows authentication, or a SQL login | Documented |
+| 7 | Login is disabled **and** the password was wrong | Enable the login and use the right password | Captured |
+| 8 | Wrong password | Reset or correct the password | Captured |
+| 11, 12 | Valid login, but server access failed (often a Windows group or permission problem) | Grant `CONNECT SQL`, check group membership, run the client elevated | Documented |
+| 13 | The SQL Server service is paused | Resume the service | Documented |
+| 18 | The password must be changed | Change the password | See note |
+| 38 | The database named in the connection string cannot be opened (missing, offline, or no user in it) | Fix the database name or map a user | Captured |
+| 40 | The login's default database cannot be opened | Change the default database | Captured |
+| 58 | SQL Server authentication was used, but the server allows Windows authentication only | Enable mixed mode | Documented |
+| 102 to 111 | Microsoft Entra ID (Azure AD) authentication failures | Check the Entra configuration and token | Documented |
+| 147 | Login lacks `CONNECT SQL` permission | `GRANT CONNECT SQL` | Captured |
+
+Two related error numbers appear in the same place: **18470** (`The account is disabled`) when a disabled login uses the right password, and **18488** (`The password of the account must be changed`). On SQL Server 2022, our `MUST_CHANGE` login produced 18488 State 1 rather than 18456 State 18. Also note that denying `CONNECT SQL` produced State 147, not 11 or 12.
+
+## Fix: Wrong or Missing Login (States 2, 5, 8)
+
+First make sure you are talking to the server you think you are. Check the login exists and its state:
+
+```sql
+SELECT name, is_disabled, is_policy_checked, is_expiration_checked,
+       LOGINPROPERTY(name, 'IsMustChange') AS must_change,
+       LOGINPROPERTY(name, 'IsExpired')    AS expired,
+       LOGINPROPERTY(name, 'IsLocked')     AS locked,
+       default_database_name
+FROM sys.sql_logins
+WHERE name = 'app_user';
+```
+
+If it does not exist, create it. If the password is wrong, reset it:
+
+```sql
+CREATE LOGIN app_user WITH PASSWORD = 'App!Passw0rd1';
+-- or
+ALTER LOGIN app_user WITH PASSWORD = 'App!NewPassw0rd2';
+```
+
+If `IsLocked` is 1 because of repeated failures under a Windows lockout policy, unlock it while setting a password:
+
+```sql
+ALTER LOGIN app_user WITH PASSWORD = 'App!NewPassw0rd2' UNLOCK;
+```
+
+Remember that SQL logins are case-insensitive on a default install, but passwords are always case-sensitive.
+
+## Fix: Enable Mixed Mode Authentication (State 58)
+
+A fresh Windows install often allows Windows authentication only. Any SQL login, including `sa`, then fails with State 58. Check the mode:
+
+```sql
+SELECT SERVERPROPERTY('IsIntegratedSecurityOnly') AS windows_auth_only;
+```
+
+`1` means Windows-only; `0` means mixed mode. SQL Server on Linux and in Docker returned `0` in our test, which is why this state does not appear there.
+
+To switch to mixed mode in SSMS, right-click the server, open **Properties, Security**, choose **SQL Server and Windows Authentication mode**, and restart the SQL Server service. The same setting can be written with T-SQL (it changes the registry, so it still needs a service restart):
+
+```sql
+EXEC xp_instance_regwrite
+     N'HKEY_LOCAL_MACHINE',
+     N'Software\Microsoft\MSSQLServer\MSSQLServer',
+     N'LoginMode', REG_DWORD, 2;
+```
+
+`2` is mixed mode, `1` is Windows-only.
+
+## Fix: Enable the sa Login (States 7, 18470)
+
+Installers that use Windows authentication leave `sa` disabled. Our test gave `Error: 18470 ... The account is disabled` with the correct password, and `18456 State 7` with a wrong one. From a sysadmin login:
+
+```sql
+ALTER LOGIN sa WITH PASSWORD = 'Str0ng!Passw0rd';
+ALTER LOGIN sa ENABLE;
+```
+
+For production servers, it is better to create a named sysadmin login and keep `sa` disabled. If you lock yourself out of the only sysadmin account on Windows, the documented recovery is to start SQL Server in single-user mode (`-m`), in which members of the local Administrators group can connect as sysadmin.
+
+## Fix: Default Database Missing (State 40)
+
+Every login has a default database. If that database is dropped, detached, offline or restoring, the login fails even though the password is right:
+
+```text
+Cannot open user default database. Login failed.
+Error: 18456, Severity: 14, State: 40.
+Login failed for user 'nodb_user'. Reason: Failed to open the database 'tempdb2' specified in the login properties.
+```
+
+Naming a database explicitly in the connection bypasses the default, which gets you in to fix it:
+
+```bash
+sqlcmd -S localhost,1433 -U nodb_user -P 'NoDb!Passw0rd1' -C -d master
+```
+
+Then point the login at an existing database:
+
+```sql
+ALTER LOGIN nodb_user WITH DEFAULT_DATABASE = master;
+```
+
+In SSMS, the equivalent is **Options, Connection Properties, Connect to database** in the login dialog.
+
+## Fix: Database in the Connection String Cannot Be Opened (State 38)
+
+State 38 means the login itself is fine, but the database named in the connection (`Database=`, `Initial Catalog=`, `-d`) could not be opened. The client sees `Cannot open database "Sales" requested by the login`. Our test produced the identical state for a database that did not exist (`Nope`) and for an existing database in which the login had no user. Check both:
+
+```sql
+SELECT name, state_desc, user_access_desc FROM sys.databases WHERE name = 'Sales';
+
+USE Sales;
+SELECT dp.name, dp.type_desc
+FROM sys.database_principals AS dp
+JOIN sys.server_principals AS sp ON sp.sid = dp.sid
+WHERE sp.name = 'app_user';
+```
+
+If the database is online and there is no user, create one:
+
+```sql
+USE Sales;
+CREATE USER app_user FOR LOGIN app_user;
+ALTER ROLE db_datareader ADD MEMBER app_user;
+```
+
+### Orphaned Users After a Restore
+
+The most common cause of State 38 after a migration is an orphaned user. Database users are linked to server logins by SID, not by name. When you restore a database on another server (or re-create a login), the user `report_user` in the database still carries the old SID, and the new login `report_user` has a different one. The names match, but the login cannot enter the database.
+
+We reproduced this by backing up a database with a user mapped to `report_user`, dropping and re-creating the login, and restoring:
+
+```text
+Cannot open database "Sales" requested by the login. The login failed.
+Error: 18456, Severity: 14, State: 38.
+Login failed for user 'report_user'. Reason: Failed to open the explicitly specified database 'Sales'.
+```
+
+Find orphaned SQL users in the database:
+
+```sql
+USE Sales;
+SELECT dp.name AS user_name, dp.type_desc, dp.sid
+FROM sys.database_principals AS dp
+LEFT JOIN sys.server_principals AS sp ON sp.sid = dp.sid
+WHERE sp.sid IS NULL
+  AND dp.authentication_type_desc = 'INSTANCE';
+```
+
+```text
+user_name   type_desc sid
+report_user SQL_USER  0x889C7FF717F6144B8F39028DB3209EB6
+```
+
+Re-map the user to the login. This replaces the deprecated `sp_change_users_login 'Auto_Fix'`:
+
+```sql
+ALTER USER report_user WITH LOGIN = report_user;
+```
+
+After that, `report_user` connected to `Sales` normally. To avoid the problem on the next migration, create the login on the target server with the original SID (`CREATE LOGIN report_user WITH PASSWORD = '...', SID = 0x889C...`), so users in restored databases match automatically.
+
+## Fix: Password Policy and Expiration (State 18, Error 18488)
+
+SQL logins can enforce the Windows password policy (`CHECK_POLICY`) and expiration (`CHECK_EXPIRATION`). A login created with `MUST_CHANGE` or whose password has expired cannot log in until the password is changed. Clients that support it can change the password during login. With the ODBC-based `sqlcmd` (the one in `/opt/mssql-tools18/bin` inside the container), the `-z` option does this; our `chg_user` connected successfully with:
+
+```bash
+sqlcmd -S localhost,1433 -U chg_user -P 'Chg!Passw0rd1' -z 'Chg!NewPassw0rd2' -C -Q "SELECT SUSER_NAME()"
+```
+
+Most application drivers cannot, so an administrator resets it instead:
+
+```sql
+ALTER LOGIN chg_user WITH PASSWORD = 'Chg!NewPassw0rd2';
+-- for a service account that must not expire:
+ALTER LOGIN chg_user WITH CHECK_EXPIRATION = OFF;
+```
+
+Weak passwords are rejected when you set them, not at login. For example, in our test:
+
+```text
+Msg 33062, Level 16, State 2
+Password validation failed. The password does not meet SQL Server password policy requirements because it is too short. The password must be at least 8 characters.
+```
+
+And `CHECK_EXPIRATION = ON` cannot be combined with `CHECK_POLICY = OFF` (Msg 15122).
+
+## Fix: Contained Database Users (State 5)
+
+A contained database user has its own password stored inside the database, and there is no server login with that name. If the connection does not name the database, SQL Server looks for a server login, does not find one, and fails with State 5:
+
+```sql
+EXEC sp_configure 'contained database authentication', 1;
+RECONFIGURE;
+CREATE DATABASE Shop CONTAINMENT = PARTIAL;
+GO
+USE Shop;
+CREATE USER shop_app WITH PASSWORD = 'Shop!Passw0rd1';
+```
+
+```text
+Error: 18456, Severity: 14, State: 5.
+Login failed for user 'shop_app'. Reason: Could not find a login matching the name provided.
+```
+
+The same user connects as soon as the database is part of the connection:
+
+```bash
+sqlcmd -S localhost,1433 -U shop_app -P 'Shop!Passw0rd1' -C -d Shop
+```
+
+Azure SQL Database works the same way for contained users: always set `Database=` in the connection string.
+
+## Fix: SQL Server in Docker on a Mac
+
+For a local SQL Server container, whether on Intel or on Apple Silicon (see [how to run SQL Server on Mac with Docker](/blog/sql-server-on-mac-docker)), 18456 is almost always State 8, and the cause is usually one of the following.
+
+### The Password Variable Only Works the First Time
+
+`MSSQL_SA_PASSWORD` is applied when the container initializes an empty data directory. If you mount a volume that already contains databases, changing the variable does nothing. We started a container with `First!Passw0rd` on a named volume, removed it, and started a new one on the same volume with `Second!Passw0rd`:
+
+```bash
+# the new password from the environment variable is rejected
+docker exec tvol /opt/mssql-tools18/bin/sqlcmd -S localhost -C -U sa -P 'Second!Passw0rd' -Q "SELECT 1"
+# Sqlcmd: Error: Microsoft ODBC Driver 18 for SQL Server : Login failed for user 'sa'..
+# errorlog: Error: 18456, Severity: 14, State: 8.
+#           Login failed for user 'sa'. Reason: Password did not match that for the login provided.
+
+# the original password still works
+docker exec tvol /opt/mssql-tools18/bin/sqlcmd -S localhost -C -U sa -P 'First!Passw0rd' -Q "SELECT 'first works'"
+```
+
+Use the original password and change it with `ALTER LOGIN sa WITH PASSWORD = ...`, or, for a throwaway dev volume, delete the volume and start fresh.
+
+### Shell Quoting
+
+In zsh and bash, `$` inside double quotes is expanded and `!` can trigger history expansion in an interactive shell, so a password like `Pa$$w0rd!` may reach the container different from what you typed. Use single quotes, both in `docker run -e 'MSSQL_SA_PASSWORD=...'` and on the `sqlcmd -P` argument.
+
+### Password Too Weak for the Container
+
+If the `sa` password does not meet the policy (eight characters, three of four character classes), setup fails and the container exits. Every connection then fails, but with a network error rather than 18456. Run `docker ps -a` and `docker logs` to see it.
+
+### The Wrong Server on Port 1433
+
+If another container, or an old Azure SQL Edge container, already publishes port 1433, your client may be authenticating against a different instance with a different `sa` password:
+
+```bash
+docker ps --filter publish=1433 --format '{{.Names}}  {{.Image}}  {{.Ports}}'
+```
+
+Azure SQL Edge was retired on September 30, 2025, so move old Edge containers to the regular `mcr.microsoft.com/mssql/server` image.
+
+### Connection Strings
+
+Use the comma port syntax for ADO.NET and `sqlcmd`, and trust the container's self-signed certificate in development:
+
+```text
+Server=localhost,1433;Database=master;User Id=sa;Password=Str0ng!Passw0rd;Encrypt=True;TrustServerCertificate=True;
+```
+
+JDBC uses a colon:
+
+```text
+jdbc:sqlserver://localhost:1433;databaseName=master;user=sa;password=Str0ng!Passw0rd;encrypt=true;trustServerCertificate=true;
+```
+
+More formats are covered in the [SQL Server connection string guide](/blog/sql-server-connection-string-guide). A GUI client such as [Chat2DB](https://chat2db.ai/download) runs natively on macOS and lets you set the port, database and "trust server certificate" option separately, which removes most syntax mistakes when you are testing credentials.
+
+## Troubleshooting Checklist
+
+1. Read the state from the error log, `RING_BUFFER_CONNECTIVITY` or `docker logs`, not from the client dialog.
+2. Check the `[CLIENT: ...]` address to find the machine sending the credentials.
+3. State 5: wrong login name, wrong instance, or a contained user connecting without a database.
+4. State 8: wrong password. In Docker, remember the password stored in the volume wins.
+5. State 7 or error 18470: the login is disabled. `ALTER LOGIN ... ENABLE`.
+6. State 38: the database in the connection string is missing, offline, or has no (or an orphaned) user for the login.
+7. State 40: the default database is gone. Connect with an explicit database and `ALTER LOGIN ... WITH DEFAULT_DATABASE`.
+8. State 58: switch the server to mixed mode and restart.
+9. Error 18488 or State 18: the password must be changed.
+10. State 147: grant `CONNECT SQL`.
+
+## Summary
+
+Error 18456 is one error number with many causes. The client message hides the cause on purpose, and the error log shows it as a state. Once you have the state, the fix is usually one `ALTER LOGIN` or `ALTER USER` statement: reset the password, enable the login, fix the default database, re-map an orphaned user, turn on mixed mode, or put the database name in the connection string for contained users.

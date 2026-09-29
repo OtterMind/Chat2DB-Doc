@@ -1,0 +1,463 @@
+---
+title: "PostgreSQL 18 RETURNING OLD and NEW Explained"
+description: "Use PostgreSQL 18 RETURNING OLD and NEW in INSERT, UPDATE, DELETE and MERGE for audit trails, row diffs and upsert insert-vs-update detection, without triggers."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: September 29, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# PostgreSQL 18 RETURNING OLD and NEW Explained
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="September 29, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+The `RETURNING` clause has been one of PostgreSQL's most useful extensions to SQL for a long time. It lets an `INSERT`, `UPDATE`, `DELETE` or `MERGE` hand back the rows it touched, so you do not need a second round trip to find out what was written. There was always one gap, though: `RETURNING` only showed the row as it looked **after** the statement. For an `UPDATE` you got the new values and had no direct way to see what they replaced.
+
+PostgreSQL 18 closes that gap. `RETURNING` now accepts the special qualifiers `old` and `new`, so a single statement can return the previous and the current version of each row side by side. You can also rename them with `RETURNING WITH (OLD AS o, NEW AS n)` when the default names collide with something in your query.
+
+This guide walks through the syntax for every DML command, shows practical patterns (audit tables, JSON diffs, upsert detection), and compares them with the workarounds people used before version 18. Every result below was produced on PostgreSQL 18.6 and copied as printed. The "before 18" errors were produced on PostgreSQL 17.11.
+
+## The Syntax in One Minute
+
+In PostgreSQL 18 the `RETURNING` list can reference three things:
+
+| Reference | Meaning |
+|---|---|
+| `col` or `table.col` | Same as before: the new row for `INSERT`/`UPDATE`, the old row for `DELETE` |
+| `old.col` / `old.*` | The row as it was before the command (NULL when there was no old row) |
+| `new.col` / `new.*` | The row as it is after the command (NULL when there is no new row) |
+
+And the optional aliasing form:
+
+```sql
+RETURNING WITH (OLD AS o, NEW AS n) o.col, n.col, ...
+```
+
+The rules for when `old` and `new` are NULL follow directly from what each command does:
+
+| Command | `old` | `new` |
+|---|---|---|
+| `INSERT` | all NULL | inserted row |
+| `INSERT ... ON CONFLICT DO UPDATE` (conflict path) | existing row before update | row after update |
+| `UPDATE` | row before update | row after update |
+| `DELETE` | deleted row | all NULL |
+| `MERGE` | depends on the action taken for that row | depends on the action taken for that row |
+
+Unqualified column names keep their old meaning, so existing queries do not change behaviour after an upgrade.
+
+## Setting Up a Test Table
+
+All examples use this small table. Run it in `psql` or any SQL client connected to a PostgreSQL 18 server.
+
+```sql
+CREATE TABLE products (
+  id    int PRIMARY KEY,
+  name  text NOT NULL,
+  price numeric(10,2) NOT NULL,
+  stock int NOT NULL DEFAULT 0
+);
+
+INSERT INTO products VALUES
+  (1, 'Keyboard', 49.00, 10),
+  (2, 'Mouse',    19.50, 25),
+  (3, 'Monitor', 189.00,  4);
+```
+
+## RETURNING OLD and NEW in UPDATE
+
+`UPDATE` is where the feature pays off most. A price increase that reports the before value, the after value and the difference in one statement:
+
+```sql
+UPDATE products
+SET price = price * 1.10
+WHERE id IN (1, 2)
+RETURNING id,
+          old.price AS old_price,
+          new.price AS new_price,
+          new.price - old.price AS delta;
+```
+
+```text
+ id | old_price | new_price | delta
+----+-----------+-----------+-------
+  1 |     49.00 |     53.90 |  4.90
+  2 |     19.50 |     21.45 |  1.95
+(2 rows)
+```
+
+Before PostgreSQL 18, getting `old_price` here needed a self-join or a CTE (covered later). Now the executor already has both row versions in hand and simply exposes them.
+
+You can also return entire rows. `old` and `new` on their own are whole-row values, which is handy for logging:
+
+```sql
+UPDATE products SET stock = stock + 1 WHERE id = 1
+RETURNING old, new;
+```
+
+```text
+             old              |             new
+------------------------------+------------------------------
+ (1,"Mech Keyboard",49.50,11) | (1,"Mech Keyboard",49.50,12)
+```
+
+(The name and price differ from the setup data because this output was captured later in the same session.)
+
+### Values Set by BEFORE Triggers Are Included
+
+`new` reflects the row that was actually stored, including anything a `BEFORE UPDATE` trigger changed. With a trigger that upper-cases `name` and stamps `updated_at`:
+
+```sql
+ALTER TABLE products ADD COLUMN updated_at timestamptz;
+
+CREATE FUNCTION touch() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+  NEW.updated_at := '2026-09-29 10:00+00';
+  NEW.name := upper(NEW.name);
+  RETURN NEW;
+END $$;
+
+CREATE TRIGGER trg_touch BEFORE UPDATE ON products
+FOR EACH ROW EXECUTE FUNCTION touch();
+
+UPDATE products SET name = 'dock' WHERE id = 7
+RETURNING old.name, old.updated_at, new.name, new.updated_at;
+```
+
+```text
+ name | updated_at | name |       updated_at
+------+------------+------+------------------------
+ Dock |            | DOCK | 2026-09-29 10:00:00+00
+```
+
+(Row 7, `Dock`, comes from the upsert example further down; this output was captured after it.)
+
+So `RETURNING new.*` is a reliable way to read back server-side modifications (defaults, triggers, generated columns) without a follow-up `SELECT`.
+
+## RETURNING OLD in DELETE and NEW in INSERT
+
+For `DELETE`, plain `RETURNING *` already returned the deleted row. With the new syntax you can be explicit, and `new` is simply all NULL:
+
+```sql
+DELETE FROM products WHERE id = 3 RETURNING old.*, new.*;
+```
+
+```text
+ id |  name   | price  | stock | id | name | price | stock
+----+---------+--------+-------+----+------+-------+-------
+  3 | Monitor | 189.00 |     4 |    |      |       |
+```
+
+For a plain `INSERT`, `old` is all NULL:
+
+```sql
+INSERT INTO products VALUES (4, 'Webcam', 59.00, 7)
+RETURNING old.id AS old_id, new.id AS new_id;
+```
+
+```text
+ old_id | new_id
+--------+--------
+        |      4
+```
+
+That NULL is not interesting on its own, but it becomes very useful as soon as `ON CONFLICT` enters the picture.
+
+## Detecting Insert vs Update in an Upsert
+
+A very common question with `INSERT ... ON CONFLICT DO UPDATE` is "which rows were inserted and which were updated?" In PostgreSQL 18 the answer is: if `old` has a value, the row already existed.
+
+```sql
+INSERT INTO products VALUES
+  (1, 'Keyboard', 52.00, 12),
+  (5, 'Headset',  79.00,  3)
+ON CONFLICT (id) DO UPDATE
+  SET price = EXCLUDED.price,
+      stock = EXCLUDED.stock
+RETURNING new.id,
+          CASE WHEN old.id IS NULL THEN 'inserted' ELSE 'updated' END AS action,
+          old.price AS old_price,
+          new.price AS new_price;
+```
+
+```text
+ id |  action  | old_price | new_price
+----+----------+-----------+-----------
+  1 | updated  |     53.90 |     52.00
+  5 | inserted |           |     79.00
+(2 rows)
+```
+
+Test `old` on a `NOT NULL` column such as the primary key. If you test a nullable column, a genuine NULL in the existing row would be misread as an insert.
+
+`ON CONFLICT DO NOTHING` still returns nothing for skipped rows, with or without `old`:
+
+```sql
+INSERT INTO products (id, name, price, stock) VALUES (7, 'x', 1, 1)
+ON CONFLICT (id) DO NOTHING
+RETURNING old.id, new.id;
+```
+
+```text
+ id | id
+----+----
+(0 rows)
+```
+
+If you want to report skipped rows too, you still need to compare the input set against what came back. For more on upsert semantics see the [ON CONFLICT DO UPDATE guide](/blog/postgres-on-conflict-do-update-guide).
+
+## RETURNING OLD and NEW in MERGE
+
+`MERGE` gained `RETURNING` in PostgreSQL 17, together with the `merge_action()` function. PostgreSQL 18 adds `old` and `new`, which makes `MERGE` output complete: you can see the action and both versions of every affected row.
+
+```sql
+CREATE TABLE price_feed (id int, price numeric(10,2), stock int);
+INSERT INTO price_feed VALUES
+  (1, 55.00, 12), (2, 21.45, 25), (6, 12.00, 40), (4, NULL, NULL);
+
+MERGE INTO products p
+USING price_feed f ON p.id = f.id
+WHEN MATCHED AND f.price IS NULL THEN DELETE
+WHEN MATCHED THEN UPDATE SET price = f.price, stock = f.stock
+WHEN NOT MATCHED THEN
+  INSERT (id, name, price, stock) VALUES (f.id, 'New item', f.price, f.stock)
+RETURNING merge_action(),
+          coalesce(new.id, old.id) AS id,
+          old.price AS old_price,
+          new.price AS new_price;
+```
+
+```text
+ merge_action | id | old_price | new_price
+--------------+----+-----------+-----------
+ UPDATE       |  1 |     52.00 |     55.00
+ UPDATE       |  2 |     21.45 |     21.45
+ INSERT       |  6 |           |     12.00
+ DELETE       |  4 |     59.00 |
+(4 rows)
+```
+
+Two details are worth noticing:
+
+1. `coalesce(new.id, old.id)` gives you a key for every row, because inserted rows have no `old` and deleted rows have no `new`.
+2. Row 2 was "updated" to the same price. `MERGE` (like `UPDATE`) still writes a new row version, so it is reported. Filter with `old IS DISTINCT FROM new` if you only care about real changes.
+
+The [MERGE statement guide](/blog/postgres-merge-statement-guide) covers the rest of `MERGE` syntax in detail.
+
+## Renaming with RETURNING WITH (OLD AS ..., NEW AS ...)
+
+The names `old` and `new` can clash in two situations:
+
+- **Trigger functions**, where `NEW` and `OLD` already mean the trigger's row variables in PL/pgSQL.
+- **Tables with columns called `old` or `new`**, or queries whose table alias is `old`/`new`.
+
+The `WITH` form lets you pick your own names:
+
+```sql
+UPDATE products SET stock = stock - 1 WHERE id = 2
+RETURNING WITH (OLD AS o, NEW AS n)
+  o.stock AS before,
+  n.stock AS after;
+```
+
+```text
+ before | after
+--------+-------
+     25 |    24
+```
+
+You can rename only one of them; the other keeps its default name:
+
+```sql
+UPDATE products SET stock = 0 WHERE id = 2
+RETURNING WITH (OLD AS old_row) old_row.stock, new.stock;
+```
+
+Here is the column-name clash in action. When a table really has columns named `old` and `new`, unqualified `old` and `new` in `RETURNING` resolve to those columns, not to the row versions:
+
+```sql
+CREATE TABLE t_old (old int, new int);
+INSERT INTO t_old VALUES (1, 2) RETURNING old, new;
+```
+
+```text
+ old | new
+-----+-----
+   1 |   2
+```
+
+With aliases you get both the columns and the row versions without ambiguity:
+
+```sql
+UPDATE t_old SET old = 5
+RETURNING WITH (OLD AS o, NEW AS n) o.old, n.old;
+```
+
+```text
+ old | old
+-----+-----
+   1 |   5
+```
+
+The alias list is validated. Each of `OLD` and `NEW` may appear once, and an alias cannot reuse the target table's name:
+
+```text
+ERROR:  OLD cannot be specified multiple times
+ERROR:  table name "products" specified more than once
+```
+
+## Practical Pattern: Audit Trail Without Triggers
+
+Because `RETURNING` output can feed a data-modifying CTE, you can write an audit record in the same statement as the change:
+
+```sql
+CREATE TABLE price_audit (
+  id         bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  product_id int,
+  old_price  numeric,
+  new_price  numeric,
+  changed_at timestamptz DEFAULT now()
+);
+
+WITH changed AS (
+  UPDATE products
+  SET price = round(price * 0.9, 2)
+  WHERE stock > 10
+  RETURNING id, old.price AS old_price, new.price AS new_price
+)
+INSERT INTO price_audit (product_id, old_price, new_price)
+SELECT id, old_price, new_price
+FROM changed
+WHERE old_price IS DISTINCT FROM new_price;
+
+SELECT product_id, old_price, new_price FROM price_audit ORDER BY product_id;
+```
+
+```text
+ product_id | old_price | new_price
+------------+-----------+-----------
+          1 |     55.00 |     49.50
+          2 |     21.45 |     19.31
+          6 |     12.00 |     10.80
+```
+
+Both statements run atomically as one command, and the audit rows see exactly the values that were written.
+
+When should you still use a trigger? This pattern only audits changes made **through this statement**. If other code paths, ad-hoc sessions or ORMs also modify the table, a trigger (or [pgAudit](/blog/pgaudit-postgres-audit-logging) for statement-level logging) is the only way to guarantee every change is captured. `RETURNING OLD/NEW` is best for application-owned workflows where you control the SQL, such as a price-change endpoint or a batch job.
+
+## Practical Pattern: Column-Level Diffs as JSON
+
+Combining `to_jsonb(old)` and `to_jsonb(new)` gives you a generic "what changed" document that works for any table:
+
+```sql
+UPDATE products
+SET name = 'Mech Keyboard', stock = 11
+WHERE id = 1
+RETURNING (
+  SELECT jsonb_object_agg(n.key, jsonb_build_object('from', o.value, 'to', n.value))
+  FROM jsonb_each(to_jsonb(old)) o
+  JOIN jsonb_each(to_jsonb(new)) n USING (key)
+  WHERE o.value IS DISTINCT FROM n.value
+) AS diff;
+```
+
+```text
+                                          diff
+----------------------------------------------------------------------------------------
+ {"name": {"to": "Mech Keyboard", "from": "Keyboard"}, "stock": {"to": 11, "from": 12}}
+```
+
+Unchanged columns are filtered out, so the diff contains only what actually moved. This is a compact format for change feeds, notification payloads or an `audit_log.changes jsonb` column.
+
+## How People Did This Before PostgreSQL 18
+
+If you run an older version, `old.` is simply not recognised. On PostgreSQL 17:
+
+```text
+ERROR:  missing FROM-clause entry for table "old"
+LINE 1: ...TE products SET price = 12 WHERE id = 1 RETURNING old.price,...
+```
+
+and the aliasing form is a syntax error:
+
+```text
+ERROR:  syntax error at or near "WITH"
+```
+
+These are the three classic workarounds, with their trade-offs.
+
+### Workaround 1: Self-Join in UPDATE ... FROM
+
+Read and lock the old row in a subquery, then join it into the `UPDATE`:
+
+```sql
+UPDATE products p
+SET price = 65.00
+FROM (SELECT id, price FROM products WHERE id = 1 FOR UPDATE) o
+WHERE p.id = o.id
+RETURNING p.id, o.price AS old_price, p.price AS new_price;
+```
+
+```text
+ id | old_price | new_price
+----+-----------+-----------
+  1 |     60.00 |     65.00
+```
+
+The `FOR UPDATE` matters. Without it, under concurrent writes the subquery can read a version that is no longer the one being updated. This works, but it scans the table twice and gets awkward with multi-row updates and complex `WHERE` clauses.
+
+### Workaround 2: Triggers
+
+An `AFTER UPDATE` trigger has access to `OLD` and `NEW` and can write to an audit table. It captures every change regardless of where it comes from, which is its big advantage, but it adds per-row overhead, hides logic from people reading the application SQL, and cannot return the old values to the calling statement. See [how to implement PostgreSQL triggers](/blog/how-to-implement-postgresql-triggers) for the full pattern.
+
+### Workaround 3: The xmax Trick for Upserts
+
+For insert-vs-update detection, the long-standing hack is to check the system column `xmax`:
+
+```sql
+INSERT INTO products VALUES (1, 'Keyboard', 60.00, 12), (7, 'Dock', 99.00, 2)
+ON CONFLICT (id) DO UPDATE SET price = EXCLUDED.price
+RETURNING id, (xmax = 0) AS inserted;
+```
+
+```text
+ id | inserted
+----+----------
+  1 | f
+  7 | t
+```
+
+It works in practice because a freshly inserted tuple has `xmax = 0`, while the updated one carries the locking transaction's ID. But it relies on an implementation detail of MVCC, is not documented as an API, and gives you no access to the previous values. On PostgreSQL 18, `old.id IS NULL` is the supported, readable replacement.
+
+### Comparison
+
+| Approach | Old values available | Extra scans | Captures all writers | Supported API |
+|---|---|---|---|---|
+| `RETURNING old/new` (PG18) | Yes | No | No, only this statement | Yes |
+| `UPDATE ... FROM` self-join | Yes | Yes | No | Yes |
+| Trigger | Inside trigger only | No | Yes | Yes |
+| `xmax = 0` | No | No | No | No, implementation detail |
+
+## Limitations and Gotchas
+
+- **Version check first.** The syntax only exists in PostgreSQL 18 and later. Run `SELECT version();` if a statement fails with `missing FROM-clause entry for table "old"`.
+- **No-op updates are still reported.** `SET price = price` produces a row in `RETURNING` with identical `old` and `new`. Filter with `IS DISTINCT FROM`.
+- **Skipped upsert rows are invisible.** `ON CONFLICT DO NOTHING` returns nothing for the skipped rows.
+- **Name clashes.** Inside PL/pgSQL trigger functions, and on tables with `old`/`new` columns, use the `WITH (OLD AS ..., NEW AS ...)` form so the reader is never unsure what `old` refers to.
+- **Client libraries.** ORMs and query builders that construct `RETURNING` clauses themselves may not expose `old.`/`new.` yet; a raw SQL call is the easy way around that.
+
+## Trying It Out
+
+The fastest way to experiment is to paste the examples above into a SQL editor connected to a PostgreSQL 18 database. [Chat2DB](https://chat2db.ai/download) shows `old` and `new` columns side by side in its result grid, which makes before/after comparisons easy to scan, and its AI assistant can draft the audit CTE for your own table if you describe the columns you want to track.
+
+For the rest of this release, see the overview of [PostgreSQL 18 new features](/blog/postgres-18-new-features).
+
+## Summary
+
+- PostgreSQL 18 lets `RETURNING` reference `old.*` and `new.*` in `INSERT`, `UPDATE`, `DELETE` and `MERGE`.
+- `old` is NULL for inserted rows and `new` is NULL for deleted rows, which makes `old.pk IS NULL` a clean insert-vs-update test in upserts and `coalesce(new.id, old.id)` a universal key in `MERGE`.
+- `RETURNING WITH (OLD AS o, NEW AS n)` renames them to avoid clashes with trigger variables or column names.
+- Data-modifying CTEs plus `RETURNING old/new` give you atomic audit rows and JSON diffs without triggers, as long as all writes go through your SQL.
+- Pre-18 workarounds (self-joins, triggers, `xmax = 0`) still work, but they are either slower, less transparent, or rely on internals.

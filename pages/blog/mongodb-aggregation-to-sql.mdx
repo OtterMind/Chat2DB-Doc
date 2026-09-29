@@ -1,0 +1,567 @@
+---
+title: "MongoDB Aggregation to SQL: Stage-by-Stage"
+description: "Translate MongoDB aggregation pipelines to SQL: $match, $group, $lookup, $unwind, $facet and $bucket mapped to PostgreSQL and MySQL, with tested examples."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: September 29, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# MongoDB Aggregation to SQL: Stage-by-Stage
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="September 29, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+A MongoDB aggregation pipeline is a list of stages, each one transforming the stream of documents produced by the previous stage. A SQL `SELECT` is a single declarative statement whose clauses are evaluated in a fixed logical order: `FROM`, `WHERE`, `GROUP BY`, `HAVING`, `SELECT`, `ORDER BY`, `LIMIT`. Translating a pipeline to SQL is mostly a matter of mapping each stage to the clause that does the same job, and noticing when a stage appears in a position where SQL needs a subquery or CTE.
+
+This guide goes in the pipeline-to-SQL direction: you have working aggregation code, for example because you are moving reports to PostgreSQL or MySQL or building a BI view over migrated data, and you need equivalent SQL. If you need the opposite, writing MongoDB queries for SQL you already know, use the [SQL to MongoDB Query Cheat Sheet](/blog/sql-to-mongodb-query-cheat-sheet).
+
+Every pipeline below was run on MongoDB 7.0, and every SQL statement on PostgreSQL 17 and MySQL 8.4, against the same data. The results shown are the actual outputs.
+
+## The Shared Sample Dataset
+
+In MongoDB, each order embeds its line items:
+
+```javascript
+db.customers.insertMany([
+  { _id: 1, name: 'Ana',  city: 'Lisbon', tier: 'gold' },
+  { _id: 2, name: 'Ben',  city: 'Berlin', tier: 'silver' },
+  { _id: 3, name: 'Chen', city: 'Lisbon', tier: 'silver' },
+  { _id: 4, name: 'Dana', city: 'Austin', tier: 'bronze' }
+]);
+
+db.orders.insertMany([
+  { _id: 101, customer_id: 1, status: 'paid',      total: 120.00, created_at: ISODate('2026-07-03T10:00:00Z'),
+    items: [ { sku: 'KB-01', qty: 1, price: 80 }, { sku: 'MS-02', qty: 2, price: 20 } ] },
+  { _id: 102, customer_id: 1, status: 'shipped',   total: 45.50,  created_at: ISODate('2026-07-18T14:30:00Z'),
+    items: [ { sku: 'MS-02', qty: 1, price: 20 }, { sku: 'PD-03', qty: 1, price: 25.5 } ] },
+  { _id: 103, customer_id: 2, status: 'paid',      total: 310.00, created_at: ISODate('2026-08-02T09:15:00Z'),
+    items: [ { sku: 'MN-04', qty: 1, price: 310 } ] },
+  { _id: 104, customer_id: 2, status: 'cancelled', total: 80.00,  created_at: ISODate('2026-08-05T16:45:00Z'),
+    items: [ { sku: 'KB-01', qty: 1, price: 80 } ] },
+  { _id: 105, customer_id: 3, status: 'paid',      total: 25.50,  created_at: ISODate('2026-08-20T11:00:00Z'),
+    items: [ { sku: 'PD-03', qty: 1, price: 25.5 } ] },
+  { _id: 106, customer_id: 3, status: 'shipped',   total: 160.00, created_at: ISODate('2026-09-01T08:20:00Z'),
+    items: [ { sku: 'KB-01', qty: 2, price: 80 } ] },
+  { _id: 107, customer_id: 1, status: 'paid',      total: 60.00,  created_at: ISODate('2026-09-10T19:05:00Z'),
+    items: [ { sku: 'MS-02', qty: 3, price: 20 } ] }
+]);
+```
+
+In SQL, the embedded `items` array becomes a child table. This schema runs unchanged on both PostgreSQL and MySQL:
+
+```sql
+CREATE TABLE customers (
+  id   INT PRIMARY KEY,
+  name VARCHAR(50) NOT NULL,
+  city VARCHAR(50) NOT NULL,
+  tier VARCHAR(10) NOT NULL
+);
+
+CREATE TABLE orders (
+  id          INT PRIMARY KEY,
+  customer_id INT NOT NULL REFERENCES customers(id),
+  status      VARCHAR(20) NOT NULL,
+  total       DECIMAL(10,2) NOT NULL,
+  created_at  TIMESTAMP NOT NULL
+);
+
+CREATE TABLE order_items (
+  order_id INT NOT NULL REFERENCES orders(id),
+  sku      VARCHAR(20) NOT NULL,
+  qty      INT NOT NULL,
+  price    DECIMAL(10,2) NOT NULL,
+  PRIMARY KEY (order_id, sku)
+);
+```
+
+The same seven orders, four customers, and nine line items are inserted on every engine.
+
+## Stage-to-Clause Mapping Table
+
+| Aggregation stage or operator | SQL equivalent | Notes |
+|---|---|---|
+| `$match` before `$group` | `WHERE` | Filters input rows |
+| `$match` after `$group` | `HAVING` | Filters groups |
+| `$group` with `_id: '$field'` | `GROUP BY field` | `_id: null` means one group: no `GROUP BY` |
+| `$sum: 1` | `COUNT(*)` | |
+| `$sum` / `$avg` / `$min` / `$max` | `SUM` / `AVG` / `MIN` / `MAX` | |
+| `$first` / `$last` after `$sort` | `ROW_NUMBER()`, or `DISTINCT ON` in PostgreSQL | |
+| `$project`, `$addFields`, `$set` | select list expressions | `$project: { x: 0 }` has no "all columns except" in SQL |
+| `$sort` | `ORDER BY` | `-1` is `DESC` |
+| `$skip` / `$limit` | `OFFSET` / `LIMIT` | |
+| `$lookup` | `LEFT JOIN` | `$lookup` keeps unmatched documents |
+| `$unwind` | `JOIN` to child table, or `jsonb_array_elements` / `JSON_TABLE` | `preserveNullAndEmptyArrays: true` is a `LEFT JOIN` |
+| `$count` | `SELECT COUNT(*)` | |
+| `$push` | `ARRAY_AGG` (PostgreSQL), `JSON_ARRAYAGG` (MySQL) | |
+| `$addToSet` | `ARRAY_AGG(DISTINCT ...)`; in MySQL, a `DISTINCT` subquery | |
+| `$facet` | CTE plus several subqueries combined into one JSON object | |
+| `$bucket` | `CASE` expression, or `width_bucket` in PostgreSQL | |
+| `$replaceRoot` | select the nested columns directly | |
+
+The rest of the article works through these in order, with the pipeline and the SQL side by side.
+
+## $match, $group, and $sort: WHERE, GROUP BY, HAVING
+
+Goal: revenue per customer for paid or shipped orders, only customers with at least 100 in revenue, highest first.
+
+```javascript
+db.orders.aggregate([
+  { $match: { status: { $in: ['paid', 'shipped'] } } },
+  { $group: { _id: '$customer_id', orders: { $sum: 1 }, revenue: { $sum: '$total' } } },
+  { $match: { revenue: { $gte: 100 } } },
+  { $sort: { revenue: -1 } }
+]);
+```
+
+```text
+[ { _id: 2, orders: 1, revenue: 310 },
+  { _id: 1, orders: 3, revenue: 225.5 },
+  { _id: 3, orders: 2, revenue: 185.5 } ]
+```
+
+The first `$match` runs before grouping, so it is a `WHERE`. The second runs on the grouped output, so it is a `HAVING`. PostgreSQL:
+
+```sql
+SELECT customer_id AS _id, COUNT(*) AS orders, SUM(total) AS revenue
+FROM orders
+WHERE status IN ('paid', 'shipped')
+GROUP BY customer_id
+HAVING SUM(total) >= 100
+ORDER BY revenue DESC;
+```
+
+MySQL allows the alias in `HAVING`, so `HAVING revenue >= 100` also works there; PostgreSQL requires the full expression. Both return:
+
+```text
+ _id | orders | revenue
+-----+--------+---------
+   2 |      1 |  310.00
+   1 |      3 |  225.50
+   3 |      2 |  185.50
+```
+
+Two translation rules follow from this example. First, count the `$match` stages and note where each one sits relative to `$group`. Second, every non-aggregated column in the SQL select list must be in `GROUP BY`. MongoDB's `$group` only outputs `_id` and the accumulators, so a faithful translation never violates this, but hand-written SQL often does; see [MySQL Error 1055: ONLY_FULL_GROUP_BY](/blog/mysql-error-1055-only-full-group-by) if you hit it.
+
+## $project, $sort, $skip, $limit: SELECT, ORDER BY, OFFSET, LIMIT
+
+Goal: the third to fifth largest non-cancelled orders, with a computed tax-inclusive total, the month, and a flag.
+
+```javascript
+db.orders.aggregate([
+  { $match: { status: { $ne: 'cancelled' } } },
+  { $project: {
+      _id: 0,
+      order_id: '$_id',
+      total: 1,
+      total_with_tax: { $round: [ { $multiply: ['$total', 1.2] }, 2 ] },
+      month: { $month: '$created_at' },
+      is_big: { $gte: ['$total', 100] }
+  } },
+  { $sort: { total: -1, order_id: 1 } },
+  { $skip: 2 },
+  { $limit: 3 }
+]);
+```
+
+```text
+[ { total: 120, order_id: 101, total_with_tax: 144,  month: 7, is_big: true },
+  { total: 60,  order_id: 107, total_with_tax: 72,   month: 9, is_big: false },
+  { total: 45.5, order_id: 102, total_with_tax: 54.6, month: 7, is_big: false } ]
+```
+
+PostgreSQL:
+
+```sql
+SELECT id AS order_id, total,
+       ROUND(total * 1.2, 2)               AS total_with_tax,
+       EXTRACT(MONTH FROM created_at)::int AS month,
+       total >= 100                        AS is_big
+FROM orders
+WHERE status <> 'cancelled'
+ORDER BY total DESC, order_id
+LIMIT 3 OFFSET 2;
+```
+
+MySQL replaces the month expression with `MONTH(created_at)`; everything else is identical. The results match, except that MySQL shows the boolean as `1`/`0`:
+
+```text
++----------+--------+----------------+-------+--------+
+| order_id | total  | total_with_tax | month | is_big |
++----------+--------+----------------+-------+--------+
+|      101 | 120.00 |         144.00 |     7 |      1 |
+|      107 |  60.00 |          72.00 |     9 |      0 |
+|      102 |  45.50 |          54.60 |     7 |      0 |
++----------+--------+----------------+-------+--------+
+```
+
+Operator mapping for common expressions:
+
+| Aggregation expression | PostgreSQL | MySQL |
+|---|---|---|
+| `$multiply`, `$add`, `$subtract`, `$divide` | `*`, `+`, `-`, `/` | same |
+| `$round: [x, 2]` | `ROUND(x, 2)` | `ROUND(x, 2)` |
+| `$concat: [a, b]` | `a \|\| b` | `CONCAT(a, b)` |
+| `$toUpper`, `$toLower` | `UPPER`, `LOWER` | `UPPER`, `LOWER` |
+| `$year`, `$month` | `EXTRACT(YEAR FROM x)` | `YEAR(x)`, `MONTH(x)` |
+| `$dateToString` | `to_char(x, 'YYYY-MM-DD')` | `DATE_FORMAT(x, '%Y-%m-%d')` |
+| `$cond: [c, a, b]` | `CASE WHEN c THEN a ELSE b END` | same, or `IF(c, a, b)` |
+| `$ifNull: [x, d]` | `COALESCE(x, d)` | `COALESCE(x, d)` or `IFNULL(x, d)` |
+| `$size: '$arr'` | `cardinality(arr)` or a `COUNT(*)` subquery | `JSON_LENGTH(arr)` or a subquery |
+
+Watch the order of `$sort`, `$skip`, and `$limit`. A pipeline can put `$limit` before `$sort`, which sorts only the first N documents. SQL always sorts before limiting, so that pipeline needs a subquery: `SELECT * FROM (SELECT ... LIMIT 10) t ORDER BY ...`. Also add a unique tiebreaker to the sort (here `order_id`), otherwise pages can overlap on both engines.
+
+## $lookup and $unwind: LEFT JOIN
+
+Goal: every customer with their number of orders and total spent, including customers without orders.
+
+```javascript
+db.customers.aggregate([
+  { $lookup: { from: 'orders', localField: '_id', foreignField: 'customer_id', as: 'orders' } },
+  { $unwind: { path: '$orders', preserveNullAndEmptyArrays: true } },
+  { $group: {
+      _id: '$name',
+      order_count: { $sum: { $cond: [ { $ifNull: ['$orders._id', false] }, 1, 0 ] } },
+      spent: { $sum: { $ifNull: ['$orders.total', 0] } }
+  } },
+  { $sort: { _id: 1 } }
+]);
+```
+
+```text
+[ { _id: 'Ana',  order_count: 3, spent: 225.5 },
+  { _id: 'Ben',  order_count: 2, spent: 390 },
+  { _id: 'Chen', order_count: 2, spent: 185.5 },
+  { _id: 'Dana', order_count: 0, spent: 0 } ]
+```
+
+`$lookup` attaches an array of matches to every input document, even if the array is empty, which is the semantics of a `LEFT JOIN`. `$unwind` with `preserveNullAndEmptyArrays: true` keeps Dana, who has no orders. SQL expresses all three stages as one join:
+
+```sql
+SELECT c.name AS _id,
+       COUNT(o.id)               AS order_count,
+       COALESCE(SUM(o.total), 0) AS spent
+FROM customers c
+LEFT JOIN orders o ON o.customer_id = c.id
+GROUP BY c.name
+ORDER BY c.name;
+```
+
+```text
++------+-------------+--------+
+| _id  | order_count | spent  |
++------+-------------+--------+
+| Ana  |           3 | 225.50 |
+| Ben  |           2 | 390.00 |
+| Chen |           2 | 185.50 |
+| Dana |           0 |   0.00 |
++------+-------------+--------+
+```
+
+Note the details that make the results identical. `COUNT(o.id)` counts only non-NULL values, which is what the `$cond`/`$ifNull` trick does in the pipeline; `COUNT(*)` would give Dana 1. `SUM` over no rows is NULL, hence `COALESCE`. If the pipeline used a plain `$unwind: '$orders'` without `preserveNullAndEmptyArrays`, Dana would disappear, and the SQL becomes an inner `JOIN`. More on join behavior in [How to Use MySQL LEFT JOIN](/blog/how-to-use-mysql-left-join).
+
+A `$lookup` with a `pipeline` and `let` (a correlated sub-pipeline) maps to a correlated subquery, or to `LEFT JOIN LATERAL` in PostgreSQL and MySQL 8.0.14 and later.
+
+## $unwind on Embedded Arrays: JOIN the Child Table
+
+Goal: units and revenue per SKU across non-cancelled orders.
+
+```javascript
+db.orders.aggregate([
+  { $match: { status: { $ne: 'cancelled' } } },
+  { $unwind: '$items' },
+  { $group: {
+      _id: '$items.sku',
+      units:   { $sum: '$items.qty' },
+      revenue: { $sum: { $multiply: ['$items.qty', '$items.price'] } }
+  } },
+  { $sort: { units: -1, _id: 1 } }
+]);
+```
+
+```text
+[ { _id: 'MS-02', units: 6, revenue: 120 },
+  { _id: 'KB-01', units: 3, revenue: 240 },
+  { _id: 'PD-03', units: 2, revenue: 51 },
+  { _id: 'MN-04', units: 1, revenue: 310 } ]
+```
+
+`$unwind` produces one document per array element, which is exactly what joining the parent to its child table does:
+
+```sql
+SELECT i.sku AS _id,
+       SUM(i.qty)           AS units,
+       SUM(i.qty * i.price) AS revenue
+FROM orders o
+JOIN order_items i ON i.order_id = o.id
+WHERE o.status <> 'cancelled'
+GROUP BY i.sku
+ORDER BY units DESC, _id;
+```
+
+```text
+  _id  | units | revenue
+-------+-------+---------
+ MS-02 |     6 |  120.00
+ KB-01 |     3 |  240.00
+ PD-03 |     2 |   51.00
+ MN-04 |     1 |  310.00
+```
+
+If you kept the array as a JSON column instead of normalizing it, unwind it inside the query. PostgreSQL:
+
+```sql
+SELECT o.id, j.sku, j.qty
+FROM orders_json o
+CROSS JOIN LATERAL jsonb_to_recordset(o.items) AS j(sku text, qty int);
+```
+
+MySQL:
+
+```sql
+SELECT o.id, j.sku, j.qty
+FROM orders_json o
+CROSS JOIN JSON_TABLE(o.items, '$[*]'
+  COLUMNS (sku VARCHAR(20) PATH '$.sku', qty INT PATH '$.qty')) AS j;
+```
+
+Both returned one row per element (`101 | KB-01 | 1` and `101 | MS-02 | 2` for order 101). PostgreSQL 17 also supports the standard `JSON_TABLE` syntax; see the [PostgreSQL JSON_TABLE guide](/blog/postgres-json-table-guide). Use `LEFT JOIN ... ON true` instead of `CROSS JOIN` to mimic `preserveNullAndEmptyArrays`.
+
+## $count: COUNT(*)
+
+```javascript
+db.orders.aggregate([
+  { $match: { status: 'paid' } },
+  { $count: 'paid_orders' }
+]);
+// [ { paid_orders: 4 } ]
+```
+
+```sql
+SELECT COUNT(*) AS paid_orders FROM orders WHERE status = 'paid';
+-- 4
+```
+
+One difference: when nothing matches, `$count` returns **no document at all**, while `COUNT(*)` returns one row with `0`. Code that reads `result[0].paid_orders` breaks on the MongoDB side, not on the SQL side.
+
+## $push and $addToSet: ARRAY_AGG and JSON_ARRAYAGG
+
+Goal: for each customer, the distinct SKUs they bought and the order statuses.
+
+```javascript
+db.orders.aggregate([
+  { $unwind: '$items' },
+  { $group: {
+      _id: '$customer_id',
+      skus:     { $addToSet: '$items.sku' },
+      statuses: { $push: '$status' }
+  } },
+  { $sort: { _id: 1 } }
+]);
+```
+
+```text
+[ { _id: 1, skus: [ 'PD-03', 'KB-01', 'MS-02' ], statuses: [ 'paid', 'paid', 'shipped', 'shipped', 'paid' ] },
+  { _id: 2, skus: [ 'MN-04', 'KB-01' ],          statuses: [ 'paid', 'cancelled' ] },
+  { _id: 3, skus: [ 'PD-03', 'KB-01' ],          statuses: [ 'paid', 'shipped' ] } ]
+```
+
+Notice that customer 1 has five statuses for three orders. `$unwind` created one document per item, and `$push` collected the status once per item. SQL joins fan out in exactly the same way, so the translation reproduces this faithfully. If you wanted one status per order, the fix is the same on both sides: aggregate before unwinding or joining.
+
+PostgreSQL has `ARRAY_AGG` with `DISTINCT` and `ORDER BY`:
+
+```sql
+SELECT o.customer_id AS _id,
+       ARRAY_AGG(DISTINCT i.sku)       AS skus,
+       ARRAY_AGG(o.status ORDER BY o.id) AS statuses
+FROM orders o
+JOIN order_items i ON i.order_id = o.id
+GROUP BY o.customer_id
+ORDER BY _id;
+```
+
+```text
+ _id |        skus         |             statuses
+-----+---------------------+----------------------------------
+   1 | {KB-01,MS-02,PD-03} | {paid,paid,shipped,shipped,paid}
+   2 | {KB-01,MN-04}       | {paid,cancelled}
+   3 | {KB-01,PD-03}       | {paid,shipped}
+```
+
+Use `JSON_AGG` or `JSONB_AGG` instead if the consumer expects JSON. MySQL's `JSON_ARRAYAGG` is the `$push` equivalent, but it does not accept `DISTINCT`:
+
+```sql
+SELECT customer_id, JSON_ARRAYAGG(DISTINCT status) FROM orders GROUP BY customer_id;
+```
+
+```text
+ERROR 1064 (42000): You have an error in your SQL syntax; check the manual that corresponds
+to your MySQL server version for the right syntax to use near 'DISTINCT status) FROM orders
+GROUP BY customer_id' at line 1
+```
+
+For `$addToSet` in MySQL, deduplicate in a derived table first, or use `GROUP_CONCAT(DISTINCT ...)` if a comma-separated string is acceptable:
+
+```sql
+SELECT customer_id AS _id, JSON_ARRAYAGG(sku) AS skus
+FROM (
+  SELECT DISTINCT o.customer_id, i.sku
+  FROM orders o
+  JOIN order_items i ON i.order_id = o.id
+) d
+GROUP BY customer_id
+ORDER BY _id;
+```
+
+```text
++-----+-----------------------------+
+| _id | skus                        |
++-----+-----------------------------+
+|   1 | ["KB-01", "MS-02", "PD-03"] |
+|   2 | ["MN-04", "KB-01"]          |
+|   3 | ["PD-03", "KB-01"]          |
++-----+-----------------------------+
+```
+
+Element order is not guaranteed by `$addToSet` in MongoDB or by `JSON_ARRAYAGG` in MySQL. Compare such arrays as sets in tests.
+
+## $bucket: CASE Expressions
+
+Goal: order counts and revenue by order size, with boundaries 0, 50, 100, 200, 1000.
+
+```javascript
+db.orders.aggregate([
+  { $bucket: {
+      groupBy: '$total',
+      boundaries: [0, 50, 100, 200, 1000],
+      default: 'other',
+      output: { orders: { $sum: 1 }, revenue: { $sum: '$total' } }
+  } }
+]);
+```
+
+```text
+[ { _id: 0,   orders: 2, revenue: 71 },
+  { _id: 50,  orders: 2, revenue: 140 },
+  { _id: 100, orders: 2, revenue: 280 },
+  { _id: 200, orders: 1, revenue: 310 } ]
+```
+
+Each bucket includes its lower boundary and excludes its upper boundary. A `CASE` expression with the same half-open ranges works on both engines:
+
+```sql
+SELECT CASE
+         WHEN total >= 0   AND total < 50   THEN '0'
+         WHEN total >= 50  AND total < 100  THEN '50'
+         WHEN total >= 100 AND total < 200  THEN '100'
+         WHEN total >= 200 AND total < 1000 THEN '200'
+         ELSE 'other'
+       END AS _id,
+       COUNT(*)   AS orders,
+       SUM(total) AS revenue
+FROM orders
+GROUP BY 1
+ORDER BY MIN(total);
+```
+
+```text
+ _id | orders | revenue
+-----+--------+---------
+ 0   |      2 |   71.00
+ 50  |      2 |  140.00
+ 100 |      2 |  280.00
+ 200 |      1 |  310.00
+```
+
+`$bucket` omits empty buckets, and so does this query. If you need empty buckets, generate the boundaries in a CTE and `LEFT JOIN` the orders to it. In PostgreSQL, `width_bucket(total, ARRAY[0, 50, 100, 200, 1000])` returns the bucket number (1 to 4 here) and is shorter for many boundaries. `$bucketAuto`, which picks boundaries to balance counts, corresponds roughly to `NTILE(n) OVER (ORDER BY total)`.
+
+## $facet: Several Aggregations in One Result
+
+`$facet` runs several sub-pipelines over the same input and returns one document with one array per facet:
+
+```javascript
+db.orders.aggregate([
+  { $match: { status: { $ne: 'cancelled' } } },
+  { $facet: {
+      by_status: [ { $group: { _id: '$status', n: { $sum: 1 } } }, { $sort: { _id: 1 } } ],
+      by_month:  [ { $group: { _id: { $month: '$created_at' }, revenue: { $sum: '$total' } } }, { $sort: { _id: 1 } } ],
+      totals:    [ { $group: { _id: null, orders: { $sum: 1 }, revenue: { $sum: '$total' } } } ]
+  } }
+]);
+```
+
+```text
+[ { by_status: [ { _id: 'paid', n: 4 }, { _id: 'shipped', n: 2 } ],
+    by_month:  [ { _id: 7, revenue: 165.5 }, { _id: 8, revenue: 335.5 }, { _id: 9, revenue: 220 } ],
+    totals:    [ { _id: null, orders: 6, revenue: 721 } ] } ]
+```
+
+In SQL, put the shared `$match` in a CTE and build each facet as a subquery. PostgreSQL:
+
+```sql
+WITH base AS (
+  SELECT * FROM orders WHERE status <> 'cancelled'
+)
+SELECT json_build_object(
+  'by_status', (SELECT json_agg(json_build_object('_id', status, 'n', n) ORDER BY status)
+                FROM (SELECT status, COUNT(*) AS n FROM base GROUP BY status) s),
+  'by_month',  (SELECT json_agg(json_build_object('_id', m, 'revenue', revenue) ORDER BY m)
+                FROM (SELECT EXTRACT(MONTH FROM created_at)::int AS m, SUM(total) AS revenue
+                      FROM base GROUP BY 1) t),
+  'totals',    (SELECT json_build_object('orders', COUNT(*), 'revenue', SUM(total)) FROM base)
+) AS facets;
+```
+
+```text
+{"by_status" : [{"_id" : "paid", "n" : 4}, {"_id" : "shipped", "n" : 2}],
+ "by_month" : [{"_id" : 7, "revenue" : 165.50}, {"_id" : 8, "revenue" : 335.50}, {"_id" : 9, "revenue" : 220.00}],
+ "totals" : {"orders" : 6, "revenue" : 721.00}}
+```
+
+MySQL uses `JSON_OBJECT` and `JSON_ARRAYAGG`:
+
+```sql
+WITH base AS (
+  SELECT * FROM orders WHERE status <> 'cancelled'
+)
+SELECT JSON_OBJECT(
+  'by_status', (SELECT JSON_ARRAYAGG(JSON_OBJECT('_id', status, 'n', n))
+                FROM (SELECT status, COUNT(*) AS n FROM base GROUP BY status ORDER BY status) s),
+  'by_month',  (SELECT JSON_ARRAYAGG(JSON_OBJECT('_id', m, 'revenue', revenue))
+                FROM (SELECT MONTH(created_at) AS m, SUM(total) AS revenue
+                      FROM base GROUP BY m ORDER BY m) t),
+  'totals',    (SELECT JSON_OBJECT('orders', COUNT(*), 'revenue', SUM(total)) FROM base)
+) AS facets;
+```
+
+It returned the same values, with keys in MySQL's own storage order. MySQL does not promise that `JSON_ARRAYAGG` respects the `ORDER BY` of a derived table, so sort in the application if order matters. In practice, a `$facet` is often better translated as separate queries: they are simpler to read and index, and most APIs can run them in parallel. Keep the single-statement version for cases where you need one round trip or one consistent snapshot.
+
+## Semantic Differences That Break Translations
+
+Getting the syntax right is the easy part. These behaviors differ even when the shapes match:
+
+- **Missing versus NULL.** A document without a field and a document with `field: null` both match `{ field: null }` in MongoDB. In SQL there is only NULL, and `= NULL` never matches; use `IS NULL`.
+- **Matching arrays.** `{ tags: 'vip' }` matches documents whose `tags` array contains `'vip'`. In SQL that is `'vip' = ANY(tags)` in PostgreSQL or `'vip' MEMBER OF (tags)` in MySQL, or a join to a child table.
+- **Types in `$sum`.** `$sum` silently ignores strings and missing values. SQL `SUM` over a text column fails in PostgreSQL and converts with warnings in MySQL. Clean up mixed-type fields before migrating.
+- **`_id` of `$group`.** A compound `_id: { city: '$city', tier: '$tier' }` becomes `GROUP BY city, tier` with two output columns, not one nested object.
+- **Comparison and sort order.** MongoDB compares mixed types by a fixed BSON type order and compares strings by binary value unless a collation is set. MySQL's default collation is case-insensitive, so `$match: { status: 'Paid' }` finds nothing in MongoDB but matches `'paid'` in MySQL.
+- **Numbers.** The pipeline used doubles (`45.5`), and the SQL used `DECIMAL`. For money, `DECIMAL` is correct, but results may differ in the last digit from a translated pipeline that did floating-point arithmetic.
+
+## Translating a Whole Pipeline
+
+A reliable manual process:
+
+1. Split the pipeline at each `$group`. Everything before the first `$group` becomes `FROM`/`JOIN`/`WHERE`; the `$group` becomes `GROUP BY` plus aggregates; a following `$match` becomes `HAVING`.
+2. A second `$group` becomes an outer query or a CTE over the first result.
+3. Turn `$lookup` into `LEFT JOIN` and `$unwind` into a join (inner or left depending on `preserveNullAndEmptyArrays`).
+4. Put `$project`/`$addFields` expressions into the select list of the level they belong to.
+5. Finish with `ORDER BY`, `LIMIT`, `OFFSET`.
+6. Run both versions on the same data and compare row by row.
+
+For quick first drafts, the [MongoDB query to SQL converter](https://chat2db.ai/tools/mongodb-query-to-sql-converter) turns `find` filters and aggregation pipelines into SQL in the browser; review its output against the semantic differences above. To run the pipeline and the SQL next to each other on real data, a client that connects to MongoDB, PostgreSQL, and MySQL at once, such as [Chat2DB](https://app.chat2db.ai), saves switching between `mongosh` and `psql`. If you mostly work in the shell, the [mongosh commands cheat sheet](/blog/mongosh-commands-cheat-sheet) covers the commands used to inspect pipelines.
+
+## Summary
+
+Most MongoDB aggregation stages have a direct SQL counterpart: `$match` is `WHERE` or `HAVING` depending on its position, `$group` is `GROUP BY`, `$project` is the select list, `$sort`/`$skip`/`$limit` are `ORDER BY`/`OFFSET`/`LIMIT`, `$lookup` plus `$unwind` is a `LEFT JOIN`, and `$push`/`$addToSet` are `ARRAY_AGG` or `JSON_ARRAYAGG`. The stages without a single-clause equivalent, `$facet` and `$bucket`, become CTEs with subqueries and `CASE` expressions. The translation is only correct when the semantics match too, so check NULL versus missing fields, array matching, collation, and `$count` on empty results, and verify every translated query against the original pipeline on the same data.
