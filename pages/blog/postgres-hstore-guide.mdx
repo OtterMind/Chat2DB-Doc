@@ -1,0 +1,376 @@
+---
+title: "Postgres hstore Guide: hstore vs jsonb"
+description: "Learn the PostgreSQL hstore extension: operators, functions, GIN and GiST indexes, updates with || and delete(), when to use jsonb instead, and how to migrate."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: September 24, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# Postgres hstore Guide: hstore vs jsonb
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="September 24, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+Long before `jsonb` existed, PostgreSQL already had a way to store schemaless attributes in a single column: the **hstore** extension. It stores a flat set of key/value pairs where both keys and values are strings. You still find hstore in many established schemas, in OpenStreetMap tooling, and in applications built on older ORMs that mapped dictionaries to it.
+
+This guide explains how hstore works, the operators and functions you will use day to day, how to index it, how to update individual keys, and how it compares to `jsonb`. It ends with a practical migration from hstore to jsonb for teams that want to consolidate on one type.
+
+## What hstore is
+
+`hstore` is a contrib extension that adds a data type representing a set of key/value pairs. Its main properties:
+
+- **Flat.** There is no nesting. A value cannot be another hstore or an array.
+- **Text only.** Keys and values are `text`. The number `42` is stored as the string `'42'`.
+- **Keys are unique.** If you declare the same key twice in a literal, only one pair is kept, and the documentation does not guarantee which.
+- **Values can be NULL.** A key can exist with a SQL `NULL` value, which is different from the key being absent.
+- **Order is not preserved.** Pairs are stored in an internal order, not the order you wrote them.
+
+Enable it once per database:
+
+```sql
+CREATE EXTENSION IF NOT EXISTS hstore;
+```
+
+Since PostgreSQL 13 hstore is a trusted extension, so a non-superuser with `CREATE` privilege on the database can install it. It is available on the major managed PostgreSQL services.
+
+### The literal format
+
+An hstore value is written as comma-separated `key => value` pairs inside a string:
+
+```sql
+SELECT 'color => red, size => M, "gift wrap" => yes, note => NULL'::hstore;
+```
+
+Keys or values containing spaces, commas, `=` or `>` must be double-quoted. The unquoted word `NULL` as a value means SQL null; write `"NULL"` if you literally mean the four-letter string.
+
+## Creating a table with an hstore column
+
+Take a product catalog where each category has different attributes:
+
+```sql
+CREATE TABLE product (
+    id     bigserial PRIMARY KEY,
+    name   text NOT NULL,
+    attrs  hstore NOT NULL DEFAULT ''
+);
+
+INSERT INTO product (name, attrs) VALUES
+  ('T-shirt',     'color => red,  size => M,   material => cotton'),
+  ('Sneakers',    'color => white, size => 42, brand => Acme'),
+  ('Laptop',      'brand => Acme, ram_gb => 16, cpu => "8-core"'),
+  ('Coffee mug',  'color => black, capacity_ml => 350'),
+  ('Gift card',   'amount => 50, currency => USD, note => NULL');
+```
+
+Defaulting to an empty hstore (`''`) instead of `NULL` keeps queries simpler, because operators applied to a `NULL` hstore return `NULL`.
+
+## Reading values: the core operators
+
+### Fetching a value with `->`
+
+`hstore -> text` returns the value for one key, or `NULL` if the key is absent:
+
+```sql
+SELECT name, attrs -> 'color' AS color
+FROM product;
+```
+
+Passing an array returns an array of values in the same order:
+
+```sql
+SELECT name, attrs -> ARRAY['brand', 'color'] AS brand_color
+FROM product;
+```
+
+Since values are text, cast when you need numbers:
+
+```sql
+SELECT name
+FROM product
+WHERE (attrs -> 'ram_gb')::int >= 16;
+```
+
+That cast fails if any row has a non-numeric `ram_gb`, which is one of the practical costs of storing everything as text.
+
+PostgreSQL 14 added subscripting for hstore, so `attrs['color']` works as a read and as an assignment target in `UPDATE`.
+
+### Key existence: `?`, `?&` and `?|`
+
+- `attrs ? 'brand'` is true if the key exists.
+- `attrs ?& ARRAY['brand','color']` is true if **all** listed keys exist.
+- `attrs ?| ARRAY['brand','color']` is true if **any** listed key exists.
+
+```sql
+SELECT name FROM product WHERE attrs ? 'brand';
+
+SELECT name FROM product WHERE attrs ?& ARRAY['color', 'size'];
+
+SELECT name FROM product WHERE attrs ?| ARRAY['capacity_ml', 'ram_gb'];
+```
+
+Note that `?` is true for the gift card's `note` key even though its value is `NULL`. Use `defined(attrs, 'note')` if you need "exists and is not null".
+
+### Containment: `@>` and `<@`
+
+`a @> b` is true if every pair in `b` also appears in `a`:
+
+```sql
+SELECT name
+FROM product
+WHERE attrs @> 'color => white, brand => Acme';
+```
+
+This returns the sneakers. Containment is the operator you want for "filter by several attribute values", because it can use a GIN or GiST index in one probe. `<@` is the reverse direction.
+
+## Useful functions
+
+### Keys and values as arrays or sets
+
+```sql
+SELECT akeys(attrs)  FROM product WHERE id = 1;   -- text[] of keys
+SELECT avals(attrs)  FROM product WHERE id = 1;   -- text[] of values
+SELECT skeys(attrs)  FROM product WHERE id = 1;   -- setof text
+SELECT svals(attrs)  FROM product WHERE id = 1;   -- setof text
+```
+
+A common reporting question is "which attribute keys are in use and how often?":
+
+```sql
+SELECT k, count(*) AS products
+FROM product, skeys(attrs) AS k
+GROUP BY k
+ORDER BY products DESC;
+```
+
+### Expanding pairs with each()
+
+`each(hstore)` returns one row per pair with columns `key` and `value`, which is ideal for turning attributes into a normalized result set:
+
+```sql
+SELECT p.name, e.key, e.value
+FROM product p
+CROSS JOIN LATERAL each(p.attrs) AS e
+ORDER BY p.name, e.key;
+```
+
+### Converting to JSON
+
+```sql
+SELECT hstore_to_json(attrs)        FROM product WHERE id = 3;
+SELECT hstore_to_jsonb(attrs)       FROM product WHERE id = 3;
+SELECT hstore_to_json_loose(attrs)  FROM product WHERE id = 3;
+```
+
+`hstore_to_json` and `hstore_to_jsonb` produce string values for everything: `"ram_gb": "16"`. The `_loose` variants (`hstore_to_json_loose`, `hstore_to_jsonb_loose`) try to detect numbers and booleans and emit them as JSON numbers and booleans: `"ram_gb": 16`. Choose deliberately, because the difference matters for later jsonb comparisons.
+
+### Other helpers
+
+- `slice(attrs, ARRAY['color','size'])` returns a new hstore with only those keys.
+- `hstore(ARRAY['a','b'], ARRAY['1','2'])` builds an hstore from key and value arrays.
+- `hstore(row)` converts a record into an hstore of column names and values, which is handy for audit logging.
+- `exist(attrs, 'k')` and `defined(attrs, 'k')` are function forms of existence checks.
+
+## Updating hstore values
+
+hstore values are immutable; every modification produces a new hstore that you assign back to the column.
+
+### Adding or replacing keys with ||
+
+The `||` operator merges two hstores, with keys on the right overwriting keys on the left:
+
+```sql
+UPDATE product
+SET attrs = attrs || 'color => blue, stock => 12'
+WHERE id = 1;
+```
+
+This sets `color` to `blue` and adds a new `stock` key while leaving the other pairs untouched. On PostgreSQL 14 and later, subscripting is an alternative for a single key:
+
+```sql
+UPDATE product SET attrs['stock'] = '11' WHERE id = 1;
+```
+
+### Removing keys with delete() and the minus operator
+
+```sql
+-- remove one key
+UPDATE product SET attrs = delete(attrs, 'note') WHERE id = 5;
+
+-- remove several keys
+UPDATE product SET attrs = attrs - ARRAY['stock', 'material'] WHERE id = 1;
+
+-- remove pairs that match exactly (key AND value)
+UPDATE product SET attrs = attrs - 'color => black'::hstore WHERE id = 4;
+```
+
+`attrs - 'key'` with a plain text operand is equivalent to `delete(attrs, 'key')`. The hstore-minus-hstore form only removes a pair when both key and value match, which is useful for conditional cleanup.
+
+Remember that PostgreSQL rewrites the whole row on every `UPDATE`. Changing one key in a large hstore still writes a new copy of the entire value, which also applies to jsonb.
+
+## Indexing hstore
+
+Without an index, every predicate on `attrs` scans the table. hstore supports several index types.
+
+### GIN index
+
+GIN is the usual choice. It supports `@>`, `?`, `?&` and `?|`:
+
+```sql
+CREATE INDEX product_attrs_gin ON product USING gin (attrs);
+
+EXPLAIN
+SELECT name FROM product WHERE attrs @> 'brand => Acme';
+```
+
+On a table with enough rows, the plan shows a `Bitmap Index Scan` on `product_attrs_gin`. GIN indexes are larger and slower to update than B-trees, but lookups are fast.
+
+### GiST index
+
+GiST supports the same operators and is cheaper to build and update, at the cost of slower lookups because it is lossy and needs rechecks:
+
+```sql
+CREATE INDEX product_attrs_gist ON product USING gist (attrs);
+```
+
+Prefer GIN for read-heavy workloads and consider GiST only if write overhead from GIN is a measured problem.
+
+### Expression index on one key
+
+If most queries filter on a single key, a B-tree expression index is smaller and supports range comparisons:
+
+```sql
+CREATE INDEX product_brand_idx ON product ((attrs -> 'brand'));
+
+SELECT name FROM product WHERE attrs -> 'brand' = 'Acme';
+```
+
+The query must use exactly the same expression for the planner to match it. hstore also has B-tree and hash operator classes for equality on the whole value, which enables `DISTINCT`, `GROUP BY` and unique constraints on hstore columns, though these are rarely needed.
+
+## hstore vs jsonb
+
+`jsonb` arrived in PostgreSQL 9.4 and covers most of what hstore does, plus much more. A side-by-side view:
+
+| Aspect | hstore | jsonb |
+| --- | --- | --- |
+| Structure | Flat key/value | Nested objects and arrays |
+| Value types | Text or NULL | String, number, boolean, null, object, array |
+| Availability | Extension | Built in |
+| Containment and key existence | `@>`, `?`, `?&` and the any-key operator | Same operators, plus SQL/JSON path operators |
+| Indexing | GIN, GiST, B-tree expression | GIN (`jsonb_ops`, `jsonb_path_ops`), B-tree expression |
+| Query language | Operators and functions | Operators, functions, SQL/JSON path |
+| Client support | Needs driver or ORM support | Understood by virtually every driver as JSON |
+
+### When hstore is still reasonable
+
+- The data really is a flat map of strings, such as HTTP headers, tags, or free-form labels.
+- An existing schema and application already use it and work well.
+- You rely on hstore-specific helpers such as `hstore(record)` and the `#=` operator for populating records.
+
+### When to prefer jsonb
+
+- You need nesting or arrays.
+- You want real numeric or boolean values so comparisons and sorting behave correctly.
+- You exchange the data with APIs that speak JSON.
+- You want SQL/JSON path queries such as `jsonb_path_query`.
+- You prefer not to depend on an extension, for example across many managed environments.
+
+For new designs, jsonb is the default choice in almost all cases. The comparisons in [JSON vs JSONB in Postgres](https://chat2db.ai/resources/blog/postgres-json-vs-jsonb) and [JSONB index performance](https://chat2db.ai/resources/blog/postgres-jsonb-index-performance) go deeper on the jsonb side.
+
+## Migrating from hstore to jsonb
+
+The migration is straightforward because PostgreSQL provides the conversion functions. The steps below keep the operation safe on a live table.
+
+### Step 1: decide on typing
+
+Decide whether values should stay strings (`hstore_to_jsonb`) or be converted to numbers and booleans where possible (`hstore_to_jsonb_loose`). Test on real data:
+
+```sql
+SELECT attrs,
+       hstore_to_jsonb(attrs)       AS strict_json,
+       hstore_to_jsonb_loose(attrs) AS loose_json
+FROM product
+LIMIT 20;
+```
+
+Loose conversion can surprise you: a product code like `007` might be interpreted as a number. If identifiers look numeric, keep strict conversion and cast in queries.
+
+### Step 2: in-place conversion for small tables
+
+For small or medium tables, a single `ALTER TABLE` does the job. It rewrites the table under an `ACCESS EXCLUSIVE` lock, so run it in a maintenance window:
+
+```sql
+BEGIN;
+
+DROP INDEX IF EXISTS product_attrs_gin;
+DROP INDEX IF EXISTS product_attrs_gist;
+DROP INDEX IF EXISTS product_brand_idx;
+
+ALTER TABLE product
+  ALTER COLUMN attrs DROP DEFAULT,
+  ALTER COLUMN attrs TYPE jsonb USING hstore_to_jsonb(attrs),
+  ALTER COLUMN attrs SET DEFAULT '{}'::jsonb;
+
+CREATE INDEX product_attrs_gin ON product USING gin (attrs);
+CREATE INDEX product_brand_idx ON product ((attrs ->> 'brand'));
+
+COMMIT;
+```
+
+Indexes that depend on hstore operators must be dropped first, because they cannot be converted, and the default must be dropped because `''` is not valid jsonb.
+
+### Step 3: online approach for large tables
+
+For big tables, avoid the long rewrite lock:
+
+1. Add a new nullable column: `ALTER TABLE product ADD COLUMN attrs_json jsonb;` (instant, no rewrite).
+2. Keep it in sync for new writes with a trigger or by updating the application to write both columns.
+3. Backfill in batches by primary key range:
+
+```sql
+UPDATE product
+SET attrs_json = hstore_to_jsonb(attrs)
+WHERE id BETWEEN 1 AND 10000
+  AND attrs_json IS NULL;
+```
+
+4. Build the index with `CREATE INDEX CONCURRENTLY ... USING gin (attrs_json);`.
+5. Switch reads to the new column, then drop the old column and rename.
+
+### Step 4: rewrite the queries
+
+Most operators carry over, with small differences:
+
+| hstore | jsonb |
+| --- | --- |
+| `attrs -> 'color'` (text) | `attrs ->> 'color'` (text) |
+| `attrs ? 'brand'` | `attrs ? 'brand'` |
+| `attrs @> 'brand => Acme'` | `attrs @> '{"brand": "Acme"}'` |
+| `delete(attrs, 'k')` | `attrs - 'k'` |
+| `attrs ?& ARRAY['a','b']` | `attrs ?& ARRAY['a','b']` |
+| `each(attrs)` | `jsonb_each_text(attrs)` |
+| `akeys(attrs)` | `ARRAY(SELECT jsonb_object_keys(attrs))` |
+
+Merging with the concatenation operator works the same way for both types: the hstore expression `attrs || 'k => v'` becomes `attrs || '{"k": "v"}'::jsonb` in jsonb. The most common bug after migration is using jsonb `->`, which returns jsonb rather than text, in a comparison with a text literal. Use `->>` for text results. A client with good autocompletion, such as [Chat2DB](https://app.chat2db.ai), helps when rewriting and testing a large set of these queries against a staging copy.
+
+Once everything reads from jsonb, you can `DROP EXTENSION hstore;` if nothing else depends on it.
+
+## FAQ
+
+### Can hstore store nested data?
+
+No. Values are text strings. You could store serialized JSON inside a value, but then you lose indexing and operators for the nested part; use jsonb instead.
+
+### Is hstore faster than jsonb?
+
+For simple flat maps their performance is in a similar range, and results depend on data shape and queries. Measure with your own workload rather than relying on general claims; the choice is usually driven by features rather than speed.
+
+### Why does `attrs -> 'missing'` return NULL instead of an error?
+
+Missing keys are not errors in hstore. `->` returns SQL `NULL`, which means `WHERE attrs -> 'k' = 'x'` simply does not match rows without the key.
+
+### How do I count keys in an hstore?
+
+Use `array_length(akeys(attrs), 1)`. It returns `NULL` for an empty hstore, so wrap it in `coalesce(..., 0)` if you need zero.

@@ -1,0 +1,293 @@
+---
+title: "Postgres MVCC Explained: xmin, xmax, Snapshots"
+description: "How PostgreSQL MVCC works: tuple versions, xmin and xmax, snapshots, visibility rules, isolation levels, dead tuples, VACUUM, HOT, and pageinspect demos."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: September 24, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# Postgres MVCC Explained: xmin, xmax, Snapshots
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="September 24, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+PostgreSQL lets readers and writers work on the same rows at the same time without blocking each other. A long report can scan a table while hundreds of transactions update it, and the report still sees a consistent picture. The mechanism behind this is **multiversion concurrency control**, or MVCC.
+
+MVCC also explains many operational behaviors that surprise people: why an `UPDATE` makes a table grow, why `VACUUM` exists at all, why a forgotten idle transaction can bloat an entire database, and why `REPEATABLE READ` transactions sometimes fail with serialization errors. This article walks through the model from the bottom up and shows how to observe every piece of it with system columns and the `pageinspect` extension.
+
+## The core idea: rows have versions
+
+In PostgreSQL a table row is not updated in place. Each physical row version is called a **tuple**. When you change a row, PostgreSQL writes a new tuple and marks the old one as no longer current. Both versions sit in the table file until the old one is provably invisible to everyone and gets cleaned up.
+
+Every transaction that starts is assigned a **transaction ID** (XID) when it first writes something. Each tuple header records which transactions created and expired it:
+
+- **xmin**: the XID of the transaction that inserted this tuple version.
+- **xmax**: the XID of the transaction that deleted it or replaced it with a newer version, or that locked it. Zero means nobody has.
+
+A reader decides whether a tuple is visible by comparing xmin and xmax with its **snapshot**, a description of which transactions had committed at the moment the snapshot was taken. Readers never have to wait for writers because they can always find the tuple version that matches their snapshot.
+
+## Seeing xmin and xmax with system columns
+
+Every table has hidden system columns. You can select them by name:
+
+```sql
+CREATE TABLE account (
+    id      int PRIMARY KEY,
+    owner   text NOT NULL,
+    balance numeric NOT NULL
+);
+
+INSERT INTO account VALUES (1, 'alice', 100), (2, 'bob', 50);
+
+SELECT ctid, xmin, xmax, * FROM account;
+```
+
+Typical output:
+
+```
+ ctid  | xmin | xmax | id | owner | balance
+-------+------+------+----+-------+---------
+ (0,1) |  750 |    0 |  1 | alice |     100
+ (0,2) |  750 |    0 |  2 | bob   |      50
+```
+
+- `ctid` is the physical location: block 0, item 1 and item 2.
+- Both rows have the same `xmin` because one transaction inserted them.
+- `xmax` is 0 because neither row has been deleted or updated.
+
+Your XID numbers will differ. You can see your own transaction's ID with `pg_current_xact_id()` (PostgreSQL 13 and later; older releases use `txid_current()`).
+
+## What an UPDATE really does
+
+Now update Alice's balance and look again:
+
+```sql
+BEGIN;
+SELECT pg_current_xact_id();   -- say it returns 751
+UPDATE account SET balance = 120 WHERE id = 1;
+SELECT ctid, xmin, xmax, * FROM account;
+COMMIT;
+```
+
+Inside the transaction:
+
+```
+ ctid  | xmin | xmax | id | owner | balance
+-------+------+------+----+-------+---------
+ (0,2) |  750 |    0 |  2 | bob   |      50
+ (0,3) |  751 |    0 |  1 | alice |     120
+```
+
+Alice's row moved from `(0,1)` to `(0,3)` and has a new `xmin`. The old tuple at `(0,1)` still exists, but with `xmax = 751`, so this query no longer sees it. The `UPDATE` was effectively an insert of a new version plus a delete of the old one.
+
+After commit, the tuple at `(0,1)` is a **dead tuple** once no running transaction can still need it. It occupies space until `VACUUM` reclaims it. This is why tables that receive frequent updates grow even when the row count is constant.
+
+A `DELETE` only sets `xmax` on the existing tuple. A `ROLLBACK` does not undo anything physically: the aborted transaction's new tuples remain in the table and become invisible because their `xmin` is recorded as aborted in the commit log (`pg_xact`). They are dead tuples too.
+
+## Looking at raw pages with pageinspect
+
+System columns only show visible tuples. To see dead versions you need `pageinspect`, which reads raw pages. It requires superuser privileges by default.
+
+```sql
+CREATE EXTENSION IF NOT EXISTS pageinspect;
+
+SELECT lp, lp_flags, t_xmin, t_xmax, t_ctid
+FROM heap_page_items(get_raw_page('account', 0));
+```
+
+After the update above:
+
+```
+ lp | lp_flags | t_xmin | t_xmax | t_ctid
+----+----------+--------+--------+--------
+  1 |        1 |    750 |    751 | (0,3)
+  2 |        1 |    750 |      0 | (0,2)
+  3 |        1 |    751 |      0 | (0,3)
+```
+
+The old version at line pointer 1 is still physically present with `t_xmax = 751`, and its `t_ctid` points to the newer version at `(0,3)`. This forward pointer forms an **update chain** that PostgreSQL follows when a concurrent writer needs to find the latest version of a row.
+
+To decode the flag bits in the tuple header, PostgreSQL 13 and later offer `heap_tuple_infomask_flags`:
+
+```sql
+SELECT lp, t_xmin, t_xmax, f.raw_flags
+FROM heap_page_items(get_raw_page('account', 0)) h,
+     LATERAL heap_tuple_infomask_flags(h.t_infomask, h.t_infomask2) f;
+```
+
+You will see flags such as `HEAP_XMIN_COMMITTED` and `HEAP_XMAX_COMMITTED`. These are **hint bits**: the first reader that checks the commit log for a tuple's transactions records the outcome in the tuple header so later readers do not have to look it up again. This is why a `SELECT` right after a large write can generate writes of its own.
+
+## Snapshots
+
+A snapshot answers one question: which transactions' effects should I see? It is represented by three parts, which you can print with `pg_current_snapshot()` (PostgreSQL 13 and later):
+
+```sql
+SELECT pg_current_snapshot();
+-- 760:764:760,762
+```
+
+The format is `xmin:xmax:xip_list`:
+
+- **xmin**: the oldest transaction still running when the snapshot was taken. Every XID below it is finished, committed or aborted.
+- **xmax**: one past the highest completed XID. Any XID at or above it had not finished yet and is treated as in progress.
+- **xip_list**: the XIDs between xmin and xmax that were still in progress.
+
+### Visibility rules, simplified
+
+For a tuple to be visible to a snapshot:
+
+1. The inserting transaction (`xmin`) must be committed and must not be in progress according to the snapshot, meaning it is below the snapshot's xmax and not in the xip list. Or it must be the current transaction itself.
+2. And the tuple must not be deleted from the snapshot's point of view: `xmax` is 0, or `xmax` aborted, or `xmax` was still in progress according to the snapshot, or `xmax` only locked the row.
+
+Within a single transaction, the command counters `cmin` and `cmax` decide whether a statement sees tuples written by earlier statements of the same transaction. The real implementation covers more cases, such as subtransactions and multixacts used for shared row locks, but these two rules capture the essence.
+
+## Isolation levels are snapshot policies
+
+The isolation levels in PostgreSQL mostly differ in **when** a snapshot is taken and what happens when two transactions touch the same row. A fuller comparison is in [Postgres transaction isolation levels](https://chat2db.ai/resources/blog/postgres-transaction-isolation-levels); here is how each relates to MVCC.
+
+### Read Committed
+
+The default. Each statement takes a new snapshot when it starts. Two consecutive `SELECT`s in one transaction can see different data if other transactions committed in between.
+
+When an `UPDATE` finds that a target row was changed by a concurrent transaction that then committed, it follows the update chain to the newest version, re-checks the `WHERE` clause against it, and updates that version if it still matches. This keeps writes from being lost but can produce results that no serial order would, which is acceptable for many applications.
+
+`READ UNCOMMITTED` is accepted as syntax but behaves exactly like Read Committed. PostgreSQL never shows uncommitted data from other transactions.
+
+### Repeatable Read
+
+The snapshot is taken at the first statement of the transaction and used for all later statements. Try it with two sessions:
+
+```sql
+-- Session A
+BEGIN ISOLATION LEVEL REPEATABLE READ;
+SELECT balance FROM account WHERE id = 2;   -- 50
+
+-- Session B
+UPDATE account SET balance = 70 WHERE id = 2;   -- autocommits
+
+-- Session A
+SELECT balance FROM account WHERE id = 2;   -- still 50
+UPDATE account SET balance = balance + 10 WHERE id = 2;
+-- ERROR:  could not serialize access due to concurrent update
+ROLLBACK;
+```
+
+Session A cannot silently overwrite a version it never saw, so PostgreSQL raises SQLSTATE `40001` instead. The application must retry the transaction. In PostgreSQL, Repeatable Read also prevents phantom reads, which is stricter than the SQL standard requires.
+
+### Serializable
+
+Serializable uses the same snapshot as Repeatable Read and adds **Serializable Snapshot Isolation** (SSI). It tracks read/write dependencies between concurrent transactions and aborts one of them with `40001` if the combination could not have happened in any serial order, for example the classic write-skew case where two transactions each read a condition and write different rows. The trade-off is extra tracking overhead and more retries, so code using it needs a retry loop.
+
+## Why dead tuples need VACUUM
+
+Because every update and delete leaves old tuples behind, something must clean up. That is the job of `VACUUM`, usually run by the autovacuum daemon. For each table it:
+
+1. Finds tuples whose `xmax` is committed and older than the oldest snapshot any session might still use.
+2. Removes their index entries, then marks their space as free in the page and records it in the free space map.
+3. Updates the **visibility map**, which marks pages where all tuples are visible to everyone. Index-only scans rely on this map to skip heap visits.
+4. **Freezes** old tuples so their XIDs no longer need to be compared. XIDs are 32-bit counters that wrap around, and freezing is how PostgreSQL prevents old rows from appearing to be in the future.
+
+You can watch dead tuples accumulate:
+
+```sql
+SELECT relname, n_live_tup, n_dead_tup, last_autovacuum
+FROM pg_stat_user_tables
+WHERE relname = 'account';
+```
+
+Then clean up manually and inspect the page again:
+
+```sql
+VACUUM account;
+
+SELECT lp, lp_flags, t_xmin, t_xmax, t_ctid
+FROM heap_page_items(get_raw_page('account', 0));
+```
+
+The dead tuple's storage has been reclaimed. Because our update did not touch an indexed column, it was a HOT update (explained below), so line pointer 1 becomes a redirect (`lp_flags = 2`) to the live version, keeping the index entry valid. For an ordinary non-HOT update the dead line pointer is marked unused (`lp_flags = 0`) once its index entries are gone. Either way, the space is available for new tuples. The file is not shrunk: regular VACUUM only frees space inside pages. See [VACUUM and autovacuum tuning](https://chat2db.ai/resources/blog/postgres-vacuum-and-autovacuum-tuning) for configuring it on busy tables.
+
+### The long-transaction problem
+
+VACUUM can only remove tuples that no snapshot can see. One session that stays open for hours, including a connection left `idle in transaction`, pins the cleanup horizon for the whole database. Dead tuples pile up in every table, not just the ones that session touched. Find such sessions with:
+
+```sql
+SELECT pid, usename, state, xact_start, backend_xmin
+FROM pg_stat_activity
+WHERE backend_xmin IS NOT NULL
+ORDER BY age(backend_xmin) DESC
+LIMIT 5;
+```
+
+Abandoned replication slots and prepared transactions can hold back the horizon in the same way. Setting `idle_in_transaction_session_timeout` is a simple safeguard.
+
+## HOT updates: avoiding index churn
+
+Writing a new tuple for every update would also mean inserting new entries into every index, which is expensive. **Heap-Only Tuple** (HOT) updates avoid this when two conditions hold:
+
+1. The update does not change any column that is referenced by an index.
+2. The new tuple fits on the **same page** as the old one.
+
+In that case no new index entries are created. The index keeps pointing at the original line pointer, and readers follow the chain within the page. Old versions in a HOT chain can also be removed by lightweight **page pruning** during normal reads and writes, without waiting for VACUUM.
+
+The earlier balance update already qualified, because only `id` is indexed. Update the balance again and inspect:
+
+```sql
+UPDATE account SET balance = 130 WHERE id = 1;
+
+SELECT lp, t_xmin, t_xmax, t_ctid, f.raw_flags
+FROM heap_page_items(get_raw_page('account', 0)) h,
+     LATERAL heap_tuple_infomask_flags(h.t_infomask, h.t_infomask2) f;
+```
+
+The superseded tuple carries `HEAP_HOT_UPDATED`, and every version created by a HOT update carries `HEAP_ONLY_TUPLE`, meaning no index entry points directly at it. Check how often your tables achieve HOT:
+
+```sql
+SELECT relname, n_tup_upd, n_tup_hot_upd,
+       round(100.0 * n_tup_hot_upd / nullif(n_tup_upd, 0), 1) AS hot_pct
+FROM pg_stat_user_tables
+ORDER BY n_tup_upd DESC
+LIMIT 10;
+```
+
+To raise the HOT ratio on update-heavy tables:
+
+- Avoid indexing columns that change often unless the index is needed.
+- Leave free space in each page with a lower `fillfactor`:
+
+```sql
+ALTER TABLE account SET (fillfactor = 80);
+VACUUM FULL account;  -- or pg_repack, so existing pages get the new layout
+```
+
+The fillfactor only affects pages written after the change, so a rewrite is needed to apply it to existing data. `VACUUM FULL` takes an exclusive lock; on production tables use an online tool instead.
+
+## A mental model to keep
+
+- Every write creates tuple versions; nothing is overwritten in place.
+- xmin and xmax on each tuple, compared with a snapshot, decide visibility.
+- Isolation levels decide when snapshots are taken and how write conflicts are resolved.
+- Dead versions are the price of non-blocking reads, and VACUUM pays it.
+- HOT and pruning reduce that price for updates that do not touch indexed columns.
+
+Running the queries in this article step by step in two sessions side by side, for example in [Chat2DB](https://chat2db.ai/download), is the fastest way to build intuition, because you can watch xmin, xmax and ctid change after each statement.
+
+## FAQ
+
+### Does a SELECT ever block an UPDATE in PostgreSQL?
+
+No. Plain `SELECT` takes only an `ACCESS SHARE` lock on the table and reads versions through its snapshot. It does block DDL that needs `ACCESS EXCLUSIVE`, such as `DROP TABLE`. `SELECT ... FOR UPDATE` locks rows and does block concurrent writers of those rows.
+
+### Why is xmax non-zero on a row that is visible?
+
+Either the deleting or updating transaction aborted, or it is still running and not visible to your snapshot, or the row was only locked, for example by `SELECT ... FOR UPDATE` or a foreign key check. Lock-only xmax values are marked with infomask flags such as `HEAP_XMAX_LOCK_ONLY`.
+
+### Does MVCC make rollbacks expensive?
+
+No. A rollback just records the transaction as aborted in the commit log. Its tuples become invisible immediately and are cleaned up later by VACUUM or pruning.
+
+### What is transaction ID wraparound?
+
+XIDs are 32-bit and reused cyclically. If very old tuples were never frozen, their XIDs could eventually appear to be in the future. Autovacuum freezes tuples to prevent this, and PostgreSQL runs aggressive anti-wraparound vacuums and, as a last resort, refuses new XIDs if freezing falls too far behind.

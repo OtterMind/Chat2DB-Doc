@@ -1,0 +1,281 @@
+---
+title: "Postgres citext vs Case Insensitive Collations"
+description: "Three ways to get case-insensitive text in PostgreSQL: citext, lower() expression indexes and nondeterministic ICU collations, trade-offs and migration."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: September 23, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# Postgres citext vs Case Insensitive Collations
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="September 23, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+Sooner or later every application hits the same bug: a user signs up as `Alice@Example.com`, later tries to log in as `alice@example.com`, and the database says the account does not exist. Or worse, a second account gets created for the same person because the unique constraint on `email` treats the two strings as different.
+
+PostgreSQL compares `text` values case-sensitively by default. There are three well-established ways to change that: the `citext` extension, expression indexes on `lower()`, and nondeterministic ICU collations. Each one behaves differently for equality, uniqueness, `LIKE`, sorting and performance. This article walks through all three with runnable examples, explains the limitations that tend to surprise people, and shows how to migrate an existing column safely.
+
+## The problem in one query
+
+```sql
+CREATE TABLE users_plain (
+    id    bigserial PRIMARY KEY,
+    email text NOT NULL UNIQUE
+);
+
+INSERT INTO users_plain (email) VALUES ('Alice@Example.com');
+INSERT INTO users_plain (email) VALUES ('alice@example.com');  -- succeeds: duplicate account
+
+SELECT * FROM users_plain WHERE email = 'ALICE@EXAMPLE.COM';   -- returns nothing
+```
+
+The unique constraint and the lookup both use byte-wise or locale-aware comparison of the exact characters, so different casing means different values. We want a column where uniqueness and equality ignore case, ideally without every developer remembering to wrap values in a function.
+
+## Option 1: the citext extension
+
+`citext` is a contrib extension that provides a case-insensitive text type. Internally it calls `lower()` on both operands when comparing, so `'Alice'::citext = 'ALICE'::citext` is true.
+
+```sql
+CREATE EXTENSION IF NOT EXISTS citext;
+
+CREATE TABLE users_citext (
+    id    bigserial PRIMARY KEY,
+    email citext NOT NULL UNIQUE
+);
+
+INSERT INTO users_citext (email) VALUES ('Alice@Example.com');
+INSERT INTO users_citext (email) VALUES ('alice@example.com');
+-- ERROR:  duplicate key value violates unique constraint "users_citext_email_key"
+
+SELECT * FROM users_citext WHERE email = 'ALICE@EXAMPLE.COM';
+-- returns the row, with the original casing preserved
+```
+
+What you get:
+
+- **Equality and uniqueness ignore case.** The unique index is an ordinary B-tree on the citext column, and lookups with `=` use it.
+- **The original casing is stored.** You display `Alice@Example.com` exactly as the user typed it.
+- **`LIKE` and regex operators are case-insensitive too.** citext overloads `LIKE`, `ILIKE`, `~` and related operators, so `email LIKE 'alice%'` matches `Alice@Example.com`.
+- **No application changes.** Queries keep writing `email = $1`.
+
+What to watch:
+
+- **Comparisons are slower than plain `text`**, because each comparison lowercases both values. For most OLTP lookups the difference is small, but heavy sorting or large joins on citext columns do more work than on text.
+- **Case folding follows the database's `LC_CTYPE`** setting. For ASCII this is what you expect; for some non-ASCII characters, results depend on the locale in use.
+- **Mixing types can silently fall back to case-sensitive behaviour.** If one side of a comparison is `text`, PostgreSQL may resolve the operator for `text` instead of `citext`. Casting the literal or parameter to `citext` avoids the surprise.
+- **It only handles case, not accents.** `'cafe'` and `'café'` remain different.
+
+Since PostgreSQL 13, citext is a trusted extension, so a database owner can typically install it without superuser rights. Note that the PostgreSQL documentation now suggests considering nondeterministic collations (Option 3) as an alternative to citext for new designs.
+
+## Option 2: expression indexes on lower()
+
+The oldest and most portable approach keeps the column as `text` and indexes a lowercased expression:
+
+```sql
+CREATE TABLE users_lower (
+    id    bigserial PRIMARY KEY,
+    email text NOT NULL
+);
+
+CREATE UNIQUE INDEX users_lower_email_uq ON users_lower (lower(email));
+
+INSERT INTO users_lower (email) VALUES ('Alice@Example.com');
+INSERT INTO users_lower (email) VALUES ('alice@example.com');
+-- ERROR:  duplicate key value violates unique constraint "users_lower_email_uq"
+```
+
+This gives you a **case insensitive unique index in Postgres** with no extension at all. The catch is on the read side: the planner only uses the index when the query uses the same expression.
+
+```sql
+-- uses the index
+SELECT * FROM users_lower WHERE lower(email) = lower('ALICE@EXAMPLE.COM');
+
+-- does NOT use the index, and is case-sensitive
+SELECT * FROM users_lower WHERE email = 'ALICE@EXAMPLE.COM';
+```
+
+Check with `EXPLAIN`:
+
+```sql
+EXPLAIN SELECT * FROM users_lower WHERE lower(email) = lower('ALICE@EXAMPLE.COM');
+```
+
+With enough rows you should see an `Index Scan using users_lower_email_uq`. If you see a sequential scan on a large table, the expression in the query does not match the index.
+
+For prefix searches such as autocomplete, add a second index with the `text_pattern_ops` operator class, which supports `LIKE 'abc%'` regardless of the database collation:
+
+```sql
+CREATE INDEX users_lower_email_prefix ON users_lower (lower(email) text_pattern_ops);
+
+SELECT * FROM users_lower WHERE lower(email) LIKE lower('ali') || '%';
+```
+
+Strengths: works on every PostgreSQL version and every hosting provider, is fully explicit, and you choose exactly where case-insensitivity applies. Weaknesses: every query author has to remember `lower()`, ORMs need custom query code, and a single forgotten `lower()` is a silent correctness bug rather than an error. Some teams mitigate this by normalising on write (storing the email already lowercased), but that loses the original casing.
+
+## Option 3: nondeterministic ICU collations
+
+PostgreSQL 12 introduced **nondeterministic collations**. A deterministic collation considers two strings equal only if they are byte-for-byte identical. A nondeterministic collation can declare strings equal when they differ only in ways the collation ignores, such as case.
+
+This requires PostgreSQL built with ICU support, which is the case for the common Linux packages and most managed services. Create a collation that ignores case but respects accents:
+
+```sql
+CREATE COLLATION case_insensitive (
+    provider      = icu,
+    locale        = 'und-u-ks-level2',
+    deterministic = false
+);
+```
+
+The locale string `und-u-ks-level2` means "root locale, comparison strength level 2". Level 2 compares base letters and accents but ignores case. If you also want to ignore accents, use `und-u-ks-level1`:
+
+```sql
+CREATE COLLATION ignore_accent_case (
+    provider      = icu,
+    locale        = 'und-u-ks-level1',
+    deterministic = false
+);
+```
+
+Apply the collation to a normal `text` column:
+
+```sql
+CREATE TABLE users_icu (
+    id    bigserial PRIMARY KEY,
+    email text COLLATE case_insensitive NOT NULL UNIQUE
+);
+
+INSERT INTO users_icu (email) VALUES ('Alice@Example.com');
+INSERT INTO users_icu (email) VALUES ('alice@example.com');
+-- ERROR:  duplicate key value violates unique constraint "users_icu_email_key"
+
+SELECT * FROM users_icu WHERE email = 'ALICE@EXAMPLE.COM';
+-- returns the row
+```
+
+The column is still `text`, the application writes plain `email = $1`, the unique constraint is case-insensitive, and the B-tree index is used for equality lookups. Unicode case rules come from ICU, so behaviour is consistent across operating systems and does not depend on the database's `LC_CTYPE`.
+
+You can also apply the collation per expression without changing the column:
+
+```sql
+SELECT * FROM users_plain
+WHERE email = 'ALICE@EXAMPLE.COM' COLLATE case_insensitive;
+```
+
+That query will not use an index built with the column's default collation, so reserve it for ad-hoc work.
+
+### The LIKE limitation
+
+The biggest practical limitation of nondeterministic collations has been pattern matching. Up to and including PostgreSQL 17, running `LIKE` against a column with a nondeterministic collation raises an error:
+
+```sql
+SELECT * FROM users_icu WHERE email LIKE 'alice%';
+-- PostgreSQL 17 and earlier:
+-- ERROR:  nondeterministic collations are not supported for LIKE
+```
+
+PostgreSQL 18 added support for `LIKE` with nondeterministic collations, so the query above works there and matches case-insensitively. Regular-expression operators such as `~` are still not supported with nondeterministic collations, and index support for pattern matching remains more limited than with `text_pattern_ops` on a deterministic column.
+
+On older versions, the usual workaround is to override the collation for the pattern match, which makes it case-sensitive again, and combine it with `ILIKE` or `lower()`:
+
+```sql
+SELECT * FROM users_icu
+WHERE email COLLATE "C" ILIKE 'alice%';
+```
+
+### Other things to know
+
+- **Sorting follows the collation**, so `ORDER BY email` interleaves upper and lower case sensibly.
+- **B-tree deduplication** is not used for indexes on nondeterministic collations, so such indexes may be somewhat larger than equivalent indexes on deterministic text.
+- **DISTINCT and GROUP BY follow the collation**: `SELECT DISTINCT email` treats differently cased values as one group, and which original spelling appears in the output is not something you should rely on.
+- **ICU version upgrades** can change collation results. After an operating-system or ICU upgrade, PostgreSQL may warn about a collation version mismatch; reindex affected indexes and then run `ALTER COLLATION ... REFRESH VERSION`.
+
+## Comparing the three options
+
+| Aspect | citext | lower() index | Nondeterministic collation |
+|---|---|---|---|
+| Needs extension | Yes | No | No (needs ICU build) |
+| Plain `=` in queries | Yes | No, must use `lower()` | Yes |
+| Case-insensitive unique | Yes | Yes | Yes |
+| Case-insensitive `LIKE` | Yes | With `lower()` on both sides | PostgreSQL 18+ |
+| Regex operators | Case-insensitive | With `lower()` or `~*` | Not supported |
+| Accent-insensitive option | No | Needs `unaccent` | Yes, with level 1 |
+| Case rules source | Database `LC_CTYPE` | Database `LC_CTYPE` | ICU |
+
+A reasonable rule of thumb:
+
+- **New project on a recent PostgreSQL version**: prefer a nondeterministic ICU collation, especially if you are on 18 and need `LIKE`.
+- **Heavy use of `LIKE` or regex on older versions, and you want zero application changes**: citext is the pragmatic choice.
+- **Maximum portability, explicit control, or you cannot install extensions**: `lower()` expression indexes.
+
+## Migrating an existing column
+
+Whichever option you choose, the first step is the same: find existing duplicates that the new rules would reject.
+
+```sql
+SELECT lower(email) AS normalized,
+       count(*)     AS copies,
+       array_agg(id ORDER BY id) AS ids
+FROM users_plain
+GROUP BY lower(email)
+HAVING count(*) > 1
+ORDER BY copies DESC;
+```
+
+Resolve them first, by merging accounts or renaming the extra addresses, according to your business rules. Adding a case-insensitive unique constraint will fail while duplicates exist.
+
+### Migrating to citext
+
+```sql
+CREATE EXTENSION IF NOT EXISTS citext;
+
+ALTER TABLE users_plain ALTER COLUMN email TYPE citext;
+```
+
+The `ALTER COLUMN ... TYPE` takes an `ACCESS EXCLUSIVE` lock, and indexes on the column are rebuilt. On a large table, test the duration on a copy first and schedule it for a quiet period.
+
+### Migrating to a nondeterministic collation
+
+```sql
+ALTER TABLE users_plain
+  ALTER COLUMN email TYPE text COLLATE case_insensitive;
+```
+
+This also takes an exclusive lock and rebuilds indexes on the column, because index ordering depends on the collation. Before running it, search the codebase for `LIKE` and `~` against the column; on PostgreSQL 17 or older those queries will start raising errors afterwards.
+
+### Migrating to a lower() index
+
+This is the least disruptive option because it does not change the column:
+
+```sql
+CREATE UNIQUE INDEX CONCURRENTLY users_plain_email_lower_uq
+    ON users_plain (lower(email));
+```
+
+`CONCURRENTLY` avoids blocking writes during the build. If it fails (for example because of a duplicate inserted mid-build), it leaves an invalid index that you must drop before retrying. Once it is in place, drop the old case-sensitive unique constraint and update queries to use `lower(email)`.
+
+When planning any of these migrations, it helps to run the duplicate check and the `EXPLAIN` verification side by side. A client such as [Chat2DB](https://chat2db.ai/download) lets you keep both queries open against staging and production, and its AI assistant can draft the `lower()` rewrites for existing queries so you only need to review them.
+
+## FAQ
+
+### Is citext deprecated?
+
+No. It is still shipped and supported. The documentation simply points out that nondeterministic collations can often do the same job without an extension.
+
+### Does ILIKE solve the problem?
+
+`ILIKE` makes a single query case-insensitive, but it does not make a unique constraint case-insensitive, and a plain B-tree index on the column generally cannot serve an `ILIKE` predicate. It is useful for search screens, not for identity columns. For fuzzy search, consider a `pg_trgm` GIN index, which supports `ILIKE`.
+
+### Should I just lowercase emails before storing them?
+
+It is simple and works well for emails, where casing rarely matters. You lose the original casing, and every code path that writes the column must normalise consistently, which a database-level rule guarantees for you.
+
+### Can I combine approaches?
+
+Yes. For example, a column with a nondeterministic collation for equality and uniqueness, plus a `pg_trgm` index on `lower(email)` for fuzzy search.
+
+## Summary
+
+PostgreSQL gives you three solid tools for case-insensitive text. citext is the most drop-in, with case-insensitive equality, uniqueness, `LIKE` and regex, at a modest CPU cost. `lower()` expression indexes are universal and explicit but depend on developer discipline. Nondeterministic ICU collations are the modern, standards-oriented approach with plain `=` queries and optional accent-insensitivity, with the caveat that `LIKE` only works from PostgreSQL 18 and regex not at all. Check for duplicates first, pick the option that matches your version and query patterns, and verify index usage with `EXPLAIN`.

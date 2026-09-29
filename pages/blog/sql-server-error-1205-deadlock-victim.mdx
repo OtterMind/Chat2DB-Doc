@@ -1,0 +1,481 @@
+---
+title: "SQL Server Error 1205: Deadlock Victim Fix"
+description: "Fix SQL Server Msg 1205 deadlock victim: reproduce a deadlock, read the graph from system_health, then fix it with access order, RCSI, UPDLOCK and retry logic."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: September 29, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# SQL Server Error 1205: Deadlock Victim Fix
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="September 29, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+```text
+Msg 1205, Level 13, State 51, Line 5
+Transaction (Process ID 67) was deadlocked on lock resources with another process and has been chosen as the deadlock victim. Rerun the transaction.
+```
+
+This is SQL Server's deadlock error. Two (or more) sessions each held a lock that the other one needed, so neither could ever continue. SQL Server's lock monitor detected the cycle, picked one session as the **victim**, rolled back its transaction, and returned error 1205 to it. The other session got its lock and finished normally.
+
+A deadlock is not a bug in SQL Server, and it does not corrupt data. It is a symptom of two code paths taking locks in conflicting orders. This guide reproduces a deadlock with two sessions, shows how to pull the deadlock graph out of the built-in `system_health` Extended Events session, explains how to read it, and then goes through the fixes, each tested against the same example: consistent access order, `READ_COMMITTED_SNAPSHOT`, `UPDLOCK`, covering indexes, shorter transactions, `DEADLOCK_PRIORITY`, and retry logic in C# and Python.
+
+All error messages and outputs below were captured on SQL Server 2022 (16.0.4295.3) in the `mcr.microsoft.com/mssql/server:2022-latest` Docker image. If you use PostgreSQL, the equivalent error is covered in [PostgreSQL deadlock detected](/blog/postgres-deadlock-detected-fix).
+
+## How SQL Server Chooses the Deadlock Victim
+
+A background task, the lock monitor, checks for deadlocks every few seconds (more often while deadlocks keep occurring). When it finds a cycle, it chooses a victim using two rules:
+
+1. The session with the lowest `DEADLOCK_PRIORITY` is chosen first.
+2. Among sessions with the same priority, SQL Server chooses the one whose transaction is cheapest to roll back, based on the amount of log it has generated.
+
+The victim's whole transaction is rolled back, not just the statement that was waiting. The error has severity 13, so the batch is aborted and the connection stays open. Anything the application wanted to do in that transaction must be done again, which is why the message ends with "Rerun the transaction."
+
+## Reproduce a Deadlock With Two Sessions
+
+Create a small table:
+
+```sql
+CREATE DATABASE DeadlockDemo;
+GO
+USE DeadlockDemo;
+CREATE TABLE dbo.Accounts (
+  AccountId INT PRIMARY KEY,
+  Owner     NVARCHAR(50) NOT NULL,
+  Balance   DECIMAL(12,2) NOT NULL
+);
+INSERT dbo.Accounts VALUES (1, N'Alice', 500.00), (2, N'Bob', 300.00);
+```
+
+Now open two query windows (or two `sqlcmd` sessions). Session 1 transfers money from account 1 to account 2:
+
+```sql
+-- Session 1
+USE DeadlockDemo;
+BEGIN TRANSACTION;
+UPDATE dbo.Accounts SET Balance = Balance - 100 WHERE AccountId = 1;
+WAITFOR DELAY '00:00:05';
+UPDATE dbo.Accounts SET Balance = Balance + 100 WHERE AccountId = 2;
+COMMIT;
+```
+
+Within five seconds, run session 2, which transfers in the opposite direction:
+
+```sql
+-- Session 2
+USE DeadlockDemo;
+BEGIN TRANSACTION;
+UPDATE dbo.Accounts SET Balance = Balance - 50 WHERE AccountId = 2;
+WAITFOR DELAY '00:00:05';
+UPDATE dbo.Accounts SET Balance = Balance + 50 WHERE AccountId = 1;
+COMMIT;
+```
+
+The sequence of events:
+
+| Time | Session 1 | Session 2 |
+|---|---|---|
+| t0 | Updates row 1, holds X lock on row 1 | |
+| t1 | | Updates row 2, holds X lock on row 2 |
+| t5 | Wants row 2, waits for session 2 | |
+| t6 | | Wants row 1, waits for session 1: cycle |
+
+Result in our run: session 2 committed, and session 1 received:
+
+```text
+Msg 1205, Level 13, State 51, Server 9bfb07ab9e62, Line 5
+Transaction (Process ID 67) was deadlocked on lock resources with another process and has been chosen as the deadlock victim. Rerun the transaction.
+```
+
+Both transactions had written about the same amount of log, so which one becomes the victim in this demo is effectively a coin toss. In other runs of the same scripts, the other session was chosen.
+
+## Capture the Deadlock Graph From system_health
+
+You do not need to set up a trace to investigate deadlocks. The `system_health` Extended Events session runs by default and records every deadlock as an `xml_deadlock_report` event. It writes to two targets: an in-memory `ring_buffer` and `system_health*.xel` files in the log directory.
+
+### Query the Event File
+
+The event file survives restarts and keeps more history, so it is the better source:
+
+```sql
+SELECT
+  x.value('(event/@timestamp)[1]', 'datetime2') AS deadlock_time_utc,
+  x.query('(event/data[@name="xml_report"]/value/deadlock)[1]') AS deadlock_graph
+FROM sys.fn_xe_file_target_read_file('system_health*.xel', NULL, NULL, NULL) AS f
+CROSS APPLY (SELECT CAST(f.event_data AS xml)) AS e(x)
+WHERE f.object_name = 'xml_deadlock_report'
+ORDER BY deadlock_time_utc DESC;
+```
+
+In SSMS, click the XML in the `deadlock_graph` column to open it. Save it with the `.xdl` extension and reopen it, and SSMS draws the graph: ovals for processes (the victim crossed out) and rectangles for the locked resources. Note that the timestamp is UTC.
+
+If you run these queries from `sqlcmd` and get `Msg 1934 ... 'QUOTED_IDENTIFIER'`, add the `-I` switch; XML methods require `QUOTED_IDENTIFIER ON`.
+
+### Query the Ring Buffer
+
+The ring buffer is faster for "what just happened" but only holds recent events and is cleared on restart:
+
+```sql
+SELECT
+  d.n.value('@timestamp', 'datetime2(0)') AS utc_time,
+  d.n.value('count(data/value/deadlock/process-list/process)', 'int') AS processes,
+  d.n.value('(data/value/deadlock/victim-list/victimProcess/@id)[1]', 'varchar(50)') AS victim_id,
+  d.n.query('data/value/deadlock') AS deadlock_graph
+FROM (
+  SELECT CAST(t.target_data AS xml) AS target_xml
+  FROM sys.dm_xe_session_targets AS t
+  JOIN sys.dm_xe_sessions AS s ON s.address = t.event_session_address
+  WHERE s.name = N'system_health' AND t.target_name = N'ring_buffer'
+) AS rb
+CROSS APPLY rb.target_xml.nodes('RingBufferTarget/event[@name="xml_deadlock_report"]') AS d(n);
+```
+
+For our deadlock it returned:
+
+```text
+utc_time            processes victim_id
+2026-09-29 08:23:34 2         processd00745468
+```
+
+### Shred the Graph Into Rows
+
+When there are many deadlocks, a tabular summary is easier to scan than XML. This query lists every process in every captured deadlock, marks the victim, and shows what it was waiting for and what it was running:
+
+```sql
+WITH dl AS (
+  SELECT CAST(f.event_data AS xml) AS x
+  FROM sys.fn_xe_file_target_read_file('system_health*.xel', NULL, NULL, NULL) AS f
+  WHERE f.object_name = 'xml_deadlock_report'
+)
+SELECT
+  dl.x.value('(event/@timestamp)[1]', 'datetime2(0)') AS utc_time,
+  p.n.value('@spid', 'int')                           AS spid,
+  CASE WHEN p.n.value('@id', 'varchar(50)') =
+            dl.x.value('(event/data/value/deadlock/victim-list/victimProcess/@id)[1]', 'varchar(50)')
+       THEN 'VICTIM' ELSE '' END                      AS victim,
+  p.n.value('@waitresource', 'varchar(100)')          AS waitresource,
+  p.n.value('@lockMode', 'varchar(10)')               AS lock_mode,
+  p.n.value('@isolationlevel', 'varchar(40)')         AS isolation_level,
+  p.n.value('(inputbuf)[1]', 'nvarchar(max)')         AS input_buffer
+FROM dl
+CROSS APPLY dl.x.nodes('event/data/value/deadlock/process-list/process') AS p(n)
+ORDER BY utc_time DESC, spid;
+```
+
+Output for our deadlock (input buffer shortened):
+
+```text
+utc_time            spid victim waitresource                            lock_mode isolation_level
+2026-09-29 08:23:34 67   VICTIM KEY: 5:72057594045726720 (61a06abd401c) X         read committed (2)
+2026-09-29 08:23:34 70          KEY: 5:72057594045726720 (8194443284a0) X         read committed (2)
+```
+
+## Read the Deadlock Graph
+
+Here are the important parts of the XML we captured, with the stack frames removed:
+
+```xml
+<deadlock>
+  <victim-list>
+    <victimProcess id="processd00745468"/>
+  </victim-list>
+  <process-list>
+    <process id="processd00745468" waitresource="KEY: 5:72057594045726720 (61a06abd401c)"
+             waittime="3770" lockMode="X" spid="67" trancount="2"
+             isolationlevel="read committed (2)" clientapp="SQLCMD" loginname="sa"
+             currentdbname="DeadlockDemo" logused="240">
+      <inputbuf>
+UPDATE dbo.Accounts SET Balance = Balance - 100 WHERE AccountId = 1;
+WAITFOR DELAY '00:00:05';
+UPDATE dbo.Accounts SET Balance = Balance + 100 WHERE AccountId = 2;
+      </inputbuf>
+    </process>
+    <process id="processd00ade4e8" waitresource="KEY: 5:72057594045726720 (8194443284a0)"
+             waittime="2714" lockMode="X" spid="70" ... />
+  </process-list>
+  <resource-list>
+    <keylock hobtid="72057594045726720" dbid="5" objectname="DeadlockDemo.dbo.Accounts"
+             indexname="PK__Accounts__349DA5A6834C2A9E" mode="X">
+      <owner-list><owner id="processd00ade4e8" mode="X"/></owner-list>
+      <waiter-list><waiter id="processd00745468" mode="X" requestType="wait"/></waiter-list>
+    </keylock>
+    <keylock hobtid="72057594045726720" dbid="5" objectname="DeadlockDemo.dbo.Accounts"
+             indexname="PK__Accounts__349DA5A6834C2A9E" mode="X">
+      <owner-list><owner id="processd00745468" mode="X"/></owner-list>
+      <waiter-list><waiter id="processd00ade4e8" mode="X" requestType="wait"/></waiter-list>
+    </keylock>
+  </resource-list>
+</deadlock>
+```
+
+Read it in three passes.
+
+**1. Victim list.** `processd00745468` is the victim, and the process list shows it was `spid="67"`, the session that got Msg 1205.
+
+**2. Process list.** For each process:
+
+- `waitresource` is the lock it was waiting for when the deadlock was detected.
+- `lockMode` is the mode it requested (`X` exclusive here; `S`, `U`, `IX` and range modes are also common).
+- `isolationlevel` often explains a lot. `serializable (4)` or `repeatable read (3)` means shared locks are held until commit; some ORMs and `TransactionScope` in .NET default to serializable.
+- `trancount`, `logused`, `clientapp`, `hostname` and `loginname` identify which application and code path ran it.
+- `inputbuf` is the batch or procedure call. `executionStack` gives the statement offsets and, for procedures, `procname` and `line`.
+
+**3. Resource list.** Each resource has an owner list and a waiter list. Follow the arrows: process `...468` waits on a key owned by `...4e8`, and `...4e8` waits on a key owned by `...468`. That is the cycle.
+
+### Map the Resource to a Table and Row
+
+`KEY: 5:72057594045726720 (61a06abd401c)` means database id 5, the B-tree (hobt) id, and a hash of the key. The graph already gives `objectname` and `indexname`, but you can also resolve them yourself:
+
+```sql
+USE DeadlockDemo;
+SELECT OBJECT_NAME(p.object_id) AS table_name, i.name AS index_name
+FROM sys.partitions AS p
+JOIN sys.indexes AS i ON i.object_id = p.object_id AND i.index_id = p.index_id
+WHERE p.hobt_id = 72057594045726720;
+
+SELECT %%lockres%% AS lock_resource, AccountId, Owner
+FROM dbo.Accounts;
+```
+
+```text
+table_name index_name
+Accounts   PK__Accounts__349DA5A6834C2A9E
+
+lock_resource  AccountId Owner
+(8194443284a0) 1         Alice
+(61a06abd401c) 2         Bob
+```
+
+So the victim (spid 67) was waiting for Bob's row while holding Alice's, and spid 70 the reverse. `%%lockres%%` is undocumented and scans the table, so only use it on small tables or with a `WHERE` clause.
+
+Other resource types you will meet: `RID` (a row in a heap), `PAGE`, `OBJECT` (a table lock, often from lock escalation), and `keylock` with `RangeS-U` or `RangeX-X` modes, which come from the serializable isolation level.
+
+## Fix 1: Access Objects in a Consistent Order
+
+A cycle needs two sessions taking the same locks in opposite orders. If every code path locks rows and tables in the same order, one session simply waits for the other instead of deadlocking.
+
+For the transfer example, always update the lower `AccountId` first. We changed session 2 to touch account 1 before account 2 and ran both sessions again:
+
+```sql
+-- Session 2, reordered
+BEGIN TRANSACTION;
+UPDATE dbo.Accounts SET Balance = Balance + 50 WHERE AccountId = 1;
+WAITFOR DELAY '00:00:05';
+UPDATE dbo.Accounts SET Balance = Balance - 50 WHERE AccountId = 2;
+COMMIT;
+```
+
+Session 2 blocked until session 1 committed, then both committed. No error.
+
+In a real application, this means: update parent before child (or the reverse) everywhere, sort lists of keys before updating them in a loop, and make stored procedures that touch the same tables use the same sequence.
+
+## Fix 2: Turn On READ_COMMITTED_SNAPSHOT for Reader/Writer Deadlocks
+
+Many deadlocks involve a reader: a `SELECT` under the default locking read committed level needs a shared lock, which waits on another transaction's exclusive lock. Here each session updates one row and then reads the other:
+
+```sql
+-- Session 1                                   -- Session 2
+BEGIN TRAN;                                    BEGIN TRAN;
+UPDATE dbo.Accounts SET Balance = Balance - 10 UPDATE dbo.Accounts SET Balance = Balance - 10
+ WHERE AccountId = 1;                           WHERE AccountId = 2;
+WAITFOR DELAY '00:00:04';                      WAITFOR DELAY '00:00:04';
+SELECT Balance FROM dbo.Accounts               SELECT Balance FROM dbo.Accounts
+ WHERE AccountId = 2;                           WHERE AccountId = 1;
+COMMIT;                                        COMMIT;
+```
+
+Under default settings this deadlocked, and session 1 got Msg 1205. Then we enabled read committed snapshot isolation (RCSI):
+
+```sql
+ALTER DATABASE DeadlockDemo SET READ_COMMITTED_SNAPSHOT ON WITH ROLLBACK IMMEDIATE;
+```
+
+With RCSI, readers under read committed read the last committed version of a row from the version store instead of taking shared locks. The same two scripts both completed without waiting or errors.
+
+Things to know before you switch it on:
+
+- `WITH ROLLBACK IMMEDIATE` rolls back open transactions in the database. Do it in a maintenance window.
+- It adds version store load in `tempdb` and a 14-byte versioning tag to modified rows.
+- Code that relied on a `SELECT` blocking until another transaction committed (for example, a "check then insert" pattern) may behave differently. Such code should use explicit locking hints instead (Fix 3).
+- RCSI does **not** fix writer/writer deadlocks. We ran the original two-update example again with RCSI on, and it still deadlocked. Azure SQL Database has RCSI on by default, which is why the deadlocks you see there are usually writer/writer.
+
+## Fix 3: Use UPDLOCK for Read-Then-Update Patterns
+
+A classic conversion deadlock: two sessions read the same row with a shared lock held until commit, then both try to update it. Each needs to convert its `S` lock to `X`, and each waits for the other's `S` lock.
+
+```sql
+SET TRANSACTION ISOLATION LEVEL REPEATABLE READ;
+BEGIN TRANSACTION;
+DECLARE @b DECIMAL(12,2);
+SELECT @b = Balance FROM dbo.Accounts WHERE AccountId = 1;
+WAITFOR DELAY '00:00:04';
+UPDATE dbo.Accounts SET Balance = @b - 10 WHERE AccountId = 1;
+COMMIT;
+```
+
+Running this script in two sessions at once made the second one the victim:
+
+```text
+Msg 1205, Level 13, State 51, Server 9bfb07ab9e62, Line 7
+Transaction (Process ID 89) was deadlocked on lock resources with another process and has been chosen as the deadlock victim. Rerun the transaction.
+```
+
+An update (`U`) lock is compatible with shared locks but not with another `U` lock, so only one session at a time can hold the "intent to update". Change the read to:
+
+```sql
+SELECT @b = Balance FROM dbo.Accounts WITH (UPDLOCK) WHERE AccountId = 1;
+```
+
+With that one change, the second session waited at the `SELECT`, and both sessions completed. Better still, when possible, do the read and write in one statement (`UPDATE ... SET Balance = Balance - 10 OUTPUT inserted.Balance`), which takes the right locks by itself.
+
+## Fix 4: Add Covering Indexes
+
+Deadlocks between a `SELECT` and an `UPDATE` on a single table often involve two indexes. The reader seeks a nonclustered index and then does a key lookup into the clustered index; the writer updates the clustered index first and then the nonclustered index. They acquire locks on the two structures in opposite orders. In the graph you see two `keylock` resources on the same `objectname` but different `indexname` values.
+
+A covering index removes the key lookup, so the reader never touches the clustered index:
+
+```sql
+CREATE INDEX IX_Accounts_Owner
+  ON dbo.Accounts (Owner)
+  INCLUDE (Balance);
+```
+
+More generally, missing indexes make `UPDATE` and `DELETE` statements scan and lock many more rows than they change, which raises the chance of overlapping with another session. Check the execution plans of the statements named in the graph for scans on large tables.
+
+## Fix 5: Keep Transactions Short
+
+The longer a transaction holds locks, the bigger the window for a cycle. Our demo used `WAITFOR` to make that window obvious; in real code the delay is usually one of these:
+
+- Network round trips inside a transaction, such as an ORM loading and saving rows one at a time.
+- Calls to external services, or waiting for user input, while the transaction is open.
+- Large batch updates in a single transaction. Break them into chunks of a few thousand rows, each in its own transaction.
+
+Also check the isolation level in the graph. If it shows `serializable (4)` and you did not choose that, find where it comes from (for example, a `TransactionScope` with default options) and lower it.
+
+## Fix 6: Set DEADLOCK_PRIORITY for Background Work
+
+When a deadlock between a user-facing transaction and a background job is hard to eliminate, you can at least choose who loses. `SET DEADLOCK_PRIORITY` accepts `LOW`, `NORMAL`, `HIGH`, or an integer from -10 to 10:
+
+```sql
+SET DEADLOCK_PRIORITY LOW;
+BEGIN TRANSACTION;
+-- nightly cleanup work ...
+COMMIT;
+```
+
+We ran the original two transfer scripts again with `SET DEADLOCK_PRIORITY LOW` in one of them, and that session was the one chosen as the victim, while the normal-priority session committed. The job still needs retry logic, but the interactive session no longer fails.
+
+## Fix 7: Retry the Victim Transaction
+
+Even a well-designed system will see occasional deadlocks under load. The error message itself tells you what to do: rerun the transaction. Retry the whole transaction, not the single failed statement, because everything was rolled back. Limit the attempts and add a short random delay so the two sessions do not collide again.
+
+### C# (Microsoft.Data.SqlClient)
+
+```csharp
+using Microsoft.Data.SqlClient;
+
+static async Task TransferAsync(string connStr, int fromId, int toId, decimal amount)
+{
+    const int maxAttempts = 3;
+    for (int attempt = 1; ; attempt++)
+    {
+        await using var conn = new SqlConnection(connStr);
+        await conn.OpenAsync();
+        await using var tx = (SqlTransaction)await conn.BeginTransactionAsync();
+        try
+        {
+            await using (var cmd = new SqlCommand(
+                "UPDATE dbo.Accounts SET Balance = Balance - @amt WHERE AccountId = @id", conn, tx))
+            {
+                cmd.Parameters.AddWithValue("@amt", amount);
+                cmd.Parameters.AddWithValue("@id", fromId);
+                await cmd.ExecuteNonQueryAsync();
+            }
+            await using (var cmd = new SqlCommand(
+                "UPDATE dbo.Accounts SET Balance = Balance + @amt WHERE AccountId = @id", conn, tx))
+            {
+                cmd.Parameters.AddWithValue("@amt", amount);
+                cmd.Parameters.AddWithValue("@id", toId);
+                await cmd.ExecuteNonQueryAsync();
+            }
+            await tx.CommitAsync();
+            return;
+        }
+        catch (SqlException ex) when (ex.Number == 1205 && attempt < maxAttempts)
+        {
+            // SQL Server already rolled the transaction back; just wait and try again.
+            await Task.Delay(TimeSpan.FromMilliseconds(100 * Math.Pow(2, attempt) + Random.Shared.Next(100)));
+        }
+    }
+}
+```
+
+`SqlException.Number` is the SQL Server error number, so the filter only retries deadlocks and lets every other error propagate. We did not execute the C# version for this article; the Python version below was run against the test server.
+
+### Python (pyodbc)
+
+```python
+import random
+import time
+
+import pyodbc
+
+CONN_STR = (
+    "DRIVER={ODBC Driver 18 for SQL Server};"
+    "SERVER=localhost,1433;DATABASE=DeadlockDemo;"
+    "UID=sa;PWD=Str0ng!Passw0rd;TrustServerCertificate=yes"
+)
+
+def is_deadlock(exc: pyodbc.Error) -> bool:
+    # SQLSTATE 40001 = serialization failure; the message carries "(1205)"
+    return exc.args[0] == "40001" or "(1205)" in str(exc)
+
+def transfer(from_id: int, to_id: int, amount: float, max_attempts: int = 3) -> None:
+    for attempt in range(1, max_attempts + 1):
+        conn = pyodbc.connect(CONN_STR, autocommit=False)
+        try:
+            cur = conn.cursor()
+            cur.execute("UPDATE dbo.Accounts SET Balance = Balance - ? WHERE AccountId = ?", amount, from_id)
+            cur.execute("UPDATE dbo.Accounts SET Balance = Balance + ? WHERE AccountId = ?", amount, to_id)
+            conn.commit()
+            return
+        except pyodbc.Error as exc:
+            conn.rollback()
+            if is_deadlock(exc) and attempt < max_attempts:
+                time.sleep(0.1 * 2 ** attempt + random.uniform(0, 0.1))
+                continue
+            raise
+        finally:
+            conn.close()
+```
+
+With a `WAITFOR DELAY` added between the two updates and two processes running `transfer(1, 2, 100)` and `transfer(2, 1, 50)` at the same time, one process committed immediately and the other printed its retry and then succeeded on the second attempt. The exception pyodbc raised for the victim was:
+
+```text
+('40001', '[40001] [Microsoft][ODBC Driver 18 for SQL Server][SQL Server]Transaction (Process ID 89) was deadlocked on lock resources with another process and has been chosen as the deadlock victim. Rerun the transaction. (1205) (SQLExecDirectW)')
+```
+
+Two cautions. Only retry when the whole unit of work is inside the transaction; if the code sent an email or called an API before the deadlock, retrying repeats that side effect. And log every retry, because a rising deadlock rate is a signal to go back to Fixes 1 to 5.
+
+## Monitoring Deadlocks Over Time
+
+`system_health` keeps a limited number of `.xel` files, so on a busy server old deadlocks roll off. If you need a longer history, create a dedicated Extended Events session that captures only `xml_deadlock_report`:
+
+```sql
+CREATE EVENT SESSION deadlocks ON SERVER
+ADD EVENT sqlserver.xml_deadlock_report
+ADD TARGET package0.event_file (SET filename = N'deadlocks', max_file_size = 50, max_rollover_files = 10)
+WITH (STARTUP_STATE = ON);
+ALTER EVENT SESSION deadlocks ON SERVER STATE = START;
+```
+
+Query it with the same `sys.fn_xe_file_target_read_file` queries, using `'deadlocks*.xel'` as the path. Events are buffered, so a new deadlock can take up to about 30 seconds (the default `MAX_DISPATCH_LATENCY`) to show up in the file. Running the shredding query from a client like [Chat2DB](https://app.chat2db.ai/) gives you a sortable grid of victims, wait resources and input buffers, which makes repeating patterns (the same two procedures, the same index) easy to spot.
+
+If your issue is sessions waiting too long rather than deadlocking, that is lock blocking, a different problem; the MySQL side of it is described in [MySQL lock wait timeout exceeded](/blog/mysql-lock-wait-timeout-exceeded). To try all of this locally on a Mac, see [SQL Server on Mac with Docker](/blog/sql-server-on-mac-docker).
+
+## Summary
+
+Msg 1205 means SQL Server broke a lock cycle by rolling back your transaction. The `system_health` session has already recorded the deadlock graph; query `xml_deadlock_report` from the event file or ring buffer, find the victim, the wait resources and the input buffers, and identify the two code paths. Then fix the cause: access tables and rows in a consistent order, use RCSI to take readers out of lock conflicts, use `UPDLOCK` for read-then-update logic, add covering indexes, keep transactions short, and set `DEADLOCK_PRIORITY` for background work. Finally, retry deadlock victims in application code, because the goal is to make deadlocks rare, and the application still has to handle the ones that happen.

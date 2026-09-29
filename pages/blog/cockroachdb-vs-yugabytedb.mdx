@@ -1,0 +1,245 @@
+---
+title: "CockroachDB vs YugabyteDB: Distributed SQL Guide"
+description: "CockroachDB vs YugabyteDB compared: PostgreSQL compatibility, storage engines, isolation defaults, multi-region placement, sharding, and licensing."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: September 23, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# CockroachDB vs YugabyteDB: Distributed SQL Guide
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="September 23, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+When a single PostgreSQL primary is no longer enough — because you need writes in multiple regions, automatic failover without data loss, or horizontal scale past one machine — the conversation usually turns to **distributed SQL**. Two of the most prominent distributed SQL databases are CockroachDB and YugabyteDB. Both were inspired by Google Spanner, both shard data automatically and replicate it with Raft consensus, and both speak the PostgreSQL wire protocol.
+
+Look closer and they make quite different design choices. This guide compares CockroachDB vs YugabyteDB on PostgreSQL compatibility, storage architecture, transaction isolation, sharding, multi-region features and licensing, with SQL examples for each. It deliberately contains no benchmark numbers: published benchmarks from either vendor are hard to compare, and your schema and access patterns matter far more than someone else's test.
+
+## Shared foundations
+
+Before the differences, it helps to see what the two systems have in common:
+
+- **Automatic sharding.** Tables are split into chunks — *ranges* in CockroachDB, *tablets* in YugabyteDB — that are distributed across nodes and split as they grow.
+- **Raft replication.** Each chunk is replicated, typically three ways, and a Raft group elects a leader (called a *leaseholder* for reads in CockroachDB). A write commits once a majority of replicas acknowledge it, so losing a minority of nodes loses no committed data.
+- **Distributed ACID transactions.** Both support multi-row, multi-table transactions across nodes, using hybrid logical clocks for ordering rather than specialised atomic-clock hardware.
+- **PostgreSQL wire protocol.** Standard PostgreSQL drivers, ORMs and tools can connect to either.
+
+## PostgreSQL compatibility
+
+This is the most important architectural difference, and it shapes everything above the storage layer.
+
+### YugabyteDB YSQL: reusing the Postgres query layer
+
+YugabyteDB's SQL API, **YSQL**, is built by reusing the actual PostgreSQL query layer — parser, analyzer, planner and executor — on top of YugabyteDB's distributed storage. Historically YSQL was based on PostgreSQL 11; recent releases have moved to a PostgreSQL 15 base. Check the version you deploy.
+
+Because the upper layers are real PostgreSQL code, many features work as they do in Postgres: stored procedures and functions in PL/pgSQL, triggers, many extensions (such as `pgcrypto`, `pg_stat_statements` and `hstore`), partial and expression indexes, and PostgreSQL's type system. Not everything carries over — some features depend on the storage layer and behave differently or are unsupported — but the starting point is PostgreSQL itself. YugabyteDB also offers **YCQL**, a Cassandra-compatible API, on the same storage engine.
+
+### CockroachDB: a wire-compatible reimplementation
+
+CockroachDB implements its own SQL layer, written in Go, that speaks the PostgreSQL wire protocol and follows PostgreSQL syntax and semantics closely. It is not built from PostgreSQL source code. Common SQL, most data types, JSONB, common table expressions, window functions and many built-in functions work as expected.
+
+CockroachDB has historically lagged on some PostgreSQL features and has been adding them over time; for example, user-defined functions, stored procedures and triggers arrived in recent versions with a PL/pgSQL subset. PostgreSQL extensions cannot be loaded because there is no Postgres extension interface. Instead, some commonly used capabilities, such as spatial types, are built in.
+
+**Practical implication:** if you are migrating an existing PostgreSQL application that relies on extensions, triggers or procedural code, YSQL usually requires fewer changes. If you are building a new application and write portable SQL, both work, and the decision rests on other factors.
+
+## Storage engines
+
+### YugabyteDB: DocDB on a RocksDB fork
+
+YugabyteDB's storage layer is called **DocDB**. Each tablet is stored in a customised fork of RocksDB, the LSM-tree key-value store. Rows are encoded into document-style keys, and YugabyteDB has extended RocksDB with its own changes for MVCC, compaction and multi-tablet transactions. Raft replication happens per tablet above the RocksDB layer.
+
+### CockroachDB: Pebble
+
+CockroachDB originally used RocksDB, then replaced it with **Pebble**, an LSM key-value store written in Go by Cockroach Labs and inspired by RocksDB and LevelDB. Pebble has been the default engine for several years. Owning the storage engine lets Cockroach Labs tune it for CockroachDB's workload and avoid crossing between Go and C++.
+
+For users, both are LSM-based engines with similar broad characteristics: fast writes, compaction in the background, and sensitivity to disk throughput. Neither engine is something you tune day to day.
+
+## Consistency and isolation defaults
+
+Isolation levels are where application behaviour differs most visibly.
+
+### CockroachDB
+
+CockroachDB's default isolation level is **SERIALIZABLE**, the strongest level in the SQL standard. Transactions behave as if executed one at a time. The price is that conflicting transactions may be aborted with a retryable error (SQLSTATE `40001`), so applications must implement retry logic. **READ COMMITTED** isolation is available in newer versions (introduced in 23.2; depending on the version it may need to be enabled with a cluster setting), which reduces retries for workloads that tolerate weaker guarantees and eases migrations from PostgreSQL, whose default is READ COMMITTED.
+
+```sql
+-- CockroachDB
+SET CLUSTER SETTING sql.txn.read_committed_isolation.enabled = true;  -- if required by your version
+BEGIN TRANSACTION ISOLATION LEVEL READ COMMITTED;
+UPDATE accounts SET balance = balance - 100 WHERE id = 1;
+COMMIT;
+```
+
+### YugabyteDB
+
+YugabyteDB's YSQL default is **snapshot isolation**, which maps to PostgreSQL's `REPEATABLE READ`. **SERIALIZABLE** is available when you request it. **READ COMMITTED** is supported too, but in many versions it must be enabled with the `yb_enable_read_committed_isolation` server flag; without it, requests for READ COMMITTED are treated as snapshot isolation. Check your version's defaults.
+
+```sql
+-- YugabyteDB YSQL
+BEGIN ISOLATION LEVEL SERIALIZABLE;
+SELECT sum(balance) FROM accounts WHERE branch_id = 7;
+INSERT INTO audit_log (branch_id, total) VALUES (7, 12345);
+COMMIT;
+```
+
+In both systems, design for retries. Distributed transactions that conflict get aborted more often than on a single-node database, and good client libraries or ORMs can retry automatically.
+
+## Sharding: hash vs range
+
+### YugabyteDB
+
+In YSQL, the first primary key column is **hash-sharded by default**, which spreads sequential keys evenly across tablets and avoids write hotspots. You can opt into **range sharding** with `ASC` or `DESC`, which keeps rows ordered and makes range scans efficient.
+
+```sql
+-- Hash sharding (default for the first key column); pre-split into 12 tablets
+CREATE TABLE orders (
+    order_id    uuid        NOT NULL,
+    customer_id bigint      NOT NULL,
+    created_at  timestamptz NOT NULL DEFAULT now(),
+    total       numeric(12,2),
+    PRIMARY KEY (order_id HASH)
+) SPLIT INTO 12 TABLETS;
+
+-- Range sharding: good for time-ordered scans
+CREATE TABLE events (
+    event_time  timestamptz NOT NULL,
+    event_id    bigint      NOT NULL,
+    payload     jsonb,
+    PRIMARY KEY (event_time ASC, event_id ASC)
+);
+
+-- Compound: hash on customer, range within a customer
+CREATE INDEX orders_by_customer ON orders (customer_id HASH, created_at DESC);
+```
+
+### CockroachDB
+
+CockroachDB **range-shards by default**: data is ordered by primary key and split into contiguous ranges. That is great for range scans, but a monotonically increasing key (such as a timestamp or sequence) sends all inserts to the last range, creating a hotspot. The usual fixes are UUID keys or **hash-sharded indexes**:
+
+```sql
+-- Default: range sharding on the primary key
+CREATE TABLE orders (
+    order_id    UUID NOT NULL DEFAULT gen_random_uuid(),
+    customer_id INT8 NOT NULL,
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+    total       DECIMAL(12,2),
+    PRIMARY KEY (order_id)
+);
+
+-- Hash-sharded primary key to spread sequential inserts
+CREATE TABLE events (
+    event_time TIMESTAMPTZ NOT NULL,
+    event_id   INT8 NOT NULL,
+    payload    JSONB,
+    PRIMARY KEY (event_time, event_id) USING HASH
+);
+
+-- Hash-sharded secondary index
+CREATE INDEX orders_created_idx ON orders (created_at) USING HASH;
+```
+
+Notice the defaults are opposite: YugabyteDB defaults to hash and lets you choose range; CockroachDB defaults to range and lets you choose hash. Both approaches work — just make the choice deliberately for each table.
+
+## Multi-region features
+
+Multi-region deployment is a major reason to pick distributed SQL, and both databases have mature but differently shaped tooling.
+
+### CockroachDB: declarative multi-region SQL
+
+CockroachDB exposes multi-region behaviour through high-level SQL. You declare database regions and a survival goal, then assign each table a locality:
+
+```sql
+ALTER DATABASE shop SET PRIMARY REGION "us-east1";
+ALTER DATABASE shop ADD REGION "europe-west1";
+ALTER DATABASE shop ADD REGION "asia-southeast1";
+
+-- Survive the loss of a whole region (default is ZONE)
+ALTER DATABASE shop SURVIVE REGION FAILURE;
+
+-- Each row is homed in the region stored in its hidden crdb_region column
+ALTER TABLE customers SET LOCALITY REGIONAL BY ROW;
+
+-- Rarely written, read everywhere: low-latency reads in every region
+ALTER TABLE currencies SET LOCALITY GLOBAL;
+
+-- Whole table homed in one region
+ALTER TABLE eu_invoices SET LOCALITY REGIONAL BY TABLE IN "europe-west1";
+```
+
+`REGIONAL BY ROW` tables automatically place each row's leaseholder in its home region, which suits per-user data and data-residency needs. `GLOBAL` tables trade slower writes for fast consistent reads everywhere. For stale-tolerant reads, **follower reads** with `AS OF SYSTEM TIME follower_read_timestamp()` let any nearby replica serve the query. Lower-level zone configurations remain available for fine control.
+
+### YugabyteDB: tablespaces and geo-partitioning
+
+YugabyteDB builds on PostgreSQL concepts. You define **tablespaces** with a replica placement policy, and place tables, indexes or partitions in them:
+
+```sql
+CREATE TABLESPACE us_east WITH (replica_placement='{"num_replicas": 3, "placement_blocks": [
+  {"cloud":"aws","region":"us-east-1","zone":"us-east-1a","min_num_replicas":1},
+  {"cloud":"aws","region":"us-east-1","zone":"us-east-1b","min_num_replicas":1},
+  {"cloud":"aws","region":"us-east-1","zone":"us-east-1c","min_num_replicas":1}]}');
+
+CREATE TABLESPACE eu_west WITH (replica_placement='{"num_replicas": 3, "placement_blocks": [
+  {"cloud":"aws","region":"eu-west-1","zone":"eu-west-1a","min_num_replicas":1},
+  {"cloud":"aws","region":"eu-west-1","zone":"eu-west-1b","min_num_replicas":1},
+  {"cloud":"aws","region":"eu-west-1","zone":"eu-west-1c","min_num_replicas":1}]}');
+
+-- Geo-partitioned table: rows live in the region named in geo
+CREATE TABLE customers (
+    customer_id bigint NOT NULL,
+    geo         text   NOT NULL,
+    email       text   NOT NULL,
+    PRIMARY KEY (customer_id HASH, geo)
+) PARTITION BY LIST (geo);
+
+CREATE TABLE customers_us PARTITION OF customers
+    FOR VALUES IN ('US') TABLESPACE us_east;
+
+CREATE TABLE customers_eu PARTITION OF customers
+    FOR VALUES IN ('EU') TABLESPACE eu_west;
+```
+
+This uses standard PostgreSQL list partitioning, so it feels familiar to Postgres users, though it is more verbose than CockroachDB's declarative localities. YugabyteDB also offers **read replicas** (asynchronous, non-voting copies for low-latency reads in remote regions), **follower reads** via settings such as `yb_read_from_followers`, and **xCluster** asynchronous replication between separate clusters for active-passive or active-active disaster recovery setups.
+
+## Licensing and deployment options
+
+Licensing has changed over the years, so verify the current terms before committing.
+
+**YugabyteDB** is open source under the Apache 2.0 license for the core database. Yugabyte sells YugabyteDB Anywhere (a self-managed control plane for running clusters) and YugabyteDB Aeon, a fully managed cloud service.
+
+**CockroachDB** used a mix of licenses historically, with a source-available core and enterprise features. In late 2024, Cockroach Labs announced a move to a single enterprise license for self-hosted CockroachDB, retiring the separate free core edition. As announced, a free tier is available for smaller businesses (subject to a revenue threshold and conditions such as telemetry), while larger companies need a paid license. Cockroach Labs also offers CockroachDB Cloud as a managed service in several tiers. Because terms like these can change, read the current license text and pricing pages rather than relying on summaries — including this one.
+
+For teams that require an OSI-approved open-source license, YugabyteDB's Apache 2.0 core is often a deciding factor.
+
+## Operational considerations
+
+Both databases are single-binary or small-binary deployments that run well on Kubernetes, and both provide web consoles, metrics and online schema changes. A few practical differences:
+
+- **Schema changes.** CockroachDB performs schema changes online as background jobs; YugabyteDB supports online operations for many DDL statements, with details varying by version.
+- **Architecture.** CockroachDB runs one symmetric process type. YugabyteDB runs two: YB-Master for metadata and YB-TServer for data.
+- **Upgrades.** Both support rolling upgrades; follow each vendor's version-skipping rules.
+- **Tooling.** Because both speak the PostgreSQL protocol, standard clients such as `psql` (or `ysqlsh` and `cockroach sql`) work, as do most GUI clients that support PostgreSQL connections.
+
+## When to choose which
+
+### Choose YugabyteDB when
+
+- You are migrating an existing PostgreSQL application that uses extensions, triggers or PL/pgSQL heavily.
+- You want an Apache 2.0 open-source core.
+- You also need a Cassandra-compatible API alongside SQL.
+- Hash sharding as the default fits your write-heavy, key-based workload.
+
+### Choose CockroachDB when
+
+- You want SERIALIZABLE isolation by default and a strong focus on correctness.
+- Declarative multi-region SQL such as `REGIONAL BY ROW` and `SURVIVE REGION FAILURE` appeals to you.
+- Its licensing terms and managed cloud offering fit your organisation.
+- You prefer a single symmetric node type for operations.
+
+## Conclusion
+
+CockroachDB vs YugabyteDB is not a contest with a single winner. Both are capable distributed SQL databases built on Raft, automatic sharding and the PostgreSQL wire protocol. YugabyteDB leans into PostgreSQL compatibility by reusing Postgres's own query layer, defaults to hash sharding and snapshot isolation, and keeps an Apache 2.0 core. CockroachDB reimplements SQL in its own engine, defaults to range sharding and SERIALIZABLE isolation, and offers some of the most expressive multi-region SQL available, under a licensing model that changed in late 2024.
+
+The best way to decide is to run your own schema and your most important queries on both, in the region layout you actually need. Connect to each with a client such as [Chat2DB](https://app.chat2db.ai), compare query plans and behaviour, and let your workload make the call.

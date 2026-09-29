@@ -1,0 +1,416 @@
+---
+title: "MySQL Error 1366: Incorrect String Value Fix"
+description: "Fix MySQL error 1366 incorrect string value for emoji: check charsets at every level, convert to utf8mb4, set JDBC, PDO and Python charsets, and strict mode."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: September 27, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# MySQL Error 1366: Incorrect String Value Fix
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="September 27, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+MySQL error 1366 is one of those errors that shows up the first time a real user types something your test data never contained. Most often it is an emoji in a comment, a product review, or a chat message, and the INSERT fails with a message full of hexadecimal bytes. Less often it is a number column receiving a string such as an empty value or `'abc'`. Both come from the same error code, `ER_TRUNCATED_WRONG_VALUE_FOR_FIELD`, and both are the server telling you that the value you sent cannot be stored in the column as defined.
+
+This guide covers MySQL 8.0 and 8.4, with notes for MariaDB. It explains exactly why the error happens, how to find which of the four or five character set settings is wrong, how to convert tables safely, how to configure the connection in Java, PHP and Python, and how to deal with the "Incorrect integer value" and "Incorrect decimal value" variants that strict mode produces.
+
+## What the error looks like
+
+The classic form is an emoji going into a column that uses the 3-byte `utf8mb3` character set:
+
+```sql
+CREATE TABLE comments (
+  id   INT AUTO_INCREMENT PRIMARY KEY,
+  body VARCHAR(500)
+) CHARACTER SET utf8mb3 COLLATE utf8mb3_general_ci;
+
+INSERT INTO comments (body) VALUES ('Great release 😀');
+```
+
+```text
+ERROR 1366 (HY000): Incorrect string value: '\xF0\x9F\x98\x80' for column 'body' at row 1
+```
+
+The bytes in the message are the UTF-8 encoding of the character that could not be stored. `F0 9F 98 80` is U+1F600, the grinning face emoji. Any sequence that starts with `\xF0` (or `\xF1` to `\xF4`) is a 4-byte UTF-8 character, which is the tell-tale sign of this particular problem.
+
+You will also see variants where the bytes are not emoji at all, for example `Incorrect string value: '\xE9t\xE9' for column 'name'`. That pattern usually means the client sent Latin-1 bytes while claiming to send UTF-8, so the server received invalid UTF-8. The fixes for that case live in the connection settings section below.
+
+## Why utf8 in MySQL is not really UTF-8
+
+Unicode characters take between one and four bytes in UTF-8. Characters in the Basic Multilingual Plane (Latin, Cyrillic, CJK, most symbols) take up to three bytes. Emoji, many historic scripts, some rare CJK ideographs and mathematical alphanumerics take four bytes.
+
+MySQL's original `utf8` character set was implemented with a maximum of three bytes per character. It is now officially named `utf8mb3`, and `utf8` is a deprecated alias for it. Starting with MySQL 8.0.28, `SHOW CREATE TABLE` and `information_schema` display `utf8mb3` instead of `utf8`, which removes some of the confusion. The full 4-byte implementation is `utf8mb4`, and it is the default character set in MySQL 8.0 and 8.4, with `utf8mb4_0900_ai_ci` as the default collation.
+
+So if you are on MySQL 8 and still see this error, something in the chain was explicitly set to `utf8mb3` or `latin1`: usually a table or column created by an older version and carried along through upgrades and dumps, or a connection that negotiates an older character set.
+
+## Check the character set at every level
+
+MySQL resolves the character set of a value through several layers. The value must survive all of them. Work from the outside in.
+
+### Server and connection variables
+
+```sql
+SHOW VARIABLES LIKE 'character_set%';
+SHOW VARIABLES LIKE 'collation%';
+```
+
+Typical output on a healthy MySQL 8 connection:
+
+```text
++--------------------------+--------------------------------+
+| Variable_name            | Value                          |
++--------------------------+--------------------------------+
+| character_set_client     | utf8mb4                        |
+| character_set_connection | utf8mb4                        |
+| character_set_database   | utf8mb4                        |
+| character_set_filesystem | binary                         |
+| character_set_results    | utf8mb4                        |
+| character_set_server     | utf8mb4                        |
+| character_set_system     | utf8mb3                        |
+| character_sets_dir       | /usr/share/mysql-8.0/charsets/ |
++--------------------------+--------------------------------+
+```
+
+What each one means:
+
+- `character_set_client` is the encoding the server assumes your statements are written in.
+- `character_set_connection` is what string literals are converted to before comparison and storage.
+- `character_set_results` is the encoding used when sending result sets back.
+- `character_set_server` and `character_set_database` are defaults for new databases and tables. They do not change existing tables.
+- `character_set_system` is always `utf8mb3`. It is used for identifiers (table and column names) and is not related to this error. Ignore it.
+
+If the first three show `latin1` or `utf8mb3`, the connection is the problem. Run this in the same session and try the INSERT again:
+
+```sql
+SET NAMES utf8mb4 COLLATE utf8mb4_0900_ai_ci;
+```
+
+`SET NAMES` sets `character_set_client`, `character_set_connection` and `character_set_results` in one statement. If the INSERT now works, fix the client configuration permanently (see the driver sections below) rather than relying on a manual statement.
+
+### Database defaults
+
+```sql
+SELECT SCHEMA_NAME, DEFAULT_CHARACTER_SET_NAME, DEFAULT_COLLATION_NAME
+FROM information_schema.SCHEMATA
+WHERE SCHEMA_NAME = 'shop';
+```
+
+A database default only matters when a new table is created without an explicit character set. It is still worth fixing so new tables do not repeat the mistake:
+
+```sql
+ALTER DATABASE shop CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci;
+```
+
+### Tables and columns
+
+The column definition is what actually decides whether the emoji fits. A table default of `utf8mb4` does not help if an individual column was declared with `utf8mb3`. Find every text column that is not on `utf8mb4`:
+
+```sql
+SELECT TABLE_NAME, COLUMN_NAME, COLUMN_TYPE,
+       CHARACTER_SET_NAME, COLLATION_NAME
+FROM information_schema.COLUMNS
+WHERE TABLE_SCHEMA = 'shop'
+  AND CHARACTER_SET_NAME IS NOT NULL
+  AND CHARACTER_SET_NAME <> 'utf8mb4'
+ORDER BY TABLE_NAME, ORDINAL_POSITION;
+```
+
+And table-level defaults:
+
+```sql
+SELECT TABLE_NAME, TABLE_COLLATION
+FROM information_schema.TABLES
+WHERE TABLE_SCHEMA = 'shop'
+  AND TABLE_COLLATION NOT LIKE 'utf8mb4%';
+```
+
+For a single table, `SHOW CREATE TABLE comments\G` shows both the table default and any per-column overrides.
+
+## Convert tables to utf8mb4
+
+Once you know which tables are affected, convert them. The statement that changes both the table default and every existing text column is:
+
+```sql
+ALTER TABLE comments
+  CONVERT TO CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci;
+```
+
+Compare that with the similar-looking statement that only changes the default for columns added later and leaves existing columns untouched:
+
+```sql
+-- Only changes the table default, NOT existing columns
+ALTER TABLE comments DEFAULT CHARACTER SET utf8mb4;
+```
+
+This is a common trap: people run the second form, check `SHOW CREATE TABLE`, see `utf8mb4` at the bottom, and are surprised that the error persists because the `body` column still carries its own `CHARACTER SET utf8mb3`.
+
+If you only need one column, modify it directly and repeat its full definition, including `NOT NULL`, defaults and comments, because `MODIFY` replaces the whole column definition:
+
+```sql
+ALTER TABLE comments
+  MODIFY body VARCHAR(500)
+  CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci NOT NULL;
+```
+
+### Things to know before running the ALTER
+
+**It rebuilds the table.** Converting character sets copies the data. On a large table this takes time and disk space roughly equal to the table size. Test on a copy first, run it in a maintenance window, or use an online schema change tool if the table is busy.
+
+**TEXT types may be promoted.** `CONVERT TO CHARACTER SET` keeps the character capacity of each column. Since `utf8mb4` needs up to four bytes per character, a `TEXT` column can become `MEDIUMTEXT`, and `MEDIUMTEXT` can become `LONGTEXT`. That is usually harmless, but it shows up in schema diffs and ORM migrations, so check `SHOW CREATE TABLE` afterward and decide whether you want to keep the new type.
+
+**Index key length can overflow.** This is the main risk. An index on `VARCHAR(255)` needs 765 bytes in `utf8mb3` but 1020 bytes in `utf8mb4`. With the InnoDB `DYNAMIC` or `COMPRESSED` row format (the default in MySQL 8), the index key prefix limit is 3072 bytes, so a single `VARCHAR(255)` is fine, but a composite index over several long columns or a table that still uses the old `COMPACT` or `REDUNDANT` row format (767-byte limit) can fail during the conversion with:
+
+```text
+ERROR 1071 (42000): Specified key was too long; max key length is 3072 bytes
+```
+
+Check your indexes before you convert:
+
+```sql
+SELECT s.TABLE_NAME, s.INDEX_NAME,
+       SUM(c.CHARACTER_MAXIMUM_LENGTH * 4) AS utf8mb4_bytes
+FROM information_schema.STATISTICS s
+JOIN information_schema.COLUMNS c
+  ON c.TABLE_SCHEMA = s.TABLE_SCHEMA
+ AND c.TABLE_NAME   = s.TABLE_NAME
+ AND c.COLUMN_NAME  = s.COLUMN_NAME
+WHERE s.TABLE_SCHEMA = 'shop'
+  AND c.CHARACTER_MAXIMUM_LENGTH IS NOT NULL
+GROUP BY s.TABLE_NAME, s.INDEX_NAME
+HAVING utf8mb4_bytes > 767
+ORDER BY utf8mb4_bytes DESC;
+```
+
+The query ignores prefix lengths, so treat it as an upper bound. If you hit the limit, the options are to shorten the column, index a prefix, or change the row format. We cover each one in detail in [MySQL Error 1071: Specified Key Too Long](/blog/mysql-error-1071-specified-key-too-long).
+
+**Collation changes affect comparisons.** `utf8mb4_0900_ai_ci` is accent-insensitive and case-insensitive and uses the Unicode 9.0 collation algorithm. It can treat strings as equal that `utf8mb3_bin` or `latin1_swedish_ci` considered different. If a unique index exists on a text column, the conversion can fail with a duplicate key error. Search for such conflicts first; the approach in [MySQL Error 1062: Duplicate Entry](/blog/mysql-error-1062-duplicate-entry) applies directly.
+
+**Foreign keys need matching charsets.** Columns on both sides of a foreign key must use the same character set and collation. Convert parent and child tables together, and if needed wrap the batch in `SET FOREIGN_KEY_CHECKS = 0;` and `SET FOREIGN_KEY_CHECKS = 1;`. Mismatches otherwise surface as foreign key errors, which are explained in [MySQL Error 1452](/blog/mysql-error-1452-foreign-key-constraint-fails).
+
+### Generate the statements for a whole schema
+
+```sql
+SELECT CONCAT('ALTER TABLE `', TABLE_NAME,
+              '` CONVERT TO CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci;') AS stmt
+FROM information_schema.TABLES
+WHERE TABLE_SCHEMA = 'shop'
+  AND TABLE_TYPE = 'BASE TABLE'
+  AND TABLE_COLLATION NOT LIKE 'utf8mb4%';
+```
+
+Review the output, then run it table by table. Running the generated script in a client that shows each statement's result, such as [Chat2DB](https://chat2db.ai/download), makes it easy to stop at the first 1071 or 1062 failure instead of discovering it at the end of a long batch.
+
+## Fix the connection character set in your application
+
+A correctly converted table still rejects emoji if the driver talks to the server in `utf8mb3` or `latin1`. It can also silently corrupt data: text stored as mojibake or as question marks. Configure every client explicitly.
+
+### Server defaults in my.cnf
+
+Setting server defaults helps clients that do not specify a character set:
+
+```ini
+[mysqld]
+character-set-server = utf8mb4
+collation-server     = utf8mb4_0900_ai_ci
+
+[client]
+default-character-set = utf8mb4
+
+[mysql]
+default-character-set = utf8mb4
+```
+
+On MySQL 8 the server values are already the defaults, so these lines mainly matter for older configuration files that override them with `utf8` or `latin1`. Search your config for such overrides:
+
+```bash
+mysqld --verbose --help | grep -E '^(character-set-server|collation-server)'
+grep -rE 'character.set|collation' /etc/mysql/ /etc/my.cnf /etc/my.cnf.d/ 2>/dev/null
+```
+
+### Java and JDBC (MySQL Connector/J)
+
+With Connector/J 8.x and later, `characterEncoding=UTF-8` is mapped to `utf8mb4`. To pin the collation too, add `connectionCollation`:
+
+```text
+jdbc:mysql://db.example.com:3306/shop?characterEncoding=UTF-8&connectionCollation=utf8mb4_0900_ai_ci
+```
+
+Avoid `characterEncoding=utf8mb3` or old driver versions (5.1 before 5.1.47 does not handle `utf8mb4` well through `characterEncoding`). In connection pools such as HikariCP, put the parameters in the JDBC URL or as data source properties, and do not issue `SET NAMES` through an `initSql` that sets anything other than `utf8mb4`.
+
+### PHP PDO and mysqli
+
+Use the `charset` parameter in the DSN. Running `SET NAMES` after connecting works but leaves the client library unaware of the change, which matters for escaping.
+
+```php
+$pdo = new PDO(
+    'mysql:host=db.example.com;dbname=shop;charset=utf8mb4',
+    'app',
+    getenv('DB_PASSWORD'),
+    [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION]
+);
+```
+
+For mysqli:
+
+```php
+$db = new mysqli('db.example.com', 'app', getenv('DB_PASSWORD'), 'shop');
+$db->set_charset('utf8mb4');
+```
+
+In Laravel, check that `config/database.php` has `'charset' => 'utf8mb4'` and a `utf8mb4` collation. In WordPress, `DB_CHARSET` in `wp-config.php` should be `utf8mb4`.
+
+### Python
+
+PyMySQL and mysqlclient:
+
+```python
+import pymysql
+
+conn = pymysql.connect(
+    host="db.example.com",
+    user="app",
+    password="secret",
+    database="shop",
+    charset="utf8mb4",
+)
+with conn.cursor() as cur:
+    cur.execute("INSERT INTO comments (body) VALUES (%s)", ("Great release 😀",))
+conn.commit()
+```
+
+MySQL Connector/Python uses `utf8mb4` by default in recent versions, but it does no harm to be explicit:
+
+```python
+import mysql.connector
+
+conn = mysql.connector.connect(
+    host="db.example.com", user="app", password="secret",
+    database="shop", charset="utf8mb4", collation="utf8mb4_0900_ai_ci",
+)
+```
+
+With SQLAlchemy, put it in the URL: `mysql+pymysql://app:secret@db.example.com/shop?charset=utf8mb4`.
+
+### The mysql command-line client
+
+```bash
+mysql --default-character-set=utf8mb4 -u app -p shop
+```
+
+Also check your terminal encoding. If the terminal is not UTF-8, the bytes you type or paste are already wrong before they reach MySQL.
+
+## Verify the fix
+
+After converting and reconnecting, insert a test row and look at the stored bytes:
+
+```sql
+INSERT INTO comments (body) VALUES ('Great release 😀');
+
+SELECT body, HEX(body), CHAR_LENGTH(body), LENGTH(body)
+FROM comments
+ORDER BY id DESC
+LIMIT 1;
+```
+
+`HEX(body)` should end in `F09F9880`, and `LENGTH` (bytes) should be three more than `CHAR_LENGTH` (characters) for that one emoji. If you see `3F` (a literal question mark) instead, the value was converted to `?` somewhere on the way in, which points back to the client or connection character set.
+
+## The numeric variants: Incorrect integer and decimal value
+
+Error 1366 is not limited to strings. The same code is raised when a value cannot be converted to a numeric column:
+
+```sql
+CREATE TABLE order_items (
+  id    INT AUTO_INCREMENT PRIMARY KEY,
+  qty   INT NOT NULL,
+  price DECIMAL(10,2) NOT NULL
+);
+
+INSERT INTO order_items (qty, price) VALUES ('', 9.99);
+```
+
+```text
+ERROR 1366 (HY000): Incorrect integer value: '' for column 'qty' at row 1
+```
+
+```sql
+INSERT INTO order_items (qty, price) VALUES (2, 'N/A');
+```
+
+```text
+ERROR 1366 (HY000): Incorrect decimal value: 'N/A' for column 'price' at row 1
+```
+
+These are errors only because of strict SQL mode. MySQL 8's default `sql_mode` includes `STRICT_TRANS_TABLES`:
+
+```sql
+SELECT @@SESSION.sql_mode;
+```
+
+```text
+ONLY_FULL_GROUP_BY,STRICT_TRANS_TABLES,NO_ZERO_IN_DATE,NO_ZERO_DATE,ERROR_FOR_DIVISION_BY_ZERO,NO_ENGINE_SUBSTITUTION
+```
+
+Without strict mode, MySQL stores the "closest" valid value (0 for `''` in an integer column) and only raises warning 1366, which you can see with `SHOW WARNINGS`. That silent conversion is exactly why strict mode exists: an empty form field turning into a quantity of 0 is a data bug, not a feature.
+
+The right fix is almost always in the application:
+
+- Send `NULL` instead of an empty string for missing values, and make the column nullable if missing is a legitimate state.
+- Validate and cast numbers before binding them. Strip currency symbols and thousands separators. `'1,299.00'` is not a valid decimal literal for MySQL.
+- Use prepared statements with typed parameters instead of concatenating strings.
+
+When loading CSV files with `LOAD DATA`, convert empty fields in the statement itself:
+
+```sql
+LOAD DATA LOCAL INFILE '/tmp/items.csv'
+INTO TABLE order_items
+FIELDS TERMINATED BY ',' OPTIONALLY ENCLOSED BY '"'
+IGNORE 1 LINES
+(@qty, @price)
+SET qty   = NULLIF(@qty, ''),
+    price = NULLIF(REPLACE(@price, ',', ''), '');
+```
+
+Disabling strict mode globally to make an import pass is possible (`SET SESSION sql_mode = ...` without `STRICT_TRANS_TABLES`), but it hides every other data problem in that session. If you must, limit it to the one session doing the import and inspect `SHOW WARNINGS` afterward.
+
+## MariaDB differences
+
+MariaDB behaves the same way for the error itself, with a few differences in names and defaults:
+
+- `utf8mb4_0900_ai_ci` is a MySQL collation. On MariaDB versions that do not support it, use `utf8mb4_unicode_ci`, or `utf8mb4_uca1400_ai_ci` on MariaDB 10.10 and later. Dumps from MySQL 8 that reference `utf8mb4_0900_ai_ci` can fail to import into such MariaDB versions for this reason; replace the collation name in the dump.
+- Older MariaDB releases default to `latin1` for `character_set_server`, so tables created without an explicit charset are more likely to hit the error. Newer releases changed the default to `utf8mb4`; check `SHOW VARIABLES LIKE 'character_set_server'` rather than assuming.
+- In MariaDB, `utf8` is also an alias for `utf8mb3` by default.
+
+The diagnostic queries against `information_schema` and the `CONVERT TO CHARACTER SET` statement work the same on both.
+
+## A checklist for the next time
+
+1. Read the bytes in the message. `\xF0` means a 4-byte character; anything else suggests an encoding mismatch in the client.
+2. Run `SHOW VARIABLES LIKE 'character_set%'` from the application's connection, not just from your own client.
+3. Query `information_schema.COLUMNS` for non-`utf8mb4` columns.
+4. Check index sizes, then `ALTER TABLE ... CONVERT TO CHARACTER SET utf8mb4`.
+5. Fix the driver configuration: JDBC URL, PDO DSN, Python `charset`.
+6. Verify with `HEX()`.
+
+If the error code in your log is not 1366, you can look up any MySQL error number, its SQLSTATE and its meaning with the free [MySQL error code lookup tool](https://chat2db.ai/tools/mysql-error-code-lookup).
+
+## FAQ
+
+### Is utf8mb4 slower or larger than utf8mb3?
+
+For characters that fit in three bytes, `utf8mb4` stores exactly the same bytes as `utf8mb3`, so data size does not change. The differences are the maximum reserved size for indexes and in-memory temporary tables, and the collation. `utf8mb4_0900_ai_ci` in MySQL 8 is well optimized, and for most workloads the difference is not noticeable.
+
+### Why does the error still happen after I converted the table?
+
+Usually one of three reasons: you ran `ALTER TABLE ... DEFAULT CHARACTER SET` instead of `CONVERT TO`, so the column still has its own `utf8mb3` definition; the application connection still uses `utf8mb3` or `latin1`; or the value goes into a different table than the one you converted, for example through a trigger or an audit table.
+
+### Can I just strip emoji in the application instead?
+
+You can, and some systems do for fields such as usernames. But it loses user data, and the same error will appear for other 4-byte characters such as some CJK ideographs. Converting to `utf8mb4` fixes the root cause.
+
+### What does error 1366 mean when the column is an INT?
+
+It means strict mode rejected a value that cannot be converted to a number, typically an empty string or text such as `'N/A'`. Send `NULL` or a real number from the application instead of turning off strict mode.

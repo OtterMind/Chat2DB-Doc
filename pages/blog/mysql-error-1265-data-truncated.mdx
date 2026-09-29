@@ -1,0 +1,456 @@
+---
+title: "MySQL Error 1265: Data Truncated for Column"
+description: "Fix MySQL 1265 Data truncated for column and 1406 Data too long: strict sql_mode, ENUM values, bad numbers, LOAD DATA CRLF, ALTER TABLE narrowing, byte size."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: September 28, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# MySQL Error 1265: Data Truncated for Column
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="September 28, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+`Data truncated for column 'x' at row N` is MySQL telling you that the value you tried to store does not fit the column exactly, so it would have to be cut, rounded, or replaced to be stored. Whether that is a hard error or a quiet warning depends on your `sql_mode`, which is why the same statement can work on one server and fail on another.
+
+It has a close sibling, `ERROR 1406 (22001): Data too long for column`, which is raised specifically when a string or binary value is longer than the column allows. The two are often confused, and the fixes overlap, so this guide covers both.
+
+Every error message below was produced on MySQL 8.4.11 with the default `sql_mode`. MySQL 8.0 behaves the same for these cases.
+
+## What the Error Codes Mean
+
+| Code | Symbol | SQLSTATE | Typical message |
+|---|---|---|---|
+| 1265 | `WARN_DATA_TRUNCATED` | 01000 | `Data truncated for column 'status' at row 1` |
+| 1406 | `ER_DATA_TOO_LONG` | 22001 | `Data too long for column 'sku' at row 1` |
+| 1366 | `ER_TRUNCATED_WRONG_VALUE_FOR_FIELD` | HY000 | `Incorrect integer value: '' for column 'qty' at row 1` |
+| 1264 | `ER_WARN_DATA_OUT_OF_RANGE` | 22003 | `Out of range value for column 'price' at row 1` |
+
+Notice the SQLSTATE of 1265: `01000` is a warning class. Code 1265 was designed as a warning, and strict mode promotes it to an error. That is the key to understanding everything else in this article.
+
+The `at row N` part is the row number within the statement, not a primary key. For a multi-row `INSERT` or a `LOAD DATA` file, row 3 means the third row of that statement or file (after any `IGNORE n LINES`).
+
+### Strict Mode Decides Error or Warning
+
+Check your current mode first:
+
+```sql
+SELECT @@GLOBAL.sql_mode, @@SESSION.sql_mode;
+```
+
+On a default MySQL 8.4 install the result is:
+
+```text
+ONLY_FULL_GROUP_BY,STRICT_TRANS_TABLES,NO_ZERO_IN_DATE,NO_ZERO_DATE,ERROR_FOR_DIVISION_BY_ZERO,NO_ENGINE_SUBSTITUTION
+```
+
+`STRICT_TRANS_TABLES` (or `STRICT_ALL_TABLES`) is what turns data conversion problems into errors. With it, MySQL rejects the statement. Without it, MySQL stores an adjusted value and emits a warning you can only see with `SHOW WARNINGS`.
+
+Here is the same table and the same inserts under both modes:
+
+```sql
+CREATE TABLE p (
+  id     INT PRIMARY KEY AUTO_INCREMENT,
+  sku    VARCHAR(5),
+  qty    INT,
+  price  DECIMAL(6,2),
+  status ENUM('new','paid','shipped')
+);
+
+-- strict (default)
+INSERT INTO p (sku)    VALUES ('ABCDEFG');
+INSERT INTO p (qty)    VALUES ('12abc');
+INSERT INTO p (status) VALUES ('cancelled');
+```
+
+```text
+ERROR 1406 (22001): Data too long for column 'sku' at row 1
+ERROR 1265 (01000): Data truncated for column 'qty' at row 1
+ERROR 1265 (01000): Data truncated for column 'status' at row 1
+```
+
+Now with strict mode disabled for the session:
+
+```sql
+SET SESSION sql_mode = '';
+INSERT INTO p (sku)    VALUES ('ABCDEFG');
+INSERT INTO p (qty)    VALUES ('12abc');
+INSERT INTO p (status) VALUES ('cancelled');
+SHOW WARNINGS;
+SELECT sku, qty, status FROM p;
+```
+
+All three inserts succeed. The warnings say `Data truncated for column 'sku'` (note: 1265, not 1406, in non-strict mode), `Data truncated for column 'qty'` and `Data truncated for column 'status'`. The stored values are `ABCDE`, `12`, and an empty string `''` in the ENUM column. That is silent data corruption: the application believes it saved `cancelled`, but the row holds an empty ENUM value.
+
+This is why turning strict mode off is almost never the right fix. It hides the error by storing wrong data.
+
+## Cause 1: String Longer Than the Column (Error 1406)
+
+In strict mode, a string that exceeds `VARCHAR(n)` or `CHAR(n)` fails with 1406:
+
+```sql
+INSERT INTO p (sku) VALUES ('ABCDEFG');
+```
+
+```text
+ERROR 1406 (22001): Data too long for column 'sku' at row 1
+```
+
+Find the real maximum length the application needs, then widen the column:
+
+```sql
+SELECT MAX(CHAR_LENGTH(sku)) FROM staging_products;
+
+ALTER TABLE p MODIFY sku VARCHAR(32);
+```
+
+If the data genuinely must be shortened, do it explicitly so the intent is visible in code review:
+
+```sql
+INSERT INTO p (sku) VALUES (LEFT('ABCDEFG', 5));
+```
+
+### Trailing Spaces Are a Special Case
+
+Excess trailing spaces do not raise 1406. MySQL removes them and records only a note:
+
+```sql
+CREATE TABLE u (id INT PRIMARY KEY, name VARCHAR(5));
+INSERT INTO u VALUES (9, 'abcd   ');
+SHOW WARNINGS;
+```
+
+```text
++-------+------+-------------------------------------------+
+| Level | Code | Message                                   |
++-------+------+-------------------------------------------+
+| Note  | 1265 | Data truncated for column 'name' at row 1 |
++-------+------+-------------------------------------------+
+```
+
+The row is stored as `abcd `. A value with non-space characters beyond the limit, like `'abcdef'`, still fails with 1406. If your tooling treats every 1265 as an error, this note is worth knowing about.
+
+## Cause 2: Character Set and Byte Length
+
+`VARCHAR(n)` and `CHAR(n)` count characters, so `VARCHAR(5)` in `utf8mb4` accepts five Japanese characters even though they take 15 bytes:
+
+```sql
+CREATE TABLE u2 (
+  id   INT PRIMARY KEY,
+  name VARCHAR(5) CHARACTER SET utf8mb4,
+  code VARBINARY(5),
+  tt   TINYTEXT CHARACTER SET utf8mb4
+);
+
+INSERT INTO u2 (id, name) VALUES (1, '日本語東京');         -- OK, 5 characters
+INSERT INTO u2 (id, name) VALUES (2, '日本語東京都');       -- 6 characters
+INSERT INTO u2 (id, code) VALUES (3, '日本');               -- 6 bytes
+INSERT INTO u2 (id, tt)   VALUES (4, REPEAT('日', 100));    -- 300 bytes
+```
+
+```text
+ERROR 1406 (22001): Data too long for column 'name' at row 1
+ERROR 1406 (22001): Data too long for column 'code' at row 1
+ERROR 1406 (22001): Data too long for column 'tt' at row 1
+```
+
+Three different limits are at work:
+
+- `VARCHAR(5)` and `CHAR(5)` limit characters.
+- `BINARY(n)`, `VARBINARY(n)` and all `BLOB` types limit bytes.
+- `TINYTEXT`, `TEXT`, `MEDIUMTEXT` and `LONGTEXT` limit bytes (255, 65,535, 16,777,215 and 4,294,967,295). A `TEXT` column in `utf8mb4` can hold as few as 16,383 four-byte characters.
+
+When a value "fits" by character count but fails anyway, compare `CHAR_LENGTH(val)` with `LENGTH(val)` to see the byte size, and pick the next larger text type if needed. If the error is `1366 Incorrect string value` instead, the problem is an invalid encoding rather than length; see the guide to [MySQL error 1366](/blog/mysql-error-1366-incorrect-string-value).
+
+## Cause 3: Invalid ENUM or SET Values
+
+An ENUM column only accepts its listed members. Anything else produces 1265, including the empty string:
+
+```sql
+INSERT INTO p (status) VALUES ('cancelled');
+INSERT INTO p (status) VALUES ('');
+```
+
+```text
+ERROR 1265 (01000): Data truncated for column 'status' at row 1
+ERROR 1265 (01000): Data truncated for column 'status' at row 1
+```
+
+What is accepted is looser than many people expect. With the default case-insensitive collation, `'PAID'` is stored as `paid`, and trailing spaces are ignored, so `'paid '` is accepted. Leading spaces are not: `' paid'` fails with 1265.
+
+Fixes, in order of preference:
+
+1. Map the application value to a valid member before inserting (for example, `cancelled` to a real status).
+2. If `cancelled` is a legitimate new state, add it to the definition. Keep the existing members in the same order, and add new ones at the end:
+
+```sql
+ALTER TABLE p MODIFY status ENUM('new','paid','shipped','cancelled');
+```
+
+3. Store `NULL` instead of an empty string when the value is unknown and the column is nullable.
+
+To find rows that were already damaged by non-strict inserts, look for the index 0 value:
+
+```sql
+SELECT id, status, status + 0 AS enum_index
+FROM p
+WHERE status = '';
+```
+
+An `enum_index` of 0 means "invalid value was stored as the empty string". For a broader discussion of the trade-offs, see [ENUM in SQL](/blog/enum-in-sql).
+
+## Cause 4: Strings That Are Not Clean Numbers
+
+Numeric columns trigger several related errors depending on what is wrong with the input. These are the results on MySQL 8.4 in strict mode:
+
+| Statement | Result |
+|---|---|
+| `INSERT INTO p (qty) VALUES ('12abc')` | `ERROR 1265: Data truncated for column 'qty'` |
+| `INSERT INTO p (qty) VALUES ('')` | `ERROR 1366: Incorrect integer value: '' for column 'qty'` |
+| `INSERT INTO p (price) VALUES ('')` | `ERROR 1366: Incorrect decimal value: '' for column 'price'` |
+| `INSERT INTO p (price) VALUES ('1,234.50')` | `ERROR 1366: Incorrect decimal value: '1,234.50'` |
+| `INSERT INTO p (price) VALUES ('$19.99')` | `ERROR 1366: Incorrect decimal value: '$19.99'` |
+| `INSERT INTO p (price) VALUES (12345.6)` | `ERROR 1264: Out of range value for column 'price'` |
+| `INSERT INTO p (price) VALUES (1.234)` | Succeeds, stores `1.23`, `Note 1265` |
+| `INSERT INTO p (qty) VALUES ('3.7')` | Succeeds, stores `4`, no warning |
+
+A few things stand out.
+
+Empty strings in numeric columns raise 1366, not 1265, on current MySQL versions. Many older answers online say "empty string into INT gives Data truncated". If you are searching for the message, check both numbers.
+
+A string with a numeric prefix followed by junk (`'12abc'`) is the classic 1265 trigger. In non-strict mode it stores `12`, which is rarely what anyone wanted.
+
+Extra decimal places are rounded and reported as a `Note`, even in strict mode. The insert succeeds. If you need to catch this, validate the scale in the application or use `ROUND()` explicitly.
+
+The fix for all of these is to clean the value before it reaches MySQL:
+
+```sql
+INSERT INTO p (qty, price)
+VALUES (
+  NULLIF(TRIM(@qty_text), ''),
+  CAST(REPLACE(REPLACE(NULLIF(TRIM(@price_text), ''), '$', ''), ',', '') AS DECIMAL(6,2))
+);
+```
+
+`NULLIF(x, '')` turns an empty string into `NULL`, which a nullable numeric column accepts without complaint. Stripping currency symbols and thousands separators is better done in the application, where locale rules are known.
+
+### Dates and Times Report 1292 Instead
+
+Date columns have their own code. `'2026-02-30'` fails with `ERROR 1292 (22007): Incorrect date value`, and an ISO string with `T` and `Z` such as `'2026-09-28T13:45:00Z'` also fails with 1292 in a `DATE` column. Inserting a full datetime like `'2026-09-28 13:45:00'` or `NOW()` into a `DATE` succeeds and records `Note 1292`, because the time part is dropped.
+
+## Cause 5: LOAD DATA With CRLF Line Endings or Empty Fields
+
+`LOAD DATA` is where 1265 appears most often, because CSV files exported from Windows tools and spreadsheets end each line with `\r\n`. If you tell MySQL lines end in `\n` (the default), the `\r` stays attached to the last field of every row.
+
+Take this file saved with CRLF endings:
+
+```text
+id,qty,status
+1,5,paid
+2,3,new
+```
+
+Loading it into a table whose last column is an ENUM:
+
+```sql
+CREATE TABLE orders (
+  id     INT PRIMARY KEY,
+  qty    INT,
+  status ENUM('new','paid','shipped')
+);
+
+LOAD DATA INFILE '/var/lib/mysql-files/orders.csv'
+INTO TABLE orders
+FIELDS TERMINATED BY ','
+IGNORE 1 LINES;
+```
+
+```text
+ERROR 1265 (01000): Data truncated for column 'status' at row 1
+```
+
+The value MySQL sees is `paid\r`, which is not an ENUM member. With `LOAD DATA ... IGNORE`, the load succeeds but every `status` becomes an empty string and `SHOW WARNINGS` lists one 1265 per row. That is worse than the error.
+
+The damage depends on the type of the last column:
+
+- ENUM or SET: 1265 in strict mode, empty value otherwise.
+- VARCHAR or TEXT: no error at all. The `\r` is silently stored (`HEX(col)` ends in `0D`), which later breaks equality comparisons and joins.
+- INT: in our test, `'5\r'` was accepted as `5` without a warning, so the problem stays hidden until another column type is last.
+
+Declare the correct line terminator:
+
+```sql
+LOAD DATA INFILE '/var/lib/mysql-files/orders.csv'
+INTO TABLE orders
+FIELDS TERMINATED BY ','
+LINES TERMINATED BY '\r\n'
+IGNORE 1 LINES;
+```
+
+If you do not know how a file ends, check it before loading:
+
+```bash
+file orders.csv
+head -2 orders.csv | od -c | head
+```
+
+`file` reports "with CRLF line terminators", and `od -c` shows `\r  \n` at line ends.
+
+### Empty Fields in Numeric Columns
+
+A CSV row like `2,B2,,` has empty strings for the last two fields. Loading that into `INT` and `DECIMAL` columns in strict mode stops the load:
+
+```text
+ERROR 1366 (HY000): Incorrect integer value: '' for column 'qty' at row 2
+```
+
+Read the raw values into user variables and convert them with `NULLIF`:
+
+```sql
+LOAD DATA INFILE '/var/lib/mysql-files/items.csv'
+INTO TABLE items
+FIELDS TERMINATED BY ','
+LINES TERMINATED BY '\r\n'
+IGNORE 1 LINES
+(id, sku, @qty, @price)
+SET qty   = NULLIF(@qty, ''),
+    price = NULLIF(@price, '');
+```
+
+Alternatively, have the exporter write `\N` for missing values, which `LOAD DATA` reads as `NULL`.
+
+For client-side files, the same options apply to `LOAD DATA LOCAL INFILE`, which additionally requires `local_infile` to be enabled on both client and server.
+
+## Cause 6: ALTER TABLE That Narrows a Column
+
+Shrinking a column that already holds longer data fails with 1265, not 1406:
+
+```sql
+CREATE TABLE c (id INT PRIMARY KEY, city VARCHAR(40), note VARCHAR(20));
+INSERT INTO c VALUES (1, 'Springfield', 'ok'), (2, 'Llanfairpwllgwyngyll', 'ok'), (3, 'NY', 'ok');
+
+ALTER TABLE c MODIFY city VARCHAR(10);
+```
+
+```text
+ERROR 1265 (01000): Data truncated for column 'city' at row 1
+```
+
+The same happens when you convert a VARCHAR to an ENUM that does not contain every existing value, or remove a member from an ENUM that is still in use:
+
+```sql
+ALTER TABLE c MODIFY note ENUM('bad');
+```
+
+```text
+ERROR 1265 (01000): Data truncated for column 'note' at row 1
+```
+
+Converting text to a number reports the value instead, which is more helpful:
+
+```text
+ERROR 1366 (HY000): Incorrect integer value: 'Springfield' for column 'city' at row 1
+```
+
+Before any narrowing change, find the rows that will not fit:
+
+```sql
+SELECT id, city, CHAR_LENGTH(city) AS len
+FROM c
+WHERE CHAR_LENGTH(city) > 10;
+
+SELECT note, COUNT(*)
+FROM c
+WHERE note NOT IN ('bad')
+GROUP BY note;
+```
+
+Then decide row by row: widen the target size, fix the data with an `UPDATE`, or move the offending rows somewhere else. Only run the `ALTER` once those queries return nothing. The ALTER itself is atomic in InnoDB, so a failed attempt does not leave the table half converted.
+
+## Multi-Row Inserts and Non-Transactional Tables
+
+With InnoDB and `STRICT_TRANS_TABLES`, a bad value in any row rejects the whole statement:
+
+```sql
+CREATE TABLE inn (id INT, s VARCHAR(3)) ENGINE=InnoDB;
+INSERT INTO inn VALUES (1,'ab'), (2,'abcdef'), (3,'x');
+-- ERROR 1406 (22001): Data too long for column 's' at row 2
+-- no rows inserted
+```
+
+For a non-transactional engine such as MyISAM, `STRICT_TRANS_TABLES` only aborts if the bad value is in the first row. For later rows MySQL cannot roll back what it already wrote, so it adjusts the value and issues a warning:
+
+```sql
+CREATE TABLE my (id INT, s VARCHAR(3)) ENGINE=MyISAM;
+INSERT INTO my VALUES (1,'ab'), (2,'abcdef'), (3,'x');
+SHOW WARNINGS;   -- Warning 1406 Data too long for column 's' at row 2
+SELECT * FROM my; -- 1 ab / 2 abc / 3 x
+```
+
+`STRICT_ALL_TABLES` changes that, but can leave a partial insert behind. The practical advice is to use InnoDB.
+
+## INSERT IGNORE and UPDATE IGNORE Hide the Problem
+
+`IGNORE` downgrades these errors back to warnings even in strict mode:
+
+```sql
+INSERT IGNORE INTO m (id, price, qty) VALUES (7, '1,234.50', 1);
+SHOW WARNINGS;
+```
+
+The row is inserted with `price = 1.00` and the warning is `Note 1265 Data truncated for column 'price' at row 1`. The same `'1,234.50'` without `IGNORE` is rejected with 1366. If you use `INSERT IGNORE` to skip duplicate keys, remember that it also accepts every truncated value in the same statement. For duplicates specifically, `INSERT ... ON DUPLICATE KEY UPDATE` is narrower; see [MySQL error 1062](/blog/mysql-error-1062-duplicate-entry).
+
+## Should You Turn Off Strict Mode?
+
+You will find advice to fix 1265 with:
+
+```sql
+SET GLOBAL sql_mode = '';
+```
+
+It makes the error disappear and the data wrong. Only consider it as a short, documented bridge for a legacy application you cannot change yet, and even then remove only the strict flags rather than clearing the mode entirely:
+
+```sql
+SET SESSION sql_mode = REPLACE(@@SESSION.sql_mode, 'STRICT_TRANS_TABLES,', '');
+```
+
+Scope it to the session of the legacy job rather than the whole server, and schedule the real fix.
+
+## Reading the Error From Application Code
+
+Drivers surface 1265 in different wrappers. MySQL Connector/J, for example, throws a `MysqlDataTruncation` exception whose message starts with `Data truncation: Data truncated for column`. Other drivers expose the numeric code (`errno` 1265 or 1406) and the SQLSTATE. Log the column name and the row number, then log the actual parameter values for that row. The value almost always explains the problem on sight: a trailing `\r`, an empty string, a currency symbol, an ENUM label with different spelling.
+
+If an error code you get back is not one of those covered here, the [MySQL error code lookup tool](https://chat2db.ai/tools/mysql-error-code-lookup) resolves any MySQL error number to its symbol and meaning.
+
+## A Checklist for 1265 and 1406
+
+1. Read the column name and row number from the message.
+2. Run `SHOW CREATE TABLE` to see the exact type, length, character set and ENUM members.
+3. Compare the offending value with the definition using `CHAR_LENGTH()`, `LENGTH()` and `HEX()`.
+4. For files, check line endings with `file` and set `LINES TERMINATED BY '\r\n'` when needed.
+5. Convert empty strings to `NULL` with `NULLIF(x, '')`.
+6. Before narrowing a column, query for rows that exceed the new limit.
+7. Keep strict mode on, and avoid `IGNORE` unless you have inspected every warning it would swallow.
+
+A client that shows warnings next to results makes steps 2 and 3 quicker. In [Chat2DB](https://chat2db.ai/download) you can open the table structure beside the editor, run `SELECT HEX(col)` on a suspicious row, and see the exact bytes that tripped the check.
+
+## FAQ
+
+### What is the difference between error 1265 and error 1406?
+
+1406 means a string or binary value is longer than the column allows. 1265 is the general "value had to be changed to fit" condition: invalid ENUM members, numbers with trailing junk, and existing rows that do not fit during `ALTER TABLE`. In non-strict mode an over-long string is reported as warning 1265 instead of error 1406.
+
+### Why does my insert work locally but fail in production?
+
+The two servers probably have different `sql_mode` values. Compare `SELECT @@GLOBAL.sql_mode` on both. The one without `STRICT_TRANS_TABLES` is accepting and silently altering the data.
+
+### Why do I get 1265 on every row of a CSV import?
+
+Almost always because the file uses CRLF line endings and the last column is an ENUM, SET or strictly validated type. Add `LINES TERMINATED BY '\r\n'` to the `LOAD DATA` statement.
+
+### Is a "Note 1265" something to worry about?
+
+Notes appear for trailing spaces that were removed and decimals that were rounded to the column scale. The statement succeeded, but the stored value differs from the input. Decide whether that rounding is acceptable for the column; for money it usually means the scale is too small.

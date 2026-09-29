@@ -1,0 +1,478 @@
+---
+title: "pg_upgrade to PostgreSQL 18: Step-by-Step Guide"
+description: "Run pg_upgrade from PostgreSQL 16 or 17 to 18: --check, link vs copy vs clone vs swap, the data checksums mismatch, kept statistics, rollback and Docker."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: September 29, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# pg_upgrade to PostgreSQL 18: Step-by-Step Guide
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="September 29, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+`pg_upgrade` moves a PostgreSQL cluster to a new major version without dumping and reloading every row. It recreates the system catalogs in a fresh cluster of the new version, then reuses (copies, links, clones or moves) the existing data files. For a large database this turns a restore measured in hours into an operation measured in minutes or seconds.
+
+PostgreSQL 18 changes several things about that process. `pg_upgrade` now carries planner statistics across, there is a new `--swap` transfer mode, and `initdb` enables data checksums by default, which causes a new and very common `--check` failure. This guide is a hands-on walkthrough of a 17 to 18 upgrade with those changes in mind. The same steps apply from PostgreSQL 16 or older supported versions.
+
+Every command output in this article was captured while upgrading a PostgreSQL 17.11 cluster to PostgreSQL 18.6 on Debian (inside a disposable Docker container). Timings are not shown as benchmarks; upgrade time depends mainly on the number of objects and the transfer mode.
+
+If you are still deciding **how** to upgrade (pg_upgrade vs dump/restore vs logical replication), start with the broader [PostgreSQL major version upgrade guide](/blog/postgres-major-version-upgrade-guide). This article assumes you have picked pg_upgrade.
+
+## How pg_upgrade Works
+
+Understanding the mechanics makes every option below easier to reason about:
+
+1. You create an **empty** new cluster with the new version's `initdb`.
+2. `pg_upgrade` starts the old server, dumps only the **schema** (`pg_dump --schema-only`, plus globals such as roles), and stops it.
+3. It restores that schema into the new cluster, preserving the original relation file numbers and OIDs.
+4. It transfers the user data files from the old data directory to the new one, using the chosen mode.
+5. It copies transaction status (`pg_xact`, multixacts) so existing tuples remain visible.
+
+Because the data files are reused as-is, the on-disk format of tables and indexes must be compatible between versions, which PostgreSQL guarantees for supported upgrade paths. It also means the new cluster must be created with **compatible settings**: encoding, locale, and, new in practice for 18, data checksums.
+
+## Step 1: Install the New Binaries Next to the Old Ones
+
+`pg_upgrade` needs both versions' binaries at the same time. On Debian/Ubuntu with the PGDG repository they live in versioned directories:
+
+```bash
+sudo apt-get install postgresql-18
+ls /usr/lib/postgresql/
+# 17  18
+```
+
+On RHEL-family systems the paths are `/usr/pgsql-17/bin` and `/usr/pgsql-18/bin`.
+
+Install the **same extensions** for the new version too. If the old cluster uses PostGIS, pgvector, TimescaleDB, hypopg or any other extension with a shared library, you need the PostgreSQL 18 build of that package (for example `postgresql-18-pgvector`). This is the most common reason `--check` fails, as shown below.
+
+Check what is installed in every database of the old cluster:
+
+```sql
+SELECT extname, extversion FROM pg_extension ORDER BY 1;
+```
+
+## Step 2: Initialize the New Cluster
+
+Create the new data directory with the new `initdb`, run as the `postgres` OS user:
+
+```bash
+/usr/lib/postgresql/18/bin/initdb -D /var/lib/postgresql/18/main -U postgres
+```
+
+Match the old cluster's encoding and locale. Check them on the old server:
+
+```sql
+SELECT datname, pg_encoding_to_char(encoding), datcollate, datctype, datlocprovider
+FROM pg_database;
+```
+
+Pass the same values to `initdb` (`--encoding`, `--locale`, `--locale-provider`) if they differ from the system defaults. Also use the same bootstrap superuser name with `-U`.
+
+### The Data Checksums Trap in PostgreSQL 18
+
+PostgreSQL 18's `initdb` enables data page checksums by default. The output of a default `initdb` says so:
+
+```text
+Data page checksums are enabled.
+```
+
+Most clusters created on 17 or earlier do **not** have checksums, because it used to be opt-in:
+
+```sql
+SHOW data_checksums;
+```
+
+```text
+ data_checksums
+----------------
+ off
+```
+
+`pg_upgrade` cannot convert data files between the two states, so the check fails immediately:
+
+```text
+Performing Consistency Checks
+-----------------------------
+Checking cluster versions                                     ok
+
+old cluster does not use data checksums but the new one does
+Failure, exiting
+```
+
+You have two ways out:
+
+**Option A: create the new cluster without checksums.**
+
+```bash
+rm -rf /var/lib/postgresql/18/main
+/usr/lib/postgresql/18/bin/initdb -D /var/lib/postgresql/18/main -U postgres --no-data-checksums
+```
+
+```text
+Data page checksums are disabled.
+```
+
+**Option B: enable checksums on the old cluster first.** `pg_checksums --enable` rewrites every data page, so it needs the old server **stopped** and takes time proportional to the cluster size:
+
+```bash
+/usr/lib/postgresql/17/bin/pg_ctl -D /var/lib/postgresql/17/main stop
+/usr/lib/postgresql/17/bin/pg_checksums --enable -D /var/lib/postgresql/17/main
+```
+
+```text
+Checksum operation completed
+Files scanned:   948
+Blocks scanned:  2823
+Files written:  780
+Blocks written: 2823
+pg_checksums: syncing data directory
+pg_checksums: updating control file
+Checksums enabled in cluster
+```
+
+(That output is from a nearly empty test cluster. On a real database, schedule the downtime accordingly.) After that, a default PostgreSQL 18 `initdb` matches and the upgrade proceeds, including in `--link` mode.
+
+The pragmatic choice for most teams is Option A for the upgrade itself, and enabling checksums later as a separate, planned maintenance step. Either way, make the choice deliberately: checksums help detect storage corruption early.
+
+The Docker official image is affected as well. A fresh `postgres:18` container reports `data_checksums = on`, while a fresh `postgres:17` container reports `off`.
+
+## Step 3: Run pg_upgrade --check
+
+`--check` runs every compatibility test without changing anything. It can even run while the old server is still up, which makes it safe to do days before the maintenance window:
+
+```bash
+cd /tmp   # pg_upgrade writes logs and scripts to the current directory
+/usr/lib/postgresql/18/bin/pg_upgrade --check \
+  -b /usr/lib/postgresql/17/bin -B /usr/lib/postgresql/18/bin \
+  -d /var/lib/postgresql/17/main -D /var/lib/postgresql/18/main \
+  -p 5432
+```
+
+Against a running old server the header says so:
+
+```text
+Performing Consistency Checks on Old Live Server
+------------------------------------------------
+Checking cluster versions                                     ok
+```
+
+A successful check on PostgreSQL 18 looks like this:
+
+```text
+Checking cluster versions                                     ok
+Checking database connection settings                         ok
+Checking database user is the install user                    ok
+Checking for prepared transactions                            ok
+Checking for contrib/isn with bigint-passing mismatch         ok
+Checking for valid logical replication slots                  ok
+Checking for subscription state                               ok
+Checking data type usage                                      ok
+Checking for objects affected by Unicode update               ok
+Checking for not-null constraint inconsistencies              ok
+Checking for presence of required libraries                   ok
+Checking database user is the install user                    ok
+Checking for prepared transactions                            ok
+Checking for new cluster tablespace directories               ok
+
+*Clusters are compatible*
+```
+
+If your config files live outside the data directory (as on Debian, where they are in `/etc/postgresql/17/main`), point `pg_upgrade` at them with `-o "-c config_file=/etc/postgresql/17/main/postgresql.conf"` and the equivalent `-O` for the new cluster.
+
+### Missing Extension Libraries
+
+This is what `--check` reports when an extension is installed in the old cluster but its library is missing from the new installation. Here, `hypopg` was installed for 17 only:
+
+```text
+Checking for presence of required libraries                   fatal
+
+Your installation references loadable libraries that are missing from the
+new installation.  You can add these libraries to the new installation,
+or remove the functions using them from the old installation.  A list of
+problem libraries is in the file:
+    /var/lib/postgresql/18/main/pg_upgrade_output.d/20260929T081040.512/loadable_libraries.txt
+Failure, exiting
+```
+
+The file names the library and the database:
+
+```text
+could not load library "$libdir/hypopg": ERROR:  could not access file "$libdir/hypopg": No such file or directory
+In database: postgres
+```
+
+Install the PostgreSQL 18 build of the extension (or drop the extension from the old cluster if it is unused) and rerun `--check`.
+
+### Other Common Check Failures
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| `old cluster does not use data checksums but the new one does` | PG18 `initdb` default | `initdb --no-data-checksums` or `pg_checksums --enable` on old |
+| `Checking for presence of required libraries  fatal` | Extension not installed for new version | Install the new version's extension package |
+| Locale or encoding mismatch reported | New cluster created with different locale | Re-run `initdb` with matching `--locale` / `--encoding` |
+| Prepared transactions check fails | Leftover two-phase transactions | `COMMIT PREPARED` / `ROLLBACK PREPARED` them |
+| Install user check fails | `-U` differs from the old bootstrap superuser | Use the same superuser name for `initdb -U` and `pg_upgrade -U` |
+| New cluster reported as not empty | Objects created in the new cluster | Re-run `initdb`; do not touch the new cluster before upgrading |
+
+The first two messages are quoted from the runs above; the others are summarized, so search the log for the check name that failed. `pg_upgrade` keeps detailed logs in `pg_upgrade_output.d` inside the new data directory when a run fails.
+
+## Step 4: Choose a Transfer Mode
+
+This is the decision with the biggest impact on downtime and on your rollback options.
+
+| Mode | How files move | Speed | Extra disk | Old cluster after upgrade |
+|---|---|---|---|---|
+| `--copy` (default) | Full copy | Slowest, proportional to data size | 100% of data | Intact and startable |
+| `--copy-file-range` | Kernel `copy_file_range` | Faster copy, can share blocks on some file systems | Up to 100% | Intact and startable |
+| `--clone` | Reflink / copy-on-write clone | Near-instant | Only blocks later changed | Intact and startable |
+| `--link` | Hard links | Near-instant | Almost none | Must not be started once the new cluster has started |
+| `--swap` (new in 18) | Moves data directories | Near-instant | Almost none | Cannot be safely started |
+
+A few notes on each:
+
+- **`--copy`** is the safest and the slowest. Use it when the data is small enough that copy time is acceptable, or when you must keep the old cluster fully usable as a fallback.
+- **`--clone`** gives link-like speed while keeping the old cluster independent, but requires a file system with reflinks (XFS with reflink enabled, Btrfs, APFS on macOS). Otherwise `--check --clone` fails with `could not clone file between old and new data directories: Operation not supported`, which is what we got on the container's overlay file system.
+- **`--link`** is the classic fast mode. Old and new clusters share the same files, so the moment the new server writes to them, the old cluster is no longer valid.
+- **`--swap`**, added in PostgreSQL 18, moves the old cluster's data directories into the new cluster instead of linking each file. For databases with a very large number of relation files it can be faster than `--link`, and it leaves no shared files behind. The trade-off is explicit in the output: the old cluster can no longer be safely started.
+
+Add `-j` (`--jobs`) with the number of CPU cores to parallelize the file transfer and the per-database work in clusters with many databases or tablespaces.
+
+## Step 5: Run the Upgrade
+
+Stop both servers, then run the real upgrade. Here with `--swap`, using environment variables instead of flags:
+
+```bash
+sudo systemctl stop postgresql@17-main
+
+export PGBINOLD=/usr/lib/postgresql/17/bin
+export PGBINNEW=/usr/lib/postgresql/18/bin
+export PGDATAOLD=/var/lib/postgresql/17/main
+export PGDATANEW=/var/lib/postgresql/18/main
+
+cd /tmp
+/usr/lib/postgresql/18/bin/pg_upgrade --swap -j 4
+```
+
+The important parts of the output:
+
+```text
+If pg_upgrade fails after this point, you must re-initdb the
+new cluster before continuing.
+
+Performing Upgrade
+------------------
+Setting locale and encoding for new cluster                   ok
+...
+Restoring global objects in the new cluster                   ok
+Restoring database schemas in the new cluster                 ok
+Adding ".old" suffix to old "global/pg_control"               ok
+
+Because "swap" mode was used, the old cluster can no longer be
+safely started.
+Swapping data directories                                     ok
+Setting next OID for new cluster                              ok
+Sync data directory to disk                                   ok
+Creating script to delete old cluster                         ok
+Checking for extension updates                                notice
+
+Your installation contains extensions that should be updated
+with the ALTER EXTENSION command.  The file
+    update_extensions.sql
+when executed by psql by the database superuser will update
+these extensions.
+
+Upgrade Complete
+----------------
+Some statistics are not transferred by pg_upgrade.
+Once you start the new server, consider running these two commands:
+    /usr/lib/postgresql/18/bin/vacuumdb --all --analyze-in-stages --missing-stats-only
+    /usr/lib/postgresql/18/bin/vacuumdb --all --analyze-only
+Running this script will delete the old cluster's data files:
+    ./delete_old_cluster.sh
+```
+
+With `--link` the message is slightly different and tells you how to recover the old cluster if the new one has **not** been started yet:
+
+```text
+If you want to start the old cluster, you will need to remove
+the ".old" suffix from "/tmp/c17/global/pg_control.old".
+Because "link" mode was used, the old cluster cannot be safely
+started once the new cluster has been started.
+```
+
+Before starting the new server, bring over configuration: `postgresql.conf` settings, `pg_hba.conf` rules and any `conf.d` includes. `pg_upgrade` does not migrate configuration files. Review parameters that were removed or renamed in the new release rather than copying the old file blindly, and carry over your `pg_hba.conf` rules unchanged unless you are also changing authentication.
+
+## Step 6: Post-Upgrade Tasks
+
+Start the new server and work through this list before opening it to traffic.
+
+### Planner Statistics Now Survive the Upgrade
+
+Before PostgreSQL 18, a freshly upgraded cluster had **no** optimizer statistics. Until `ANALYZE` finished, the planner guessed, and the first hour after an upgrade was often the worst for query performance.
+
+PostgreSQL 18's `pg_upgrade` transfers most statistics. In our test, a table analyzed on 17 still had its column statistics after the upgrade, before any `ANALYZE` ran on 18:
+
+```sql
+SELECT count(*) AS column_stats FROM pg_stats WHERE schemaname = 'public';
+```
+
+```text
+ column_stats
+--------------
+            4
+```
+
+`pg_stat_user_tables.last_analyze` was empty, because that is activity-counter data, not planner statistics, and the plan already used the column's real estimate:
+
+```sql
+EXPLAIN SELECT * FROM orders WHERE customer_id = 42;
+```
+
+```text
+ Bitmap Heap Scan on orders  (cost=5.83..549.57 rows=198 width=25)
+   Recheck Cond: (customer_id = 42)
+   ->  Bitmap Index Scan on orders_customer_id_idx  (cost=0.00..5.78 rows=198 width=0)
+         Index Cond: (customer_id = 42)
+```
+
+What does **not** transfer is **extended statistics** created with `CREATE STATISTICS`. The object exists in the new cluster, but it has no data:
+
+```sql
+SELECT statistics_name, n_distinct IS NOT NULL AS has_data FROM pg_stats_ext;
+```
+
+```text
+ statistics_name | has_data
+-----------------+----------
+(0 rows)
+```
+
+That is why the upgrade output recommends `vacuumdb --missing-stats-only`, a new PostgreSQL 18 option that analyzes only relations with missing statistics instead of the whole cluster:
+
+```bash
+/usr/lib/postgresql/18/bin/vacuumdb --all --analyze-in-stages --missing-stats-only -j 4
+```
+
+```text
+vacuumdb: processing database "postgres": Generating minimal optimizer statistics (1 target)
+vacuumdb: processing database "shop": Generating minimal optimizer statistics (1 target)
+vacuumdb: processing database "template1": Generating minimal optimizer statistics (1 target)
+vacuumdb: processing database "postgres": Generating medium optimizer statistics (10 targets)
+...
+vacuumdb: processing database "shop": Generating default (full) optimizer statistics
+```
+
+Afterwards the extended statistics were populated:
+
+```text
+  statistics_name   | has_data
+--------------------+----------
+ orders_cust_status | t
+```
+
+`--analyze-in-stages` builds rough statistics first (target 1, then 10, then the default) so the planner gets usable numbers quickly. The second recommended command, `vacuumdb --all --analyze-only`, refreshes everything; it is safe to run later, off-peak. If you prefer the old behaviour, `pg_upgrade --no-statistics` skips the statistics transfer. The mechanics of planner statistics are covered in [ANALYZE and planner statistics](/blog/postgres-analyze-and-planner-statistics).
+
+The transfer is done by the new version's `pg_upgrade`, so it applies when the target is 18 or later, whichever supported version you come from. Upgrades into 17 or earlier transfer no statistics at all, and a full `vacuumdb --all --analyze-in-stages` is mandatory there.
+
+### Update Extensions
+
+`pg_upgrade` keeps each extension at its old version. The generated `update_extensions.sql` brings them to the new default versions:
+
+```bash
+psql -U postgres -f update_extensions.sql
+```
+
+```text
+You are now connected to database "shop" as user "postgres".
+ALTER EXTENSION
+```
+
+In our test this moved `pg_stat_statements` from 1.11 to 1.12. Extensions with their own upgrade procedures (PostGIS, TimescaleDB) may need additional steps from their documentation.
+
+### Replicas, Collations and Cleanup
+
+- **Streaming replicas** cannot be upgraded by themselves. Either rebuild them from the new primary with `pg_basebackup`, or follow the documented `rsync --hard-links` procedure for `--link` upgrades, which is fast but must be done exactly as documented.
+- **Logical replication slots**: when the old cluster is PostgreSQL 17 or later, `pg_upgrade` can migrate logical slots and subscriptions, subject to the checks listed above. From older versions, recreate them after the upgrade.
+- **Collations**: if the upgrade also changed the OS (for example a new Debian release with a newer glibc), indexes on text columns may need rebuilding. See [collation version mismatch](/blog/postgres-collation-version-mismatch).
+- **Cleanup**: run `delete_old_cluster.sh` only after you are sure you will not roll back.
+
+## Rollback Plan
+
+Decide how you would go back **before** you start, because the transfer mode determines what is possible:
+
+| Mode | Rollback before new server starts | Rollback after new server starts |
+|---|---|---|
+| `--copy` / `--clone` / `--copy-file-range` | Start the old cluster | Start the old cluster, but writes made on 18 are lost |
+| `--link` | Rename `global/pg_control.old` back and start the old cluster | Restore from backup or promote a replica |
+| `--swap` | Restore from backup or promote a replica | Restore from backup or promote a replica |
+
+Practical rules:
+
+- Take a verified backup (physical with pgBackRest or `pg_basebackup`, or a logical dump) right before the window.
+- For `--link` or `--swap`, keep a streaming replica on the **old** version detached before the upgrade. It is the fastest rollback target.
+- Test the whole procedure on a copy of production first, including application smoke tests against the new version.
+
+Dump-based fallbacks are described in [pg_dump and pg_restore backups](/blog/pg-dump-pg-restore-backup-guide).
+
+## Debian, Ubuntu and pg_upgradecluster
+
+On Debian-based systems, `postgresql-common` wraps all of this in `pg_upgradecluster`, which creates the new cluster, migrates configuration from `/etc/postgresql`, runs the upgrade and switches ports:
+
+```bash
+sudo pg_upgradecluster -v 18 -m upgrade 17 main
+# or: -m link, -m clone
+```
+
+Be aware of two defaults, taken from the script's own documentation in `postgresql-common` 293:
+
+- The default method is `dump` (pg_dumpall and restore), not `pg_upgrade`. Pass `-m upgrade`, `-m link` or `-m clone` to use pg_upgrade.
+- Checksums are handled for you. When the old cluster has no checksums and the method is `upgrade`, the new 18 cluster is created with `--no-data-checksums`. With the `dump` method, the new 18 cluster gets checksums enabled by default, which is a convenient way to switch them on during an upgrade if you can afford dump/restore time.
+
+After a successful run, `pg_dropcluster 17 main` removes the old cluster once you are confident.
+
+## Upgrading PostgreSQL in Docker
+
+The official `postgres` images contain only one major version, so `pg_upgrade` cannot run inside the normal 18 container out of the box. Also note a layout change in the 18 image: `PGDATA` is `/var/lib/postgresql/18/docker` and the declared volume is `/var/lib/postgresql`, while images up to 17 used `/var/lib/postgresql/data` for both. Mounting an old volume at the old path in an 18 container will not pick up your data.
+
+A workable approach is a one-off container based on the 18 image with the 17 binaries added from the PGDG repository (the image already has the repository configured for 18 only):
+
+```bash
+docker run --rm -it -u root \
+  -v pgdata17:/old -v pgdata18:/var/lib/postgresql \
+  postgres:18 bash
+
+# inside the container
+sed -i 's/ main 18$/ main 17 18/' /etc/apt/sources.list.d/pgdg.list
+apt-get update && apt-get install -y postgresql-17
+su postgres -c '/usr/lib/postgresql/18/bin/initdb -D /var/lib/postgresql/18/docker --no-data-checksums'
+cd /tmp && su postgres -c '/usr/lib/postgresql/18/bin/pg_upgrade \
+  -b /usr/lib/postgresql/17/bin -B /usr/lib/postgresql/18/bin \
+  -d /old -D /var/lib/postgresql/18/docker --check'
+```
+
+Adjust `/old` to wherever `PG_VERSION` lives in your old volume, match the `initdb -U` user to your old `POSTGRES_USER`, and install any extension packages for both versions. Community images such as `tianon/postgres-upgrade` package this pattern with both versions preinstalled. Hard links only work within one file system, so `--link` requires the old and new directories to be on the same volume; with two separate volumes use the default copy mode.
+
+## Alternatives to pg_upgrade
+
+| Method | Downtime | Best for |
+|---|---|---|
+| `pg_upgrade --link` / `--swap` | Minutes, mostly independent of data size | Most self-managed servers |
+| `pg_dump` / `pg_restore` | Proportional to data size | Small databases, changing encoding or checksums, moving hosts |
+| Logical replication | Seconds at cutover | Large databases that cannot afford a maintenance window |
+
+Logical replication runs the new version side by side and cuts over when it has caught up, at the cost of more setup (sequences, DDL and large objects are not replicated). See the [logical replication guide](/blog/postgres-logical-replication-guide) for that path.
+
+## After the Upgrade
+
+Once the new cluster is live, spot-check query plans and the statistics state. Connecting a SQL client such as [Chat2DB](https://chat2db.ai/download) to both the old (if still available) and the new server lets you run the same `EXPLAIN` and `pg_stats_ext` queries side by side and confirm that nothing regressed before you delete the old data directory.
+
+## Summary
+
+- Install new binaries and extension packages, `initdb` a new cluster with matching locale and encoding, then run `pg_upgrade --check` (it can run against the live old server).
+- PostgreSQL 18 `initdb` enables data checksums by default. Upgrading from a cluster without checksums fails with `old cluster does not use data checksums but the new one does`; use `--no-data-checksums` or run `pg_checksums --enable` on the old cluster first.
+- Pick the transfer mode deliberately: `--copy` and `--clone` keep the old cluster usable, `--link` and the new `--swap` are fast but remove easy rollback.
+- PostgreSQL 18 keeps planner statistics across the upgrade except extended statistics; run `vacuumdb --all --analyze-in-stages --missing-stats-only`, then `update_extensions.sql`.
+- On Debian, `pg_upgradecluster` defaults to the dump method; pass `-m upgrade` or `-m link` to use pg_upgrade.

@@ -1,0 +1,256 @@
+---
+title: "TiDB vs MySQL: Architecture and Compatibility"
+description: "TiDB vs MySQL compared: TiKV, PD and TiFlash vs InnoDB and replication, compatibility gaps like AUTO_RANDOM and stored procedures, scaling, cost, migration."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: September 24, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# TiDB vs MySQL: Architecture and Compatibility
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="September 24, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+TiDB speaks the MySQL wire protocol, accepts most MySQL syntax, and works with the usual MySQL drivers and clients. That makes "TiDB vs MySQL" look like a comparison between two flavors of the same thing. It is not. Underneath the familiar SQL surface, TiDB is a distributed database built from several cooperating services, while MySQL is a single-node engine that scales out through replication and, if needed, application-level sharding.
+
+This article compares the two on the points that actually drive a decision: architecture, compatibility and its known gaps, how each scales, transaction behavior, operational cost, and migration. It deliberately avoids performance numbers. Throughput and latency depend so heavily on schema, hardware, and topology that the only benchmark worth trusting is one you run on your own workload.
+
+## Architecture
+
+### MySQL: one server, one storage engine, replicas for scale
+
+A MySQL server is a single process that parses SQL, plans queries, and stores data through a storage engine, almost always InnoDB. InnoDB keeps each table as a B+tree clustered on the primary key, with secondary indexes pointing back to it, and handles transactions with MVCC, row locks, and a redo log.
+
+Everything a single transaction touches lives on one machine. To go beyond one machine, MySQL offers:
+
+- **Asynchronous or semi-synchronous replication**: a primary writes the binary log, replicas apply it. Replicas serve reads and act as failover targets.
+- **Group Replication / InnoDB Cluster**: a group of servers that agree on transactions using a Paxos-based protocol, with automatic failover. By default it runs in single-primary mode.
+- **Sharding**: splitting data across several independent MySQL primaries, handled by the application or by middleware such as Vitess or ProxySQL-based routing.
+
+Replication scales reads. Writes are still limited to what one primary (or one primary per shard) can handle, and cross-shard queries and transactions are the application's problem.
+
+### TiDB: separate compute, storage and coordination
+
+A TiDB cluster is made of distinct components:
+
+- **TiDB server**: the stateless SQL layer. It speaks the MySQL protocol (port 4000 by default), parses and optimizes SQL, and turns it into key-value operations. You can run as many as you need behind a load balancer.
+- **TiKV**: the distributed, transactional key-value storage layer. Data is split into ranges called Regions; each Region is replicated (three copies by default) using the Raft consensus protocol across TiKV nodes. Locally, TiKV stores data in RocksDB.
+- **PD (Placement Driver)**: the cluster's brain. It stores metadata, decides where Regions live and when to split or move them, and hands out timestamps (the timestamp oracle) that order transactions. PD itself is usually deployed as three nodes for high availability.
+- **TiFlash**: an optional columnar storage engine. TiFlash replicas receive data from TiKV as Raft learners, so they stay consistent with the row store, and the optimizer can read from them for analytical queries. This is what makes TiDB an HTAP (hybrid transactional and analytical processing) system.
+
+Because every table is really a set of key ranges spread across TiKV nodes, adding storage nodes lets PD rebalance Regions onto them automatically, and adding TiDB servers adds SQL processing capacity. No application-level sharding is needed.
+
+### What the architecture means in practice
+
+The trade-off follows directly from the design:
+
+- A MySQL point lookup or small transaction is handled inside one process with local storage. A TiDB transaction involves at least a network hop from the TiDB server to TiKV, a timestamp from PD, and Raft replication on commit. Single-row latency is therefore typically higher on TiDB than on a well-tuned single MySQL server.
+- In exchange, TiDB's total capacity for data size and write throughput grows as you add nodes, and it survives the loss of a TiKV node without manual failover because every Region has Raft replicas elsewhere.
+- Analytical queries on MySQL compete with OLTP traffic on the same InnoDB buffer pool unless you offload them to replicas or a separate warehouse. On TiDB, you can add a TiFlash replica for specific tables and let those queries run on columnar storage.
+
+Enabling TiFlash for a table is a single statement:
+
+```sql
+ALTER TABLE orders SET TIFLASH REPLICA 1;
+
+-- Check replication progress
+SELECT TABLE_SCHEMA, TABLE_NAME, REPLICA_COUNT, AVAILABLE, PROGRESS
+FROM information_schema.tiflash_replica;
+
+-- Optionally force a query to read from TiFlash
+SELECT /*+ READ_FROM_STORAGE(TIFLASH[orders]) */
+       customer_id, SUM(total) AS revenue
+FROM orders
+GROUP BY customer_id;
+```
+
+## MySQL compatibility and known differences
+
+TiDB aims to be highly compatible with MySQL 5.7 and MySQL 8.0 at the protocol and syntax level, and most applications that use plain DML and common DDL run unchanged. The differences below are the ones that most often matter during evaluation. Always check the compatibility page for the exact TiDB version you plan to deploy, because the list has shrunk over time.
+
+### Auto-increment behavior
+
+In MySQL, `AUTO_INCREMENT` values on a single server are allocated in increasing order. In TiDB, each TiDB server caches a batch of IDs, so with several TiDB servers:
+
+- Values are unique, but not necessarily consecutive.
+- Values are not guaranteed to be monotonically increasing across the cluster. A row inserted later through one TiDB server can get a smaller ID than a row inserted earlier through another.
+- Restarting a TiDB server can leave gaps, because unused cached IDs are discarded.
+
+If your application relies on IDs being strictly ordered by insertion time, that assumption breaks. Newer TiDB versions offer a MySQL-compatible allocation mode by creating the table with `AUTO_ID_CACHE 1`, which allocates IDs centrally at some cost to throughput. Otherwise, order by a timestamp column rather than by ID.
+
+### AUTO_RANDOM and write hotspots
+
+A monotonically increasing primary key is the ideal pattern for InnoDB, because inserts append to the right edge of the B+tree. In TiDB it is the opposite: consecutive keys land in the same Region, so all inserts hit one TiKV node, creating a write hotspot.
+
+TiDB offers `AUTO_RANDOM` for this case. It applies to a `BIGINT` primary key and fills the high bits with a shard value so that new rows spread across Regions:
+
+```sql
+CREATE TABLE events (
+  id         BIGINT PRIMARY KEY AUTO_RANDOM,
+  user_id    BIGINT NOT NULL,
+  event_type VARCHAR(32) NOT NULL,
+  created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  KEY idx_user_created (user_id, created_at)
+);
+
+INSERT INTO events (user_id, event_type) VALUES (42, 'login');
+SELECT LAST_INSERT_ID();
+```
+
+`AUTO_RANDOM` is TiDB-specific syntax, so a schema that uses it will not load into MySQL as-is. TiDB writes it inside a special comment form in `SHOW CREATE TABLE` output so that MySQL ignores it when the dump is replayed there. For tables without an integer primary key (or with non-clustered primary keys), the similar `SHARD_ROW_ID_BITS` table option scatters the hidden row ID.
+
+### Foreign keys
+
+For a long time TiDB parsed `FOREIGN KEY` definitions but did not enforce them. Enforcement was introduced as an experimental feature in TiDB v6.6.0 and has matured in later releases. If referential integrity is enforced by the database in your MySQL schema today, verify the behavior on your target TiDB version, especially `ON DELETE CASCADE` and the `foreign_key_checks` variable during bulk loads.
+
+### Features TiDB does not support
+
+The following MySQL features are not supported by TiDB (check the current documentation for any changes in recent versions):
+
+- Stored procedures and stored functions
+- Triggers
+- Events (the MySQL event scheduler)
+- User-defined functions
+- `SPATIAL` data types, functions and indexes
+- XA transaction syntax
+
+If your application keeps business logic in stored procedures or triggers, that logic must move into the application or into a separate service before migration. That is often the largest single piece of migration work.
+
+### Other behavioral differences
+
+- **Default collation**: TiDB's default collation for `utf8mb4` is `utf8mb4_bin`, while MySQL 8.0 defaults to `utf8mb4_0900_ai_ci`. Queries that rely on case-insensitive comparison can behave differently unless you set collations explicitly.
+- **Isolation levels**: TiDB provides snapshot isolation, which it reports as `REPEATABLE-READ`, and supports `READ-COMMITTED` in pessimistic transaction mode. It does not implement `SERIALIZABLE`. The anomalies allowed by snapshot isolation differ slightly from InnoDB's repeatable read, which uses gap locks.
+- **Transaction size**: very large single transactions are limited by memory and configuration (for example `txn-total-size-limit`). Bulk updates that run fine as one transaction on MySQL may need batching on TiDB.
+- **DDL**: TiDB performs schema changes online, as a distributed, asynchronous process. Adding a column or index does not lock the table the way some MySQL `ALTER TABLE` operations can, but `ALTER TABLE` statements that make several changes at once may be restricted depending on version.
+- **Execution plans**: `EXPLAIN` output uses TiDB operator names such as `TableReader`, `IndexLookUp`, and `cop[tikv]` tasks, so MySQL plan-reading habits need adjusting.
+
+A quick way to see which system you are connected to:
+
+```sql
+SELECT VERSION();          -- TiDB returns a MySQL-style version string with a TiDB suffix
+SELECT tidb_version();     -- TiDB only; fails on MySQL
+```
+
+## Transactions
+
+Both systems provide ACID transactions, but they get there differently.
+
+MySQL InnoDB uses locks and MVCC on one node. A commit writes the redo log (and the binary log, with two-phase commit between them) and returns.
+
+TiDB implements distributed transactions based on the Percolator model: PD provides a start timestamp, writes are buffered, and commit runs a two-phase commit across the TiKV Regions involved, with each write replicated through Raft. TiDB supports two modes:
+
+- **Pessimistic** (default for new clusters since v3.0.8): rows are locked as DML executes, similar to MySQL, so application code written for InnoDB behaves more predictably.
+- **Optimistic**: conflicts are detected at commit time, and the commit fails with a write conflict error that the application must retry.
+
+Features like `SELECT ... FOR UPDATE` work in both. Because a TiDB commit involves more network round trips, workloads made of many tiny transactions on a few hot rows (counters, for example) are a known weak spot and deserve special design attention.
+
+## Scaling and high availability
+
+| Concern | MySQL | TiDB |
+| --- | --- | --- |
+| Read scaling | Add replicas; handle replication lag | Add TiDB servers; reads are consistent across nodes |
+| Write scaling | Bigger primary, or shard the data | Add TiKV nodes; Regions rebalance automatically |
+| Failover | Replica promotion via Group Replication, orchestrators, or a managed service | Raft elects new Region leaders automatically |
+| Online schema change | Online DDL for many operations, external tools for others | Online DDL built in |
+| Analytics | Replicas, external warehouse, or MySQL HeatWave on Oracle Cloud | TiFlash columnar replicas in the same cluster |
+
+The table summarizes design capabilities, not measured results. A single MySQL primary on modern hardware handles a very large amount of traffic, and many teams never outgrow it.
+
+## Operational cost
+
+MySQL's operational model is widely understood: one primary, a couple of replicas, backups with tools like `mysqldump`, MySQL Shell dump utilities, or physical backup tools, and a large ecosystem of monitoring and tuning knowledge. A small deployment can be a single server.
+
+A production TiDB cluster typically runs at least three PD nodes, three TiKV nodes, and two or more TiDB servers, plus monitoring (Prometheus and Grafana) and optional TiFlash nodes. TiDB provides tooling for this:
+
+- **TiUP** for deploying, scaling, and upgrading clusters on hosts.
+- **TiDB Operator** for running TiDB on Kubernetes.
+- **BR** for distributed backup and restore.
+- **TiDB Cloud** as a managed service if you prefer not to operate the cluster yourself.
+
+The minimum footprint and the number of moving parts mean TiDB costs more to run than a small MySQL setup. That changes when the alternative is a sharded MySQL fleet with custom routing, resharding scripts, and cross-shard reporting jobs; at that scale, TiDB can reduce operational complexity even if it uses more machines.
+
+To try TiDB locally without a full deployment:
+
+```bash
+curl --proto '=https' --tlsv1.2 -sSf https://tiup-mirrors.pingcap.com/install.sh | sh
+source ~/.bash_profile   # or restart the shell so tiup is on PATH
+tiup playground
+
+# In another terminal, connect with the regular MySQL client
+mysql --host 127.0.0.1 --port 4000 -u root
+```
+
+## When to choose each
+
+Choose **MySQL** when:
+
+- Your data and write load fit comfortably on one primary, now and for the foreseeable future.
+- You depend on stored procedures, triggers, events, or spatial features.
+- Low single-row latency is the top priority.
+- Your team wants the simplest possible operational footprint.
+
+Choose **TiDB** when:
+
+- You are sharding MySQL, or are about to, and want to stop managing shards in the application.
+- Data volume or write throughput is growing beyond what one primary can handle.
+- You want automatic failover without replication lag concerns and consistent reads from any SQL node.
+- You need real-time analytics on fresh transactional data and would otherwise build an ETL pipeline to a separate warehouse.
+
+For a broader look at how distributed SQL databases approach the same problems, see our comparison of [PostgreSQL and CockroachDB](https://chat2db.ai/resources/blog/postgres-vs-cockroachdb).
+
+## Migrating from MySQL to TiDB
+
+PingCAP provides a set of migration tools:
+
+- **Dumpling** exports data from MySQL (or TiDB) to SQL or CSV files.
+- **TiDB Lightning** imports large datasets into TiDB quickly, either through the SQL interface or by writing sorted data directly into TiKV (physical import mode).
+- **DM (Data Migration)** handles full and incremental migration: it performs the initial load and then replicates changes from the MySQL binlog, including merging sharded MySQL tables into one TiDB table.
+- **sync-diff-inspector** compares data between source and target to verify the migration.
+- **TiCDC** streams changes out of TiDB, which is useful for a rollback path or for feeding downstream systems.
+
+A typical migration looks like this:
+
+1. **Audit compatibility.** Search the schema and code for stored procedures, triggers, events, spatial types, and reliance on ordered auto-increment IDs. The query below lists routines and triggers in MySQL:
+
+```sql
+SELECT ROUTINE_SCHEMA, ROUTINE_NAME, ROUTINE_TYPE
+FROM information_schema.ROUTINES
+WHERE ROUTINE_SCHEMA NOT IN ('mysql', 'sys', 'performance_schema', 'information_schema');
+
+SELECT TRIGGER_SCHEMA, TRIGGER_NAME, EVENT_OBJECT_TABLE
+FROM information_schema.TRIGGERS
+WHERE TRIGGER_SCHEMA NOT IN ('mysql', 'sys');
+```
+
+2. **Adapt the schema.** Consider `AUTO_RANDOM` for insert-heavy tables with auto-increment keys, set collations explicitly, and review foreign keys.
+3. **Load and replicate.** Use DM for a full load plus ongoing binlog replication (MySQL must have `binlog_format = ROW`), or Dumpling plus Lightning for a one-time move.
+4. **Verify.** Run sync-diff-inspector and replay representative queries, comparing results and plans.
+5. **Test the workload.** Run your own load tests; watch for hotspots in the TiDB Dashboard's Key Visualizer.
+6. **Cut over.** Stop writes on MySQL, let DM catch up, switch the application connection string to TiDB, and keep a reverse path with TiCDC if you need a fallback.
+
+Because TiDB uses the MySQL protocol, the same client tools work against both systems during the migration. You can keep a MySQL and a TiDB connection open side by side in a client such as [Chat2DB](https://chat2db.ai/download) and run the same verification queries against source and target.
+
+## FAQ
+
+### Is TiDB a drop-in replacement for MySQL?
+
+For many applications that use standard SQL and common DDL, it is close. It is not a drop-in replacement if you use stored procedures, triggers, events, spatial features, or rely on strictly increasing auto-increment IDs.
+
+### Can I use MySQL drivers and ORMs with TiDB?
+
+Yes. TiDB implements the MySQL protocol, so standard MySQL connectors and most ORMs work. Connect to port 4000 by default.
+
+### Does TiDB support MySQL replication?
+
+TiDB does not act as a MySQL replica in the native sense. Use DM to replicate from MySQL into TiDB, and TiCDC to stream changes out of TiDB to MySQL, Kafka, or other targets.
+
+### Is TiDB faster than MySQL?
+
+It depends on the workload. A single MySQL server usually has lower latency for small point queries; TiDB can handle more total data and write throughput by adding nodes and can run analytics on TiFlash. Benchmark your own workload before deciding.
+
+### Is TiDB open source?
+
+Yes, TiDB, TiKV, and PD are open source under the Apache 2.0 license. The code is developed in public on GitHub, and PingCAP also offers TiDB Cloud as a managed service.

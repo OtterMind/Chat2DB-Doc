@@ -1,0 +1,472 @@
+---
+title: "How to Migrate PostgreSQL to MySQL"
+description: "Migrate PostgreSQL to MySQL step by step: type mapping, SQL dialect rewrites, COPY to CSV plus LOAD DATA, utf8mb4, checksum verification, and common pitfalls."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: September 29, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# How to Migrate PostgreSQL to MySQL
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="September 29, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+Most migration guides go from MySQL to PostgreSQL. The opposite direction is less common but very real: a company standardizes on MySQL, a product has to run on a managed MySQL service or a MySQL-compatible engine such as TiDB, Vitess, or Aurora MySQL, or an application was prototyped on PostgreSQL and the team that operates it knows MySQL better.
+
+Going this way is harder than the reverse, because PostgreSQL has more types and more SQL features than MySQL. Arrays, `JSONB`, custom `ENUM` types, `RETURNING`, sequences, and `ILIKE` all need a decision, not just a rename. This guide walks through the schema mapping, the SQL rewrites, a data move that survives commas, quotes, newlines, and NULLs, and the queries that prove nothing was lost.
+
+Everything below was run on PostgreSQL 17.11 and MySQL 8.4.11 in Docker, and the error messages are copied from those runs. If you are going the other direction, read [Migrating a MySQL Database to PostgreSQL Without Data Loss](/blog/migrating-a-mysql-database-to-postgresql-without-data-loss) instead.
+
+## When Migrating PostgreSQL to MySQL Makes Sense
+
+Before starting, check that the move is worth it. It usually is when:
+
+- Your organization runs MySQL everywhere and one PostgreSQL database is the operational exception.
+- You are moving to a platform that only offers MySQL, or to a MySQL-protocol distributed database.
+- The application uses a portable subset of SQL through an ORM, so few queries depend on PostgreSQL features.
+
+It usually is not worth it when the application relies on PostGIS, full-text search with `tsvector`, extensions such as `pg_trgm` or `pgvector`, row-level security, or heavy use of arrays and `JSONB` operators. Each of these needs an application rewrite, not a schema conversion. Search your code for `::`, `ILIKE`, `RETURNING`, `ANY(`, `->>`, `@>`, and `jsonb_` to estimate the work early.
+
+## The Sample Schema
+
+The examples use one PostgreSQL schema that touches most of the hard cases:
+
+```sql
+CREATE TYPE order_status AS ENUM ('new', 'paid', 'shipped');
+
+CREATE TABLE customers (
+  id         BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  public_id  UUID NOT NULL DEFAULT gen_random_uuid(),
+  email      TEXT NOT NULL UNIQUE,
+  is_active  BOOLEAN NOT NULL DEFAULT true,
+  tags       TEXT[] NOT NULL DEFAULT '{}',
+  prefs      JSONB,
+  avatar     BYTEA,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE TABLE orders (
+  id          SERIAL PRIMARY KEY,
+  customer_id BIGINT NOT NULL REFERENCES customers(id),
+  status      order_status NOT NULL DEFAULT 'new',
+  total       NUMERIC(10,2) NOT NULL,
+  note        TEXT,
+  placed_at   TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+```
+
+The test data deliberately includes two emails that differ only in case (`ana@example.com` and `Ana@Example.com`), a non-ASCII address (`zoë@example.com`), an array element containing a comma, JSON with an escaped `\n`, a note with a tab and double quotes, a note with a real line break, and a note containing the literal string `NULL`.
+
+## Step 1: Map the Data Types
+
+This is the core of the migration. The table below lists the mapping used in this guide and the reasoning behind each choice.
+
+| PostgreSQL | MySQL 8.4 | Notes |
+|---|---|---|
+| `SERIAL`, `BIGSERIAL` | `INT AUTO_INCREMENT`, `BIGINT AUTO_INCREMENT` | Must be part of a key; one per table |
+| `GENERATED ... AS IDENTITY` | `BIGINT AUTO_INCREMENT` | No `ALWAYS` equivalent: MySQL always accepts explicit values |
+| `SMALLINT` / `INTEGER` / `BIGINT` | same names | Identical ranges |
+| `NUMERIC(p,s)` | `DECIMAL(p,s)` | Unconstrained `NUMERIC` has no equivalent; pick a precision (max 65) |
+| `REAL` / `DOUBLE PRECISION` | `FLOAT` / `DOUBLE` | |
+| `BOOLEAN` | `BOOLEAN` (alias for `TINYINT(1)`) | `true`/`false` literals work; stored as 1/0 |
+| `TEXT` | `TEXT` (64 KB), `MEDIUMTEXT` (16 MB), `LONGTEXT` (4 GB) | Limits are in bytes, not characters |
+| `VARCHAR(n)` | `VARCHAR(n)` | Indexable only up to 3072 bytes, i.e. `VARCHAR(768)` in utf8mb4 |
+| `TIMESTAMP` | `DATETIME(6)` | Microsecond precision needs the `(6)` |
+| `TIMESTAMPTZ` | `DATETIME(6)` holding UTC, or `TIMESTAMP(6)` | `TIMESTAMP` ends at 2038-01-19 |
+| `DATE`, `TIME` | `DATE`, `TIME(6)` | |
+| `INTERVAL` | `BIGINT` seconds, or two columns | MySQL has no interval column type |
+| `JSONB` / `JSON` | `JSON` | Operators differ; see the dialect section |
+| `UUID` | `CHAR(36)` or `BINARY(16)` | Use `UUID_TO_BIN(x, 1)` for index-friendly binary |
+| `TEXT[]`, `INT[]` | `JSON` array, or a child table | No native arrays |
+| `CREATE TYPE ... AS ENUM` | inline `ENUM(...)` or a lookup table | MySQL ENUM is per column |
+| `BYTEA` | `BLOB` / `LONGBLOB` | `BLOB` holds 64 KB, `LONGBLOB` 4 GB |
+| `INET`, `CIDR` | `VARBINARY(16)` with `INET6_ATON()`, or `VARCHAR(43)` | |
+| `CITEXT` | `VARCHAR` with a `_ci` collation | |
+
+### Text limits are in bytes
+
+PostgreSQL `TEXT` holds up to 1 GB. MySQL `TEXT` holds 65,535 **bytes**, which is only about 16,000 characters of 4-byte utf8mb4 text. Under the default strict `sql_mode`, an oversized value is rejected:
+
+```sql
+CREATE TABLE t_txt (t TEXT);
+INSERT INTO t_txt VALUES (REPEAT('x', 70000));
+```
+
+```text
+ERROR 1406 (22001): Data too long for column 't' at row 1
+```
+
+Check the real maximum before choosing a type. In PostgreSQL, `SELECT max(octet_length(note)) FROM orders;` gives the largest value in bytes. When in doubt, use `MEDIUMTEXT` or `LONGTEXT`; the storage cost is the same for short values.
+
+### Time zones: TIMESTAMPTZ has no direct equivalent
+
+PostgreSQL `TIMESTAMPTZ` stores an absolute instant. MySQL has two options, neither identical:
+
+- `TIMESTAMP` converts from the session time zone to UTC on write and back on read, like `TIMESTAMPTZ`, but its range ends in January 2038:
+
+```text
+ERROR 1292 (22007): Incorrect datetime value: '2040-01-01 00:00:00' for column 't' at row 1
+```
+
+- `DATETIME` has a range up to year 9999 but stores exactly what you give it, with no zone.
+
+The safest pattern is `DATETIME(6)` with the rule that every value is UTC, enforced by exporting in UTC and by setting `time_zone = '+00:00'` in the application's connection settings.
+
+### UUID, arrays and ENUM types
+
+`CHAR(36)` keeps UUIDs readable and is the simplest target. If the column is a primary key or heavily indexed, `BINARY(16)` is less than half the size. `UUID_TO_BIN(x, 1)` swaps the time fields so version 1 UUIDs sort in time order:
+
+```sql
+SELECT HEX(UUID_TO_BIN('f8507ce5-0768-4fe9-9774-02af4abd09fb', 1)) AS b,
+       BIN_TO_UUID(UUID_TO_BIN('f8507ce5-0768-4fe9-9774-02af4abd09fb', 1), 1) AS back;
+```
+
+```text
+b                                  back
+4FE90768F8507CE5977402AF4ABD09FB   f8507ce5-0768-4fe9-9774-02af4abd09fb
+```
+
+Arrays become either a `JSON` column (easy to migrate, queryable with `JSON_CONTAINS` and `MEMBER OF`) or a child table (better when you filter or join on the elements). A PostgreSQL `ENUM` type used by several tables becomes an inline `ENUM(...)` on each column, or a small lookup table with a foreign key if the values change often, since altering a MySQL `ENUM` rewrites the table in many cases.
+
+### The resulting MySQL DDL
+
+```sql
+CREATE DATABASE app CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci;
+USE app;
+
+CREATE TABLE customers (
+  id         BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY,
+  public_id  CHAR(36) NOT NULL DEFAULT (UUID()),
+  email      VARCHAR(320) COLLATE utf8mb4_0900_as_cs NOT NULL,
+  is_active  BOOLEAN NOT NULL DEFAULT TRUE,
+  tags       JSON NOT NULL DEFAULT (JSON_ARRAY()),
+  prefs      JSON NULL,
+  avatar     LONGBLOB NULL,
+  created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+  UNIQUE KEY uq_customers_email (email)
+);
+
+CREATE TABLE orders (
+  id          INT NOT NULL AUTO_INCREMENT PRIMARY KEY,
+  customer_id BIGINT NOT NULL,
+  status      ENUM('new','paid','shipped') NOT NULL DEFAULT 'new',
+  total       DECIMAL(10,2) NOT NULL,
+  note        LONGTEXT NULL,
+  placed_at   DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+  CONSTRAINT fk_orders_customer FOREIGN KEY (customer_id) REFERENCES customers (id)
+);
+```
+
+The explicit `utf8mb4_0900_as_cs` collation on `email` is not decoration; the pitfalls section shows the load failing without it. Expression defaults such as `(UUID())` and `(JSON_ARRAY())` need the parentheses and MySQL 8.0.13 or later.
+
+For a large schema, converting DDL by hand is slow and error-prone. The free [PostgreSQL to MySQL converter](https://chat2db.ai/tools/postgresql-to-mysql-converter) turns `CREATE TABLE` statements into MySQL DDL in the browser, which gives you a first draft to review against the table above.
+
+## Step 2: Rewrite PostgreSQL-Specific SQL
+
+Schema is only half of the migration. Queries in the application, views, and functions must be rewritten too. MySQL rejects most PostgreSQL-only syntax outright, which at least makes the problems easy to find:
+
+```sql
+SELECT * FROM customers WHERE email ILIKE 'ana%';
+```
+
+```text
+ERROR 1064 (42000): You have an error in your SQL syntax; check the manual that
+corresponds to your MySQL server version for the right syntax to use near 'ILIKE 'ana%'' at line 1
+```
+
+```sql
+INSERT INTO orders (customer_id, total) VALUES (1, 5.00) RETURNING id;
+```
+
+```text
+ERROR 1064 (42000): ... near 'RETURNING id' at line 1
+```
+
+The `::` cast fails the same way. The dangerous one is `||`, because it does **not** fail:
+
+```sql
+SELECT 'a' || 'b' AS x;
+```
+
+```text
++---+
+| x |
++---+
+| 0 |
++---+
+1 row in set, 3 warnings
+```
+
+In MySQL's default mode `||` is logical OR (deprecated, warning 1287), so both strings are converted to numbers and the result is `0`. Any concatenation you miss silently returns wrong data. For the full catalog of 1064 causes, see [MySQL Error 1064: SQL Syntax Error](/blog/mysql-error-1064-syntax-error).
+
+| PostgreSQL | MySQL 8.4 |
+|---|---|
+| `a \|\| b` | `CONCAT(a, b)`; `CONCAT` returns NULL if any argument is NULL, use `CONCAT_WS('', a, b)` to skip NULLs |
+| `email ILIKE 'ana%'` | `email LIKE 'ana%'` on a `_ci` column, or `LOWER(email) LIKE 'ana%'` |
+| `x::int`, `x::text` | `CAST(x AS SIGNED)`, `CAST(x AS CHAR)` |
+| `INSERT ... ON CONFLICT (email) DO UPDATE SET ...` | `INSERT ... AS new ON DUPLICATE KEY UPDATE col = new.col` |
+| `INSERT ... ON CONFLICT DO NOTHING` | `INSERT IGNORE` (also hides other errors) or the upsert with a no-op |
+| `INSERT ... RETURNING id` | `LAST_INSERT_ID()` after the insert |
+| `STRING_AGG(x, ', ' ORDER BY y)` | `GROUP_CONCAT(x ORDER BY y SEPARATOR ', ')` |
+| `ARRAY_AGG(x)` / `JSON_AGG(x)` | `JSON_ARRAYAGG(x)` |
+| `nextval('seq')`, `currval` | `AUTO_INCREMENT` and `LAST_INSERT_ID()`; no standalone sequences |
+| `DISTINCT ON (a)` | `ROW_NUMBER() OVER (PARTITION BY a ORDER BY ...) = 1` in a subquery |
+| `LIMIT n OFFSET m` | same (also `LIMIT m, n`) |
+| `now()`, `CURRENT_TIMESTAMP` | `NOW(6)` for microseconds |
+| `jsonb_col ->> 'key'` | `json_col ->> '$.key'` |
+| `jsonb_col @> '{"k":1}'` | `JSON_CONTAINS(json_col, '{"k":1}')` |
+| `x = ANY(array_col)` | `x MEMBER OF (json_col)` |
+| `generate_series(1, 10)` | recursive CTE |
+
+The upsert and the aggregate, run on MySQL:
+
+```sql
+INSERT INTO customers (email, is_active) VALUES ('ana@example.com', false) AS new
+ON DUPLICATE KEY UPDATE is_active = new.is_active;
+-- Query OK, 2 rows affected   (2 means "existing row updated")
+
+SELECT c.email, GROUP_CONCAT(o.status ORDER BY o.id SEPARATOR ', ') AS statuses
+FROM customers c JOIN orders o ON o.customer_id = c.id
+GROUP BY c.email;
+```
+
+```text
++------------------+---------------+
+| email            | statuses      |
++------------------+---------------+
+| ana@example.com  | paid, shipped |
+| zoë@example.com  | new, new      |
++------------------+---------------+
+```
+
+Two behavioral differences to remember. `ON DUPLICATE KEY UPDATE` fires on **any** unique key, not just the one you named in `ON CONFLICT (...)`, so tables with several unique keys can update an unexpected row. And `GROUP_CONCAT` truncates its result at `group_concat_max_len` (1024 bytes by default) with only a warning, where `STRING_AGG` has no such limit. Raise it in the session when the output can be long.
+
+## Step 3: Export the Data from PostgreSQL
+
+There are two practical routes.
+
+### Option A: pg_dump with INSERT statements
+
+```bash
+pg_dump -U postgres --data-only --column-inserts --no-owner \
+  -t customers -t orders appdb > data.sql
+```
+
+This is fine for small databases, but the output is PostgreSQL SQL and does not load into MySQL as-is. Running the actual dump output against MySQL surfaced these problems:
+
+- `SET` lines, `SELECT pg_catalog.set_config(...)`, `SELECT pg_catalog.setval(...)`, and, on recent pg_dump versions, `\restrict` and `\unrestrict` lines.
+- A `public.` schema prefix on every table name.
+- `OVERRIDING SYSTEM VALUE` on tables with identity columns.
+- Timestamps written as `'2026-03-05 10:00:00+00'`, which MySQL rejects:
+
+```text
+ERROR 1292 (22007): Incorrect datetime value: '2026-03-05 10:00:00+00' for column 'd' at row 1
+```
+
+- Array literals like `'{vip,beta}'`, which are not JSON:
+
+```text
+ERROR 3140 (22032): Invalid JSON text: "Missing a name for object member." at position 1
+in value for column 'customers.tags'.
+```
+
+- Backslashes. PostgreSQL writes JSON `"line1\nline2"` with a literal backslash, but MySQL treats `\n` inside a string literal as an escape and turns it into a real newline, which makes the JSON invalid:
+
+```text
+ERROR 3140 (22032): Invalid JSON text: "Invalid encoding in string." at position 15 in value for column 't_j.j'.
+```
+
+- `BYTEA` values as `'\x89504e47'`, which MySQL would store as text characters.
+
+You can fix all of this with `sed` and `NO_BACKSLASH_ESCAPES`, but for anything beyond a few tables, Option B is cleaner.
+
+### Option B: COPY to CSV, converting types on the way out
+
+Let PostgreSQL produce values that MySQL understands, and use CSV quoting that both sides agree on. `COPY ... TO STDOUT` runs server-side but writes to the client, so the files land wherever you run `psql`:
+
+```bash
+psql -U postgres -d appdb -At -c "COPY (
+  SELECT id, public_id, email, is_active::int, to_json(tags), prefs,
+         encode(avatar, 'hex'),
+         to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS.US')
+  FROM customers ORDER BY id
+) TO STDOUT WITH (FORMAT csv, NULL 'NULL')" > customers.csv
+
+psql -U postgres -d appdb -At -c "COPY (
+  SELECT id, customer_id, status, total, note,
+         to_char(placed_at AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS.US')
+  FROM orders ORDER BY id
+) TO STDOUT WITH (FORMAT csv, NULL 'NULL')" > orders.csv
+```
+
+What each conversion does:
+
+- `is_active::int` writes `1`/`0` instead of `t`/`f`.
+- `to_json(tags)` turns `{vip,beta}` into `["vip","beta"]`.
+- `encode(avatar, 'hex')` writes bytes as hex, decoded later with `UNHEX()`.
+- `AT TIME ZONE 'UTC'` plus `to_char` writes a zone-free UTC timestamp with microseconds.
+- `NULL 'NULL'` writes SQL NULL as an unquoted `NULL`. A real string `'NULL'` is quoted by PostgreSQL, so the two stay distinguishable.
+
+The resulting file:
+
+```text
+1,f8507ce5-...,ana@example.com,1,"[""vip"",""beta""]","{""lang"": ""pt"", ""theme"": ""dark""}",89504e47,2026-03-01 08:15:00.000000
+2,7bef8b63-...,Ana@Example.com,0,[],NULL,NULL,2026-03-02 23:40:00.000000
+3,47a94259-...,zoë@example.com,1,"[""with,comma""]","{""note"": ""line1\nline2""}",NULL,2026-03-03 00:00:00.000000
+```
+
+(UUIDs shortened here.) Quotes are doubled, commas and newlines are inside quoted fields, and backslashes are left alone.
+
+## Step 4: Load the CSV into MySQL
+
+`LOAD DATA LOCAL INFILE` must be enabled on both the server (`local_infile=ON`) and the client (`mysql --local-infile=1`). Then create the MySQL schema from Step 1 and load parents before children:
+
+```sql
+LOAD DATA LOCAL INFILE '/tmp/customers.csv'
+INTO TABLE customers
+CHARACTER SET utf8mb4
+FIELDS TERMINATED BY ',' OPTIONALLY ENCLOSED BY '"' ESCAPED BY ''
+LINES TERMINATED BY '\n'
+(id, public_id, email, is_active, tags, prefs, @avatar_hex, created_at)
+SET avatar = UNHEX(@avatar_hex);
+
+LOAD DATA LOCAL INFILE '/tmp/orders.csv'
+INTO TABLE orders
+CHARACTER SET utf8mb4
+FIELDS TERMINATED BY ',' OPTIONALLY ENCLOSED BY '"' ESCAPED BY ''
+LINES TERMINATED BY '\n'
+(id, customer_id, status, total, note, placed_at);
+```
+
+```text
+Query OK, 3 rows affected
+Records: 3  Deleted: 0  Skipped: 0  Warnings: 0
+
+Query OK, 4 rows affected
+Records: 4  Deleted: 0  Skipped: 0  Warnings: 0
+```
+
+The important options:
+
+- `CHARACTER SET utf8mb4` makes MySQL read the file as UTF-8. Using `utf8mb3` (the old `utf8`) fails on emoji and other 4-byte characters; see [MySQL Error 1366: Incorrect String Value](/blog/mysql-error-1366-incorrect-string-value).
+- `ESCAPED BY ''` disables MySQL's backslash processing, so `\n` inside JSON stays two characters, matching PostgreSQL's CSV output.
+- With an empty escape character, an **unquoted** `NULL` is read as SQL NULL and a quoted `"NULL"` stays a string, matching the `NULL 'NULL'` export option.
+- `@avatar_hex` reads the column into a variable so `SET avatar = UNHEX(...)` can decode it.
+
+Every tricky value came through intact. The tab and quotes, the real line break, and the string `NULL` versus SQL NULL all survived:
+
+```text
++----+---------+-------+---------------------+---------+
+| id | status  | total | note                | is_null |
++----+---------+-------+---------------------+---------+
+|  1 | paid    | 25.00 | first order         |       0 |
+|  2 | shipped | 40.00 | tab	here, quote "x" |       0 |
+|  3 | new     | 15.50 | multi
+line          |       0 |
+|  4 | new     |  9.99 | NULL                |       0 |
++----+---------+-------+---------------------+---------+
+```
+
+`AUTO_INCREMENT` advances automatically when rows are inserted with explicit ids. After loading four orders, `information_schema.TABLES.AUTO_INCREMENT` for `orders` was `5`, so unlike PostgreSQL there is no `setval` step. For very large tables, load in chunks (for example with `split -l`) so one bad row does not roll back hours of work, and add secondary indexes after the load.
+
+## Step 5: Verify Row Counts and Checksums
+
+Never trust a migration because the load reported no errors. With `LOCAL`, MySQL downgrades duplicate-key errors to warnings and skips the row, as the pitfalls section shows. Compare both sides.
+
+Row counts and sums are the first check. The second is a checksum over a canonical text form of each row, built identically on both sides. In PostgreSQL:
+
+```sql
+SELECT count(*) AS n, sum(total) AS total_sum,
+       md5(string_agg(concat_ws('|', id, customer_id, status, total,
+             to_char(placed_at AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS.US')),
+           ',' ORDER BY id)) AS checksum
+FROM orders;
+```
+
+In MySQL:
+
+```sql
+SET SESSION group_concat_max_len = 1024 * 1024 * 64;
+
+SELECT COUNT(*) AS n, SUM(total) AS total_sum,
+       MD5(GROUP_CONCAT(CONCAT_WS('|', id, customer_id, status, total,
+             DATE_FORMAT(placed_at, '%Y-%m-%d %H:%i:%s.%f'))
+           ORDER BY id SEPARATOR ',')) AS checksum
+FROM orders;
+```
+
+Both returned the same result on the sample data:
+
+```text
+ n | total_sum |             checksum
+---+-----------+----------------------------------
+ 4 |     90.49 | 5d91ef38be731de88ae2b215ef60da4b
+```
+
+For big tables, compute the checksum per id range (for example `WHERE id BETWEEN 1 AND 100000`) so a mismatch points you at a small slice. Include every column you care about, and format dates, decimals, and booleans the same way on both sides; a mismatch caused by formatting is still worth understanding before you sign off.
+
+Running the same verification queries against both connections side by side is easier in a multi-database client such as [Chat2DB](https://chat2db.ai/download), where a PostgreSQL and a MySQL tab can stay open next to each other.
+
+## Pitfalls to Check Before Cutover
+
+### Case- and accent-insensitive collations
+
+The first load attempt for this guide used the database default collation, `utf8mb4_0900_ai_ci`, for `email`. The load "succeeded", but one row was missing:
+
+```text
+Query OK, 2 rows affected, 1 warning
+Records: 3  Deleted: 0  Skipped: 1  Warnings: 1
+
++---------+------+--------------------------------------------------------------------------+
+| Level   | Code | Message                                                                  |
++---------+------+--------------------------------------------------------------------------+
+| Warning | 1062 | Duplicate entry 'Ana@Example.com' for key 'customers.uq_customers_email' |
++---------+------+--------------------------------------------------------------------------+
+```
+
+PostgreSQL compares text case-sensitively, so `ana@example.com` and `Ana@Example.com` were two valid rows. MySQL's default collation is case- **and** accent-insensitive (`SELECT 'zoe@example.com' = 'zoë@example.com'` returns `1`), so the unique index treated them as duplicates. With `LOAD DATA LOCAL`, that becomes a warning and a skipped row, not an error. Either declare such columns with a `_as_cs` or `_bin` collation, or deduplicate the data deliberately before the move. More on this class of error in [MySQL Error 1062: Duplicate Entry](/blog/mysql-error-1062-duplicate-entry).
+
+The same collation difference changes query results: `WHERE email = 'ANA@EXAMPLE.COM'` matches in MySQL on a `_ci` column but not in PostgreSQL.
+
+### Identifier case and length
+
+PostgreSQL folds unquoted identifiers to lowercase and keeps quoted ones like `"OrderItems"` exactly. On Linux, MySQL table names are case-sensitive by default (`lower_case_table_names=0`), while on Windows and macOS they are not. Use lowercase names everywhere to avoid differences between environments.
+
+Length is rarely a problem in this direction: PostgreSQL truncates identifiers at 63 bytes and MySQL allows 64 characters. What does bite is that foreign key constraint names must be unique per MySQL database, and MySQL reserves words that PostgreSQL does not, such as `rank`:
+
+```text
+ERROR 1064 (42000): ... near 'rank INT)' at line 1
+```
+
+Quote such names with backticks or rename them.
+
+### sql_mode
+
+MySQL 8.4 defaults to `ONLY_FULL_GROUP_BY,STRICT_TRANS_TABLES,NO_ZERO_IN_DATE,NO_ZERO_DATE,ERROR_FOR_DIVISION_BY_ZERO,NO_ENGINE_SUBSTITUTION`. Keep strict mode on during the migration; without it, over-long strings and bad dates are silently truncated instead of rejected. Some managed services ship a different default, so check `SELECT @@GLOBAL.sql_mode` on the target.
+
+### Index key length
+
+A PostgreSQL B-tree index on a `TEXT` column is normal. In MySQL, you cannot index a `TEXT` column without a prefix length, and a `VARCHAR` index is capped at 3072 bytes. Converting `TEXT` to `VARCHAR(1000)` and adding a unique index fails with error 1071; see [MySQL Error 1071: Specified Key Was Too Long](/blog/mysql-error-1071-specified-key-too-long).
+
+### Features without an equivalent
+
+Partial indexes (`WHERE deleted_at IS NULL`), exclusion constraints, deferrable constraints, `CHECK` constraints that call functions, and PL/pgSQL functions all need a new design. MySQL 8.0.16+ enforces simple `CHECK` constraints, and functional indexes can sometimes replace partial ones. Triggers and stored procedures must be rewritten by hand.
+
+## Migration Checklist
+
+1. Inventory PostgreSQL-only features in the schema and the application code.
+2. Map every column type with the table in Step 1, choosing collations deliberately.
+3. Convert and review the DDL, then create the MySQL schema with foreign keys.
+4. Rewrite `||`, `ILIKE`, `::`, `ON CONFLICT`, `RETURNING`, `STRING_AGG`, and JSON operators.
+5. Export with `COPY` to CSV, converting booleans, arrays, bytea, and time zones.
+6. Load with `LOAD DATA LOCAL INFILE ... CHARACTER SET utf8mb4 ... ESCAPED BY ''`, parents first.
+7. Check `SHOW WARNINGS` after every load.
+8. Compare row counts, sums, and checksums per table.
+9. Run the application test suite against MySQL before cutover.
+
+## Summary
+
+Migrating PostgreSQL to MySQL is a translation from a richer type system to a narrower one, so most of the work is making decisions: `DATETIME(6)` in UTC for `TIMESTAMPTZ`, `JSON` or child tables for arrays, inline `ENUM` or lookup tables for enum types, and explicit collations wherever PostgreSQL's case-sensitive comparisons matter. Export with `COPY` so PostgreSQL does the value conversions, load with `LOAD DATA` using matching CSV rules, and do not consider the job done until row counts and checksums agree on both sides.

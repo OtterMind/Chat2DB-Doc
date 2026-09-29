@@ -1,0 +1,377 @@
+---
+title: "Fix Permission Denied for Schema public"
+description: "Fix PostgreSQL ERROR: permission denied for schema public (42501) since PostgreSQL 15: GRANT CREATE, database owner, app schemas, Django, Prisma and Flyway."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: September 29, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# Fix Permission Denied for Schema public
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="September 29, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+You create a database, create a login role for your application, grant it `CONNECT`, run the first migration, and PostgreSQL answers:
+
+```text
+ERROR:  permission denied for schema public
+LINE 1: CREATE TABLE orders (id int);
+                     ^
+```
+
+The same setup worked for years on PostgreSQL 13 and 14. What changed is PostgreSQL 15: it stopped letting every role create objects in the `public` schema. This guide explains exactly what the default privileges are now, how to diagnose which privilege is missing, and the right fix for each situation, from a one-line `GRANT` to a dedicated application schema. It also covers how Django, Prisma and Flyway surface the error.
+
+All outputs below were captured on PostgreSQL 18.6. PostgreSQL 15, 16 and 17 behave the same way for everything in this article.
+
+## What the Error Means
+
+The full error with `\set VERBOSITY verbose` in psql is:
+
+```text
+ERROR:  42501: permission denied for schema public
+LINE 1: CREATE TABLE orders (id int);
+                     ^
+LOCATION:  aclcheck_error, aclchk.c:2793
+```
+
+SQLSTATE `42501` is `insufficient_privilege`, the same code used for every privilege failure in PostgreSQL. The important word is **schema**. PostgreSQL checked a privilege on the schema itself, not on a table, and it failed. Schemas have exactly two privileges:
+
+| Privilege | Letter in ACL | What it allows |
+|---|---|---|
+| `USAGE` | `U` | Look up objects inside the schema (needed to read or write any table in it) |
+| `CREATE` | `C` | Create new objects (tables, views, sequences, functions, types) in the schema |
+
+So "permission denied for schema public" means one of two things:
+
+1. You tried to **create** something in `public` and lack `CREATE` (by far the most common case since PostgreSQL 15).
+2. You tried to **access** something in `public` and lack `USAGE` (usually because someone revoked it).
+
+If your error says `permission denied for table orders` instead, the schema is fine and the problem is table-level grants. That is a different fix, covered in [permission denied for table](/blog/postgres-permission-denied-for-table-fix).
+
+## Why It Started in PostgreSQL 15
+
+Up to PostgreSQL 14, a new database's `public` schema was owned by the bootstrap superuser and granted `USAGE` **and** `CREATE` to the pseudo-role `PUBLIC`, meaning every role. Any user who could connect could create tables there.
+
+PostgreSQL 15 changed two things for newly created clusters:
+
+- `CREATE` on `public` is no longer granted to `PUBLIC`. Only `USAGE` is.
+- The `public` schema is owned by the predefined role `pg_database_owner`, which always resolves to the owner of the current database.
+
+You can see this in any fresh database:
+
+```sql
+\dn+ public
+```
+
+```text
+                                       List of schemas
+  Name  |       Owner       |           Access privileges            |      Description
+--------+-------------------+----------------------------------------+------------------------
+ public | pg_database_owner | pg_database_owner=UC/pg_database_owner+| standard public schema
+        |                   | =U/pg_database_owner                   |
+```
+
+Reading the ACL: `pg_database_owner=UC` means the database owner has `USAGE` and `CREATE`; `=U` (an empty role name means `PUBLIC`) means everyone else has only `USAGE`.
+
+The change closes a security hole: with the old default, any low-privileged user could create a function or operator in `public` that shadowed a built-in and was picked up by other users' queries through `search_path`.
+
+One subtlety: clusters **upgraded** from 14 or earlier with `pg_upgrade`, or restored from a dump taken on an old version, keep the old, permissive `public` ACL. That is why the error often appears only on a brand-new server, a fresh Docker container, or a new managed instance, while the old production box works fine.
+
+## Step 1: Reproduce and Diagnose
+
+Here is the minimal reproduction, run as a superuser:
+
+```sql
+CREATE DATABASE appdb;
+CREATE ROLE app_user LOGIN PASSWORD 'change-me';
+GRANT CONNECT ON DATABASE appdb TO app_user;
+```
+
+Then, connected to `appdb` as `app_user` (or `SET ROLE app_user` from a superuser session):
+
+```sql
+CREATE TABLE orders (id int);
+-- ERROR:  permission denied for schema public
+
+CREATE TABLE public.orders (id int);
+-- ERROR:  permission denied for schema public
+
+CREATE SEQUENCE s1;
+-- ERROR:  permission denied for schema public
+
+CREATE FUNCTION f() RETURNS int LANGUAGE sql AS 'select 1';
+-- ERROR:  permission denied for schema public
+```
+
+Every object type that lives in a schema fails the same way. To confirm exactly which privilege is missing, ask PostgreSQL directly:
+
+```sql
+SELECT has_schema_privilege('public', 'CREATE') AS can_create,
+       has_schema_privilege('public', 'USAGE')  AS can_use;
+```
+
+```text
+ can_create | can_use
+------------+---------
+ f          | t
+```
+
+To check several roles at once, pass the role name as the first argument:
+
+```sql
+SELECT r.rolname,
+       has_schema_privilege(r.rolname, 'public', 'CREATE') AS create_public,
+       has_schema_privilege(r.rolname, 'public', 'USAGE')  AS usage_public
+FROM pg_roles r
+WHERE r.rolname IN ('app_user', 'app_rw', 'shop_owner');
+```
+
+Also check who owns the database and the schema, because ownership decides which fix is cleanest:
+
+```sql
+SELECT datname, pg_get_userbyid(datdba) AS db_owner
+FROM pg_database WHERE datname = current_database();
+
+SELECT nspname, pg_get_userbyid(nspowner) AS schema_owner, nspacl
+FROM pg_namespace WHERE nspname = 'public';
+```
+
+## Fix 1: Grant CREATE on Schema public
+
+The quickest fix, and the one most tutorials give, restores the privilege for a specific role:
+
+```sql
+-- run as the database owner or a superuser, connected to the target database
+GRANT CREATE ON SCHEMA public TO app_user;
+```
+
+After this the `CREATE TABLE` succeeds:
+
+```text
+           List of tables
+ Schema |  Name  | Type  |  Owner
+--------+--------+-------+----------
+ public | orders | table | app_user
+```
+
+Two mistakes to avoid:
+
+- **Wrong database.** Schemas belong to a database. `GRANT ... ON SCHEMA public` applies only to the database you are connected to. Granting while connected to `postgres` does nothing for `appdb`.
+- **Granting to PUBLIC.** `GRANT CREATE ON SCHEMA public TO PUBLIC;` brings back the pre-15 behaviour for every role, including the security issue the change was made to fix. Only do this on a throwaway development database.
+
+`GRANT ALL PRIVILEGES ON DATABASE appdb TO app_user` does **not** fix this error. Database privileges are `CONNECT`, `CREATE` (create schemas) and `TEMPORARY`; they say nothing about objects inside the `public` schema. See [GRANT ALL PRIVILEGES ON DATABASE](/blog/postgres-grant-all-privileges-on-database) for what that command really covers.
+
+## Fix 2: Make the Application Role Own the Database
+
+Because `public` is owned by `pg_database_owner`, the owner of a database automatically has full rights on its `public` schema. If one role is responsible for an application's schema, make it the database owner and no schema grant is needed at all:
+
+```sql
+CREATE ROLE shop_owner LOGIN PASSWORD 'change-me';
+CREATE DATABASE shopdb OWNER shop_owner;
+```
+
+Connected to `shopdb` as `shop_owner`:
+
+```sql
+CREATE TABLE t1 (id int);   -- works
+SELECT pg_has_role('shop_owner', 'pg_database_owner', 'MEMBER');
+```
+
+```text
+ pg_has_role
+-------------
+ t
+```
+
+For an existing database:
+
+```sql
+ALTER DATABASE appdb OWNER TO app_user;
+```
+
+The change takes effect immediately: after `ALTER DATABASE ... OWNER TO`, the new owner can create tables in `public` without any schema grant, because `pg_database_owner` now resolves to it. Note that the database owner is not a superuser; it just owns this one database and its `public` schema. This works well when one application owns one database.
+
+## Fix 3: Change the Owner of Schema public
+
+If you cannot change the database owner (a shared database, or a managed service where the database is created for you), you can hand the `public` schema itself to the application role:
+
+```sql
+ALTER SCHEMA public OWNER TO app_user;
+```
+
+The schema owner has all privileges on it. The downside is that the schema is no longer tied to `pg_database_owner`, which surprises people later if the database changes owner. Prefer Fix 2 or Fix 4 when you can.
+
+## Fix 4: Use a Dedicated Application Schema
+
+The cleanest long-term setup is to leave `public` alone and give the application its own schema:
+
+```sql
+-- as the database owner or superuser, connected to appdb
+CREATE SCHEMA app AUTHORIZATION app_user;
+ALTER ROLE app_user IN DATABASE appdb SET search_path = app;
+```
+
+`AUTHORIZATION app_user` makes `app_user` the schema owner. The `ALTER ROLE ... SET search_path` makes unqualified names resolve to `app` for new sessions of that role in that database. In an existing session you can set it manually:
+
+```sql
+SET search_path = app;
+CREATE TABLE customers (id int);
+SELECT current_schema();
+```
+
+```text
+ current_schema
+----------------
+ app
+```
+
+If you point `search_path` at a schema that does not exist, you get a different error. It is worth knowing because it looks related:
+
+```sql
+SET search_path = does_not_exist;
+CREATE TABLE x (id int);
+```
+
+```text
+ERROR:  no schema has been selected to create in
+```
+
+That one is SQLSTATE `3F000` (`invalid_schema_name`) and means no schema on the path exists, not a privilege problem. The [search_path and schemas guide](/blog/postgres-search-path-and-schemas) explains resolution order in detail.
+
+## The Other Variant: Missing USAGE
+
+If someone hardened the database with `REVOKE ALL ON SCHEMA public FROM PUBLIC` (a common CIS-style recommendation), read access fails too:
+
+```sql
+REVOKE USAGE ON SCHEMA public FROM PUBLIC;
+-- as a role without its own grant:
+SELECT * FROM public.orders;
+```
+
+```text
+ERROR:  permission denied for schema public
+LINE 1: SELECT * FROM public.orders;
+                      ^
+```
+
+The fix is `USAGE` for the roles that need it:
+
+```sql
+GRANT USAGE ON SCHEMA public TO app_rw;
+```
+
+Watch what happens next: the schema error goes away and the table-level check takes over.
+
+```text
+ERROR:  permission denied for table orders
+```
+
+That is expected. `USAGE` on the schema only lets the role find objects; each table still needs `SELECT`, `INSERT` and so on. Layered errors like this are the normal way PostgreSQL privilege problems unfold: fix the schema, then the table, then any sequence. The [GRANT USAGE ON SCHEMA and SELECT ON ALL TABLES guide](/blog/postgres-grant-usage-on-schema-select-all-tables) has complete read-only role recipes.
+
+## Future Objects: ALTER DEFAULT PRIVILEGES
+
+A frequent setup has one role that runs migrations (and therefore owns the tables) and another role the application uses at runtime. Granting on existing tables is not enough, because tables created by the next migration will again be inaccessible. Default privileges solve that:
+
+```sql
+GRANT USAGE ON SCHEMA app TO app_rw;
+
+ALTER DEFAULT PRIVILEGES FOR ROLE app_user IN SCHEMA app
+  GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO app_rw;
+```
+
+Check the result with `\ddp`:
+
+```text
+            Default access privileges
+  Owner   | Schema | Type  |  Access privileges
+----------+--------+-------+----------------------
+ app_user | app    | table | app_rw=arwd/app_user
+```
+
+Now a table created by `app_user` is immediately usable by `app_rw`, while a table created **before** the default privilege existed is not:
+
+```sql
+-- as app_user
+CREATE TABLE app.invoices (id int);
+
+-- as app_rw
+SELECT * FROM app.invoices;   -- 0 rows, works
+SELECT * FROM app.customers;  -- ERROR:  permission denied for table customers
+```
+
+Two rules trip people up:
+
+- `FOR ROLE` must name the role that will **create** the objects (the migration role), not the role running the `ALTER DEFAULT PRIVILEGES`.
+- Default privileges never apply retroactively. Pair them with a one-off `GRANT ... ON ALL TABLES IN SCHEMA app TO app_rw`.
+
+Default privileges control access to future tables; they do not grant `CREATE` on a schema. The migration role still needs `CREATE` (via ownership or a grant) to fix "permission denied for schema public".
+
+## ORMs and Migration Tools
+
+Migration tools hit this error first because the very first thing they do is create their bookkeeping table.
+
+### Django
+
+`python manage.py migrate` starts by creating `django_migrations` in the default schema. With a role that lacks `CREATE` on `public`, Django reports a `MigrationSchemaMissing` exception ("Unable to create the django_migrations table") that wraps `permission denied for schema public`. Fix it with Fix 1, 2 or 4. If you choose a dedicated schema, set the path for the connection in `settings.py`:
+
+```python
+DATABASES = {
+    "default": {
+        "ENGINE": "django.db.backends.postgresql",
+        "NAME": "appdb",
+        "USER": "app_user",
+        "PASSWORD": "change-me",
+        "HOST": "localhost",
+        "OPTIONS": {"options": "-c search_path=app"},
+    }
+}
+```
+
+More on connecting Django in [integrating Django with PostgreSQL](/blog/integrate-django-with-postgresql).
+
+### Prisma
+
+`prisma migrate deploy` and `prisma db push` fail with a database error carrying code `42501` when the role cannot create in the target schema. Prisma uses the `schema` parameter in the connection string (default `public`):
+
+```bash
+DATABASE_URL="postgresql://app_user:change-me@localhost:5432/appdb?schema=app"
+```
+
+`prisma migrate dev` has an extra requirement: it creates a temporary **shadow database** to detect drift, so the role also needs `CREATEDB`, or you must provide a `shadowDatabaseUrl` pointing to a database it can use. That is a separate failure from the schema error, but it tends to appear right after you fix it.
+
+### Flyway and Liquibase
+
+Flyway creates `flyway_schema_history` and Liquibase creates `databasechangelog` and `databasechangeloglock` before running any change set, so they fail on the first run. Either grant `CREATE` on the target schema, or configure the tool to use a schema the role owns:
+
+```bash
+flyway -url=jdbc:postgresql://localhost:5432/appdb \
+       -user=app_user -password=change-me \
+       -schemas=app migrate
+```
+
+Flyway creates schemas listed in `-schemas` if they are missing, which needs the database-level `CREATE` privilege. If you pre-create the schema with `AUTHORIZATION app_user`, no extra database privilege is needed.
+
+## Which Fix Should You Use?
+
+| Situation | Recommended fix |
+|---|---|
+| Local development, throwaway database | `GRANT CREATE ON SCHEMA public TO app_user` |
+| One application per database | `CREATE DATABASE ... OWNER app_user` (or `ALTER DATABASE ... OWNER TO`) |
+| Shared database, several applications | One schema per application with `CREATE SCHEMA ... AUTHORIZATION` plus `search_path` |
+| Separate migration and runtime roles | Migration role owns the schema; runtime role gets `USAGE` plus `ALTER DEFAULT PRIVILEGES` |
+| Read-only error on `SELECT` | `GRANT USAGE ON SCHEMA public TO ...`, then table grants |
+| Error mentions a table, not a schema | Table-level `GRANT`, see the table permission guide |
+
+## Working With Grants Visually
+
+Privilege problems are easier to debug when you can see the ACLs of schemas, tables and default privileges together instead of decoding `=U/pg_database_owner` strings. [Chat2DB](https://app.chat2db.ai/) lets you connect as the application role to reproduce the error, then switch to an admin connection to run the `GRANT` and inspect schema owners without leaving the editor.
+
+## Summary
+
+- `ERROR: permission denied for schema public` (SQLSTATE `42501`) means a schema-level privilege is missing: `CREATE` when creating objects, `USAGE` when accessing them.
+- Since PostgreSQL 15, new databases grant only `USAGE` on `public` to everyone, and `public` is owned by `pg_database_owner`. Upgraded clusters keep the old permissive ACL, which is why the error often shows up only on new servers.
+- Fix it by granting `CREATE` to the specific role, making that role the database owner, or, best for shared databases, giving the application its own schema and `search_path`.
+- Use `ALTER DEFAULT PRIVILEGES` for runtime roles so future tables are accessible, and remember that a schema fix often reveals the next layer: table privileges.

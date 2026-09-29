@@ -1,0 +1,374 @@
+---
+title: "Patroni vs repmgr: Postgres High Availability"
+description: "Patroni vs repmgr compared: DCS leader locks vs repmgrd and witness nodes, failover and switchover commands, config examples, and when to choose each."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: September 26, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# Patroni vs repmgr: Postgres High Availability
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="September 26, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+PostgreSQL ships with excellent streaming replication, but it does not ship with automatic failover. If the primary dies, a standby keeps waiting for WAL until someone promotes it, and applications keep trying to connect to a server that no longer answers. Turning replication into **postgres high availability** requires an external tool that detects failure, picks a new primary, promotes it, repoints the other standbys and tells clients where to connect.
+
+Two open source tools have been the most common answers for self-managed clusters: **Patroni** and **repmgr**. They solve the same problem with very different designs. Patroni delegates the hard question, "who is the primary right now", to a distributed consensus store. repmgr keeps its metadata inside PostgreSQL and relies on its monitoring daemon and careful network topology to make that decision.
+
+This article compares Patroni vs repmgr on architecture, split-brain protection, failover and switchover workflows, configuration, client routing and monitoring. It includes no benchmarks: failover time depends on your timeouts, network and workload, and should be measured in your own environment. Before adopting either tool, check its current release notes to confirm support for your PostgreSQL major version.
+
+## The Short Version
+
+| Aspect | Patroni | repmgr |
+|--------|---------|--------|
+| Language | Python | C (PostgreSQL extension plus CLI) |
+| Source of truth for leadership | External DCS: etcd, Consul, ZooKeeper or Kubernetes | Metadata tables in the `repmgr` database, replicated to standbys |
+| Consensus | Leader lock with TTL in the DCS | No built-in consensus; repmgrd decides from what it can see |
+| Split-brain protection | Primary demotes itself if it cannot renew the leader lock | Depends on witness placement, `location`, and your own fencing |
+| Manages PostgreSQL process | Yes, Patroni starts, stops and configures PostgreSQL | No, PostgreSQL runs under your service manager |
+| Client routing | REST API health checks for HAProxy, or Kubernetes services | Not built in; virtual IP, pgBouncer reconfiguration or libpq multi-host strings |
+| Planned switchover | `patronictl switchover` | `repmgr standby switchover` |
+| Extra infrastructure | A DCS cluster (usually three or five nodes) | Optional witness server |
+
+## Architecture
+
+### Patroni: a DCS and a leader lock
+
+Every PostgreSQL node runs a Patroni agent. Patroni owns the PostgreSQL process: it runs `initdb` or clones a replica on bootstrap, writes the configuration, starts and stops the server, and promotes or demotes it.
+
+All agents talk to a **distributed configuration store** (DCS). Supported stores are etcd (v3 API), Consul, ZooKeeper and Kubernetes (using Endpoints or ConfigMaps as the store). The DCS holds a **leader key** with a time to live. The node that holds the key is the primary. Every `loop_wait` seconds, the leader's Patroni agent renews the key. Replicas watch it.
+
+The failover logic follows from that:
+
+1. If the primary node crashes, it stops renewing the key, which expires after `ttl` seconds.
+2. The remaining Patroni agents race to acquire the key. Before trying, each one checks that it is healthy and not too far behind (`maximum_lag_on_failover`), and compares its WAL position with the other members.
+3. The winner promotes its PostgreSQL. The others reconfigure themselves to follow it.
+4. If the old primary comes back, it sees that someone else holds the key, and rejoins as a replica, using `pg_rewind` if enabled.
+
+The key property is the reverse case. If the primary is alive but **cannot reach the DCS**, for example because of a network partition, it cannot renew the lock. Patroni then demotes it to read-only rather than risk two writable primaries. The DCS itself uses a consensus protocol (Raft in etcd and Consul, ZAB in ZooKeeper), so only one side of a partition can hold a quorum and grant the lock.
+
+Patroni also exposes a **REST API** on each node (port 8008 by default). Endpoints like `/primary`, `/replica` and `/health` return HTTP 200 or 503 depending on the node's role, which is what load balancers use for routing. The same API powers `patronictl`.
+
+### repmgr: extension, repmgrd daemon and witness
+
+repmgr has two parts. The `repmgr` command-line tool clones standbys, registers nodes, performs switchovers and shows cluster state. The `repmgrd` daemon runs on each node, monitors the upstream server and performs automatic failover.
+
+Cluster metadata lives in tables inside a dedicated database (conventionally named `repmgr`), created by the `repmgr` extension on the primary. Because those tables are ordinary tables, they replicate to every standby with the rest of the data.
+
+When the primary becomes unreachable, the `repmgrd` daemons on the standbys:
+
+1. Retry the connection `reconnect_attempts` times, `reconnect_interval` seconds apart.
+2. If the primary is still unreachable, they compare notes with the other standbys to find the most advanced candidate, taking `priority` into account.
+3. The chosen standby runs `promote_command`. The others run `follow_command` to follow the new primary.
+
+A **witness server** is a small, separate PostgreSQL instance that is not part of replication. It holds a copy of the repmgr metadata and helps standbys decide whether the primary is really down or whether they are the ones that are isolated. Placed in the same location as the primary, it acts as a tie-breaker: if standbys in a remote data center cannot see the primary but also cannot see the witness, they conclude that they are the isolated side and do not promote.
+
+### Split-brain considerations
+
+This is the most important difference between the two tools. repmgr has **no external consensus**. It can make a good decision when its assumptions about the network hold, and it offers settings to help:
+
+- `location`: nodes only promote if they are in the same location as the majority of visible nodes, which prevents a standby in a partitioned data center from promoting itself.
+- A witness server in the primary's location.
+- `primary_visibility_consensus`: when enabled, standbys check whether any other node can still see the primary before promoting.
+
+What repmgr does not do on its own is **fence** the old primary. If the old primary is still running and reachable by some clients, it will keep accepting writes after a standby is promoted. Operators typically handle this with a custom `promote_command` script or an `event_notification_command` that moves a virtual IP, reconfigures pgBouncer, or shuts down the old node.
+
+Patroni's leader lock handles the isolated-primary case automatically. It still has failure modes (a Patroni process that hangs while PostgreSQL keeps running, for example), which is why Patroni supports a Linux **watchdog** device to reset a node whose agent stops responding.
+
+## Configuration Examples
+
+### A minimal patroni.yml
+
+This example uses etcd v3. Adjust addresses, paths and passwords for your environment.
+
+```yaml
+scope: pg-cluster
+name: node1
+
+restapi:
+  listen: 0.0.0.0:8008
+  connect_address: 10.0.0.11:8008
+
+etcd3:
+  hosts: 10.0.0.21:2379,10.0.0.22:2379,10.0.0.23:2379
+
+bootstrap:
+  dcs:
+    ttl: 30
+    loop_wait: 10
+    retry_timeout: 10
+    maximum_lag_on_failover: 1048576
+    postgresql:
+      use_pg_rewind: true
+      use_slots: true
+      parameters:
+        wal_level: replica
+        hot_standby: "on"
+        max_wal_senders: 10
+        max_replication_slots: 10
+        wal_log_hints: "on"
+  initdb:
+    - encoding: UTF8
+    - data-checksums
+
+postgresql:
+  listen: 0.0.0.0:5432
+  connect_address: 10.0.0.11:5432
+  data_dir: /var/lib/postgresql/17/main
+  bin_dir: /usr/lib/postgresql/17/bin
+  authentication:
+    superuser:
+      username: postgres
+      password: change-me
+    replication:
+      username: replicator
+      password: change-me
+  pg_hba:
+    - host replication replicator 10.0.0.0/24 scram-sha-256
+    - host all all 10.0.0.0/24 scram-sha-256
+
+tags:
+  nofailover: false
+  noloadbalance: false
+```
+
+The `bootstrap.dcs` section is only used the first time the cluster is created. After that, cluster-wide settings live in the DCS and are changed with `patronictl edit-config`, not by editing the file. The values above for `ttl`, `loop_wait` and `retry_timeout` are Patroni's defaults; tune them together, since shorter values detect failures faster but make the cluster more sensitive to brief network or DCS hiccups.
+
+### A minimal repmgr.conf
+
+repmgr requires `shared_preload_libraries = 'repmgr'` in `postgresql.conf` on every node where `repmgrd` runs.
+
+```ini
+node_id=1
+node_name='node1'
+conninfo='host=10.0.0.11 user=repmgr dbname=repmgr connect_timeout=2'
+data_directory='/var/lib/postgresql/17/main'
+pg_bindir='/usr/lib/postgresql/17/bin'
+
+use_replication_slots=yes
+location='dc1'
+priority=100
+
+failover='automatic'
+promote_command='/usr/bin/repmgr standby promote -f /etc/repmgr.conf --log-to-file'
+follow_command='/usr/bin/repmgr standby follow -f /etc/repmgr.conf --log-to-file --upstream-node-id=%n'
+
+reconnect_attempts=6
+reconnect_interval=10
+monitoring_history=yes
+
+service_start_command='sudo systemctl start postgresql@17-main'
+service_stop_command='sudo systemctl stop postgresql@17-main'
+service_restart_command='sudo systemctl restart postgresql@17-main'
+```
+
+Setting up a cluster then follows a fixed sequence:
+
+```bash
+# On the primary
+repmgr -f /etc/repmgr.conf primary register
+
+# On each standby (empty data directory)
+repmgr -h 10.0.0.11 -U repmgr -d repmgr -f /etc/repmgr.conf standby clone
+sudo systemctl start postgresql@17-main
+repmgr -f /etc/repmgr.conf standby register
+
+# On the witness (its own PostgreSQL instance)
+repmgr -h 10.0.0.11 -U repmgr -d repmgr -f /etc/repmgr.conf witness register
+
+# On every node
+repmgrd -f /etc/repmgr.conf
+
+# Check the result
+repmgr -f /etc/repmgr.conf cluster show
+```
+
+## Switchover and Failover
+
+### Patroni
+
+List the cluster:
+
+```bash
+patronictl -c /etc/patroni/patroni.yml list
+```
+
+A planned switchover (for maintenance or patching) moves the primary role to a healthy replica:
+
+```bash
+patronictl -c /etc/patroni/patroni.yml switchover pg-cluster \
+  --leader node1 --candidate node2 --force
+```
+
+Older Patroni releases use `--master` instead of `--leader`. You can also schedule a switchover with `--scheduled`. A manual failover, used when the cluster has no healthy leader, is `patronictl failover`.
+
+For maintenance where you do not want Patroni to react to anything, such as restarting the DCS, enable maintenance mode:
+
+```bash
+patronictl -c /etc/patroni/patroni.yml pause pg-cluster
+# maintenance work
+patronictl -c /etc/patroni/patroni.yml resume pg-cluster
+```
+
+Other everyday commands include `patronictl restart` (rolling restarts, for example after changing a parameter that needs one), `patronictl reinit` (rebuild a broken replica) and `patronictl edit-config` (change DCS-stored settings).
+
+### repmgr
+
+A switchover is run **on the standby that should become the new primary**:
+
+```bash
+repmgr -f /etc/repmgr.conf standby switchover --siblings-follow --dry-run
+repmgr -f /etc/repmgr.conf standby switchover --siblings-follow
+```
+
+`--dry-run` checks prerequisites, including SSH access to the current primary, which repmgr needs in order to shut it down cleanly. `--siblings-follow` makes the other standbys follow the new primary.
+
+After an automatic failover, the old primary must be rejoined as a standby. With `pg_rewind` available (which requires `wal_log_hints = on` or data checksums):
+
+```bash
+repmgr -f /etc/repmgr.conf node rejoin \
+  -d 'host=10.0.0.12 user=repmgr dbname=repmgr' --force-rewind
+```
+
+Useful inspection commands are `repmgr cluster show`, `repmgr cluster event` (history of switchovers, promotions and registrations) and `repmgr service status`. To stop `repmgrd` from acting during maintenance, use `repmgr service pause` and `repmgr service unpause`.
+
+## Routing Clients to the Primary
+
+Failover is only half the job. Clients must also find the new primary.
+
+### With Patroni
+
+The standard pattern is HAProxy in front of the cluster, using the REST API as a health check:
+
+```text
+listen primary
+    bind *:5000
+    option httpchk OPTIONS /primary
+    http-check expect status 200
+    default-server inter 3s fall 3 rise 2 on-marked-down shutdown-sessions
+    server node1 10.0.0.11:5432 maxconn 100 check port 8008
+    server node2 10.0.0.12:5432 maxconn 100 check port 8008
+    server node3 10.0.0.13:5432 maxconn 100 check port 8008
+
+listen replicas
+    bind *:5001
+    balance roundrobin
+    option httpchk OPTIONS /replica
+    http-check expect status 200
+    default-server inter 3s fall 3 rise 2 on-marked-down shutdown-sessions
+    server node1 10.0.0.11:5432 maxconn 100 check port 8008
+    server node2 10.0.0.12:5432 maxconn 100 check port 8008
+    server node3 10.0.0.13:5432 maxconn 100 check port 8008
+```
+
+Only the current primary answers 200 on `/primary`, so port 5000 always points to it. pgBouncer can sit in front of HAProxy, or on each node, to pool connections. On Kubernetes, Patroni-based operators update service endpoints directly.
+
+### With repmgr
+
+repmgr does not route traffic. Common options are:
+
+- A **virtual IP** managed by keepalived or moved by the `promote_command` script.
+- An `event_notification_command` that rewrites the pgBouncer configuration and reloads it after a promotion.
+- **libpq multi-host connection strings**, which need no extra infrastructure:
+
+```text
+postgresql://app@10.0.0.11,10.0.0.12,10.0.0.13/appdb?target_session_attrs=read-write
+```
+
+With `target_session_attrs=read-write`, libpq tries each host and keeps the first one that accepts writes. JDBC offers a similar `targetServerType=primary` option.
+
+## Monitoring Replication with SQL
+
+Whichever tool you pick, the underlying PostgreSQL views tell you the truth about replication. On the primary:
+
+```sql
+SELECT application_name,
+       client_addr,
+       state,
+       sync_state,
+       pg_wal_lsn_diff(pg_current_wal_lsn(), replay_lsn) AS replay_lag_bytes,
+       write_lag,
+       flush_lag,
+       replay_lag
+FROM pg_stat_replication
+ORDER BY application_name;
+```
+
+`state` should be `streaming`. `sync_state` shows `async`, `sync`, `potential` or `quorum`. The lag columns are intervals measured by the primary.
+
+On a standby:
+
+```sql
+SELECT pg_is_in_recovery()             AS is_standby,
+       pg_last_wal_receive_lsn()       AS received,
+       pg_last_wal_replay_lsn()        AS replayed,
+       now() - pg_last_xact_replay_timestamp() AS time_since_last_replayed_xact;
+
+SELECT status, sender_host, sender_port, slot_name, latest_end_time
+FROM pg_stat_wal_receiver;
+```
+
+Note that `time_since_last_replayed_xact` grows when the primary is idle, even if the standby is fully caught up, so compare it with WAL positions before raising an alarm.
+
+Replication slots prevent the primary from removing WAL a standby still needs, but an abandoned slot can fill the disk:
+
+```sql
+SELECT slot_name, slot_type, active, wal_status, safe_wal_size,
+       pg_size_pretty(pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn)) AS retained_wal
+FROM pg_replication_slots;
+```
+
+Setting `max_slot_wal_keep_size` caps how much WAL a slot can hold back.
+
+For repmgr clusters, the metadata is also queryable:
+
+```sql
+SELECT node_id, node_name, type, upstream_node_id, active, location, priority
+FROM repmgr.nodes
+ORDER BY node_id;
+
+SELECT event_timestamp, node_id, event, successful, details
+FROM repmgr.events
+ORDER BY event_timestamp DESC
+LIMIT 20;
+```
+
+## Managing the Cluster Day to Day
+
+Most days nothing fails, and the work is inspection: confirming every standby is streaming, checking that slots are not retaining too much WAL, verifying which node is primary after a planned switchover, and reviewing recent events. The CLI tools (`patronictl list`, `repmgr cluster show`) give a quick summary, but you will still spend time in the SQL views above.
+
+A SQL client that keeps saved connections to every node helps here. In [Chat2DB](https://app.chat2db.ai/), you can register the primary and each standby as separate connections, save the `pg_stat_replication`, `pg_stat_wal_receiver` and `pg_replication_slots` queries, and rerun them against any node after a switchover. Its AI assistant can also explain unfamiliar columns or draft variations of these queries, such as filtering for standbys whose replay lag exceeds a threshold you choose.
+
+A few habits pay off regardless of tool:
+
+1. **Rehearse switchovers** regularly in a staging cluster with the same topology, so a real failover is not the first time the procedure runs.
+2. **Alert on replication state**, not just on node liveness: a standby that is up but not streaming is not a failover candidate.
+3. **Keep timeouts consistent**: client connect timeouts, HAProxy health check intervals and the HA tool's detection settings should be planned together.
+4. **Back up independently**. Replication copies mistakes instantly; use pgBackRest, Barman or another tool for point-in-time recovery.
+
+## When to Choose Which
+
+### Choose Patroni when
+
+- You want automatic failover with strong protection against split-brain, and you can run (or already run) etcd, Consul, ZooKeeper or Kubernetes.
+- You deploy on Kubernetes, where several PostgreSQL operators build on Patroni.
+- You want the HA tool to manage PostgreSQL configuration centrally and perform rolling restarts.
+- You want health-check-based routing through HAProxy with no custom scripts.
+
+The cost is operating a DCS correctly. An unhealthy etcd cluster can cause Patroni to demote a perfectly good primary, so the DCS needs the same monitoring and care as the database.
+
+### Choose repmgr when
+
+- You prefer fewer moving parts and no separate consensus cluster.
+- You already manage PostgreSQL through systemd, configuration management and your own scripts, and want a tool that fits in rather than takes over.
+- You primarily need convenient cloning, registration and controlled switchovers, with automatic failover as an option you configure carefully.
+- Your topology is simple enough (for example, one data center, or a clear primary location with a witness) that its visibility-based decisions are sound.
+
+The cost is that fencing and client routing are your responsibility. Budget time to write and test the scripts that move a virtual IP or reconfigure pgBouncer, and to test network partitions, not just crashes.
+
+## Summary
+
+The Patroni vs repmgr choice comes down to where you want the source of truth for leadership to live. Patroni puts it in a consensus store, gains automatic protection against two primaries, and manages the whole PostgreSQL lifecycle, at the cost of running a DCS. repmgr keeps metadata in PostgreSQL itself, stays lightweight and scriptable, and leaves fencing and routing to you. Both can deliver reliable postgres high availability when configured deliberately, monitored through `pg_stat_replication` and related views, and tested with regular switchover drills.

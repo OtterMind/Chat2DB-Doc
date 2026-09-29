@@ -1,0 +1,424 @@
+---
+title: "PostgreSQL 18 Async I/O: io_method and pg_aios"
+description: "A hands-on guide to PostgreSQL 18 asynchronous I/O: io_method worker, io_uring and sync, io_workers, effective_io_concurrency, pg_aios, and safe benchmarking."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: September 28, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# PostgreSQL 18 Async I/O: io_method and pg_aios
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="September 28, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+Until PostgreSQL 18, a backend that needed a data block that was not in shared buffers called `read()` (or `preadv()`) and waited for it. Prefetching existed for a few cases through `posix_fadvise`, but the actual read into shared buffers was still synchronous. PostgreSQL 18 introduces an **asynchronous I/O (AIO) subsystem**: a backend can issue several reads, keep working, and collect the results when it needs them.
+
+This article explains the new settings, what each `io_method` does, which operations use AIO in version 18, how to observe it with the new `pg_aios` view and with `pg_stat_io`, and how to compare methods without fooling yourself. Commands and output were run on PostgreSQL 18.6 in the official `postgres:18` Docker image on Linux (arm64). Where something could not be tested in that environment, the article says so and falls back to the official documentation.
+
+No benchmark numbers are given here. AIO gains depend heavily on storage latency, and a container on a laptop tells you nothing about a cloud volume or a NVMe array. Instead, the article shows how to run the comparison on your own hardware.
+
+## What Changed in PostgreSQL 18
+
+At a high level:
+
+- A new server setting, `io_method`, selects how asynchronous reads are executed: `worker` (default), `io_uring`, or `sync`.
+- A new process type, the **I/O worker**, performs reads on behalf of backends when `io_method = worker`.
+- The subsystem is used for reads through the "read stream" interface. Operations built on it include sequential scans, bitmap heap scans, and vacuum. Writes (checkpoints, background writer, WAL) are not asynchronous in PostgreSQL 18.
+- Defaults changed: `effective_io_concurrency` and `maintenance_io_concurrency` now default to 16.
+- A new view, `pg_aios`, lists I/O handles that are currently in use.
+- `pg_stat_io` gained byte columns such as `read_bytes`, which make combined reads easier to reason about.
+
+## Step 1: Inspect the Current Settings
+
+Connect with `psql` and look at every AIO-related parameter at once:
+
+```sql
+SELECT name, setting, unit, context, short_desc
+FROM pg_settings
+WHERE name IN ('io_method', 'io_workers', 'effective_io_concurrency',
+               'maintenance_io_concurrency', 'io_combine_limit',
+               'io_max_combine_limit', 'io_max_concurrency');
+```
+
+```text
+            name            | setting | unit |  context   |                                       short_desc
+----------------------------+---------+------+------------+----------------------------------------------------------------------------------------
+ effective_io_concurrency   | 16      |      | user       | Number of simultaneous requests that can be handled efficiently by the disk subsystem.
+ io_combine_limit           | 16      | 8kB  | user       | Limit on the size of data reads and writes.
+ io_max_combine_limit       | 16      | 8kB  | postmaster | Server-wide limit that clamps io_combine_limit.
+ io_max_concurrency         | 64      |      | postmaster | Max number of IOs that one process can execute simultaneously.
+ io_method                  | worker  |      | postmaster | Selects the method for executing asynchronous I/O.
+ io_workers                 | 3       |      | sighup     | Number of IO worker processes, for io_method=worker.
+ maintenance_io_concurrency | 16      |      | user       | A variant of "effective_io_concurrency" that is used for maintenance work.
+```
+
+The `context` column tells you how each setting can be changed, which is the first thing to understand before tuning:
+
+| Setting | Context | How to change |
+| --- | --- | --- |
+| `io_method` | postmaster | `postgresql.conf` or `ALTER SYSTEM`, then restart |
+| `io_max_concurrency` | postmaster | Restart |
+| `io_max_combine_limit` | postmaster | Restart |
+| `io_workers` | sighup | Config file, then `SELECT pg_reload_conf()` |
+| `effective_io_concurrency` | user | `SET` per session, per role, per database, or per tablespace |
+| `maintenance_io_concurrency` | user | Same as above |
+| `io_combine_limit` | user | Same as above, clamped by `io_max_combine_limit` |
+
+`io_max_concurrency` has a boot value of `-1`, which means PostgreSQL computes it from `shared_buffers` and the maximum number of processes. On the test server it resolved to 64. Check the allowed `io_method` values on your build:
+
+```sql
+SELECT enumvals FROM pg_settings WHERE name = 'io_method';
+```
+
+```text
+        enumvals
+------------------------
+ {sync,worker,io_uring}
+```
+
+`io_uring` only appears when PostgreSQL was built with `--with-liburing`, which the official Debian-based Docker image is.
+
+## Step 2: Understand the Three io_method Values
+
+### worker (the default)
+
+With `io_method = worker`, the postmaster starts a pool of I/O worker processes. You can see them in the process list:
+
+```bash
+docker exec pg18 ps -eo pid,cmd | grep postgres
+```
+
+```text
+    1 postgres
+   28 postgres: io worker 0
+   29 postgres: io worker 1
+   30 postgres: io worker 2
+   31 postgres: checkpointer
+   32 postgres: background writer
+   ...
+```
+
+A backend that wants blocks puts a request in shared memory; a worker performs the actual read into shared buffers; the backend picks up the result later. It works on every platform PostgreSQL supports, which is why it is the default.
+
+### io_uring
+
+On Linux, `io_method = io_uring` submits reads directly to the kernel through `io_uring`, without the extra hop through worker processes. With this method no I/O workers are started. It requires Linux, a PostgreSQL build with liburing, and a kernel and container runtime that allow `io_uring`.
+
+### sync
+
+`io_method = sync` performs reads synchronously, similar to PostgreSQL 17, while still using the new code paths. It is useful as a baseline when comparing and as a fallback if you suspect an AIO-related problem. After switching to `sync` and restarting, the process list on the test server showed no `io worker` processes at all.
+
+## Step 3: Change io_method Safely
+
+`io_method` cannot be changed at runtime. Trying it in a session fails immediately:
+
+```sql
+SET io_method = 'sync';
+```
+
+```text
+ERROR:  parameter "io_method" cannot be changed without restarting the server
+```
+
+`ALTER SYSTEM` accepts it, but a reload does not apply it. `pending_restart` shows the state:
+
+```sql
+ALTER SYSTEM SET io_method = 'io_uring';
+SELECT pg_reload_conf();
+SELECT name, setting, pending_restart FROM pg_settings WHERE name = 'io_method';
+```
+
+```text
+   name    | setting | pending_restart
+-----------+---------+-----------------
+ io_method | worker  | t
+```
+
+The server log also records it:
+
+```text
+LOG:  parameter "io_method" cannot be changed without restarting the server
+```
+
+### A Real Failure: io_uring Blocked in Docker
+
+Restarting the container with `io_method = 'io_uring'` in `postgresql.auto.conf` produced this, and the server did not start:
+
+```text
+FATAL:  could not setup io_uring queue: Operation not permitted
+HINT:  Check if io_uring is disabled via /proc/sys/kernel/io_uring_disabled.
+LOG:  database system is shut down
+```
+
+On that host, `/proc/sys/kernel/io_uring_disabled` was `0`, so the kernel allowed `io_uring`. The block came from Docker's default seccomp profile, which rejects the `io_uring` system calls. A separate test container started with `--security-opt seccomp=unconfined` and `-c io_method=io_uring` came up normally and reported `io_uring`:
+
+```bash
+docker run -d --name pg18-uring --security-opt seccomp=unconfined \
+  -e POSTGRES_PASSWORD=pw postgres:18 -c io_method=io_uring
+
+docker exec pg18-uring psql -U postgres -c "SHOW io_method"
+```
+
+Disabling seccomp is a security decision, not a tuning knob. For production containers, prefer a custom seccomp profile that allows only the needed calls, or stay with `worker`. The lessons for any environment:
+
+1. A wrong `io_method` is a startup failure, not a warning. Test the change on a replica or staging server first.
+2. Keep a way to edit the config without a running server. If you set it through `ALTER SYSTEM`, the value lives in `postgresql.auto.conf` in the data directory; remove that line to recover.
+3. Managed services may not expose `io_method` at all. Check your provider documentation.
+
+Performance testing of `io_uring` was not done for this article; only startup and the reported setting were verified.
+
+## Step 4: Tune io_workers
+
+`io_workers` defaults to 3 and only applies to `io_method = worker`. It can be changed with a reload, and the pool grows immediately:
+
+```sql
+ALTER SYSTEM SET io_workers = 6;
+SELECT pg_reload_conf();
+```
+
+```text
+   28 postgres: io worker 0
+   29 postgres: io worker 1
+   30 postgres: io worker 2
+  143 postgres: io worker 3
+  144 postgres: io worker 4
+  145 postgres: io worker 5
+```
+
+It cannot be set per session:
+
+```sql
+SET io_workers = 2;
+```
+
+```text
+ERROR:  parameter "io_workers" cannot be changed now
+```
+
+How many workers you need depends on how many concurrent read streams your workload has and how slow your storage is. Too few workers means requests queue up behind each other. Start from the default, watch `pg_aios` under real load (Step 6), and increase gradually if requests are consistently waiting in a submitted state.
+
+## Step 5: effective_io_concurrency and io_combine_limit
+
+### effective_io_concurrency
+
+This setting controls how far ahead a read stream may issue I/O for normal queries, and `maintenance_io_concurrency` does the same for maintenance work such as vacuum. The PostgreSQL 18 default of 16 is higher than the old default of 1 for `effective_io_concurrency`, because the setting now drives real concurrent reads rather than only advisory prefetch hints.
+
+It is a user-level setting, so you can set it per tablespace when storage differs:
+
+```sql
+ALTER TABLESPACE fast_nvme SET (effective_io_concurrency = 64);
+```
+
+or per session while testing:
+
+```sql
+SET effective_io_concurrency = 32;
+```
+
+Setting it to 0 disables issuing reads ahead for the affected operations.
+
+### io_combine_limit
+
+Read streams merge adjacent blocks into one larger read. `io_combine_limit` caps the size of each combined I/O. The default is 128kB (16 blocks). Values above `io_max_combine_limit` are accepted but have no effect beyond that limit, and the absolute maximum is 1MB:
+
+```sql
+SET io_combine_limit = '2MB';
+```
+
+```text
+ERROR:  256 8kB is outside the valid range for parameter "io_combine_limit" (1 8kB .. 128 8kB)
+```
+
+To use combined reads larger than 128kB you must raise `io_max_combine_limit` (restart required) as well.
+
+## Step 6: Watch In-Flight I/O With pg_aios
+
+`pg_aios` shows every AIO handle currently in use. It is empty on an idle server:
+
+```sql
+SELECT * FROM pg_aios;
+```
+
+Querying it requires superuser or the `pg_read_all_stats` role. An ordinary role gets:
+
+```text
+ERROR:  permission denied for view pg_aios
+```
+
+```sql
+GRANT pg_read_all_stats TO monitoring_user;
+```
+
+To see something, run a sequential scan on a table larger than `shared_buffers` in one session, and sample the view from another:
+
+```sql
+SELECT pid, state, operation, off, length, target, result, target_desc
+FROM pg_aios;
+```
+
+A sample taken during a `count(*)` over a 220 MB table with 128 MB of `shared_buffers`:
+
+```text
+ pid |      state       | operation |    off    | length | target | result  |                target_desc
+-----+------------------+-----------+-----------+--------+--------+---------+--------------------------------------------
+  70 | SUBMITTED        | readv     | 152043520 | 131072 | smgr   | UNKNOWN | blocks 18560..18575 in file "base/5/16525"
+  70 | COMPLETED_SHARED | readv     | 151519232 | 131072 | smgr   | OK      | blocks 18496..18511 in file "base/5/16525"
+  70 | COMPLETED_SHARED | readv     | 151126016 | 131072 | smgr   | OK      | blocks 18448..18463 in file "base/5/16525"
+  70 | SUBMITTED        | readv     | 152567808 | 131072 | smgr   | UNKNOWN | blocks 18624..18639 in file "base/5/16525"
+  70 | SUBMITTED        | readv     | 152961024 | 131072 | smgr   | UNKNOWN | blocks 18672..18687 in file "base/5/16525"
+```
+
+What this tells you:
+
+- `pid` is the process that issued the I/O (the backend running the query), not the I/O worker that executed it.
+- `length` is 131072 bytes, which is 16 blocks: the `io_combine_limit` default in action.
+- Several reads are `SUBMITTED` at once while earlier ones are already `COMPLETED_SHARED`. That is the read-ahead behaviour AIO enables.
+- `target_desc` identifies the relation file and block range, which you can map to a table through `pg_relation_filenode()`.
+
+Because the view is a snapshot of very short-lived state, most samples are empty. Sample repeatedly, or aggregate in a loop, rather than trusting a single query:
+
+```sql
+SELECT state, count(*)
+FROM pg_aios
+GROUP BY state;
+```
+
+## Step 7: Measure With pg_stat_io and EXPLAIN
+
+`pg_aios` shows what is happening now. `pg_stat_io` shows cumulative totals. Reset it, run the workload, force a stats flush, and read the result:
+
+```sql
+SET track_io_timing = on;
+SET max_parallel_workers_per_gather = 0;
+SELECT pg_stat_reset_shared('io');
+
+SELECT count(*) FROM events WHERE payload <> 'y';
+
+SELECT pg_stat_force_next_flush();
+SELECT 1;
+
+SELECT backend_type, context, reads,
+       pg_size_pretty(read_bytes) AS read,
+       round(read_time::numeric, 1) AS read_ms,
+       hits, reuses
+FROM pg_stat_io
+WHERE object = 'relation' AND reads > 0;
+```
+
+```text
+  backend_type  | context  | reads |  read  | read_ms | hits | reuses
+----------------+----------+-------+--------+---------+------+--------
+ client backend | bulkread |  1735 | 216 MB |     0.7 |  470 |  27606
+```
+
+Two things stand out. First, `reads` counts I/O operations, not blocks: 216 MB in 1735 reads is roughly 128kB per read, matching the combine limit. Second, `read_time` is tiny. With AIO, the time a backend records is mostly the time it spent waiting for I/O that was not ready yet, not the full duration of each read. Low `read_time` means reads were issued early enough; it does not mean storage was fast.
+
+Stats are not flushed instantly, which is why `pg_stat_force_next_flush()` and a following statement are needed when you check in the same session. For a deeper tour of this view, see the [pg_stat_io guide](/blog/postgres-pg-stat-io-guide).
+
+`EXPLAIN (ANALYZE, BUFFERS)` with `track_io_timing = on` shows the same effect per plan node:
+
+```text
+ Aggregate (actual time=151.470..151.476 rows=1.00 loops=1)
+   Buffers: shared hit=282 read=27888
+   I/O Timings: shared read=0.678
+   ->  Seq Scan on events (actual time=0.118..100.690 rows=2000000.00 loops=1)
+         Filter: (payload <> 'y'::text)
+         Buffers: shared hit=282 read=27888
+         I/O Timings: shared read=0.678
+```
+
+There is no special plan node or label for asynchronous reads. You infer AIO effectiveness from `Buffers` versus `I/O Timings` and from overall execution time. Note that `read=27888` here counts blocks (buffers), while `pg_stat_io.reads` counts combined operations. More on reading these lines in [EXPLAIN BUFFERS explained](/blog/postgres-explain-buffers-analyze).
+
+## Step 8: Benchmark io_method Without Fooling Yourself
+
+If you want to know whether `worker`, `io_uring`, or `sync` is best on your hardware, compare them properly. A careless test measures the operating system page cache, not your storage.
+
+### Use a Realistic Setup
+
+- Run on the same hardware class and storage type as production. A laptop SSD, a network-attached cloud volume, and local NVMe behave very differently under concurrent reads.
+- Use a dataset larger than `shared_buffers` plus the OS page cache, or clear the caches between runs.
+- Test on a staging copy or a replica, never on the primary, because each `io_method` change is a restart.
+
+### Clear Caches Between Runs
+
+On a dedicated Linux test host, stop PostgreSQL (or at least make sure it is not holding the data in `shared_buffers`), then drop the page cache:
+
+```bash
+sudo systemctl restart postgresql
+sync
+echo 3 | sudo tee /proc/sys/vm/drop_caches
+```
+
+Restarting PostgreSQL empties `shared_buffers`; dropping caches empties the kernel cache. Do this only on a machine where evicting the page cache for everything is acceptable.
+
+### Run the Same Workload for Each Method
+
+A minimal loop for a single scan-heavy query:
+
+```bash
+for m in sync worker io_uring; do
+  psql -U postgres -c "ALTER SYSTEM SET io_method = '$m'"
+  sudo systemctl restart postgresql
+  sync; echo 3 | sudo tee /proc/sys/vm/drop_caches > /dev/null
+  psql -U postgres -c "SHOW io_method"
+  psql -U postgres -c "EXPLAIN (ANALYZE, BUFFERS) SELECT count(*) FROM big_table"
+done
+```
+
+For concurrency effects, use `pgbench` with a custom script and several clients rather than a single query, because AIO benefits depend on how many read streams compete for the same storage:
+
+```bash
+pgbench -n -c 8 -j 4 -T 120 -f scan.sql bench
+```
+
+Run each configuration several times and compare medians. Record `pg_stat_io` deltas alongside latency so you can confirm the runs actually read from storage.
+
+### Change One Thing at a Time
+
+`io_method`, `io_workers`, `effective_io_concurrency`, and `io_combine_limit` all interact. Settle on a method first with default values, then tune `io_workers` (for `worker`), then `effective_io_concurrency` per tablespace. If you need a starting point for the rest of `postgresql.conf`, the [PostgreSQL config calculator](https://chat2db.ai/tools/postgres-config-calculator) generates memory and parallelism settings from your hardware, and the [postgresql.conf tuning guide](/blog/postgresql-conf-performance-tuning) explains them.
+
+## Which Operations Benefit in PostgreSQL 18
+
+Based on the PostgreSQL 18 release notes and documentation, AIO in version 18 applies to reads issued through read streams. That includes:
+
+- Sequential scans (the example above).
+- Bitmap heap scans.
+- Vacuum, which reads heap pages ahead. See [vacuum and autovacuum tuning](/blog/postgres-vacuum-and-autovacuum-tuning) for the other knobs that affect it.
+- Other read-stream users such as `ANALYZE` sampling and `pg_prewarm`.
+
+Plain index scans that fetch one heap page at a time do not get the same read-ahead in 18, and writes are still synchronous. Workloads that are mostly cached in `shared_buffers` will see little difference either way, because there is nothing to read.
+
+## Practical Recommendations
+
+1. Keep `io_method = worker` unless you have tested an alternative on production-like hardware.
+2. Consider `io_uring` only on Linux, with a build that includes liburing, and after verifying your container runtime or security policy permits it.
+3. Keep `sync` in mind as a diagnostic fallback if you suspect an AIO problem.
+4. Leave `effective_io_concurrency` at 16 initially; raise it per tablespace for high-latency or highly parallel storage after measuring.
+5. Monitor `pg_stat_io` over time, and sample `pg_aios` when investigating slow scans.
+
+When you are comparing settings across several servers, a client that can run the same diagnostic SQL against each connection saves time. [Chat2DB](https://chat2db.ai/download) supports PostgreSQL 18 and can keep these monitoring queries as saved snippets.
+
+## FAQ
+
+### Is asynchronous I/O enabled by default in PostgreSQL 18?
+
+Yes. The default `io_method` is `worker`, which starts three I/O worker processes. You do not need to do anything to use it.
+
+### Can I switch io_method without a restart?
+
+No. It is a postmaster-level setting. `SET` fails, and `ALTER SYSTEM` followed by a reload only marks it as `pending_restart`.
+
+### Why does io_uring fail with "Operation not permitted"?
+
+Either the kernel has `io_uring` disabled through `/proc/sys/kernel/io_uring_disabled`, or a sandbox such as Docker's default seccomp profile blocks the system calls. In testing, the second cause produced exactly that error while the kernel setting was `0`.
+
+### Does AIO speed up writes or checkpoints?
+
+Not in PostgreSQL 18. The subsystem is used for reads only; checkpoint, background writer, and WAL writes still happen synchronously.
+
+### Why is pg_aios always empty when I query it?
+
+It only shows I/O that is in flight at the moment of the query. On an idle or fully cached server there is nothing to show. Run a large scan in another session and sample repeatedly.

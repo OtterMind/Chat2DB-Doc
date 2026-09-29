@@ -1,0 +1,366 @@
+---
+title: "Postgres Range Types and Multiranges Explained"
+description: "Learn Postgres range types: int4range, tstzrange, daterange, multiranges in PG14+, bound syntax, &&, @> and -|- operators, GiST indexes and range_agg."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: September 24, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# Postgres Range Types and Multiranges Explained
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="September 24, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+Hotel bookings, meeting-room reservations, price lists that change over time, IP allocations, shift schedules, subscription periods: a surprising amount of business data is really about **intervals**. The traditional way to store an interval is two columns, `start_at` and `end_at`, plus a lot of carefully written `WHERE` clauses that everyone gets slightly wrong. Is the end inclusive? What does a `NULL` end mean? How do you find overlaps without a full table scan?
+
+PostgreSQL has a better answer built in: **range types**. A range is a single value that represents a span of some ordered type, with explicit rules for its bounds. Since PostgreSQL 14 there are also **multiranges**, which hold an ordered set of non-overlapping ranges in one value. Together with GiST indexes and a small family of operators, they turn interval logic from error-prone boilerplate into short, indexable expressions.
+
+This guide covers the built-in range types, bound notation, the operators you will actually use, indexing, multiranges and `range_agg`, and two realistic examples: a booking system and a time-versioned price list.
+
+## The built-in range types
+
+PostgreSQL ships six range types, each built on a subtype:
+
+| Range type | Subtype | Typical use |
+| --- | --- | --- |
+| `int4range` | `integer` | seat numbers, version ranges |
+| `int8range` | `bigint` | large ID blocks |
+| `numrange` | `numeric` | price bands, measurement tolerances |
+| `tsrange` | `timestamp without time zone` | local schedules |
+| `tstzrange` | `timestamp with time zone` | bookings, validity periods |
+| `daterange` | `date` | hotel nights, contracts, holidays |
+
+Starting with PostgreSQL 14, every range type has a matching multirange type: `int4multirange`, `int8multirange`, `nummultirange`, `tsmultirange`, `tstzmultirange` and `datemultirange`. You can also define your own range types with `CREATE TYPE ... AS RANGE`, which automatically creates the corresponding multirange type as well.
+
+For anything involving real-world time, prefer `tstzrange` over `tsrange`. A `timestamptz` value identifies an absolute instant, so comparisons stay correct across time zones and daylight saving changes.
+
+## Range bounds and literal syntax
+
+A range literal is written as a string with brackets and parentheses that describe whether each bound is included:
+
+- `[` and `]` mean the bound is **inclusive**
+- `(` and `)` mean the bound is **exclusive**
+
+```sql
+SELECT '[2026-09-01, 2026-09-05)'::daterange;   -- includes the 1st, excludes the 5th
+SELECT '[10, 20]'::int4range;                   -- 10 through 20
+SELECT '(0, 100)'::numrange;                    -- strictly between 0 and 100
+SELECT '[2026-09-24 09:00+00, 2026-09-24 10:30+00)'::tstzrange;
+```
+
+You can also use constructor functions. With two arguments the default is `[)`; a third argument sets the bounds explicitly:
+
+```sql
+SELECT daterange('2026-09-01', '2026-09-05');          -- [2026-09-01,2026-09-05)
+SELECT int4range(10, 20, '[]');                        -- [10,21)
+SELECT tstzrange(now(), now() + interval '2 hours');   -- [now, now+2h)
+```
+
+### Canonical form for discrete types
+
+Notice that `int4range(10, 20, '[]')` prints as `[10,21)`. For **discrete** types (`int4range`, `int8range`, `daterange`), PostgreSQL normalises every value to the half-open `[)` form. That means `[10,20]` and `[10,21)` are the same value and compare as equal. Continuous types such as `numrange` and `tstzrange` keep whatever bounds you specify, because there is no "next value" to step to.
+
+The half-open convention `[start, end)` is worth adopting everywhere, even for continuous types. Two adjacent bookings `[09:00, 10:00)` and `[10:00, 11:00)` then share a boundary without overlapping, and a sequence of periods tiles time without gaps or double-counting.
+
+### Unbounded and empty ranges
+
+Leaving a bound out makes the range unbounded on that side. `NULL` passed to a constructor means the same thing:
+
+```sql
+SELECT '[2026-01-01,)'::daterange;          -- from Jan 1, 2026 onwards, no end
+SELECT daterange(NULL, '2026-01-01');       -- everything before 2026
+SELECT 'empty'::int4range;                  -- contains no points at all
+SELECT int4range(5, 5);                     -- [5,5) is empty too
+```
+
+An open-ended range is the natural representation for "currently valid" rows. The special value `empty` is a real range that contains nothing; it overlaps nothing and is contained in everything. If empty ranges make no sense in your domain, reject them with a `CHECK (NOT isempty(col))` constraint.
+
+### Accessor functions
+
+A handful of functions pull a range apart:
+
+```sql
+SELECT lower(r), upper(r), lower_inc(r), upper_inc(r),
+       lower_inf(r), upper_inf(r), isempty(r)
+FROM (SELECT '[2026-09-01,)'::daterange AS r) t;
+```
+
+This returns the lower bound `2026-09-01`, an upper bound of `NULL` (unbounded), `true` for lower inclusive, `false` for upper inclusive, `false` and `true` for the infinity checks, and `false` for `isempty`.
+
+## Range operators you will actually use
+
+Range operators are what make the type worthwhile. The most important ones:
+
+| Operator | Meaning | Example | Result |
+| --- | --- | --- | --- |
+| `&&` | overlaps | `int4range(1,5) && int4range(4,8)` | true |
+| `@>` | contains range or element | `int4range(1,10) @> 5` | true |
+| `<@` | is contained by | `int4range(2,3) <@ int4range(1,10)` | true |
+| `-\|-` | is adjacent to | `int4range(1,5) -\|- int4range(5,8)` | true |
+| `<<` | strictly left of | `int4range(1,3) << int4range(5,8)` | true |
+| `>>` | strictly right of | `int4range(5,8) >> int4range(1,3)` | true |
+| `&<` | does not extend to the right of | `int4range(1,3) &< int4range(2,8)` | true |
+| `&>` | does not extend to the left of | `int4range(5,8) &> int4range(2,6)` | true |
+| `+` | union | `int4range(1,5) + int4range(3,8)` | `[1,8)` |
+| `*` | intersection | `int4range(1,5) * int4range(3,8)` | `[3,5)` |
+| `-` | difference | `int4range(1,8) - int4range(5,10)` | `[1,5)` |
+
+A few practical notes:
+
+- **Overlap** is the query you run most often: "is anything booked during this window?" becomes `during && tstzrange($1, $2)`.
+- **Containment** with an element answers "which price was valid at this instant?" as `valid_during @> $ts::timestamptz`.
+- **Adjacency** `-|-` is useful for merging consecutive periods or checking that a series of periods leaves no gaps.
+- The union `+` and difference `-` operators raise an error if the result would not be a single contiguous range. For example `int4range(1,3) + int4range(5,8)` fails with "result of range union would not be contiguous". Multiranges, covered below, solve exactly this.
+
+## Indexing ranges with GiST
+
+A B-tree index can sort ranges, but it cannot answer "overlaps" or "contains" efficiently. For those operators you want a **GiST** index (SP-GiST also supports ranges):
+
+```sql
+CREATE TABLE reservation (
+    id        bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    room_id   int       NOT NULL,
+    guest     text      NOT NULL,
+    during    tstzrange NOT NULL,
+    CHECK (NOT isempty(during))
+);
+
+CREATE INDEX reservation_during_gist ON reservation USING gist (during);
+```
+
+The GiST index supports `&&`, `@>`, `<@`, `-|-`, `<<`, `>>`, `&<`, `&>` and `=`. Check that it is being used with `EXPLAIN`:
+
+```sql
+EXPLAIN
+SELECT *
+FROM reservation
+WHERE during && tstzrange('2026-10-01 00:00+00', '2026-10-02 00:00+00');
+```
+
+On a table with enough rows you will see a Bitmap Index Scan or Index Scan on `reservation_during_gist`. On a tiny table the planner may still pick a sequential scan, which is expected.
+
+### Combining a scalar column and a range
+
+Most real queries filter by something like `room_id = 42` as well as a time window. GiST does not support plain equality on `integer` out of the box, but the `btree_gist` extension adds GiST operator classes for common scalar types, so you can build one multicolumn index:
+
+```sql
+CREATE EXTENSION IF NOT EXISTS btree_gist;
+
+CREATE INDEX reservation_room_during_gist
+    ON reservation USING gist (room_id, during);
+```
+
+## Preventing double bookings with an exclusion constraint
+
+The most valuable use of ranges is letting the database itself reject overlapping data. An **exclusion constraint** generalises a unique constraint: instead of "no two rows are equal", it says "no two rows satisfy all of these operators at once".
+
+```sql
+ALTER TABLE reservation
+    ADD CONSTRAINT reservation_no_overlap
+    EXCLUDE USING gist (room_id WITH =, during WITH &&);
+```
+
+Read it as: no two rows may have the same `room_id` **and** overlapping `during`. Now try it:
+
+```sql
+INSERT INTO reservation (room_id, guest, during) VALUES
+  (101, 'Alice', '[2026-10-01 14:00+00, 2026-10-03 11:00+00)'),
+  (101, 'Bob',   '[2026-10-03 11:00+00, 2026-10-05 11:00+00)'),  -- adjacent, allowed
+  (102, 'Carol', '[2026-10-01 14:00+00, 2026-10-03 11:00+00)');  -- other room, allowed
+
+INSERT INTO reservation (room_id, guest, during) VALUES
+  (101, 'Dave',  '[2026-10-02 12:00+00, 2026-10-04 11:00+00)');
+-- ERROR:  conflicting key value violates exclusion constraint "reservation_no_overlap"
+```
+
+The error carries SQLSTATE `23P01` (`exclusion_violation`), which application code can catch and turn into a friendly "that room is already taken" message. Because the check happens inside the database, it is safe under concurrency: two transactions trying to book the same slot cannot both succeed, which is very hard to guarantee with a "SELECT, then INSERT" pattern in application code. For a deeper look at the constraint itself, see the [Postgres exclusion constraints guide](https://chat2db.ai/resources/blog/postgres-exclusion-constraints-guide).
+
+### Finding free slots
+
+Ranges also make availability queries short. To list rooms free for a whole requested stay:
+
+```sql
+SELECT r.room_id
+FROM (VALUES (101), (102), (103)) AS r(room_id)
+WHERE NOT EXISTS (
+    SELECT 1
+    FROM reservation x
+    WHERE x.room_id = r.room_id
+      AND x.during && tstzrange('2026-10-02 14:00+00', '2026-10-04 11:00+00')
+);
+```
+
+With the `(room_id, during)` GiST index in place, the inner lookup is an index probe per room rather than a scan.
+
+## Multiranges in PostgreSQL 14 and later
+
+A multirange is an ordered list of non-overlapping, non-adjacent ranges stored as one value. The literal syntax uses curly braces:
+
+```sql
+SELECT '{[1,3), [5,8)}'::int4multirange;
+SELECT '{[2026-12-24,2026-12-27), [2026-12-31,2027-01-02)}'::datemultirange;
+SELECT int4multirange(int4range(1,3), int4range(5,8), int4range(7,10));
+-- {[1,3),[5,10)}   overlapping members are merged automatically
+```
+
+PostgreSQL normalises multiranges on input: overlapping or adjacent members are merged, and members are sorted. This is the answer to the "union would not be contiguous" error:
+
+```sql
+SELECT int4multirange(int4range(1,3)) + int4multirange(int4range(5,8));
+-- {[1,3),[5,8)}
+
+SELECT int4multirange(int4range(1,10)) - int4multirange(int4range(4,6));
+-- {[1,4),[6,10)}
+```
+
+Most range operators also work with multiranges, including mixed forms such as a multirange containing a range or an element:
+
+```sql
+SELECT '{[1,3), [5,8)}'::int4multirange @> 6;                 -- true
+SELECT '{[1,3), [5,8)}'::int4multirange && int4range(3,5);    -- false
+SELECT '{[1,3), [5,8)}'::int4multirange @> int4range(1,2);    -- true
+```
+
+Use `unnest()` to expand a multirange back into its member ranges, and `range_merge()` to get the smallest single range that covers all of them:
+
+```sql
+SELECT unnest('{[1,3), [5,8)}'::int4multirange);      -- two rows: [1,3) and [5,8)
+SELECT range_merge('{[1,3), [5,8)}'::int4multirange);  -- [1,8)
+```
+
+### Aggregating with range_agg
+
+`range_agg` (PostgreSQL 14+) collapses a set of ranges into a multirange. It is the tool for "when was this room occupied at all?" and "where are the gaps?":
+
+```sql
+SELECT room_id, range_agg(during) AS occupied
+FROM reservation
+GROUP BY room_id
+ORDER BY room_id;
+```
+
+For room 101 the two adjacent reservations merge into a single member, `["2026-10-01 14:00:00+00","2026-10-05 11:00:00+00")`.
+
+Gaps fall out of a subtraction. Here we compute the free time for each room inside October 2026:
+
+```sql
+SELECT room_id,
+       unnest(
+         tstzmultirange(tstzrange('2026-10-01 00:00+00', '2026-11-01 00:00+00'))
+         - range_agg(during)
+       ) AS free_window
+FROM reservation
+GROUP BY room_id
+ORDER BY room_id, free_window;
+```
+
+The companion aggregate `range_intersect_agg` returns the intersection of all input ranges, which is handy for "find a time window that works for everyone" queries.
+
+## Example: a time-versioned price list
+
+Ranges fit price histories nicely. Each price row is valid over a `daterange`, and an exclusion constraint guarantees that one product never has two prices on the same day:
+
+```sql
+CREATE TABLE product_price (
+    product_id  int        NOT NULL,
+    price       numeric(10,2) NOT NULL CHECK (price >= 0),
+    valid       daterange  NOT NULL CHECK (NOT isempty(valid)),
+    EXCLUDE USING gist (product_id WITH =, valid WITH &&)
+);
+
+INSERT INTO product_price VALUES
+  (1, 19.99, '[2026-01-01,2026-07-01)'),
+  (1, 17.49, '[2026-07-01,2026-10-01)'),
+  (1, 21.00, '[2026-10-01,)');
+```
+
+Look up the price on a given day with the containment operator:
+
+```sql
+SELECT price
+FROM product_price
+WHERE product_id = 1
+  AND valid @> DATE '2026-08-15';
+-- 17.49
+```
+
+Join order lines to the price valid on the order date:
+
+```sql
+SELECT o.order_id, o.ordered_on, p.price
+FROM orders o
+JOIN product_price p
+  ON p.product_id = o.product_id
+ AND p.valid @> o.ordered_on;
+```
+
+To change the current price, close the open-ended row and insert a new one in a single transaction:
+
+```sql
+BEGIN;
+UPDATE product_price
+SET valid = daterange(lower(valid), '2027-01-01')
+WHERE product_id = 1 AND upper_inf(valid);
+
+INSERT INTO product_price VALUES (1, 22.50, '[2027-01-01,)');
+COMMIT;
+```
+
+You can verify that a product's price history has no gaps by checking that the aggregated multirange contains exactly one member:
+
+```sql
+SELECT product_id,
+       range_agg(valid) AS coverage,
+       (SELECT count(*) FROM unnest(range_agg(valid))) = 1 AS contiguous
+FROM product_price
+GROUP BY product_id;
+```
+
+## Migrating from start/end columns
+
+If you already have `start_at` and `end_at` columns, you do not need a big-bang migration. A generated column gives you a range to index and constrain while old code keeps writing the two scalar columns:
+
+```sql
+ALTER TABLE booking
+  ADD COLUMN during tstzrange
+  GENERATED ALWAYS AS (tstzrange(start_at, end_at, '[)')) STORED;
+
+CREATE INDEX booking_during_gist ON booking USING gist (during);
+```
+
+Alternatively, add an expression index and exclusion constraint directly on `tstzrange(start_at, end_at)` without a new column. Either way, the query side changes from `start_at < $2 AND end_at > $1` to the clearer `during && tstzrange($1, $2)`.
+
+## Common pitfalls
+
+- **Mixing bound conventions.** If some code writes `[]` and some writes `[)`, adjacent periods will appear to overlap by one instant. Standardise on `[)`.
+- **Forgetting `btree_gist`.** An exclusion constraint that mixes `WITH =` on a scalar column and `WITH &&` on a range needs the extension, otherwise PostgreSQL reports that the data type has no default operator class for GiST.
+- **Using `tsrange` for global data.** Local timestamps are ambiguous around daylight saving transitions. Use `tstzrange` unless you truly mean wall-clock time.
+- **Assuming union always works.** The `+` operator on plain ranges errors on disjoint inputs; switch to multiranges or `range_agg`.
+- **Empty ranges.** `int4range(5,5)` is empty, and empty ranges never overlap anything, so they slip past exclusion constraints. Add a `CHECK (NOT isempty(...))`.
+
+When experimenting with these queries it helps to see results and plans side by side; a SQL client such as [Chat2DB](https://chat2db.ai/download) lets you run the examples, inspect `EXPLAIN` output and browse the exclusion constraints on each table without switching tools.
+
+## FAQ
+
+### Which PostgreSQL version do I need for range types?
+
+Range types and exclusion constraints have been available since PostgreSQL 9.2. Multiranges, `range_agg` over ranges and `unnest` of multiranges require PostgreSQL 14 or later.
+
+### Should I use tstzrange or two timestamp columns?
+
+Use `tstzrange` when you need overlap checks, containment lookups or database-enforced non-overlap. Two columns are fine for simple display data, but you lose the GiST-indexable operators and exclusion constraints.
+
+### Can a range column be part of a primary key?
+
+On PostgreSQL 17 and earlier, a range column can be in a B-tree primary key, but that only enforces equality, not non-overlap; use an exclusion constraint for the latter. PostgreSQL 18 adds `WITHOUT OVERLAPS` for primary keys and unique constraints.
+
+### Are multiranges indexable?
+
+Yes. Multirange types have GiST support, so you can index a multirange column with `USING gist` and use `&&`, `@>` and `<@` against it.
+
+### How do I get the length of a range?
+
+Subtract the bounds: `upper(r) - lower(r)`. For a `daterange` this returns an integer number of days; for a `tstzrange` it returns an `interval`. Check `upper_inf(r)` first, because unbounded ranges have a `NULL` upper bound.

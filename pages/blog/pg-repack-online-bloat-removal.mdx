@@ -1,0 +1,335 @@
+---
+title: "pg_repack: Remove Postgres Bloat Online"
+description: "Use pg_repack to remove PostgreSQL table and index bloat online: install it, meet the key requirements, run it safely, measure bloat, and compare alternatives."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: September 24, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# pg_repack: Remove Postgres Bloat Online
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="September 24, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+Every PostgreSQL table that receives updates and deletes accumulates dead space. Autovacuum marks that space as reusable, but it rarely gives it back to the operating system, and it cannot compact a table whose live rows are scattered across millions of half-empty pages. After a large purge, a bad batch job, or months of an autovacuum that could not keep up, you can end up with a 200 GB table that holds 40 GB of live data, and indexes that are several times larger than they need to be.
+
+The built-in fix is `VACUUM FULL` (or `CLUSTER`), which rewrites the table into a fresh file. The problem is the lock: both take an `ACCESS EXCLUSIVE` lock for the entire rewrite, which blocks every read and write on the table. On a busy production table that can mean an outage of minutes or hours.
+
+**pg_repack** solves this. It rebuilds a table and its indexes in the background and only needs an exclusive lock for a very short moment at the start and at the end. This guide covers how to install it, what it requires, the commands you will actually use, how it works internally, the lock behavior you need to plan for, how to measure bloat before and after, and when `pg_squeeze` or `REINDEX CONCURRENTLY` is a better fit.
+
+## Why bloat happens and why VACUUM does not fix it
+
+PostgreSQL uses multiversion concurrency control. An `UPDATE` writes a new row version and marks the old one as expired; a `DELETE` just marks the row as expired. The old versions stay on disk until no running transaction can see them, and then regular `VACUUM` marks their space as free inside the page.
+
+That free space is reused by later inserts and updates, but the file itself only shrinks when completely empty pages sit at the very end of the table. If you delete 70 percent of the rows evenly across the table, every page is still partly occupied, so the file keeps its size. Sequential scans still read every page, the buffer cache holds mostly empty space, and backups carry the dead weight.
+
+Indexes behave similarly. B-tree pages that become sparse after deletes are not merged back together the way you might hope, so index bloat is common on tables with heavy churn on indexed columns. For a deeper look at the difference between plain and full vacuum, see [VACUUM FULL vs VACUUM](https://chat2db.ai/resources/blog/postgres-vacuum-full-vs-vacuum).
+
+To actually shrink the files, something has to write the live rows into a new, compact file. `VACUUM FULL` does that while holding the table hostage. pg_repack does it while the application keeps running.
+
+## Measuring bloat before you act
+
+Do not repack blindly. Measure first so you know which tables are worth the effort and so you can verify the result.
+
+### Quick size overview
+
+Start with the largest relations:
+
+```sql
+SELECT n.nspname AS schema,
+       c.relname AS table_name,
+       pg_size_pretty(pg_relation_size(c.oid))       AS heap_size,
+       pg_size_pretty(pg_indexes_size(c.oid))        AS index_size,
+       pg_size_pretty(pg_total_relation_size(c.oid)) AS total_size
+FROM pg_class c
+JOIN pg_namespace n ON n.oid = c.relnamespace
+WHERE c.relkind = 'r'
+  AND n.nspname NOT IN ('pg_catalog', 'information_schema')
+ORDER BY pg_total_relation_size(c.oid) DESC
+LIMIT 20;
+```
+
+Combine it with `pg_stat_user_tables` to see which of those tables have a lot of dead tuples or have not been vacuumed recently:
+
+```sql
+SELECT relname, n_live_tup, n_dead_tup,
+       last_autovacuum, last_vacuum
+FROM pg_stat_user_tables
+ORDER BY n_dead_tup DESC
+LIMIT 20;
+```
+
+Keep in mind that `n_dead_tup` only counts tuples not yet vacuumed. A table can have zero dead tuples and still be heavily bloated, because vacuum turned the dead tuples into free space that nobody reuses.
+
+### Exact numbers with pgstattuple
+
+The `pgstattuple` contrib extension reads the table and reports exactly how much space is live, dead, and free:
+
+```sql
+CREATE EXTENSION IF NOT EXISTS pgstattuple;
+
+SELECT table_len,
+       tuple_percent,
+       dead_tuple_percent,
+       free_percent
+FROM pgstattuple('public.orders');
+```
+
+If `tuple_percent` is 30 and `free_percent` is 65, roughly two thirds of the table is empty space and a repack will shrink it substantially. `pgstattuple` performs a full scan, so on very large tables use `pgstattuple_approx('public.orders')`, which uses the visibility map to skip all-visible pages and is much cheaper.
+
+For B-tree indexes, use `pgstatindex`:
+
+```sql
+SELECT avg_leaf_density, leaf_fragmentation
+FROM pgstatindex('public.orders_customer_id_idx');
+```
+
+A freshly built B-tree has a leaf density near its fillfactor (90 by default). A density of 40 or 50 means the index is about twice as large as necessary.
+
+Record these numbers along with `pg_total_relation_size` so you can compare after the repack.
+
+## Installing pg_repack
+
+pg_repack has two parts: a server-side extension that must be installed in each database you want to process, and a client binary called `pg_repack` that drives the work. **The client and extension versions must match**, otherwise the client refuses to run.
+
+### Installing the packages
+
+On Debian or Ubuntu with the PGDG repository, the package name includes the server major version:
+
+```bash
+sudo apt-get install postgresql-16-repack
+```
+
+On RHEL-family systems with the PGDG yum repository:
+
+```bash
+sudo dnf install pg_repack_16
+```
+
+You can also build from source with PGXS, which requires the server development headers:
+
+```bash
+git clone https://github.com/reorg/pg_repack.git
+cd pg_repack
+make
+sudo make install
+```
+
+Managed services vary. Amazon RDS and Aurora PostgreSQL support the extension; you install the matching client version on an EC2 instance or your workstation and run it against the endpoint. Check your provider's supported extension list before planning around it.
+
+### Creating the extension
+
+Connect to the target database and run:
+
+```sql
+CREATE EXTENSION pg_repack;
+```
+
+This creates a schema called `repack` holding helper functions. Confirm the version:
+
+```sql
+SELECT extversion FROM pg_extension WHERE extname = 'pg_repack';
+```
+
+Then check the client:
+
+```bash
+pg_repack --version
+```
+
+## Requirements and limitations
+
+Before you run it, make sure your environment meets these conditions:
+
+- **Primary key or unique not-null index.** A full table repack needs a way to identify each row when replaying changes. The table must have a `PRIMARY KEY`, or at least a `UNIQUE` index on columns that are all `NOT NULL`. Tables without one are skipped with an error. Repacking only indexes does not need this.
+- **Superuser, by default.** The client checks that it connects as a superuser. On managed services where you do not have a real superuser, use `--no-superuser-check` (`-k`) together with an account that has the necessary rights, as the provider documents.
+- **Free disk space.** The new copy of the table and its indexes is built next to the old one, so you need roughly the size of the live data plus indexes available as free space. Plan for the worst case: about twice the total size of the table being processed.
+- **No DDL during the run.** pg_repack holds an `ACCESS SHARE` lock for its whole run, which blocks `ALTER TABLE`, `TRUNCATE`, and similar commands. Do not schedule migrations at the same time.
+- **Extra WAL.** Rewriting the table generates WAL for every page written. Watch replica lag and archive storage on large tables.
+
+## Running pg_repack
+
+All examples use standard libpq connection options (`-h`, `-p`, `-U`, `-d`), and environment variables such as `PGPASSWORD` work as usual.
+
+### Dry run first
+
+`--dry-run` (`-N`) prints what would be done without touching anything:
+
+```bash
+pg_repack -h db1 -U postgres -d shop --table public.orders --dry-run
+```
+
+### Repacking a single table
+
+```bash
+pg_repack -h db1 -U postgres -d shop --table public.orders
+```
+
+This rebuilds the table in physical order of its clustering index if one is defined (via `ALTER TABLE ... CLUSTER ON`), otherwise it simply copies the rows, and then rebuilds all of its indexes. You can pass `--table` multiple times to process several tables in one run.
+
+### Choosing the row order
+
+`--no-order` (`-n`) copies rows without sorting, which is the online equivalent of `VACUUM FULL`. It is the default when no clustering index exists. `--order-by` (`-o`) sorts the new table by the given columns, similar to an online `CLUSTER`:
+
+```bash
+pg_repack -d shop --table public.events --order-by "created_at"
+```
+
+Ordering helps range scans on that column but makes the rebuild slower because of the sort.
+
+### Repacking only indexes
+
+When the heap is fine but indexes are bloated, `--only-indexes` (`-x`) rebuilds just the indexes of a table:
+
+```bash
+pg_repack -d shop --table public.orders --only-indexes
+```
+
+To rebuild one specific index, use `--index` (`-i`):
+
+```bash
+pg_repack -d shop --index public.orders_customer_id_idx
+```
+
+### Parallel index builds with -j
+
+`--jobs` (`-j`) opens extra connections so that indexes of a table are built in parallel. It is most useful on tables with many indexes and a server with spare CPU and I/O:
+
+```bash
+pg_repack -d shop --table public.orders -j 4
+```
+
+### Whole database or schema
+
+```bash
+pg_repack -d shop                 # every eligible table in the database
+pg_repack -d shop --schema sales  # every eligible table in one schema
+pg_repack --all                   # every database where the extension is installed
+```
+
+Running against a whole database is convenient but rarely a good idea on large systems. Target the tables you measured instead.
+
+## How pg_repack works internally
+
+Understanding the mechanism makes the lock behavior and failure modes obvious. For a full table repack, the steps are:
+
+1. **Create a log table** in the `repack` schema to record changes to the original table.
+2. **Add a trigger** to the original table that writes every `INSERT`, `UPDATE`, and `DELETE` into the log table. Steps 1 and 2 happen under a short `ACCESS EXCLUSIVE` lock so that no change is missed.
+3. **Copy the data** into a new table, optionally sorted. From this point on, only an `ACCESS SHARE` lock is held on the original, so normal reads and writes continue.
+4. **Build indexes** on the new table, in parallel if `-j` is set.
+5. **Replay the log**: rows captured by the trigger during the copy are applied to the new table. This repeats until the backlog is small.
+6. **Swap** the two tables under a brief `ACCESS EXCLUSIVE` lock. The swap exchanges the underlying files, including indexes and TOAST, in the system catalogs, so the table keeps its OID, name, grants, and dependent objects.
+7. **Drop** the old files and the helper objects.
+
+For `--only-indexes`, it builds a new index with `CREATE INDEX CONCURRENTLY` and then swaps it with the old one, which needs only a very short exclusive lock.
+
+Because changes flow through a trigger into a log table, a heavy write workload during the repack adds overhead to every write and makes the replay phase take longer. Run it during the quietest period you have.
+
+## Lock considerations in production
+
+The phrase "online" hides two important details.
+
+### Acquiring the exclusive lock
+
+At the start and at the end, pg_repack must obtain `ACCESS EXCLUSIVE`. If a long-running transaction holds any lock on the table, pg_repack waits. Worse, while it waits in the lock queue, every new query on that table queues behind it. This is the same effect that makes a blocked `ALTER TABLE` take down an application.
+
+pg_repack controls this with `--wait-timeout` (`-T`, default 60 seconds). After that timeout it cancels conflicting queries, and if they are still there after twice the timeout it terminates their backends. If you would rather have pg_repack give up than kill anything, add `--no-kill-backend` (`-D`):
+
+```bash
+pg_repack -d shop --table public.orders --wait-timeout 30 --no-kill-backend
+```
+
+Before starting, look for old transactions:
+
+```sql
+SELECT pid, state, xact_start, now() - xact_start AS age, left(query, 60)
+FROM pg_stat_activity
+WHERE xact_start IS NOT NULL
+ORDER BY xact_start
+LIMIT 10;
+```
+
+### Long transactions and the copy phase
+
+A transaction that stays open during the whole repack does not block the copy, but it does prevent cleanup of the dead tuples generated by the trigger log and elsewhere in the database. Keep sessions short and avoid idle-in-transaction connections.
+
+### Interrupted runs
+
+If pg_repack is killed partway through, the trigger and log table may be left behind, which slows writes on that table. Current versions try to clean up on error, but if leftovers remain, the documented recovery is to drop and recreate the extension:
+
+```sql
+DROP EXTENSION pg_repack CASCADE;
+CREATE EXTENSION pg_repack;
+```
+
+## Verifying the result
+
+After the run, repeat your measurements:
+
+```sql
+SELECT pg_size_pretty(pg_total_relation_size('public.orders'));
+
+SELECT tuple_percent, dead_tuple_percent, free_percent
+FROM pgstattuple('public.orders');
+```
+
+`free_percent` should now be small and `tuple_percent` high. Run `ANALYZE public.orders;` if you want fresh planner statistics right away, then check a couple of important query plans with `EXPLAIN (ANALYZE, BUFFERS)`. Fewer buffers read on sequential and range scans is the practical payoff. Running these checks side by side in a SQL client such as [Chat2DB](https://chat2db.ai/download) makes before-and-after comparisons easy to keep track of.
+
+Also fix the root cause. If the table bloated because autovacuum could not keep up, tune it per table, otherwise you will be repacking again next quarter. The guide on [autovacuum tuning](https://chat2db.ai/resources/blog/postgres-vacuum-and-autovacuum-tuning) covers the relevant settings.
+
+## Alternatives to pg_repack
+
+### REINDEX CONCURRENTLY
+
+Since PostgreSQL 12, you can rebuild indexes online without any extension:
+
+```sql
+REINDEX INDEX CONCURRENTLY orders_customer_id_idx;
+REINDEX TABLE CONCURRENTLY orders;
+```
+
+If your problem is only index bloat, this is usually the simplest choice. It cannot run inside a transaction block, and if it fails it can leave an invalid index named with a `_ccnew` suffix that you must drop manually. It does nothing for heap bloat. See [table bloat and REINDEX](https://chat2db.ai/resources/blog/postgres-table-bloat-reindex-guide) for more detail.
+
+### pg_squeeze
+
+`pg_squeeze` is another extension that rewrites tables online, but instead of triggers it reads changes through logical decoding. That avoids trigger overhead on writes during the rebuild. It requires `wal_level = logical`, loading the library through `shared_preload_libraries` (which needs a restart), and a primary key or replica identity on the table. It can also run on a schedule inside the server using a background worker:
+
+```sql
+CREATE EXTENSION pg_squeeze;
+SELECT squeeze.squeeze_table('public', 'orders', null, null, null);
+```
+
+The argument list has changed across pg_squeeze releases, so check the documentation of the version you install. Choose pg_squeeze if you already run logical replication or want scheduled, server-side processing; choose pg_repack if you cannot change `wal_level` or restart the server.
+
+### VACUUM FULL during a maintenance window
+
+If the table is small, or you have a maintenance window where downtime is acceptable, plain `VACUUM FULL` is the simplest and most predictable option. It needs no extension and no primary key.
+
+### Partitioning and DROP
+
+For append-mostly data that is deleted by age, the real fix is often partitioning by time and dropping old partitions. Dropping a partition releases its space instantly and produces no dead tuples.
+
+## FAQ
+
+### Does pg_repack block reads and writes?
+
+Only briefly. It takes an `ACCESS EXCLUSIVE` lock at the start to install the trigger and at the end to swap files. In between it holds `ACCESS SHARE`, which allows normal DML but blocks DDL.
+
+### Can I use pg_repack on a table without a primary key?
+
+Not for a full table repack. Add a primary key or a unique index on `NOT NULL` columns first. You can still use `--only-indexes` on such a table.
+
+### Does pg_repack work on replicas?
+
+No. It must run on the primary. The rewrite is replicated through WAL like any other change, so streaming replicas receive the compacted table automatically.
+
+### Is pg_repack safe on partitioned tables?
+
+You can repack individual partitions with `--table`, and recent versions provide `--parent-table` (`-I`) to process a parent and all of its children. Repacking partitions one at a time keeps disk usage and lock impact small.
+
+### How often should I run it?
+
+Only when measurements show significant bloat. If you need it regularly, that is a sign that autovacuum settings, fillfactor, or the data lifecycle need attention.
