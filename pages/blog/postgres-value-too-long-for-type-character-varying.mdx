@@ -1,0 +1,229 @@
+---
+title: "Fix Postgres: Value Too Long for Type Varchar"
+description: "Fix PostgreSQL ERROR: value too long for type character varying(n) (22001): find the column, widen it safely, switch to text, or truncate data on purpose."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: October 19, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# Fix Postgres: Value Too Long for Type Varchar
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="October 19, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+You insert or update a row and PostgreSQL rejects it:
+
+```text
+ERROR:  value too long for type character varying(50)
+```
+
+The error (SQLSTATE `22001`, `string_data_right_truncation`) means a string is longer than the declared maximum length of a `varchar(n)` column, and PostgreSQL refuses to cut it silently. That strictness is a feature: unlike MySQL in non-strict mode, PostgreSQL never stores a truncated value without telling you.
+
+The annoying part is that the message names only the type, not the column. If a table has five `varchar(50)` columns, you have to work out which one overflowed. This guide shows how to find the column, how to fix the schema without locking a big table for minutes, when to switch to `text`, and how to truncate deliberately when that is really what you want.
+
+## Reproducing the Error
+
+```sql
+CREATE TABLE customers (
+  id         bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  first_name varchar(50) NOT NULL,
+  last_name  varchar(50) NOT NULL,
+  email      varchar(100) NOT NULL,
+  country    char(2) NOT NULL
+);
+
+INSERT INTO customers (first_name, last_name, email, country)
+VALUES ('Ana', 'García', repeat('x', 95) || '@example.com', 'ES');
+```
+
+```text
+ERROR:  value too long for type character varying(100)
+```
+
+The email is 107 characters, so the `varchar(100)` column rejects it. Note that the limit counts **characters**, not bytes. `varchar(50)` accepts 50 characters of Chinese, Arabic or emoji text even though they take two to four bytes each in UTF-8. That is a difference from MySQL's older `utf8` and from SQL Server's `varchar`, where limits are in bytes.
+
+The same rule applies to `char(n)`, which gives `value too long for type character(2)` if you insert `'ESP'` into `country`.
+
+## Step 1: Find Which Column Overflowed
+
+### Compare input lengths against column limits
+
+List the length-limited columns of the table:
+
+```sql
+SELECT column_name, data_type, character_maximum_length
+FROM information_schema.columns
+WHERE table_schema = 'public'
+  AND table_name = 'customers'
+  AND character_maximum_length IS NOT NULL
+ORDER BY ordinal_position;
+```
+
+Then check the values you are trying to insert. If the data comes from a staging table or CSV import, compare in one query:
+
+```sql
+SELECT
+  max(char_length(first_name)) AS first_name_len,
+  max(char_length(last_name))  AS last_name_len,
+  max(char_length(email))      AS email_len
+FROM staging_customers;
+```
+
+Any column whose maximum exceeds its limit is the culprit. Use `char_length()` (characters) rather than `octet_length()` (bytes), since that is what PostgreSQL checks.
+
+### Find the offending rows
+
+```sql
+SELECT id, email, char_length(email) AS len
+FROM staging_customers
+WHERE char_length(email) > 100
+ORDER BY len DESC
+LIMIT 20;
+```
+
+Looking at the actual rows often tells you whether the data is legitimate (a genuinely long company name) or garbage (an HTML fragment pasted into a name field, or a column mapping error in an import where address text lands in the `country` field).
+
+### Watch out for implicit sources
+
+The value does not have to come from your `INSERT` directly. The same error appears when:
+
+- a **trigger** writes a computed string into a limited column,
+- a **default** expression, such as a concatenation, produces a long value,
+- `UPDATE ... SET col = col || '_archived'` pushes existing values over the limit,
+- an **ORM** maps a model field to `varchar(255)` while another service writes longer values.
+
+If the failing statement does not obviously touch a long string, check the table's triggers with `\d customers` in `psql`.
+
+## Step 2: Decide How to Fix It
+
+There are three legitimate fixes, and which one is right depends on whether the limit means something.
+
+| Situation | Fix |
+| --- | --- |
+| The limit was arbitrary (`varchar(255)` "just because") | Widen the column or change it to `text` |
+| The limit is a real business rule (a 2-letter country code) | Fix or validate the input; keep the limit |
+| You genuinely want to keep only the first n characters | Truncate explicitly in SQL or application code |
+
+## Fix A: Widen the Column
+
+```sql
+ALTER TABLE customers ALTER COLUMN email TYPE varchar(255);
+```
+
+Since PostgreSQL 9.2, **increasing** the length of a `varchar` column, or removing the limit by changing it to `text` or unconstrained `varchar`, does not rewrite the table and does not rebuild indexes. It only updates the catalog. That makes it fast even on a table with hundreds of millions of rows.
+
+It still takes an `ACCESS EXCLUSIVE` lock, though, and that lock has to wait for every running query on the table to finish. Meanwhile, every new query queues behind the `ALTER`. On a busy table, set a lock timeout so that the statement gives up instead of blocking traffic:
+
+```sql
+SET lock_timeout = '3s';
+ALTER TABLE customers ALTER COLUMN email TYPE varchar(255);
+```
+
+If it times out, retry a few times. The actual change takes milliseconds once the lock is granted.
+
+**Decreasing** the length is different. `ALTER COLUMN ... TYPE varchar(20)` must check every row, so it scans the table under the exclusive lock, and fails if any value is too long. Avoid shrinking columns on large tables in production; use a `CHECK` constraint added `NOT VALID` and validated later instead (see below).
+
+### Views and dependent objects
+
+If a view selects the column, the `ALTER` fails:
+
+```text
+ERROR:  cannot alter type of a column used by a view or rule
+DETAIL:  rule _RETURN on view customer_summary depends on column "email"
+```
+
+You have to drop and recreate the view in the same transaction:
+
+```sql
+BEGIN;
+SET LOCAL lock_timeout = '3s';
+DROP VIEW customer_summary;
+ALTER TABLE customers ALTER COLUMN email TYPE varchar(255);
+CREATE VIEW customer_summary AS
+  SELECT id, first_name || ' ' || last_name AS name, email FROM customers;
+COMMIT;
+```
+
+Save the view definition first with `SELECT pg_get_viewdef('customer_summary', true);` and reapply any grants on it.
+
+## Fix B: Use text Instead
+
+In PostgreSQL, `text`, `varchar` and `varchar(n)` are stored in exactly the same way. There is no performance advantage to a length limit, and `text` is not "heavier" than `varchar(255)`. The only thing `n` adds is a check. Many teams therefore use `text` everywhere and add a `CHECK` constraint where a limit is a real rule:
+
+```sql
+ALTER TABLE customers ALTER COLUMN email TYPE text;
+
+ALTER TABLE customers
+  ADD CONSTRAINT customers_email_len CHECK (char_length(email) <= 320) NOT VALID;
+
+ALTER TABLE customers VALIDATE CONSTRAINT customers_email_len;
+```
+
+This has two advantages over `varchar(n)`:
+
+1. Changing the limit later is a constraint change, not a type change, so dependent views do not get in the way.
+2. `NOT VALID` plus a separate `VALIDATE CONSTRAINT` lets you add a stricter limit to a big table without holding an exclusive lock during the full scan. `VALIDATE` takes only a `SHARE UPDATE EXCLUSIVE` lock, which allows reads and writes to continue.
+
+The error message also becomes clearer: a violated check reports the constraint name (`customers_email_len`), which tells you the column, unlike the generic `value too long for type character varying`.
+
+## Fix C: Truncate on Purpose
+
+If the target system only has room for a fixed number of characters, for example an SMS preview or a legacy integration, truncate explicitly so that the behaviour is visible in code:
+
+```sql
+INSERT INTO customers (first_name, last_name, email, country)
+SELECT left(first_name, 50), left(last_name, 50), email, upper(left(country, 2))
+FROM staging_customers;
+```
+
+`left(s, n)` and `substring(s FROM 1 FOR n)` both count characters, so they never split a multi-byte character.
+
+PostgreSQL also has one built-in truncation rule that surprises people: an **explicit cast** to `varchar(n)` truncates silently instead of raising an error. This is required by the SQL standard:
+
+```sql
+SELECT 'Hello, world'::varchar(5);   -- returns 'Hello', no error
+```
+
+So `INSERT INTO t (col) VALUES ($1::varchar(50))` will never fail, but will cut data. It is useful when you mean it, and a hidden data-loss bug when you do not. There is one more exception: if every character beyond the limit is a space, PostgreSQL accepts the value and drops the extra spaces instead of raising an error.
+
+## Fix D: Validate in the Application
+
+When the limit reflects a real rule, the database error is the last line of defence, not the user-facing validation. Return a useful message before you reach the database. If you use an ORM, keep its model metadata in sync with the schema. A model that says `max_length=255` while the column is `varchar(100)` lets the form accept values that the database then rejects with `22001`.
+
+You can generate the limits from the catalog to keep them aligned:
+
+```sql
+SELECT table_name, column_name, character_maximum_length
+FROM information_schema.columns
+WHERE table_schema = 'public'
+  AND character_maximum_length IS NOT NULL
+ORDER BY table_name, ordinal_position;
+```
+
+## Bulk Imports with COPY
+
+`COPY` stops at the first over-length value and reports the line number, which is better than nothing:
+
+```text
+ERROR:  value too long for type character varying(50)
+CONTEXT:  COPY customers, line 18342, column last_name: "..."
+```
+
+Here PostgreSQL does name the column. Since PostgreSQL 17, `COPY` has an `ON_ERROR ignore` option that skips rows whose values fail data type input, but silently dropping customer rows is rarely what you want for a length problem. The robust pattern is to load into a staging table with `text` columns, find the bad rows with the length queries above, fix them, and then `INSERT ... SELECT` into the real table.
+
+## Checklist
+
+1. Compare `char_length()` of the input with `character_maximum_length` to find the column.
+2. Look at the offending rows: is the data legitimate or a mapping error?
+3. If the limit is arbitrary, widen it or switch to `text`; widening is a catalog-only change, but use `lock_timeout`.
+4. If the limit is a rule, keep it, ideally as a named `CHECK` constraint, and validate input earlier.
+5. Truncate only explicitly with `left()`, and remember that `::varchar(n)` casts truncate silently.
+
+When you are tracking down which column of a wide table overflows, it helps to have the column definitions and the data side by side. [Chat2DB](https://chat2db.ai/download) shows each table's column types and lengths next to the query editor, and its AI assistant can write the `char_length` comparison query for every limited column in a table from a one-line request.
+
+## Summary
+
+"Value too long for type character varying(n)" means a string exceeds a `varchar(n)` limit measured in characters. Find the column by comparing input lengths with the catalog, then decide whether the limit is meaningful. Arbitrary limits are cheap to widen, since that does not rewrite the table, or can be replaced by `text`. Meaningful limits are better expressed as named `CHECK` constraints and enforced in your application, and any truncation should be deliberate and visible in the code.

@@ -1,0 +1,238 @@
+---
+title: "Postgres work_mem Tuning: How to Set It Safely"
+description: "Tune PostgreSQL work_mem: how sorts and hashes use it, spotting disk spills with EXPLAIN and temp file logs, safe values and per-query overrides."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: October 19, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# Postgres work_mem Tuning: How to Set It Safely
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="October 19, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+`work_mem` is one of the most effective PostgreSQL settings to tune, and one of the easiest to get dangerously wrong. Raise it and a slow report that sorted on disk suddenly runs in memory. Raise it too far and a burst of concurrent queries can push the server into swap or trigger the Linux OOM killer.
+
+The default is only **4MB**, which is conservative for modern hardware. This guide explains what `work_mem` actually limits, how to tell whether your queries are spilling to disk, how to pick a value that is safe for your workload, and how to give more memory only to the queries that need it.
+
+## What work_mem Controls
+
+`work_mem` is the amount of memory a single **operation** inside a query can use before it starts writing temporary files. The operations that use it are:
+
+- **Sorts**: `ORDER BY`, `DISTINCT`, merge joins and window functions that need sorted input. (Sorting while building an index is governed by `maintenance_work_mem` instead.)
+- **Hash tables**: hash joins, hash aggregates (`GROUP BY` with a hash plan), hashed `IN` subqueries and `UNION` deduplication.
+- **Bitmap heap scans**: the bitmap of matching pages. When it does not fit, it becomes "lossy" and PostgreSQL has to recheck whole pages.
+- **Materialize** and **Memoize** nodes, and the tuple stores used by CTEs and set-returning functions.
+
+The crucial point is that the limit is **per operation, per process**, not per query and not per server. One query with three sorts and two hash joins can use up to five times `work_mem`. Run that query in parallel with four workers and each worker gets its own allowance. Then multiply by the number of concurrent connections.
+
+### hash_mem_multiplier
+
+Since PostgreSQL 13, hash-based operations may use `work_mem × hash_mem_multiplier`. The multiplier defaults to **2.0** as of PostgreSQL 15 (it was 1.0 in 13 and 14). With the defaults, a hash join can use 8MB while a sort is limited to 4MB. Hash operations get more because spilling a hash table is usually more expensive than spilling a sort.
+
+```sql
+SHOW work_mem;              -- 4MB
+SHOW hash_mem_multiplier;   -- 2
+```
+
+## Step 1: Find Out Whether Queries Spill to Disk
+
+Do not change `work_mem` blindly. First measure whether it is a bottleneck.
+
+### Log temporary files
+
+Set `log_temp_files` to log every temporary file above a size threshold. `0` logs all of them:
+
+```sql
+ALTER SYSTEM SET log_temp_files = '10MB';
+SELECT pg_reload_conf();
+```
+
+The server log then shows lines like:
+
+```text
+LOG:  temporary file: path "base/pgsql_tmp/pgsql_tmp12345.0", size 268435456
+STATEMENT:  SELECT customer_id, sum(amount) FROM payments GROUP BY customer_id ORDER BY 2 DESC
+```
+
+That query wrote a 256MB temporary file. It is a candidate for more memory.
+
+### Check cumulative statistics
+
+`pg_stat_database` counts temporary files per database since the last stats reset:
+
+```sql
+SELECT datname,
+       temp_files,
+       pg_size_pretty(temp_bytes) AS temp_size
+FROM pg_stat_database
+WHERE datname = current_database();
+```
+
+With `pg_stat_statements` installed, you can see which statements produce the most temporary I/O:
+
+```sql
+SELECT left(query, 80) AS query,
+       calls,
+       temp_blks_written,
+       pg_size_pretty(temp_blks_written * 8192) AS temp_written
+FROM pg_stat_statements
+WHERE temp_blks_written > 0
+ORDER BY temp_blks_written DESC
+LIMIT 10;
+```
+
+### Read it in EXPLAIN ANALYZE
+
+For a specific query, `EXPLAIN (ANALYZE, BUFFERS)` tells you exactly which node spilled:
+
+```sql
+EXPLAIN (ANALYZE, BUFFERS)
+SELECT customer_id, sum(amount)
+FROM payments
+GROUP BY customer_id
+ORDER BY 2 DESC;
+```
+
+Look for these lines in the output:
+
+```text
+Sort Method: external merge  Disk: 187344kB
+```
+
+A sort that did not fit in memory. In memory it would say `Sort Method: quicksort  Memory: 2304kB` or `top-N heapsort`.
+
+```text
+Batches: 16  Memory Usage: 8241kB  Disk Usage: 210000kB
+```
+
+A hash aggregate or hash join that needed 16 batches. `Batches: 1` means it fit in memory.
+
+```text
+Heap Blocks: exact=1203 lossy=48211
+```
+
+A bitmap that became lossy because it did not fit in `work_mem`.
+
+## Step 2: Test a Higher Value for One Session
+
+`work_mem` can be changed per session without a restart, so experiment safely:
+
+```sql
+SET work_mem = '64MB';
+
+EXPLAIN (ANALYZE, BUFFERS)
+SELECT customer_id, sum(amount)
+FROM payments
+GROUP BY customer_id
+ORDER BY 2 DESC;
+
+RESET work_mem;
+```
+
+Compare the plan and the timing. Sometimes more memory not only removes the spill but changes the plan. The planner may switch from a sort plus group aggregate to a hash aggregate, or from a merge join to a hash join, because it now estimates the hash table will fit. That can be a big win, or occasionally a regression, which is another reason to test before changing the global setting.
+
+Increase in steps (16MB, 32MB, 64MB, 128MB) and stop when the spill disappears. The amount shown in `Disk:` is a rough guide, but in-memory sorts need more memory than the size of the spill file, because the in-memory representation has overhead.
+
+## Step 3: Pick a Safe Global Value
+
+There is no formula that is correct for every workload, but a common starting point is to make sure the worst case stays within the RAM left over after `shared_buffers` and the operating system:
+
+```text
+work_mem ≈ (total RAM − shared_buffers − OS/other) / (max_connections × operations per query)
+```
+
+Take a server with 32GB of RAM, `shared_buffers = 8GB`, about 4GB reserved for the OS and page cache headroom, and `max_connections = 200`. If you assume an average of two memory-hungry operations per active query:
+
+```text
+(32GB − 8GB − 4GB) / (200 × 2) ≈ 51MB
+```
+
+That calculation is pessimistic because it assumes every connection is running a heavy query at the same moment. In an OLTP application most connections are idle or running index lookups that use almost no `work_mem`. In practice:
+
+- **OLTP with many connections** (web apps, 100+ connections): keep the global value modest, 8MB to 32MB, and raise it per query or per role for reports.
+- **Analytics with few connections** (a warehouse with 10 to 20 concurrent users): 128MB to 512MB, or more, is common.
+- **Mixed**: a moderate global value plus per-role overrides works best.
+
+Set it in `postgresql.conf` or with `ALTER SYSTEM`. It takes effect for new sessions after a reload:
+
+```sql
+ALTER SYSTEM SET work_mem = '32MB';
+SELECT pg_reload_conf();
+```
+
+A connection pooler such as PgBouncer is the best way to keep the number of concurrently active backends low, which in turn makes a higher `work_mem` safe.
+
+## Step 4: Give More Memory Only Where It Is Needed
+
+The most robust approach is to keep the global value moderate and raise `work_mem` exactly where it pays off.
+
+### Per role
+
+Give your reporting or ETL user more memory:
+
+```sql
+ALTER ROLE reporting SET work_mem = '256MB';
+```
+
+Every new session of `reporting` starts with that value. You can also scope it to a database with `ALTER ROLE reporting IN DATABASE analytics SET work_mem = '256MB';`.
+
+### Per transaction
+
+In application code, raise it for one heavy query only. `SET LOCAL` reverts at the end of the transaction, which is also safe with transaction-mode connection pooling:
+
+```sql
+BEGIN;
+SET LOCAL work_mem = '256MB';
+SELECT customer_id, sum(amount)
+FROM payments
+GROUP BY customer_id
+ORDER BY 2 DESC;
+COMMIT;
+```
+
+Avoid plain `SET work_mem` in pooled applications: the setting would stay on the server connection and leak into whatever request uses it next.
+
+### Per function
+
+```sql
+ALTER FUNCTION monthly_revenue_report(date) SET work_mem = '128MB';
+```
+
+## Step 5: Fix the Query Before Adding Memory
+
+More memory is not always the right fix. Before raising `work_mem`, check whether the query needs to sort or hash that much data in the first place:
+
+- An index matching the `ORDER BY` lets PostgreSQL read rows in order and skip the sort entirely, especially with `LIMIT`.
+- Filtering earlier, for example in a subquery before a join, reduces the size of hash tables.
+- Selecting fewer columns makes each sorted row smaller. `SELECT *` into a sort carries every column through it.
+- For bitmap scans, a more selective index can avoid lossy pages without any memory change.
+
+```sql
+-- the ORDER BY ... LIMIT can use this index and stop after 50 rows
+CREATE INDEX CONCURRENTLY payments_created_at_idx ON payments (created_at DESC);
+
+SELECT id, customer_id, amount
+FROM payments
+ORDER BY created_at DESC
+LIMIT 50;
+```
+
+## Watching Memory After the Change
+
+After raising `work_mem`, watch the server rather than assuming it is fine:
+
+- Operating system memory and swap (`free -m`, `vmstat 5`). Any swapping is a red flag.
+- Temporary file statistics in `pg_stat_database`, which should drop.
+- On PostgreSQL 14 and later, `pg_backend_memory_contexts` shows memory use of your own session, and `pg_log_backend_memory_contexts(pid)` writes another backend's memory contexts to the log, which helps when one process grows unexpectedly.
+
+On Linux, also make sure the PostgreSQL postmaster is protected from the OOM killer and consider `vm.overcommit_memory = 2`, as recommended in the PostgreSQL documentation, so that a backend gets an out-of-memory error instead of the whole server being killed.
+
+## Summary
+
+`work_mem` caps memory per sort, hash or bitmap operation, in each process, so the total can be many times the setting. Measure first with `log_temp_files`, `pg_stat_statements` and `EXPLAIN (ANALYZE, BUFFERS)`, test higher values with `SET` in one session, and keep the global value conservative when you have many connections. Then give more memory to the roles, transactions and functions that need it, and fix queries that sort more data than necessary.
+
+When you compare plans before and after a `work_mem` change, running the same `EXPLAIN (ANALYZE, BUFFERS)` side by side makes the difference obvious. [Chat2DB](https://app.chat2db.ai/) lets you run both versions in separate tabs against the same connection and keep the results open next to each other while you tune.

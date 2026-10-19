@@ -1,0 +1,228 @@
+---
+title: "Fix SQL Server: String or Binary Data Truncated"
+description: "Fix SQL Server Msg 8152 and Msg 2628 String or binary data would be truncated: find the column and value, widen it safely, and handle imports and ORMs."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: October 19, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# Fix SQL Server: String or Binary Data Truncated
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="October 19, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+For years, SQL Server developers dreaded this message:
+
+```text
+Msg 8152, Level 16, State 30, Line 1
+String or binary data would be truncated.
+The statement has been terminated.
+```
+
+It tells you that some value was too long for some column, but not which one, and not which row. On a 40-column `INSERT ... SELECT` of a million rows, that leaves a lot of guessing. Since SQL Server 2019 there is a much better version:
+
+```text
+Msg 2628, Level 16, State 1, Line 1
+String or binary data would be truncated in table 'Shop.dbo.Customers', column 'Email'.
+Truncated value: 'ana.garcia.long.address@exampl'.
+```
+
+This article shows how to get the detailed message on your server, how to find the offending rows when you are stuck with Msg 8152, and how to fix the cause, whether it is a column that is too narrow, an import with bad data, or a mismatch between your application model and the table.
+
+## Reproducing the Error
+
+```sql
+CREATE TABLE dbo.Customers (
+  CustomerId int IDENTITY PRIMARY KEY,
+  FirstName  nvarchar(50)  NOT NULL,
+  Email      nvarchar(30)  NOT NULL,
+  Country    char(2)       NOT NULL
+);
+
+INSERT INTO dbo.Customers (FirstName, Email, Country)
+VALUES (N'Ana', N'ana.garcia.long.address@example.com', 'ES');
+```
+
+The email is 35 characters and the column allows 30, so SQL Server rejects the whole statement. Unlike some databases, it never stores a cut-off value in an `INSERT` or `UPDATE` when `ANSI_WARNINGS` is on, which it is by default for every modern client.
+
+Note how SQL Server counts length: `nvarchar(30)` means 30 byte-pairs (UTF-16 code units), and `varchar(30)` means 30 bytes. With a UTF-8 collation on `varchar` (SQL Server 2019+), a character outside ASCII takes two to four of those bytes, so a `varchar(30)` column can hold fewer than 30 accented or Asian characters.
+
+## Step 1: Get the Detailed Message (Msg 2628)
+
+### SQL Server 2019 and later
+
+On SQL Server 2019 and later, and on Azure SQL Database, the detailed message is controlled by the database compatibility level. At level 150 or higher, Msg 2628 replaces Msg 8152 automatically:
+
+```sql
+SELECT name, compatibility_level
+FROM sys.databases
+WHERE name = DB_NAME();
+```
+
+The behaviour is governed by the database scoped configuration `VERBOSE_TRUNCATION_WARNINGS`, which is `ON` by default. Check that nobody switched it off:
+
+```sql
+SELECT name, value
+FROM sys.database_scoped_configurations
+WHERE name = 'VERBOSE_TRUNCATION_WARNINGS';
+
+ALTER DATABASE SCOPED CONFIGURATION SET VERBOSE_TRUNCATION_WARNINGS = ON;
+```
+
+This setting only takes effect at compatibility level 150 or higher. If the database was upgraded from an older version and still runs at, say, level 130, use trace flag 460 as described in the next section, which also works on SQL Server 2019 and later.
+
+Raising the compatibility level itself (`ALTER DATABASE Shop SET COMPATIBILITY_LEVEL = 160;`) also changes optimizer behaviour, so test that separately rather than doing it only for a better error message.
+
+### SQL Server 2016 SP2, 2017 CU12 and lower compatibility levels
+
+These versions also contain the detailed message, behind trace flag 460:
+
+```sql
+-- for one query
+INSERT INTO dbo.Customers (FirstName, Email, Country)
+VALUES (N'Ana', N'ana.garcia.long.address@example.com', 'ES')
+OPTION (QUERYTRACEON 460);
+
+-- or for the whole instance (requires sysadmin)
+DBCC TRACEON (460, -1);
+```
+
+Trace flag 460 is meant for diagnosis; turn it off once you have found the problem if you enabled it instance-wide.
+
+## Step 2: Find the Rows When You Only Have Msg 8152
+
+If you are on an older version, or cannot change settings on a production server, compare the source data with the target column sizes. First, list the target's string columns and their limits:
+
+```sql
+SELECT c.name AS column_name,
+       t.name AS data_type,
+       CASE WHEN t.name IN ('nchar', 'nvarchar') AND c.max_length > 0
+            THEN c.max_length / 2
+            ELSE c.max_length END AS max_chars
+FROM sys.columns AS c
+JOIN sys.types   AS t ON t.user_type_id = c.user_type_id
+WHERE c.object_id = OBJECT_ID('dbo.Customers')
+  AND t.name IN ('char', 'nchar', 'varchar', 'nvarchar', 'binary', 'varbinary')
+ORDER BY c.column_id;
+```
+
+`max_length` is in bytes, which is why `nvarchar` columns are divided by two. A value of `-1` means `(max)`, which cannot be truncated.
+
+Then find the source rows that exceed those limits. For an `INSERT ... SELECT` from a staging table:
+
+```sql
+SELECT *
+FROM staging.Customers
+WHERE LEN(FirstName) > 50
+   OR LEN(Email)     > 30
+   OR LEN(Country)   > 2;
+```
+
+Be aware that `LEN()` ignores trailing spaces. If the data may contain trailing spaces, which do count against the limit for `varchar` and `nvarchar` columns, use `DATALENGTH()` and compare bytes instead: `DATALENGTH(Email) > 60` for an `nvarchar(30)`.
+
+### Generate the check for wide tables
+
+Typing the `WHERE` clause by hand for 40 columns is tedious. Generate it from the catalog:
+
+```sql
+SELECT STRING_AGG(
+         CAST('DATALENGTH(' + QUOTENAME(c.name) + ') > ' + CAST(c.max_length AS varchar(10)) AS nvarchar(max)),
+         CHAR(10) + ' OR ')
+FROM sys.columns AS c
+JOIN sys.types   AS t ON t.user_type_id = c.user_type_id
+WHERE c.object_id = OBJECT_ID('dbo.Customers')
+  AND t.name IN ('char', 'nchar', 'varchar', 'nvarchar', 'binary', 'varbinary')
+  AND c.max_length > 0;
+```
+
+Paste the result after `SELECT * FROM staging.Customers WHERE`. This compares bytes to bytes, which is exact as long as the staging columns use the same types as the target (both `nvarchar`, for example).
+
+## Step 3: Fix the Cause
+
+### The column really is too narrow
+
+If legitimate values are longer than the column, widen it:
+
+```sql
+ALTER TABLE dbo.Customers ALTER COLUMN Email nvarchar(320) NOT NULL;
+```
+
+Restate the nullability; otherwise `ALTER COLUMN` makes the column nullable. Widening a `varchar` or `nvarchar` column is a metadata-only change in most cases, so it is fast even on large tables. It still needs a schema modification lock, which waits for running queries and blocks new ones while it waits, so run it in a quiet period or with `SET LOCK_TIMEOUT 5000;` before the statement.
+
+Things that block the change:
+
+- **Indexes on the column**: increasing the length of an indexed `varchar` column is allowed as long as the new size stays within the index key limit (1,700 bytes for nonclustered indexes, 900 for clustered). Converting to `(max)` requires dropping the index first.
+- **Schema-bound views and computed columns** referencing the column must be dropped and recreated.
+- **Constraints** such as `CHECK` or `DEFAULT` usually do not block widening, but foreign keys do: both sides must have the same type and length, so widen them together.
+
+### The data is wrong
+
+If the long values are not legitimate, for example an address that ended up in the `Country` column because of a shifted CSV delimiter, fix the data or the import mapping rather than the schema. Widening `Country` to `nvarchar(255)` only hides the bug.
+
+### You want to truncate on purpose
+
+Make it explicit with `LEFT()`:
+
+```sql
+INSERT INTO dbo.Customers (FirstName, Email, Country)
+SELECT LEFT(FirstName, 50), Email, LEFT(Country, 2)
+FROM staging.Customers;
+```
+
+Do not use `SET ANSI_WARNINGS OFF` to make the error disappear. It does make SQL Server truncate silently, but it also changes how `NULL` aggregates and divide-by-zero behave, and indexed views, computed column indexes and filtered indexes require `ANSI_WARNINGS ON`, so modifications to those tables fail. It is not a safe switch.
+
+## Common Sources of the Error
+
+### Variables and parameters
+
+Truncation also happens silently when assigning to a variable, which can cause the error much later:
+
+```sql
+DECLARE @email nvarchar(20) = N'ana.garcia.long.address@example.com';
+SELECT @email;   -- 'ana.garcia.long.addr', no error
+```
+
+Assignments to variables and parameters truncate without an error. If that truncated value is later compared or joined, you get wrong results rather than an error. Declare variables with the same length as the column they correspond to.
+
+### Stored procedures with too-short parameters
+
+The same applies to procedure parameters. A procedure declared with `@Email nvarchar(30)` truncates longer input silently, even if the column is later widened to 320. When you widen a column, search for procedures that take it as a parameter.
+
+### Entity Framework and other ORMs
+
+In Entity Framework, the error usually surfaces as `DbUpdateException` with an inner `SqlException` containing Msg 8152 or 2628. The cause is typically a model without a `MaxLength` that matches the column, so client-side validation allows values the table rejects. Keep `[MaxLength(320)]` or `HasMaxLength(320)` in sync with the database, ideally by generating migrations from the model.
+
+### SSIS, BULK INSERT and bcp
+
+Import tools report truncation in their own ways. SSIS fails a data flow with a truncation error on a specific column and lets you redirect bad rows to an error output instead of failing. `BULK INSERT` and `bcp` support an error file and `MAXERRORS`, so that rows that fail conversion are written aside:
+
+```sql
+BULK INSERT staging.Customers
+FROM 'C:\import\customers.csv'
+WITH (
+  FORMAT = 'CSV',
+  FIRSTROW = 2,
+  MAXERRORS = 100,
+  ERRORFILE = 'C:\import\customers_errors'
+);
+```
+
+A robust pattern for any import is the one used above: load into a staging table with generous `nvarchar(max)` columns, run the length check, fix or reject bad rows, and then insert into the real table.
+
+## Checklist
+
+1. On SQL Server 2019+, make sure Msg 2628 is enabled: compatibility level 150+ with `VERBOSE_TRUNCATION_WARNINGS = ON`.
+2. On 2016 SP2, 2017 CU12+ or a lower compatibility level, use trace flag 460 for the query.
+3. Otherwise, compare `DATALENGTH()` of the source with `sys.columns.max_length` to find the rows.
+4. Widen the column if the data is legitimate, restating `NOT NULL`, and update procedure parameters and ORM models too.
+5. Fix the data or mapping if it is not, and truncate only explicitly with `LEFT()`.
+6. Do not turn off `ANSI_WARNINGS` to hide the error.
+
+Tracking the error down is much quicker when the table definition and the staging data are side by side. [Chat2DB](https://chat2db.ai/download) connects to SQL Server and shows each column's type and length next to the query editor, and its AI assistant can generate the `DATALENGTH` comparison for a wide table from a short description.
+
+## Summary
+
+"String or binary data would be truncated" means a value is longer than the target column, and SQL Server refuses to cut it silently. On SQL Server 2019 and later, Msg 2628 names the table, column and value, so enable it if you still see Msg 8152. On older versions, compare source lengths against `sys.columns`. Then widen the column if the data is valid, fix the data if it is not, and keep variables, parameters and application models the same length as the columns they feed.

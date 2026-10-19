@@ -1,0 +1,253 @@
+---
+title: "MySQL Partitioning: RANGE, LIST, HASH and KEY"
+description: "A practical MySQL partitioning guide: RANGE COLUMNS for dates, LIST, HASH and KEY, primary key rules, pruning with EXPLAIN and partition maintenance."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: October 19, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# MySQL Partitioning: RANGE, LIST, HASH and KEY
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="October 19, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+Partitioning splits one logical MySQL table into several physical pieces, each stored in its own InnoDB tablespace file. Queries still use the table name as usual, but MySQL can skip partitions that cannot contain matching rows, and you can drop a whole month of data in a fraction of a second instead of running a `DELETE` that takes hours.
+
+Partitioning is also easy to misuse. It does not make every query faster, it comes with strict rules for primary keys, and it rules out foreign keys. This guide covers when partitioning is worth it, each partitioning type with working examples, the rules MySQL enforces, how to confirm pruning with `EXPLAIN`, and the maintenance commands you will run every month. All examples are for MySQL 8.0 and 8.4 with InnoDB.
+
+## When Partitioning Helps, and When It Does Not
+
+Partitioning is a good fit when:
+
+- **You delete old data by time.** Dropping a partition is a metadata operation that removes a file. Deleting the same rows row by row generates huge amounts of undo and binary log, holds locks and fragments the table.
+- **Most queries filter on the partition column**, for example "events in the last 7 days". MySQL then reads only the partitions involved (partition pruning).
+- **The table is very large** and maintenance such as `OPTIMIZE` or rebuilds is easier one partition at a time.
+
+It is a poor fit when:
+
+- Queries rarely filter on the partition column. Without pruning, MySQL has to look into every partition, which is often slower than one big table with a good index.
+- The table is small, say a few million rows. A well-chosen index is simpler and just as fast.
+- You need foreign keys. Partitioned InnoDB tables cannot have them, in either direction.
+
+Partitioning is not sharding: all partitions live on the same server and share its CPU, memory and disk.
+
+## RANGE COLUMNS: Partitioning by Date
+
+Time-based range partitioning is by far the most common use. `RANGE COLUMNS` lets you write readable date boundaries:
+
+```sql
+CREATE TABLE events (
+  id          BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+  tenant_id   BIGINT UNSIGNED NOT NULL,
+  event_type  VARCHAR(40) NOT NULL,
+  payload     JSON NULL,
+  created_at  DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  PRIMARY KEY (id, created_at),
+  KEY idx_tenant_created (tenant_id, created_at)
+) ENGINE=InnoDB
+PARTITION BY RANGE COLUMNS (created_at) (
+  PARTITION p2026_01 VALUES LESS THAN ('2026-02-01'),
+  PARTITION p2026_02 VALUES LESS THAN ('2026-03-01'),
+  PARTITION p2026_03 VALUES LESS THAN ('2026-04-01'),
+  PARTITION p2026_04 VALUES LESS THAN ('2026-05-01'),
+  PARTITION pmax     VALUES LESS THAN (MAXVALUE)
+);
+```
+
+Each partition holds rows strictly less than its bound and at least the previous bound. The `pmax` partition catches everything beyond the last defined month, so inserts never fail. Without it, a row dated after April 2026 raises `ERROR 1526 (HY000): Table has no partition for value`.
+
+Notice the primary key: `PRIMARY KEY (id, created_at)`, not just `id`. That is required, as explained below.
+
+### RANGE with an expression
+
+Classic `RANGE` (without `COLUMNS`) accepts one integer expression. You will see it in older schemas:
+
+```sql
+PARTITION BY RANGE (TO_DAYS(created_at)) (
+  PARTITION p2026_01 VALUES LESS THAN (TO_DAYS('2026-02-01')),
+  PARTITION p2026_02 VALUES LESS THAN (TO_DAYS('2026-03-01')),
+  PARTITION pmax     VALUES LESS THAN MAXVALUE
+);
+```
+
+Pruning works with `TO_DAYS()`, `YEAR()` and `TO_SECONDS()` because MySQL knows those functions are monotonic. For new tables, `RANGE COLUMNS` is clearer.
+
+### TIMESTAMP columns
+
+A `TIMESTAMP` column cannot be used with `RANGE COLUMNS`, and the only function allowed on it is `UNIX_TIMESTAMP()`:
+
+```sql
+PARTITION BY RANGE (UNIX_TIMESTAMP(created_at)) (
+  PARTITION p2026_01 VALUES LESS THAN (UNIX_TIMESTAMP('2026-02-01 00:00:00')),
+  PARTITION pmax     VALUES LESS THAN MAXVALUE
+);
+```
+
+The boundary literal is converted using the session time zone when the table is created, so set a fixed `time_zone` before running the DDL. If you can choose, a `DATETIME` column is simpler to partition.
+
+## LIST and LIST COLUMNS: Fixed Groups
+
+`LIST` partitioning assigns rows by an exact value, useful for a small, stable set of categories such as regions:
+
+```sql
+CREATE TABLE orders (
+  id         BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+  country    CHAR(2) NOT NULL,
+  total      DECIMAL(12,2) NOT NULL,
+  created_at DATETIME NOT NULL,
+  PRIMARY KEY (id, country)
+) ENGINE=InnoDB
+PARTITION BY LIST COLUMNS (country) (
+  PARTITION p_na   VALUES IN ('US', 'CA', 'MX'),
+  PARTITION p_eu   VALUES IN ('DE', 'FR', 'GB', 'IT', 'ES'),
+  PARTITION p_apac VALUES IN ('JP', 'KR', 'SG', 'AU')
+);
+```
+
+MySQL has no `DEFAULT` partition for `LIST`. Inserting `'BR'` fails with error 1526 until you add a partition containing it. That makes `LIST` a poor choice for open-ended values such as tenant IDs that grow every day.
+
+## HASH and KEY: Spreading Rows Evenly
+
+`HASH` distributes rows across a fixed number of partitions using an integer expression modulo the partition count:
+
+```sql
+CREATE TABLE sessions (
+  id         BIGINT UNSIGNED NOT NULL,
+  user_id    BIGINT UNSIGNED NOT NULL,
+  data       BLOB,
+  PRIMARY KEY (id, user_id)
+) ENGINE=InnoDB
+PARTITION BY HASH (user_id)
+PARTITIONS 8;
+```
+
+`KEY` is similar but uses MySQL's internal hash function and accepts non-integer columns:
+
+```sql
+PARTITION BY KEY (session_token) PARTITIONS 8;
+```
+
+Hash and key partitioning prune only for equality lookups (`WHERE user_id = 42`). They give no benefit for range queries, and you cannot drop "old" data by partition. Their main use is reducing contention on very hot tables, which is a narrow case; for most workloads, range partitioning is the one that pays off.
+
+## The Rules MySQL Enforces
+
+### Every unique key must include the partition columns
+
+This is the rule that trips everyone up:
+
+```sql
+CREATE TABLE events (
+  id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
+  created_at DATETIME NOT NULL
+)
+PARTITION BY RANGE COLUMNS (created_at) (
+  PARTITION p0 VALUES LESS THAN ('2026-01-01')
+);
+```
+
+```text
+ERROR 1503 (HY000): A PRIMARY KEY must include all columns in the table's partitioning function
+```
+
+MySQL indexes are local to each partition. A unique index on `id` alone could only be enforced by checking every partition, which MySQL does not do. Including the partition column guarantees that any duplicate would land in the same partition. The fix is a composite key, `PRIMARY KEY (id, created_at)`. `AUTO_INCREMENT` on `id` still works because `id` is the first column of an index.
+
+The consequence is that you can no longer guarantee that `id` alone is unique at the database level. With `AUTO_INCREMENT` that is fine in practice. For natural keys such as an email address, it means a partitioned table cannot enforce uniqueness on that column at all, which is often a reason not to partition that table.
+
+### No foreign keys
+
+```text
+ERROR 1506 (HY000): Foreign keys are not yet supported in conjunction with partitioning
+```
+
+Neither the partitioned table nor tables referencing it can use foreign keys. Enforce those relationships in application code.
+
+### Other limits
+
+- Up to 8192 partitions per table, but every partition is a file and adds overhead to opening the table. Dozens to a few hundred is typical.
+- Partitioning functions must be deterministic; you cannot partition by `NOW()` or a stored function.
+- Full-text and spatial indexes are not supported on partitioned InnoDB tables.
+
+## Confirming Partition Pruning with EXPLAIN
+
+The `partitions` column of `EXPLAIN` shows which partitions a query reads:
+
+```sql
+EXPLAIN SELECT COUNT(*)
+FROM events
+WHERE created_at >= '2026-03-01' AND created_at < '2026-04-01';
+```
+
+```text
++----+-------------+--------+------------+-------+---------------+---------+------+---------+----------+--------------------------+
+| id | select_type | table  | partitions | type  | possible_keys | key     | ...  | rows    | filtered | Extra                    |
++----+-------------+--------+------------+-------+---------------+---------+------+---------+----------+--------------------------+
+|  1 | SIMPLE      | events | p2026_03   | ALL   | NULL          | NULL    | ...  | 1043221 |    11.11 | Using where              |
++----+-------------+--------+------------+-------+---------------+---------+------+---------+----------+--------------------------+
+```
+
+Only `p2026_03` is read. Pruning breaks when you wrap the partition column in a function in the `WHERE` clause:
+
+```sql
+-- reads every partition: MySQL cannot prune through DATE_FORMAT()
+EXPLAIN SELECT COUNT(*) FROM events
+WHERE DATE_FORMAT(created_at, '%Y-%m') = '2026-03';
+```
+
+Always express filters as ranges on the raw column. If you need help reading the `type`, `rows` and `Extra` columns of a plan like this, paste it into the [MySQL EXPLAIN Analyzer](https://chat2db.ai/tools/mysql-explain-analyzer).
+
+## Monthly Maintenance
+
+### Add next month's partition
+
+With a `MAXVALUE` partition, you cannot use `ADD PARTITION` (it fails with error 1481 because nothing can be added above `MAXVALUE`). Split the catch-all instead:
+
+```sql
+ALTER TABLE events REORGANIZE PARTITION pmax INTO (
+  PARTITION p2026_05 VALUES LESS THAN ('2026-06-01'),
+  PARTITION pmax     VALUES LESS THAN (MAXVALUE)
+);
+```
+
+While `pmax` is empty this is almost instant. If rows have already landed in it, MySQL copies them, which takes time and blocks writes, so schedule this well before each month begins. Most teams run it from a cron job or their migration tool, which keeps the DDL in version control, rather than from a MySQL event.
+
+### Drop old data
+
+```sql
+ALTER TABLE events DROP PARTITION p2026_01;
+```
+
+The rows are gone immediately, and the tablespace file is removed. If you need to keep the data, swap the partition into a regular table first:
+
+```sql
+CREATE TABLE events_2026_01 LIKE events;
+ALTER TABLE events_2026_01 REMOVE PARTITIONING;
+ALTER TABLE events EXCHANGE PARTITION p2026_01 WITH TABLE events_2026_01;
+ALTER TABLE events DROP PARTITION p2026_01;
+```
+
+`EXCHANGE PARTITION` is a metadata swap, so it is fast regardless of size. `TRUNCATE PARTITION` empties a partition but keeps its definition.
+
+### Inspect partitions
+
+```sql
+SELECT PARTITION_NAME, PARTITION_DESCRIPTION, TABLE_ROWS,
+       ROUND(DATA_LENGTH / 1024 / 1024) AS data_mb
+FROM information_schema.PARTITIONS
+WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'events'
+ORDER BY PARTITION_ORDINAL_POSITION;
+```
+
+`TABLE_ROWS` is an estimate for InnoDB, good enough to spot a partition that is unexpectedly large or rows piling up in `pmax`.
+
+## Converting an Existing Table
+
+You can partition an existing table with `ALTER TABLE ... PARTITION BY`, but it copies the whole table and blocks writes while doing so. For a large production table, use an online schema change tool such as `gh-ost` or `pt-online-schema-change`, and adjust the primary key first if it does not include the partition column.
+
+## Summary
+
+Partition a MySQL table when you need to drop old data cheaply or when queries consistently filter on one column, usually a date. Use `RANGE COLUMNS` with a `MAXVALUE` catch-all for time series, make the partition column part of every unique key, accept that foreign keys are off the table, and verify pruning with the `partitions` column of `EXPLAIN`. Then automate the monthly `REORGANIZE` and `DROP PARTITION` steps.
+
+To skip writing the DDL by hand, the free [MySQL Partition Generator](https://chat2db.ai/tools/mysql-partition-generator) produces the `CREATE TABLE`, the monthly partitions and the maintenance statements from a few inputs. To run and check them against your database, [Chat2DB](https://chat2db.ai/download) connects to MySQL and shows each table's partitions next to its structure.

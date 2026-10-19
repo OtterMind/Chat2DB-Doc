@@ -1,0 +1,245 @@
+---
+title: "Fix Postgres: Current Transaction Is Aborted"
+description: "Why PostgreSQL says current transaction is aborted, commands ignored until end of transaction block (25P02), and how to fix it with ROLLBACK and savepoints."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: October 19, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# Fix Postgres: Current Transaction Is Aborted
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="October 19, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+You run a perfectly valid query and PostgreSQL refuses it:
+
+```text
+ERROR:  current transaction is aborted, commands ignored until end of transaction block
+```
+
+The query is not the problem. This error (SQLSTATE `25P02`, `in_failed_sql_transaction`) means that an **earlier** statement in the same transaction failed, and PostgreSQL has put the whole transaction into an aborted state. Until you end that transaction, every further command, even `SELECT 1`, gets this error.
+
+This behaviour surprises people coming from MySQL or SQL Server, where a failed statement usually leaves the rest of the transaction usable. In PostgreSQL, an error inside a transaction block aborts the entire block. This article explains why, shows how to find the statement that really failed, and covers the correct fixes: `ROLLBACK`, savepoints, the `ON_ERROR_ROLLBACK` setting in `psql`, and the patterns that cause this error in Python, Java and Node.js applications.
+
+## Reproducing the Error
+
+Create a small table and open a transaction:
+
+```sql
+CREATE TABLE accounts (
+  id      int PRIMARY KEY,
+  balance numeric NOT NULL CHECK (balance >= 0)
+);
+
+INSERT INTO accounts VALUES (1, 100), (2, 50);
+
+BEGIN;
+UPDATE accounts SET balance = balance - 80 WHERE id = 2;
+```
+
+That `UPDATE` violates the `CHECK` constraint:
+
+```text
+ERROR:  new row for relation "accounts" violates check constraint "accounts_balance_check"
+DETAIL:  Failing row contains (2, -30).
+```
+
+Now try anything else in the same transaction:
+
+```sql
+SELECT * FROM accounts;
+```
+
+```text
+ERROR:  current transaction is aborted, commands ignored until end of transaction block
+```
+
+`psql` even shows the state in its prompt: `appdb=!#` (with an exclamation mark) means you are in a failed transaction, while `appdb=*#` means a healthy open transaction.
+
+## Why PostgreSQL Aborts the Whole Transaction
+
+A transaction is meant to be atomic: all of its changes happen, or none do. When a statement fails halfway through, PostgreSQL cannot know whether the rest of your transaction still makes sense without it. Maybe the next statement transfers money that the failed one was supposed to withdraw. Rather than guess, PostgreSQL marks the transaction as failed and only accepts commands that end it.
+
+Internally there is also a simpler reason: a failed statement may have done partial work, such as inserting some rows of a multi-row `INSERT`, before it hit the error. PostgreSQL undoes that work by rolling back to the start of the transaction (or to a savepoint). It has no cheaper way to undo "just that one statement" unless you ask for one with a savepoint.
+
+## Fix 1: Roll Back and Start Again
+
+The direct fix is to end the failed transaction:
+
+```sql
+ROLLBACK;
+```
+
+You can also type `COMMIT`; in an aborted transaction PostgreSQL performs a rollback anyway and reports `ROLLBACK`. Prefer the explicit `ROLLBACK` so that nobody reading the code thinks the changes were saved.
+
+Then fix whatever caused the first error and run the transaction again:
+
+```sql
+BEGIN;
+UPDATE accounts SET balance = balance - 30 WHERE id = 2;
+UPDATE accounts SET balance = balance + 30 WHERE id = 1;
+COMMIT;
+```
+
+## Fix 2: Find the Statement That Actually Failed
+
+In an application the `25P02` error is usually what ends up in your logs, while the original error was swallowed by a `try/except` or logged somewhere else. To find it, turn on server-side error logging, which is on by default at the `ERROR` level:
+
+```sql
+SHOW log_min_error_statement;  -- default: error
+```
+
+With that setting, the server log contains each failing statement right after its error:
+
+```text
+ERROR:  duplicate key value violates unique constraint "users_email_key"
+DETAIL:  Key (email)=(a@example.com) already exists.
+STATEMENT:  INSERT INTO users (email) VALUES ('a@example.com')
+ERROR:  current transaction is aborted, commands ignored until end of transaction block
+STATEMENT:  SELECT id FROM users WHERE email = 'a@example.com'
+```
+
+The **first** error in the transaction is the one to fix. Everything after it is noise.
+
+## Fix 3: Use a Savepoint When You Expect an Error
+
+Sometimes a statement is allowed to fail. A classic example is "insert, and if it already exists, carry on". You can protect such a statement with a savepoint, which lets you roll back just that part:
+
+```sql
+BEGIN;
+
+INSERT INTO accounts VALUES (3, 10);
+
+SAVEPOINT before_risky;
+INSERT INTO accounts VALUES (1, 999);        -- duplicate key, fails
+ROLLBACK TO SAVEPOINT before_risky;           -- transaction is usable again
+
+UPDATE accounts SET balance = balance + 5 WHERE id = 3;
+COMMIT;
+```
+
+After `ROLLBACK TO SAVEPOINT`, the transaction is healthy again and the first `INSERT` is still part of it. You can `RELEASE SAVEPOINT before_risky` when the protected statement succeeds, which frees the savepoint's resources.
+
+Savepoints are not free. Each one starts a subtransaction, and a transaction with a very large number of subtransactions (more than 64 at a time per backend) can cause measurable slowdowns on busy servers because of subtransaction cache overflow. Use them around the few statements that can legitimately fail, not around every statement in a loop.
+
+### Prefer ON CONFLICT where possible
+
+For the "insert unless it exists" case you do not need a savepoint at all. `INSERT ... ON CONFLICT` handles the conflict without raising an error:
+
+```sql
+INSERT INTO accounts (id, balance)
+VALUES (1, 999)
+ON CONFLICT (id) DO NOTHING;
+
+-- or update the existing row instead
+INSERT INTO accounts (id, balance)
+VALUES (1, 999)
+ON CONFLICT (id) DO UPDATE SET balance = EXCLUDED.balance;
+```
+
+Similarly, `CREATE TABLE IF NOT EXISTS`, `DROP ... IF EXISTS` and `MERGE` (PostgreSQL 15+) avoid predictable errors that would otherwise abort the transaction.
+
+## Fix 4: psql ON_ERROR_ROLLBACK for Interactive Work
+
+When you type statements by hand, losing a long transaction because of one typo is painful. `psql` can create an implicit savepoint before every statement inside a transaction:
+
+```sql
+\set ON_ERROR_ROLLBACK interactive
+```
+
+With `interactive`, the savepoint is only used in interactive sessions, not when running a script with `-f`, which is the safe choice: scripts should still stop on errors. Add the line to `~/.psqlrc` to make it permanent. For scripts, use the opposite setting so they fail fast:
+
+```bash
+psql -v ON_ERROR_STOP=1 -f migration.sql
+```
+
+## The Error in Application Code
+
+Most `25P02` reports come from applications, and the pattern is always the same: an exception is caught, but the transaction is not rolled back, and the same connection is used again.
+
+### Python (psycopg)
+
+```python
+import psycopg
+
+with psycopg.connect("dbname=appdb user=app") as conn:
+    with conn.cursor() as cur:
+        try:
+            cur.execute("INSERT INTO users (email) VALUES (%s)", ("a@example.com",))
+        except psycopg.errors.UniqueViolation:
+            pass  # BUG: the transaction is still aborted
+
+        cur.execute("SELECT count(*) FROM users")  # raises InFailedSqlTransaction
+```
+
+psycopg opens a transaction implicitly on the first statement, so the failed `INSERT` aborts it. Fix it by rolling back in the handler, or by wrapping the risky statement in a nested transaction block, which psycopg 3 implements with a savepoint:
+
+```python
+with psycopg.connect("dbname=appdb user=app") as conn:
+    with conn.cursor() as cur:
+        try:
+            with conn.transaction():          # savepoint inside the outer transaction
+                cur.execute("INSERT INTO users (email) VALUES (%s)", ("a@example.com",))
+        except psycopg.errors.UniqueViolation:
+            pass                              # only the savepoint was rolled back
+
+        cur.execute("SELECT count(*) FROM users")  # works
+```
+
+In Django, the equivalent is `transaction.atomic()` around the statement that may fail. Catching `IntegrityError` inside an outer `atomic()` block without an inner one produces exactly this error, and Django reports it as `TransactionManagementError` or `InternalError: current transaction is aborted`.
+
+### Java (JDBC)
+
+```java
+conn.setAutoCommit(false);
+try (Statement st = conn.createStatement()) {
+    st.executeUpdate("INSERT INTO users (email) VALUES ('a@example.com')");
+} catch (SQLException e) {
+    if ("23505".equals(e.getSQLState())) {
+        conn.rollback();  // without this, every later statement fails with 25P02
+    } else {
+        throw e;
+    }
+}
+```
+
+The PostgreSQL JDBC driver also has an `autosave` connection parameter. With `autosave=conservative`, the driver sets a savepoint before each statement and rolls back to it on failure. It is convenient for legacy code, but it adds a round trip per statement and hides errors you probably want to see, so use it as a stopgap.
+
+### Node.js (node-postgres)
+
+```js
+const client = await pool.connect();
+try {
+  await client.query("BEGIN");
+  await client.query("UPDATE accounts SET balance = balance - 80 WHERE id = 2");
+  await client.query("COMMIT");
+} catch (err) {
+  await client.query("ROLLBACK");   // always roll back before releasing
+  throw err;
+} finally {
+  client.release();
+}
+```
+
+If you forget the `ROLLBACK` and release the client back to the pool, the next request that borrows that connection inherits the aborted transaction, and fails with `25P02` on a query that has nothing to do with the original error. That is why this error sometimes appears to move randomly around an application.
+
+## Connection Poolers
+
+With a connection pool, whether it lives in your application (HikariCP, node-postgres `Pool`, SQLAlchemy) or in front of the server (PgBouncer), a connection outlives the request that used it. Make sure every code path ends its transaction before the connection goes back to the pool, and treat a `25P02` error on a query that looks unrelated as a sign that some other code path skipped its `ROLLBACK`.
+
+## Debugging Checklist
+
+1. Find the **first** error in the transaction in the server log; `25P02` is only the consequence.
+2. Run `ROLLBACK` to end the failed transaction, fix the cause, and retry.
+3. If a statement may legitimately fail, wrap it in a `SAVEPOINT`, or better, avoid the error with `ON CONFLICT` or `IF NOT EXISTS`.
+4. In `psql`, use `\set ON_ERROR_ROLLBACK interactive` for manual work and `ON_ERROR_STOP=1` for scripts.
+5. In application code, roll back in every exception handler before reusing or releasing the connection.
+
+When you work through a multi-statement change by hand, it helps to see transaction state clearly. In [Chat2DB](https://app.chat2db.ai/) you can switch a session to manual commit, run statements one by one, and roll back with a click when one fails, without retyping the whole transaction.
+
+## Summary
+
+"Current transaction is aborted, commands ignored until end of transaction block" is PostgreSQL protecting the atomicity of your transaction after an earlier statement failed. It is never fixed by changing the statement that reports it. End the transaction with `ROLLBACK`, find and fix the first error, and use savepoints or `ON CONFLICT` for statements that are expected to fail. In applications, a missing rollback in an exception handler, often combined with connection pooling, is almost always the root cause.

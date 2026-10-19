@@ -1,0 +1,193 @@
+---
+title: "Fix MySQL Error 1146: Table doesn't exist"
+description: "Fix MySQL ERROR 1146 (42S02) Table doesn't exist: wrong schema, lower_case_table_names, views with missing tables and InnoDB tables lost after a copy."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: October 19, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# Fix MySQL Error 1146: Table doesn't exist
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="October 19, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+MySQL error 1146 looks simple:
+
+```text
+ERROR 1146 (42S02): Table 'shop.Orders' doesn't exist
+```
+
+Most of the time it is simple: a typo, or the wrong database selected. But the same message also appears when the table is clearly visible in `SHOW TABLES`, when it worked yesterday on another server, or when the files are sitting right there in the data directory. Those cases have different causes: case sensitivity, views that point at dropped tables, privileges, and InnoDB tables whose data dictionary entry is missing.
+
+This guide walks from the quick checks to the harder cases, with the queries to diagnose each one.
+
+## Read the Name in the Error Carefully
+
+The error always shows the fully qualified name MySQL looked for: `'schema.table'`. Compare both parts with what you expected.
+
+- `Table 'shop.orders' doesn't exist` while the table lives in `shop_prod`: you are connected to the wrong database.
+- `Table 'shop.Orders' doesn't exist` while the table is `orders`: a case-sensitivity problem.
+- `Table 'shop.order' doesn't exist`: a typo, or an ORM that singularises or pluralises table names differently than you think.
+
+## Check 1: The Current Database
+
+Unqualified table names resolve against the current default database:
+
+```sql
+SELECT DATABASE();
+SHOW TABLES LIKE 'orders';
+```
+
+If `DATABASE()` returns `NULL` you would get error 1046 (`No database selected`) instead, so 1146 means some database is selected, just maybe not the one you think. Search for the table across all schemas:
+
+```sql
+SELECT TABLE_SCHEMA, TABLE_NAME, TABLE_TYPE
+FROM information_schema.TABLES
+WHERE TABLE_NAME = 'orders';
+```
+
+Common sources of a wrong default database:
+
+- The connection string's database name (for example `jdbc:mysql://db:3306/shop`) differs between environments.
+- A `USE` statement earlier in a script changed it.
+- A connection pool reuses a session where an earlier request ran `USE other_db`.
+
+Qualifying table names (`shop.orders`) in scripts that span several databases avoids the ambiguity entirely.
+
+## Check 2: Case Sensitivity and lower_case_table_names
+
+In MySQL, each database is a directory and, for many storage engines historically, each table had a file whose name matched the table name. As a result, **table name case sensitivity depends on the operating system's file system**, controlled by the `lower_case_table_names` system variable:
+
+| Value | Typical platform | Behaviour |
+| --- | --- | --- |
+| `0` | Linux | Names are stored as given and compared case-sensitively. `Orders` and `orders` are different tables. |
+| `1` | Windows | Names are stored in lowercase and compared case-insensitively. |
+| `2` | macOS | Names are stored as given but compared in lowercase. |
+
+```sql
+SHOW VARIABLES LIKE 'lower_case_table_names';
+```
+
+The classic failure: an application developed on macOS or Windows queries `Orders`, the table was created as `orders`, everything works locally, and on the Linux production server the query fails with 1146.
+
+The fix is to make names consistent, not to change the server setting. Pick lowercase table names with underscores and use them everywhere. To find tables whose names contain uppercase letters:
+
+```sql
+SELECT TABLE_SCHEMA, TABLE_NAME
+FROM information_schema.TABLES
+WHERE TABLE_SCHEMA NOT IN ('mysql', 'sys', 'performance_schema', 'information_schema')
+  AND BINARY TABLE_NAME <> LOWER(TABLE_NAME);
+```
+
+Rename them if needed:
+
+```sql
+RENAME TABLE `Orders` TO orders;
+```
+
+Why not just set `lower_case_table_names = 1` on Linux? Since MySQL 8.0, this variable can **only be set when the data directory is initialised**. Changing it in `my.cnf` on an existing server prevents it from starting, with an error that the setting differs from the one used at initialisation. Changing it means dumping all data, re-initialising with `mysqld --initialize --lower-case-table-names=1`, and reloading. Plan that for new servers if you need it; do not attempt it as a quick fix.
+
+## Check 3: The Object Is a View With a Missing Base Table
+
+A view keeps working only as long as the tables it references exist. If one is dropped or renamed, selecting from the view raises an error about the base table, which can be confusing because the view itself exists:
+
+```sql
+CREATE TABLE customers (id INT PRIMARY KEY, name VARCHAR(100));
+CREATE VIEW customer_names AS SELECT id, name FROM customers;
+RENAME TABLE customers TO clients;
+
+SELECT * FROM customer_names;
+```
+
+```text
+ERROR 1356 (HY000): View 'shop.customer_names' references invalid table(s) or column(s) or function(s) or definer/invoker of view lack rights to use them
+```
+
+Depending on the context, you will see 1356 or 1146 naming the base table. Find views that reference a given table:
+
+```sql
+SELECT TABLE_SCHEMA, TABLE_NAME
+FROM information_schema.VIEWS
+WHERE VIEW_DEFINITION LIKE '%customers%';
+```
+
+`CHECK TABLE customer_names;` also reports broken views. Fix by recreating the view against the new name with `CREATE OR REPLACE VIEW`.
+
+The same applies to stored procedures, functions and triggers. They are only validated when executed, so a procedure referencing a dropped table fails with 1146 at runtime, not when it was created. The `information_schema.ROUTINES.ROUTINE_DEFINITION` column lets you search their bodies.
+
+## Check 4: Temporary Tables and Sessions
+
+A `CREATE TEMPORARY TABLE` is visible only in the session that created it and is dropped when that session ends. If one request creates it and another request, running on a different pooled connection, queries it, the second gets 1146. Similarly, a temporary table disappears after a reconnect, which some drivers perform automatically after a timeout. Use a regular table with a session key, or make sure the whole workflow runs on a single connection.
+
+## Check 5: Privileges
+
+If a user has no privileges at all on a table, MySQL reports a permission error, not 1146:
+
+```text
+ERROR 1142 (42000): SELECT command denied to user 'app'@'%' for table 'orders'
+```
+
+So privilege problems normally announce themselves. However, `SHOW TABLES` and `information_schema.TABLES` only list tables the current user has some privilege on. If you diagnose with a restricted account, a table can seem missing when it exists. Repeat the `information_schema` search as an administrative user before concluding that the table is gone.
+
+## Check 6: The Table Is Listed but Still "Doesn't Exist"
+
+This is the alarming case: `SHOW TABLES` lists `orders`, or the `.ibd` file is in the data directory, yet every query fails with 1146. The server error log usually contains more detail:
+
+```text
+[ERROR] [MY-012592] [InnoDB] Operating system error number 2 in a file operation.
+[ERROR] [MY-012213] [InnoDB] Cannot open datafile for read-only: './shop/orders.ibd'
+```
+
+Typical causes:
+
+### Files copied without the data dictionary
+
+Copying a database directory from one server to another, or restoring individual `.ibd` files, does not work with InnoDB. Since MySQL 8.0 table definitions live in the transactional data dictionary inside the system tablespace (`mysql.ibd`), and older versions kept InnoDB's own dictionary in `ibdata1`. A lone `.ibd` file is not a table to the server.
+
+To move a single InnoDB table correctly, use transportable tablespaces:
+
+```sql
+-- on the source
+FLUSH TABLES orders FOR EXPORT;
+-- copy orders.ibd and orders.cfg to the destination's schema directory, then:
+UNLOCK TABLES;
+
+-- on the destination, with an identical CREATE TABLE already run
+ALTER TABLE orders DISCARD TABLESPACE;
+-- place the copied files, fix ownership (chown mysql:mysql), then:
+ALTER TABLE orders IMPORT TABLESPACE;
+```
+
+For whole databases, use a logical dump (`mysqldump` or MySQL Shell's `util.dumpInstance`) or a physical backup tool such as Percona XtraBackup or MySQL Enterprise Backup, which copy the data dictionary consistently.
+
+### File permissions or ownership
+
+After restoring files manually, the `.ibd` file may be owned by `root`. The MySQL server process cannot open it and reports the table as missing. Check with `ls -l /var/lib/mysql/shop/` and fix ownership with `chown -R mysql:mysql`. On systems with SELinux or AppArmor, a data directory moved to a new path also needs the right security context.
+
+### A crash or interrupted DDL
+
+On older versions, a crash during `ALTER TABLE` could leave orphaned intermediate tables (named like `#sql-ib123`) or mismatched dictionary entries. MySQL 8.0's atomic DDL largely removed this class of problem. If you hit it on 5.7, check the error log, and restore the table from backup rather than experimenting with `innodb_force_recovery` on a production server.
+
+## Check 7: Replication and Migrations
+
+On a replica, 1146 stops the SQL thread when a replicated statement refers to a table that does not exist there, typically because the table was created while replication filters (`replicate-ignore-table`, `replicate-do-db`) excluded it, or because someone wrote directly to the replica. `SHOW REPLICA STATUS\G` shows the failing statement in `Last_SQL_Error`. The correct fix is to bring the table onto the replica (from a dump of the source) and resume, not to skip the error, which leaves the replica inconsistent.
+
+In migration-based deployments, 1146 often means migrations ran against a different database than the app connects to, or a migration that creates the table failed halfway. Check your migration tool's history table (for example `flyway_schema_history`) in the database your application actually uses.
+
+## Quick Checklist
+
+1. Read the `schema.table` in the message: wrong schema, wrong case or a typo?
+2. Run `SELECT DATABASE()` and search `information_schema.TABLES` for the name, as an admin user.
+3. On Linux, remember that table names are case-sensitive with `lower_case_table_names = 0`.
+4. If the object is a view, procedure or trigger, check that its base tables still exist.
+5. For temporary tables, make sure the same session creates and reads them.
+6. If the table is listed but unusable, read the server error log; check copied files, ownership and the data dictionary.
+
+Many of these checks are faster with a client that shows every schema and object type in one tree. [Chat2DB](https://chat2db.ai/download) lists tables, views and routines for every MySQL database you connect to, so you can see at a glance whether `orders` lives in another schema or under a different case, and its AI assistant can explain a 1146 error from the failing statement.
+
+## Summary
+
+MySQL error 1146 means the server could not find the table in the schema it searched. Usually the default database is wrong or the name's case differs from the stored name on a case-sensitive Linux server. When the table seems to exist, look for a view or routine pointing at a dropped table, a temporary table in another session, a restricted account hiding the table, or InnoDB files copied without the data dictionary, and read the server error log for the real reason.

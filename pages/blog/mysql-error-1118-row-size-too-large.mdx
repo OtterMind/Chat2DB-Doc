@@ -1,0 +1,208 @@
+---
+title: "Fix MySQL Error 1118: Row size too large"
+description: "Fix MySQL ERROR 1118 Row size too large (8126 or 65535 bytes): how InnoDB row limits work, DYNAMIC row format, VARCHAR to TEXT and splitting wide tables."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: October 19, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# Fix MySQL Error 1118: Row size too large
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="October 19, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+MySQL error 1118 comes in two flavours, and they have different causes:
+
+```text
+ERROR 1118 (42000): Row size too large. The maximum row size for the used table type,
+not counting BLOBs, is 65535. This includes storage overhead, check the manual.
+You have to change some columns to TEXT or BLOBs
+```
+
+```text
+ERROR 1118 (42000): Row size too large (> 8126). Changing some columns to TEXT or BLOB
+may help. In current row format, BLOB prefix of 0 bytes is stored inline.
+```
+
+The first is a limit of the MySQL server on the **declared** size of all columns in a table definition. The second is an InnoDB limit on how much data fits in one **page**. The fixes overlap, but understanding which limit you hit tells you which fix will work. This guide explains both limits, how to measure your table against them, and the fixes in order of preference.
+
+## The Two Limits
+
+### Limit 1: 65,535 bytes per row definition
+
+MySQL caps the combined maximum size of all columns in a row at 65,535 bytes, regardless of storage engine. `TEXT` and `BLOB` columns count only 9 to 12 bytes towards it, because their contents are stored separately. `VARCHAR` columns count their **maximum** size in bytes, including length bytes.
+
+The byte size depends on the character set. With `utf8mb4`, each character can take up to 4 bytes, so a `VARCHAR(255)` reserves 1,020 bytes plus 2 length bytes. A table with 70 `VARCHAR(255)` columns in `utf8mb4` already declares more than 71,000 bytes:
+
+```sql
+CREATE TABLE wide_import (
+  id INT PRIMARY KEY,
+  c1  VARCHAR(255), c2  VARCHAR(255), /* ... */ c70 VARCHAR(255)
+) DEFAULT CHARSET=utf8mb4;
+-- ERROR 1118: ... maximum row size ... is 65535
+```
+
+This check happens at `CREATE TABLE` or `ALTER TABLE` time, before any data exists.
+
+### Limit 2: about half an InnoDB page
+
+InnoDB stores rows in pages, 16KB by default. Each page must hold at least two rows, so a row stored entirely on the page can be at most roughly half a page: **8,126 bytes** with the default 16KB page size (the exact number appears in the error message).
+
+Variable-length columns (`VARCHAR`, `VARBINARY`, `TEXT`, `BLOB`) can be moved **off-page** into overflow pages when a row is too long, leaving only a pointer in the main record. How much stays inline depends on the row format:
+
+| Row format | What stays on the page for a long variable-length column |
+| --- | --- |
+| `REDUNDANT`, `COMPACT` | The first 768 bytes, plus a 20-byte pointer |
+| `DYNAMIC` (default since MySQL 5.7), `COMPRESSED` | Only a 20-byte pointer |
+
+With `COMPACT`, a table with many `TEXT` columns can still exceed 8,126 bytes, because each one keeps 768 bytes inline. With `DYNAMIC`, each long column costs only 20 bytes on the page. The message "BLOB prefix of 0 bytes is stored inline" tells you the table is already `DYNAMIC` or `COMPRESSED`, so the remaining culprits are fixed-size columns and short variable columns that are not moved off-page.
+
+Fixed-length types (`INT`, `BIGINT`, `DATETIME`, `DECIMAL`, `CHAR` in single-byte charsets) always stay on the page. `VARCHAR` values are only moved off-page when the column is long enough; short `VARCHAR` values (up to about 40 bytes) always stay inline.
+
+This page check happens when a row is inserted or updated, or at `CREATE TABLE` time when `innodb_strict_mode` is `ON` (the default since MySQL 5.7). With strict mode on, MySQL refuses to create a table whose worst-case row could not fit. That is safer than discovering the problem when the first wide row arrives.
+
+## Step 1: Measure the Table
+
+Check the table's row format and character set:
+
+```sql
+SELECT TABLE_NAME, ROW_FORMAT, TABLE_COLLATION
+FROM information_schema.TABLES
+WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'wide_import';
+```
+
+Then estimate the declared size of each column. This query approximates the bytes each column reserves in the row definition:
+
+```sql
+SELECT COLUMN_NAME,
+       COLUMN_TYPE,
+       CHARACTER_SET_NAME,
+       CASE
+         WHEN DATA_TYPE IN ('tinytext','text','mediumtext','longtext',
+                            'tinyblob','blob','mediumblob','longblob','json') THEN 12
+         WHEN DATA_TYPE IN ('varchar','varbinary') THEN CHARACTER_OCTET_LENGTH + 2
+         WHEN DATA_TYPE IN ('char','binary') THEN CHARACTER_OCTET_LENGTH
+         WHEN DATA_TYPE IN ('bigint','double','datetime') THEN 8
+         WHEN DATA_TYPE IN ('int','float','timestamp') THEN 4
+         ELSE 8
+       END AS approx_bytes
+FROM information_schema.COLUMNS
+WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'wide_import'
+ORDER BY approx_bytes DESC;
+```
+
+Sum the `approx_bytes` column. Above 65,535 you hit limit 1. Below that, but with many columns that would stay inline, you are likely to hit limit 2. It is an approximation, but it shows which columns dominate.
+
+## Fix 1: Use the DYNAMIC Row Format
+
+If the table is `COMPACT` or `REDUNDANT`, typically because it was created on an old server or with an explicit `ROW_FORMAT`, convert it:
+
+```sql
+ALTER TABLE wide_import ROW_FORMAT=DYNAMIC;
+```
+
+This rebuilds the table. For large tables, run it with an online schema change tool or during a maintenance window. Make sure new tables get `DYNAMIC` too:
+
+```sql
+SHOW VARIABLES LIKE 'innodb_default_row_format';   -- should be dynamic
+```
+
+This is often the whole fix for tables with many `TEXT` columns: under `DYNAMIC` each of them costs only 20 bytes on the page instead of 788.
+
+## Fix 2: Convert Long VARCHAR Columns to TEXT
+
+For limit 1 (65,535), the error message itself suggests the fix. `TEXT` counts only a few bytes towards the row definition, so converting the widest `VARCHAR` columns solves it:
+
+```sql
+ALTER TABLE wide_import
+  MODIFY c1 TEXT,
+  MODIFY c2 TEXT,
+  MODIFY c3 TEXT;
+```
+
+Things to consider before converting:
+
+- `TEXT` columns cannot have a `DEFAULT` value except an expression default in MySQL 8.0.13 and later, for example `DEFAULT ('')`.
+- Indexing a `TEXT` column requires a prefix length (`KEY (c1(100))`) or a functional index.
+- Temporary tables for `GROUP BY` or `ORDER BY` that include `TEXT` columns used to go to disk; MySQL 8.0's `TempTable` engine handles them in memory, so this is much less of a concern than it once was.
+
+## Fix 3: Right-size the Columns
+
+Wide tables usually come from imports where every column was declared `VARCHAR(255)` "to be safe". Check the real data and shrink columns to fit:
+
+```sql
+SELECT MAX(CHAR_LENGTH(c1)) AS c1_max,
+       MAX(CHAR_LENGTH(c2)) AS c2_max,
+       MAX(CHAR_LENGTH(c3)) AS c3_max
+FROM wide_import;
+```
+
+A postal code column whose longest value is 10 characters does not need `VARCHAR(255)`; `VARCHAR(16)` reserves 66 bytes instead of 1,022 in `utf8mb4`. Similarly, columns that hold only ASCII codes, such as country codes, currency codes and hashes, can use the `ascii` character set:
+
+```sql
+ALTER TABLE wide_import
+  MODIFY country_code CHAR(2) CHARACTER SET ascii,
+  MODIFY sha256 CHAR(64) CHARACTER SET ascii;
+```
+
+That cuts their reserved size by a factor of four compared with `utf8mb4`.
+
+## Fix 4: Split the Table
+
+A table with hundreds of columns is often a sign that several entities have been flattened into one. Splitting it vertically into a main table and one or more detail tables keyed by the same primary key keeps each row comfortably within the limits:
+
+```sql
+CREATE TABLE products (
+  id          BIGINT UNSIGNED PRIMARY KEY,
+  sku         VARCHAR(40) NOT NULL,
+  name        VARCHAR(200) NOT NULL,
+  price       DECIMAL(10,2) NOT NULL
+) ENGINE=InnoDB;
+
+CREATE TABLE product_specs (
+  product_id  BIGINT UNSIGNED PRIMARY KEY,
+  weight_g    INT,
+  dimensions  VARCHAR(60),
+  materials   TEXT,
+  care_notes  TEXT,
+  CONSTRAINT fk_specs_product FOREIGN KEY (product_id) REFERENCES products (id)
+) ENGINE=InnoDB;
+```
+
+If many of the columns are sparse attributes that differ by product type, a `JSON` column is another option. It is stored off-page like a `BLOB` and counts only a few bytes towards both limits:
+
+```sql
+ALTER TABLE products ADD COLUMN attributes JSON;
+```
+
+## What Not to Do
+
+### Disabling innodb_strict_mode
+
+You will find advice to set `innodb_strict_mode = OFF`. With strict mode off, `CREATE TABLE` succeeds with a warning, but the limit has not gone away: the first `INSERT` or `UPDATE` whose row really exceeds the page limit fails with error 1118 at runtime, possibly in production. That trades an error you see at deploy time for one you see when a customer saves a long form. Turn it off only temporarily to import an old dump, then fix the schema.
+
+### Changing the page size
+
+`innodb_page_size` can be set to 32KB or 64KB, which raises the per-row limit. But it can only be set when the data directory is initialised, applies to the whole instance, and has performance trade-offs. It is not a fix for one wide table.
+
+## A Note on Imports and Dumps
+
+Error 1118 frequently appears while restoring a dump from an older server, because the dump contains `ROW_FORMAT=COMPACT` explicitly or because the old server used `latin1` and the new one defaults to `utf8mb4`, quadrupling the declared size of every `VARCHAR`. Check the `CREATE TABLE` statements in the dump. Removing the explicit `ROW_FORMAT` clause, or keeping the original character set for that table, often lets the restore complete, and you can then convert columns deliberately.
+
+## Checklist
+
+1. Identify which limit you hit: 65,535 (row definition) or about 8,126 (InnoDB page).
+2. Check `ROW_FORMAT`; convert `COMPACT`/`REDUNDANT` tables to `DYNAMIC`.
+3. For the 65,535 limit, convert the widest `VARCHAR` columns to `TEXT`.
+4. Shrink over-declared columns and use `ascii` for code columns.
+5. Split very wide tables or move sparse attributes into `JSON`.
+6. Keep `innodb_strict_mode` on so problems surface at `CREATE TABLE` time.
+
+When you are working through a wide table, being able to see every column's type and character set in one grid makes it quick to spot the `VARCHAR(255)` columns that do not need to be. [Chat2DB](https://app.chat2db.ai/) shows the full column list of a MySQL table and lets you edit types visually, generating the `ALTER TABLE` statement for review before it runs.
+
+## Summary
+
+Error 1118 is either the 65,535-byte limit on a row's declared size or InnoDB's limit of roughly half a page per row. `DYNAMIC` row format, `TEXT` instead of long `VARCHAR`, right-sized columns and splitting wide tables address both. Avoid turning off strict mode as a fix: it only moves the error from schema changes to runtime writes.

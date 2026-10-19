@@ -1,0 +1,213 @@
+---
+title: "Fix MySQL Error 1292: Incorrect datetime value"
+description: "Fix MySQL ERROR 1292 Incorrect datetime value: ISO 8601 strings with T and Z, zero dates, NO_ZERO_DATE, empty strings, STR_TO_DATE and TIMESTAMP range."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: October 19, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# Fix MySQL Error 1292: Incorrect datetime value
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="October 19, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+MySQL raises error 1292 when it cannot turn a value into a valid date or time:
+
+```text
+ERROR 1292 (22007): Incorrect datetime value: '2026-10-19T14:30:00.000Z' for column 'created_at' at row 1
+```
+
+The same error code covers several variants: `Incorrect date value`, `Incorrect datetime value`, `Incorrect time value` and `Truncated incorrect DOUBLE value`, the last of which shows up when MySQL converts a string to a number during a comparison. This article focuses on the date and time variants, which are by far the most common, and covers each typical cause with the fix that keeps your data correct.
+
+## Why MySQL Is Strict About It
+
+Since MySQL 5.7, the default `sql_mode` includes `STRICT_TRANS_TABLES`, `NO_ZERO_DATE`, `NO_ZERO_IN_DATE` and `ERROR_FOR_DIVISION_BY_ZERO`. In strict mode, an invalid value in an `INSERT` or `UPDATE` is an error rather than a warning. Before 5.7, MySQL silently stored `0000-00-00 00:00:00` instead, which is how many old databases ended up full of zero dates.
+
+Check your current mode:
+
+```sql
+SELECT @@SESSION.sql_mode;
+```
+
+A typical MySQL 8 value is:
+
+```text
+ONLY_FULL_GROUP_BY,STRICT_TRANS_TABLES,NO_ZERO_IN_DATE,NO_ZERO_DATE,ERROR_FOR_DIVISION_BY_ZERO,NO_ENGINE_SUBSTITUTION
+```
+
+Strictness is good: it stops bad data at the door. The fixes below make the input valid instead of weakening the mode.
+
+## Cause 1: ISO 8601 Strings with T and Z
+
+This is the most common cause today. JavaScript's `Date.prototype.toISOString()`, many JSON APIs and logging systems produce timestamps like `2026-10-19T14:30:00.000Z`. MySQL's `DATETIME` literal format is `YYYY-MM-DD hh:mm:ss[.fraction]`. MySQL accepts the `T` separator, but the trailing `Z` (or an offset such as `+02:00` in versions before 8.0.19) is the problem.
+
+```sql
+CREATE TABLE logins (
+  id INT AUTO_INCREMENT PRIMARY KEY,
+  created_at DATETIME(3) NOT NULL
+);
+
+INSERT INTO logins (created_at) VALUES ('2026-10-19T14:30:00.000Z');
+-- ERROR 1292: Incorrect datetime value
+```
+
+Since MySQL 8.0.19, datetime literals may include a time zone offset such as `+00:00`, and MySQL converts the value to the session time zone before storing it:
+
+```sql
+INSERT INTO logins (created_at) VALUES ('2026-10-19 14:30:00.000+00:00');  -- OK on 8.0.19+
+```
+
+The `Z` suffix itself is not accepted as an offset, so replace it, or better, convert in the application. In Node.js with `mysql2`, pass a `Date` object instead of a string and let the driver format it. In SQL you can also normalise the string:
+
+```sql
+INSERT INTO logins (created_at)
+VALUES (STR_TO_DATE(REPLACE('2026-10-19T14:30:00.000Z', 'Z', ''), '%Y-%m-%dT%H:%i:%s.%f'));
+```
+
+Remember what time zone the stored value represents. `DATETIME` has no time zone; if the source was UTC (`Z`), store UTC consistently and convert on display, or use `TIMESTAMP`, which converts from the session time zone to UTC on write and back on read.
+
+## Cause 2: Zero Dates
+
+```sql
+INSERT INTO logins (created_at) VALUES ('0000-00-00 00:00:00');
+-- ERROR 1292 under NO_ZERO_DATE + strict mode
+```
+
+Zero dates are not real dates, and with `NO_ZERO_DATE` and strict mode they are rejected. `NO_ZERO_IN_DATE` also rejects partial zeros such as `2026-00-15`. Typical sources:
+
+- An application that uses `'0000-00-00'` to mean "no value".
+- A dump from an older server that contains zero dates, which then fails to import into MySQL 8.
+- A column definition like `DEFAULT '0000-00-00 00:00:00'`, which makes even `ALTER TABLE` on that table fail.
+
+The right fix is to represent "no value" as `NULL`:
+
+```sql
+ALTER TABLE orders MODIFY shipped_at DATETIME NULL DEFAULT NULL;
+```
+
+For existing data, convert zero dates to `NULL`. Because the strict mode also complains about comparisons with zero dates in some contexts, relax the mode for this one session while cleaning up:
+
+```sql
+SET SESSION sql_mode = REPLACE(REPLACE(@@SESSION.sql_mode, 'NO_ZERO_DATE', ''), 'NO_ZERO_IN_DATE', '');
+
+UPDATE orders
+SET shipped_at = NULL
+WHERE shipped_at = '0000-00-00 00:00:00';
+```
+
+The change applies only to the current session and is gone when you disconnect. Then fix the application so that it writes `NULL` instead of a zero date.
+
+### Importing an old dump with zero dates
+
+Dumps written by `mysqldump` start with `SET @OLD_SQL_MODE=@@SQL_MODE, SQL_MODE='NO_AUTO_VALUE_ON_ZERO'`, which replaces the session mode and therefore turns the zero-date checks off while the dump loads, so they usually restore fine. Exports from other tools, or SQL files that were edited or split and lost that header, fail with 1292 on the first zero date. To restore such a file as-is, import it in a session with a relaxed mode and clean the data immediately afterwards:
+
+```bash
+mysql --init-command="SET SESSION sql_mode='NO_ENGINE_SUBSTITUTION'" shop < old_dump.sql
+```
+
+## Cause 3: Empty Strings
+
+```sql
+INSERT INTO orders (id, shipped_at) VALUES (42, '');
+-- ERROR 1292: Incorrect datetime value: '' for column 'shipped_at' at row 1
+```
+
+An empty string is not a date. This often comes from HTML forms or CSV files where an empty field is sent as `''`. Convert it to `NULL` in the application, or in SQL with `NULLIF`:
+
+```sql
+INSERT INTO orders (id, shipped_at) VALUES (42, NULLIF('', ''));
+```
+
+With `LOAD DATA`, read the field into a variable and convert it:
+
+```sql
+LOAD DATA INFILE '/var/lib/mysql-files/orders.csv'
+INTO TABLE orders
+FIELDS TERMINATED BY ',' OPTIONALLY ENCLOSED BY '"'
+IGNORE 1 LINES
+(id, @shipped_at)
+SET shipped_at = NULLIF(@shipped_at, '');
+```
+
+## Cause 4: Non-standard Formats
+
+MySQL does not guess formats like `10/19/2026`, `19.10.2026` or `Oct 19 2026 2:30PM`. Parse them explicitly with `STR_TO_DATE()`:
+
+```sql
+SELECT STR_TO_DATE('10/19/2026', '%m/%d/%Y');              -- 2026-10-19
+SELECT STR_TO_DATE('19.10.2026 14:30', '%d.%m.%Y %H:%i');  -- 2026-10-19 14:30:00
+SELECT STR_TO_DATE('Oct 19 2026 2:30PM', '%b %d %Y %l:%i%p');
+```
+
+`STR_TO_DATE` returns `NULL` with a warning if the string does not match the format, so check the result before inserting, or combine it with the `LOAD DATA` variable pattern above:
+
+```sql
+SET shipped_at = STR_TO_DATE(@shipped_at, '%m/%d/%Y');
+```
+
+If you are building a format string, the [MySQL DATE_FORMAT builder](https://chat2db.ai/tools/mysql-date-format-builder) shows what each specifier does with a live example.
+
+## Cause 5: Dates That Do Not Exist
+
+```sql
+INSERT INTO orders (id, shipped_at) VALUES (43, '2026-02-30');
+-- ERROR 1292: Incorrect datetime value
+```
+
+February 30th does not exist, and in strict mode MySQL rejects it. The same applies to `2026-04-31` or a time like `24:30:00` in a `DATETIME`. These usually come from date arithmetic done on strings in application code ("add one to the day number"). Use date functions instead:
+
+```sql
+SELECT LAST_DAY('2026-02-01');                       -- 2026-02-28
+SELECT DATE_ADD('2026-01-31', INTERVAL 1 MONTH);     -- 2026-02-28
+```
+
+## Cause 6: TIMESTAMP Range and Time Zone Gaps
+
+`TIMESTAMP` columns can only store values from `1970-01-01 00:00:01` UTC to `2038-01-19 03:14:07` UTC. Anything outside that range raises error 1292:
+
+```sql
+CREATE TABLE subscriptions (expires_at TIMESTAMP NULL);
+INSERT INTO subscriptions VALUES ('2040-01-01 00:00:00');
+-- ERROR 1292: Incorrect datetime value
+```
+
+Use `DATETIME` for dates far in the future or before 1970, such as birth dates or "valid until" dates.
+
+A subtler case: `TIMESTAMP` values are interpreted in the session time zone. In a zone with daylight saving time, a local time that falls into the spring-forward gap, for example `2026-03-08 02:30:00` in `America/New_York`, does not exist, and MySQL adjusts it rather than storing it as given. Set the session time zone to UTC for writes (`SET time_zone = '+00:00'`) to avoid ambiguity.
+
+## Cause 7: Comparing a Date Column With a Bad String
+
+Error 1292 also appears as a warning or error in `WHERE` clauses and in `UPDATE ... WHERE`:
+
+```sql
+UPDATE orders SET status = 'late' WHERE shipped_at < 'yesterday';
+-- ERROR 1292: Incorrect datetime value: 'yesterday'
+```
+
+In `SELECT` statements this is usually only a warning, and the comparison quietly behaves unexpectedly. In `UPDATE` and `DELETE` under strict mode it becomes an error. Compute the boundary with date functions:
+
+```sql
+UPDATE orders SET status = 'late' WHERE shipped_at < CURDATE() - INTERVAL 1 DAY;
+```
+
+## Why Not Just Remove Strict Mode?
+
+You can make the error go away globally by removing `STRICT_TRANS_TABLES` and the zero-date modes from `sql_mode`. MySQL then stores `0000-00-00` or a truncated value with a warning instead. That makes every later bug harder to find: reports, ORMs and other databases do not understand zero dates, and incorrectly parsed values become silently wrong rather than visibly rejected. Relax the mode only for a single session while cleaning up data, as shown above.
+
+## Checklist
+
+1. Read the value in the error message: it tells you the exact input MySQL rejected.
+2. ISO strings: drop the `Z`, use a numeric offset on 8.0.19+, or pass native date objects from the driver.
+3. Zero dates and empty strings: store `NULL` and make the column nullable.
+4. Custom formats: parse explicitly with `STR_TO_DATE()`.
+5. Impossible dates and `TIMESTAMP` range: use date functions and `DATETIME` for dates outside 1970 to 2038.
+6. Keep strict mode on; relax it only per session for clean-up.
+
+When you are cleaning date columns in an imported table, it helps to find the bad values before the `ALTER TABLE` or `INSERT` fails. With [Chat2DB](https://chat2db.ai/download) you can query the staging table, filter rows where `STR_TO_DATE` returns `NULL`, and fix them in the result grid, and its AI assistant can write the format string for an unusual date layout from a sample value.
+
+## Summary
+
+MySQL error 1292 means a value could not be converted into a valid date, time or datetime. Strict mode turned what used to be silent corruption into an error, and that is worth keeping. Fix the input: normalise ISO 8601 strings, use `NULL` instead of zero dates and empty strings, parse custom formats with `STR_TO_DATE`, and choose `DATETIME` over `TIMESTAMP` for values outside the 1970 to 2038 range.
