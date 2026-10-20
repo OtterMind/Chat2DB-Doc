@@ -1,0 +1,206 @@
+---
+title: "Fix MySQL Error 1364: Field Has No Default Value"
+description: "Fix MySQL ERROR 1364 Field doesn't have a default value: find NOT NULL columns without defaults, add expression defaults and fix strict-mode surprises."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: October 20, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# Fix MySQL Error 1364: Field Has No Default Value
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="October 20, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+```text
+ERROR 1364 (HY000): Field 'api_key' doesn't have a default value
+```
+
+MySQL raises error 1364 when an `INSERT` leaves out a column that is `NOT NULL` and has no `DEFAULT`, while strict SQL mode is on. MySQL does not know what to put in that column, so it rejects the row.
+
+The error often shows up "out of nowhere" after an upgrade, a server move, or a switch to a managed database. The schema and the code did not change; strict mode did. This guide explains exactly when MySQL raises 1364, how to find every column that can cause it, and the right fix for each situation. All examples were run on MySQL 8.4.
+
+## Reproduce the error
+
+```sql
+CREATE TABLE users (
+  id         INT PRIMARY KEY AUTO_INCREMENT,
+  email      VARCHAR(100) NOT NULL,
+  api_key    CHAR(36)     NOT NULL,
+  created_at DATETIME     NOT NULL,
+  bio        TEXT         NOT NULL
+);
+
+INSERT INTO users (email) VALUES ('ann@example.com');
+-- ERROR 1364 (HY000): Field 'api_key' doesn't have a default value
+```
+
+MySQL reports the first offending column only. Fix `api_key` and the same statement will fail on `created_at`, then on `bio`. That is why it pays to find all of them at once (see below).
+
+Error 1364 is about a column that is *omitted*. If your statement passes an explicit `NULL` instead, you get a different error, `1048 Column 'x' cannot be null`.
+
+## Why it worked before: strict mode
+
+Whether 1364 is an error or a warning depends on `sql_mode`:
+
+```sql
+SELECT @@GLOBAL.sql_mode, @@SESSION.sql_mode;
+```
+
+MySQL 5.7 and later enable `STRICT_TRANS_TABLES` by default. Without strict mode, MySQL inserts the row anyway, fills each missing column with the *implicit default* for its type, and only raises a warning:
+
+```sql
+CREATE TABLE t2 (id INT PRIMARY KEY, name VARCHAR(10) NOT NULL, n INT NOT NULL, d DATE NOT NULL);
+
+SET SESSION sql_mode = '';
+INSERT INTO t2 (id) VALUES (1);
+SHOW WARNINGS;
+```
+
+```text
++---------+------+-------------------------------------------+
+| Level   | Code | Message                                   |
++---------+------+-------------------------------------------+
+| Warning | 1364 | Field 'name' doesn't have a default value |
+| Warning | 1364 | Field 'n' doesn't have a default value    |
+| Warning | 1364 | Field 'd' doesn't have a default value    |
++---------+------+-------------------------------------------+
+```
+
+```text
++----+------+---+------------+
+| id | name | n | d          |
++----+------+---+------------+
+|  1 |      | 0 | 0000-00-00 |
++----+------+---+------------+
+```
+
+An empty string, a zero and an invalid zero date: that is silent data corruption, and the reason strict mode became the default. Code written against an old non-strict server often depends on it without anyone noticing.
+
+## Step 1: Find every NOT NULL column without a default
+
+This query lists the columns an `INSERT` must always supply:
+
+```sql
+SELECT TABLE_NAME, COLUMN_NAME, COLUMN_TYPE
+FROM information_schema.COLUMNS
+WHERE TABLE_SCHEMA = DATABASE()
+  AND IS_NULLABLE = 'NO'
+  AND COLUMN_DEFAULT IS NULL
+  AND EXTRA NOT LIKE '%auto_increment%'
+  AND EXTRA NOT LIKE '%GENERATED%'
+ORDER BY TABLE_NAME, ORDINAL_POSITION;
+```
+
+Compare that list with the columns your application's `INSERT` statements actually set. Every column in the list that the code leaves out is a 1364 waiting to happen.
+
+## Step 2: Choose the right fix
+
+### Fix A: The application should supply the value
+
+If the column is genuinely required business data, like `email` above, the database is right to refuse the row. Fix the code: add the column to the `INSERT` and validate it earlier in the request. Don't add a meaningless default (`''`) just to make the error go away; you would only move the bug into your data.
+
+### Fix B: Add a sensible default
+
+If there is a correct value for "not specified", put it in the schema:
+
+```sql
+ALTER TABLE users
+  MODIFY created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP;
+```
+
+Since MySQL 8.0.13 a default can be an expression in parentheses, which covers most cases that used to need a trigger:
+
+```sql
+ALTER TABLE users
+  MODIFY api_key CHAR(36) NOT NULL DEFAULT (UUID()),
+  MODIFY bio     TEXT     NOT NULL DEFAULT ('');
+
+INSERT INTO users (email) VALUES ('bob@example.com');   -- works
+```
+
+Note the parentheses on `('')`. `TEXT`, `BLOB`, `JSON` and geometry columns cannot have a literal default, and `DEFAULT ''` fails with `ERROR 1101: BLOB, TEXT, GEOMETRY or JSON column 'bio' can't have a default value`. An expression default is allowed.
+
+`information_schema` then shows the new defaults:
+
+```text
++-------------+-------------------+-------------+-------------------+
+| COLUMN_NAME | COLUMN_DEFAULT    | IS_NULLABLE | EXTRA             |
++-------------+-------------------+-------------+-------------------+
+| api_key     | uuid()            | NO          | DEFAULT_GENERATED |
+| created_at  | CURRENT_TIMESTAMP | NO          | DEFAULT_GENERATED |
++-------------+-------------------+-------------+-------------------+
+```
+
+Changing only the default with `ALTER COLUMN ... SET DEFAULT` is a metadata change, with no table rebuild. `MODIFY` with the same type and nullability is usually instant as well, but check with `ALGORITHM=INSTANT` to make MySQL refuse rather than copy a large table:
+
+```sql
+ALTER TABLE users ALTER COLUMN created_at SET DEFAULT (NOW()), ALGORITHM=INSTANT;
+```
+
+### Fix C: Make the column nullable
+
+If "unknown" is a legitimate state, allow `NULL`:
+
+```sql
+ALTER TABLE users MODIFY bio TEXT NULL;
+```
+
+This changes the meaning of the data, so check every query that reads the column. `WHERE bio = ''` will no longer find rows where it was never set.
+
+### Fix D: Set the value in a BEFORE INSERT trigger
+
+For values that a default expression cannot express, such as one depending on another column in the same row, a trigger works. MySQL checks `NOT NULL` after `BEFORE INSERT` triggers run:
+
+```sql
+CREATE TRIGGER users_bi
+BEFORE INSERT ON users
+FOR EACH ROW
+SET NEW.api_key = COALESCE(NEW.api_key, UUID());
+```
+
+Prefer an expression default when you can. Triggers are easy to forget, run once per row and make bulk loads slower.
+
+## Don't fix it by turning strict mode off
+
+You can make the error disappear by removing `STRICT_TRANS_TABLES`:
+
+```sql
+-- Not recommended
+SET GLOBAL sql_mode = 'NO_ENGINE_SUBSTITUTION';
+```
+
+It works, but every missing value becomes an empty string, a zero or a zero date, and other strict checks go too (out-of-range numbers are clipped, long strings are truncated with only a warning). If you need it as a stop-gap during a migration, limit it to the one legacy application's session and plan to remove it:
+
+```sql
+SET SESSION sql_mode = REPLACE(@@SESSION.sql_mode, 'STRICT_TRANS_TABLES', '');
+```
+
+Also note `INSERT IGNORE` turns 1364 into a warning in the same way, so it is not a safe "skip bad rows" switch either.
+
+## Where 1364 hides
+
+- **ORMs with partial inserts.** Some ORMs only include columns the model has set. A field without a value in the model and no database default triggers 1364.
+- **`INSERT ... SELECT` and `LOAD DATA`.** Every target column missing from the column list needs a default. For `LOAD DATA`, list the columns explicitly and use `SET` for derived values:
+
+```sql
+LOAD DATA INFILE '/var/lib/mysql-files/users.csv'
+INTO TABLE users
+FIELDS TERMINATED BY ',' IGNORE 1 LINES
+(email, @bio)
+SET bio = COALESCE(@bio, ''), created_at = NOW(), api_key = UUID();
+```
+
+- **Replicas and dumps.** If `sql_mode` differs between primary and replica, or between the server that made a dump and the one restoring it, inserts can succeed in one place and fail with 1364 in the other. Align `sql_mode` everywhere.
+- **New columns added to a busy table.** `ALTER TABLE ADD COLUMN x INT NOT NULL` without a default succeeds (existing rows get the implicit default), but from then on every `INSERT` that does not mention `x` fails. Always add a `DEFAULT` with new `NOT NULL` columns, or deploy the code that writes the column first.
+
+## Checklist
+
+1. Confirm strict mode with `SELECT @@SESSION.sql_mode`.
+2. List all `NOT NULL` columns without defaults with the `information_schema` query.
+3. For each column, decide: application must supply it, add a default (expression defaults for `TEXT` / `UUID()` / computed values), or allow `NULL`.
+4. Keep strict mode on.
+
+Spotting columns without defaults is quicker when you can see the table definition next to your query. In [Chat2DB](https://chat2db.ai/download) the table view shows nullability and defaults for every column, and the AI assistant can generate the `ALTER TABLE` statements for the defaults you choose.

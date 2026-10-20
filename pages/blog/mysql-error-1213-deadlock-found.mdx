@@ -1,0 +1,274 @@
+---
+title: "Fix MySQL Error 1213: Deadlock Found"
+description: "Fix MySQL ERROR 1213 (40001) Deadlock found when trying to get lock: read the InnoDB deadlock report, fix lock order and gap locks, and retry safely."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: October 20, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# Fix MySQL Error 1213: Deadlock Found
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="October 20, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+```text
+ERROR 1213 (40001): Deadlock found when trying to get lock; try restarting transaction
+```
+
+A deadlock happens when two transactions each hold a lock the other one needs. Neither can continue, so InnoDB picks one of them as the victim, rolls it back and returns error 1213. The other transaction carries on as if nothing happened.
+
+Two facts shape everything below:
+
+- **The whole transaction is rolled back**, not just the last statement. Any work the victim did before the error is gone.
+- **Deadlocks are normal in a busy OLTP database.** The goal is to make them rare and to retry the ones that still happen, not to eliminate them completely.
+
+This guide shows how to reproduce a deadlock, read the InnoDB report, fix the two most common patterns, and retry correctly. All output below is from MySQL 8.4.
+
+## Reproduce a classic deadlock
+
+```sql
+CREATE TABLE accounts (
+  id      INT PRIMARY KEY,
+  balance DECIMAL(10,2) NOT NULL
+);
+INSERT INTO accounts VALUES (1, 100), (2, 100);
+```
+
+Run two sessions side by side:
+
+```sql
+-- Session A
+START TRANSACTION;
+UPDATE accounts SET balance = balance - 10 WHERE id = 1;   -- locks row 1
+
+-- Session B
+START TRANSACTION;
+UPDATE accounts SET balance = balance - 5 WHERE id = 2;    -- locks row 2
+
+-- Session A
+UPDATE accounts SET balance = balance + 10 WHERE id = 2;   -- waits for B
+
+-- Session B
+UPDATE accounts SET balance = balance + 5 WHERE id = 1;    -- waits for A -> deadlock
+-- ERROR 1213 (40001): Deadlock found when trying to get lock; try restarting transaction
+```
+
+InnoDB detects the cycle immediately (deadlock detection is on by default via `innodb_deadlock_detect`) and rolls back session B. Session A's second update then succeeds.
+
+## Read the deadlock report
+
+InnoDB keeps the most recent deadlock in the engine status:
+
+```sql
+SHOW ENGINE INNODB STATUS\G
+```
+
+Look for the `LATEST DETECTED DEADLOCK` section. Trimmed to the useful lines, the example above looks like this:
+
+```text
+*** (1) TRANSACTION:
+TRANSACTION 1853, ACTIVE 3 sec starting index read
+UPDATE accounts SET balance=balance+10 WHERE id=2
+
+*** (1) HOLDS THE LOCK(S):
+RECORD LOCKS ... index PRIMARY of table `shop`.`accounts` trx id 1853 lock_mode X locks rec but not gap
+ 0: len 4; hex 80000001; ...
+
+*** (1) WAITING FOR THIS LOCK TO BE GRANTED:
+RECORD LOCKS ... index PRIMARY of table `shop`.`accounts` trx id 1853 lock_mode X locks rec but not gap waiting
+ 0: len 4; hex 80000002; ...
+
+*** (2) TRANSACTION:
+TRANSACTION 1854, ACTIVE 2 sec starting index read
+UPDATE accounts SET balance=balance+5 WHERE id=1
+
+*** (2) HOLDS THE LOCK(S):
+... lock_mode X locks rec but not gap
+ 0: len 4; hex 80000002; ...
+
+*** (2) WAITING FOR THIS LOCK TO BE GRANTED:
+... lock_mode X locks rec but not gap waiting
+ 0: len 4; hex 80000001; ...
+
+*** WE ROLL BACK TRANSACTION (2)
+```
+
+How to read it:
+
+- **The statement** under each transaction is the one that was *waiting*, not necessarily the one that took the lock. The lock was taken by an earlier statement in the same transaction, which the report does not show. You need application logs or the code to find it.
+- **`index PRIMARY of table`** tells you which index the lock is on. Locks on a secondary index point to a different access path than you might expect.
+- **`hex 80000001`** is the key value. For a signed `INT`, InnoDB flips the sign bit, so `80000001` is `1` and `80000002` is `2`.
+- **The lock mode** tells you the type:
+  - `locks rec but not gap`: a record lock on one row.
+  - `locks gap before rec`: a gap lock (no row, just the space before a key).
+  - `insert intention`: an `INSERT` waiting to place a row in a gap.
+  - no qualifier (`lock_mode X`): a next-key lock, the row plus the gap before it.
+
+Only the latest deadlock is kept. To log all of them to the error log, enable:
+
+```sql
+SET PERSIST innodb_print_all_deadlocks = ON;
+```
+
+To track how often they happen:
+
+```sql
+SELECT NAME, COUNT
+FROM information_schema.INNODB_METRICS
+WHERE NAME = 'lock_deadlocks';
+```
+
+## Pattern 1: Inconsistent lock order
+
+The transfer example is the textbook case: A locks 1 then 2, B locks 2 then 1. The fix is to always lock rows in the same order. For a transfer, lock both rows up front in key order:
+
+```sql
+START TRANSACTION;
+
+SELECT id, balance
+FROM accounts
+WHERE id IN (1, 2)
+ORDER BY id
+FOR UPDATE;
+
+UPDATE accounts SET balance = balance - 10 WHERE id = 1;
+UPDATE accounts SET balance = balance + 10 WHERE id = 2;
+
+COMMIT;
+```
+
+Now the second transaction blocks on the first row and waits instead of deadlocking. The same idea applies to batch jobs: sort the IDs before updating them, and update in primary-key order (`ORDER BY id` on `UPDATE` or `DELETE` with `LIMIT`).
+
+## Pattern 2: Gap locks from SELECT ... FOR UPDATE on a missing row
+
+This is the most common deadlock in "check then insert" code under the default `REPEATABLE READ` isolation level:
+
+```sql
+CREATE TABLE slots (id INT PRIMARY KEY, v INT);
+INSERT INTO slots VALUES (1, 1), (20, 1);
+
+-- Session A
+START TRANSACTION;
+SELECT * FROM slots WHERE id = 10 FOR UPDATE;   -- no row: takes a gap lock (1, 20)
+
+-- Session B
+START TRANSACTION;
+SELECT * FROM slots WHERE id = 10 FOR UPDATE;   -- gap locks don't conflict: also succeeds
+
+-- Session A
+INSERT INTO slots VALUES (10, 1);               -- waits: B holds the gap
+
+-- Session B
+INSERT INTO slots VALUES (10, 2);               -- waits for A -> deadlock
+```
+
+The report shows it clearly:
+
+```text
+lock_mode X locks gap before rec
+lock_mode X locks gap before rec insert intention waiting
+```
+
+Two gap locks on the same gap are compatible, so both `SELECT ... FOR UPDATE` statements succeed, and then each insert waits for the other's gap lock.
+
+**Fixes, in order of preference:**
+
+1. **Skip the check and let the unique key decide.** Insert directly and handle the duplicate:
+
+```sql
+INSERT INTO slots (id, v) VALUES (10, 1)
+ON DUPLICATE KEY UPDATE v = VALUES(v);
+```
+
+Or use `INSERT IGNORE` if you just want the first writer to win. In MySQL 8.0.19+, prefer the row alias syntax over `VALUES()`: `INSERT INTO slots VALUES (10, 1) AS new ON DUPLICATE KEY UPDATE v = new.v;`
+
+2. **Use `READ COMMITTED`** for this transaction. It does not take gap locks for searches and index scans (they are still used for foreign-key and duplicate-key checks), which removes this whole pattern:
+
+```sql
+SET TRANSACTION ISOLATION LEVEL READ COMMITTED;
+START TRANSACTION;
+...
+```
+
+Check that your application does not rely on repeatable-read snapshots before changing the isolation level globally.
+
+## Pattern 3: Missing indexes widen the lock footprint
+
+InnoDB locks the index records it *scans*, not just the rows that match. An `UPDATE` with a `WHERE` on an unindexed column scans the whole table and locks every row it reads:
+
+```sql
+UPDATE orders SET status = 'expired'
+WHERE created_at < NOW() - INTERVAL 30 DAY;   -- no index on created_at
+```
+
+Two such statements, or one of these plus normal traffic, deadlock easily. Check with `EXPLAIN`. If `type` is `ALL`, or `index` with `key` = `PRIMARY` (a full scan in primary-key order, which is what MySQL 8.4 shows for this `UPDATE`), add an index:
+
+```sql
+EXPLAIN UPDATE orders SET status = 'expired'
+WHERE created_at < NOW() - INTERVAL 30 DAY;
+
+ALTER TABLE orders ADD INDEX idx_orders_created_at (created_at);
+```
+
+Also break big updates into small batches, so each transaction holds fewer locks for less time:
+
+```sql
+UPDATE orders SET status = 'expired'
+WHERE created_at < NOW() - INTERVAL 30 DAY AND status <> 'expired'
+ORDER BY id
+LIMIT 1000;
+-- repeat until 0 rows affected
+```
+
+## Pattern 4: Foreign keys
+
+Inserting a child row takes a shared lock on the parent row, to make sure the parent is not deleted at the same time. Two transactions that insert children for the same parent and then update that parent (for example a `order_count` column) can deadlock: both hold `S` locks and both want `X`. Lock the parent first with `SELECT ... FOR UPDATE`, or move counters out of hot parent rows.
+
+## Retry the whole transaction
+
+Even with good lock ordering, deadlocks still happen under load. Every code path that writes in a transaction should retry on error 1213, and it must retry the *entire* transaction, because everything was rolled back:
+
+```python
+import time, random
+import mysql.connector
+from mysql.connector import errorcode
+
+def transfer(conn, src, dst, amount, attempts=3):
+    for attempt in range(1, attempts + 1):
+        try:
+            cur = conn.cursor()
+            conn.start_transaction()
+            cur.execute(
+                "SELECT id FROM accounts WHERE id IN (%s, %s) ORDER BY id FOR UPDATE",
+                (src, dst),
+            )
+            cur.execute("UPDATE accounts SET balance = balance - %s WHERE id = %s", (amount, src))
+            cur.execute("UPDATE accounts SET balance = balance + %s WHERE id = %s", (amount, dst))
+            conn.commit()
+            return
+        except mysql.connector.Error as e:
+            conn.rollback()
+            if e.errno == errorcode.ER_LOCK_DEADLOCK and attempt < attempts:
+                time.sleep(random.uniform(0.05, 0.2) * attempt)   # jittered backoff
+                continue
+            raise
+```
+
+Retrying after `ERROR 1205 Lock wait timeout exceeded` is different: by default only the *statement* is rolled back, not the transaction, unless `innodb_rollback_on_timeout` is on.
+
+## Don't just turn off deadlock detection
+
+`innodb_deadlock_detect = OFF` exists for very high-concurrency systems where detection itself becomes a bottleneck. With it off, deadlocked transactions wait for `innodb_lock_wait_timeout` (50 seconds by default) and then fail with error 1205 instead. That hides the problem and makes it slower. Leave detection on unless you have measured that it is the bottleneck.
+
+## Checklist
+
+1. Capture the report with `SHOW ENGINE INNODB STATUS` or `innodb_print_all_deadlocks`.
+2. Identify the index, the key values and the lock modes.
+3. Find the earlier statement in each transaction that took the first lock.
+4. Fix lock order, remove check-then-insert gap locks, and add missing indexes.
+5. Keep transactions short and retry the whole transaction on 1213.
+
+While you investigate, [Chat2DB](https://chat2db.ai/download) is handy for running the two sessions side by side in separate tabs, and you can paste a deadlock report into its AI assistant to get a plain-English explanation of which locks collided and why.

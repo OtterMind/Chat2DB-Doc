@@ -1,0 +1,253 @@
+---
+title: "Fix Postgres Error: Column Does Not Exist (42703)"
+description: "Fix PostgreSQL ERROR: column does not exist (42703): mixed-case names, double-quoted strings, aliases in WHERE, schema drift and typos in ON CONFLICT."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: October 20, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# Fix Postgres Error: Column Does Not Exist (42703)
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="October 20, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+`ERROR: column "..." does not exist` (SQLSTATE `42703`, `undefined_column`) is one of the most common PostgreSQL errors, and also one of the most confusing. Often the column clearly exists: you can see it in the table definition, and the same query worked in MySQL. In most cases the cause is one of six things. This guide shows each one with the exact error text and the fix.
+
+All examples use this table:
+
+```sql
+CREATE TABLE customers (
+  id          int PRIMARY KEY,
+  "FirstName" text,
+  email       text NOT NULL,
+  created_at  timestamptz NOT NULL DEFAULT now()
+);
+
+INSERT INTO customers (id, "FirstName", email)
+VALUES (1, 'Ann', 'ann@example.com');
+```
+
+## Read the error message first
+
+PostgreSQL gives you three useful clues:
+
+```text
+ERROR:  column "firstname" does not exist
+LINE 1: SELECT firstname FROM customers;
+               ^
+HINT:  Perhaps you meant to reference the column "customers.FirstName".
+```
+
+- **The name in quotes** is the name *after* Postgres has processed it. If you typed `FirstName` and the error says `firstname`, case folding is the problem.
+- **The caret (`^`)** points at the exact token that failed.
+- **The HINT** (PostgreSQL 10+) suggests a similarly named column when there is one. When it shows a different case or a different table alias, you are almost done.
+
+## Cause 1: Mixed-case column names created with double quotes
+
+PostgreSQL folds unquoted identifiers to lower case. `SELECT FirstName` is read as `SELECT firstname`. But a column created as `"FirstName"` (with quotes) keeps its exact case, so it can only be referenced with quotes:
+
+```sql
+SELECT FirstName FROM customers;
+-- ERROR:  column "firstname" does not exist
+-- HINT:  Perhaps you meant to reference the column "customers.FirstName".
+
+SELECT "FirstName" FROM customers;   -- works
+```
+
+This usually comes from ORMs and migration tools that quote every identifier (Prisma, Entity Framework, some Sequelize setups), or from tables imported from SQL Server or MySQL with case preserved.
+
+**Fix options:**
+
+1. Quote the column everywhere: `"FirstName"`. Fine for generated code, tedious by hand.
+2. Rename it to lower case once, which is the long-term fix if you control the schema:
+
+```sql
+ALTER TABLE customers RENAME COLUMN "FirstName" TO first_name;
+```
+
+To find every mixed-case column in a database:
+
+```sql
+SELECT table_schema, table_name, column_name
+FROM information_schema.columns
+WHERE column_name <> lower(column_name)
+  AND table_schema NOT IN ('pg_catalog', 'information_schema')
+ORDER BY 1, 2, 3;
+```
+
+## Cause 2: Double quotes used for a string value
+
+In standard SQL and PostgreSQL, double quotes mean "identifier" and single quotes mean "string". MySQL accepts both for strings by default, so this slips in during migrations:
+
+```sql
+SELECT * FROM customers WHERE email = "ann@example.com";
+-- ERROR:  column "ann@example.com" does not exist
+```
+
+The error names your *value* as a column, which is the giveaway. Use single quotes:
+
+```sql
+SELECT * FROM customers WHERE email = 'ann@example.com';
+```
+
+The same thing happens in JSON-building code that concatenates strings with `"`. Use bind parameters instead of concatenation and the quoting issue disappears.
+
+## Cause 3: Using a column alias in WHERE, GROUP BY expressions or HAVING
+
+A `SELECT` list alias is not visible in `WHERE`, because `WHERE` is evaluated before the select list:
+
+```sql
+SELECT id, email AS mail
+FROM customers
+WHERE mail LIKE '%@example.com';
+-- ERROR:  column "mail" does not exist
+-- HINT:  Perhaps you meant to reference the column "customers.email".
+```
+
+Aliases *are* allowed in `ORDER BY` (and as plain names in `GROUP BY`), which is why the same alias works in one clause and fails in another:
+
+```sql
+SELECT id, email AS mail FROM customers ORDER BY mail;   -- works
+```
+
+**Fixes:** repeat the expression, or wrap the query so the alias becomes a real column:
+
+```sql
+-- Repeat the expression
+SELECT id, email AS mail
+FROM customers
+WHERE email LIKE '%@example.com';
+
+-- Or use a subquery / CTE
+SELECT *
+FROM (
+  SELECT id, lower(email) AS mail FROM customers
+) AS c
+WHERE mail LIKE '%@example.com';
+```
+
+For a computed expression you need in many places, a `LATERAL` subquery keeps it in one spot:
+
+```sql
+SELECT c.id, x.domain
+FROM customers c
+CROSS JOIN LATERAL (SELECT split_part(c.email, '@', 2) AS domain) AS x
+WHERE x.domain = 'example.com';
+```
+
+## Cause 4: The column is in a different table, alias or schema
+
+With joins, a column must be qualified with the right alias, and the alias replaces the table name completely:
+
+```sql
+SELECT customers.email
+FROM customers c;
+-- ERROR:  invalid reference to FROM-clause entry for table "customers"
+-- HINT:  Perhaps you meant to reference the table alias "c".
+```
+
+That case has its own message. The `42703` version appears when the alias is right but the column belongs to another table:
+
+```sql
+SELECT c.id FROM customers c ORDER BY c.idx;
+-- ERROR:  column c.idx does not exist
+-- HINT:  Perhaps you meant to reference the column "c.id".
+```
+
+Also check `search_path`. If two schemas both have a `customers` table and only one has the column, the query may be resolving to the other one:
+
+```sql
+SHOW search_path;
+
+SELECT table_schema, table_name
+FROM information_schema.columns
+WHERE column_name = 'email' AND table_name = 'customers';
+```
+
+Qualify the table (`billing.customers`) or fix `search_path` for the role:
+
+```sql
+ALTER ROLE app_user SET search_path = billing, public;
+```
+
+## Cause 5: Schema drift between environments
+
+"It works on my machine" often means a migration has not run everywhere. Compare the columns the code expects with what the database really has:
+
+```sql
+SELECT column_name, data_type, is_nullable, column_default
+FROM information_schema.columns
+WHERE table_schema = 'public' AND table_name = 'customers'
+ORDER BY ordinal_position;
+```
+
+Then check your migration tool's history table (`flyway_schema_history`, `schema_migrations`, `alembic_version`, `_prisma_migrations`) to confirm which version each environment is on.
+
+A related trap is views. A view stores its column list when it is created. If you add a column to the base table, `SELECT *` from the view does not include it:
+
+```sql
+CREATE VIEW v_customers AS SELECT * FROM customers;
+ALTER TABLE customers ADD COLUMN phone text;
+
+SELECT phone FROM v_customers;
+-- ERROR:  column "phone" does not exist
+```
+
+Recreate the view to pick up the new column:
+
+```sql
+CREATE OR REPLACE VIEW v_customers AS SELECT * FROM customers;
+```
+
+## Cause 6: Typos in special references (EXCLUDED, NEW, OLD)
+
+`INSERT ... ON CONFLICT` exposes the proposed row as `excluded`, and typos there produce the same error:
+
+```sql
+INSERT INTO customers (id, email)
+VALUES (3, 'c@example.com')
+ON CONFLICT (id) DO UPDATE SET email = excluded.emial;
+-- ERROR:  column excluded.emial does not exist
+-- HINT:  Perhaps you meant to reference the column "excluded.email".
+```
+
+In PL/pgSQL triggers, `NEW.column` and `OLD.column` fail at *run time*, not when you create the function, because PL/pgSQL only plans each statement the first time it runs. A trigger function with a typo can sit in the database for weeks until an insert hits that branch. Run `plpgsql_check` (an extension) or exercise each trigger in tests to catch these early:
+
+```sql
+CREATE EXTENSION IF NOT EXISTS plpgsql_check;
+SELECT * FROM plpgsql_check_function('my_trigger_fn()', 'customers');
+```
+
+## A note on functions and variables
+
+Inside a SQL or PL/pgSQL function, a name can refer to a column, a parameter or a variable. When a function's query references a column that was renamed after the function was created, the error only appears on the next call. Search function bodies for the old name:
+
+```sql
+SELECT p.oid::regprocedure AS function_name
+FROM pg_proc p
+JOIN pg_namespace n ON n.oid = p.pronamespace
+WHERE n.nspname NOT IN ('pg_catalog', 'information_schema')
+  AND p.prosrc ILIKE '%firstname%';
+```
+
+## Quick diagnostic checklist
+
+| Symptom in the error | Likely cause | Fix |
+| --- | --- | --- |
+| Name is lower case, your SQL used capitals | Quoted mixed-case column | Use `"FirstName"` or rename the column |
+| Name is a value like an email or a date | Double quotes around a string | Use single quotes |
+| HINT points to another column in the same table | Alias used in `WHERE` | Repeat the expression or use a subquery |
+| Works in one environment only | Missing migration or stale view | Compare `information_schema.columns`, recreate views |
+| Mentions `excluded.`, `new.` or `old.` | Typo in a special reference | Fix the column name |
+
+## Prevent it next time
+
+Most `42703` errors come from typing column names from memory. A SQL editor with schema-aware autocomplete removes that whole class of bugs. [Chat2DB](https://app.chat2db.ai/) reads your real schema, so it completes quoted mixed-case names correctly, and its AI assistant can explain an error like this one and rewrite the failing query for the actual table definition.
+
+Two habits help too:
+
+- Create identifiers in lower case `snake_case` and never quote them. Then case never matters.
+- Keep migrations as the only way to change a schema, and run them in every environment from the same pipeline.

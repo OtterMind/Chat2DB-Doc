@@ -1,0 +1,241 @@
+---
+title: "Fix MySQL Error 1093: Can't Specify Target Table"
+description: "Fix MySQL ERROR 1093 You can't specify target table for update in FROM clause: rewrite UPDATE and DELETE with joins, derived tables or CTEs, with examples."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: October 20, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# Fix MySQL Error 1093: Can't Specify Target Table
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="October 20, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+```text
+ERROR 1093 (HY000): You can't specify target table 'emails' for update in FROM clause
+```
+
+MySQL raises error 1093 when an `UPDATE` or `DELETE` reads from the same table it is modifying through a subquery. Queries like these are perfectly valid SQL, and PostgreSQL, SQL Server and Oracle run them, but MySQL refuses because it would be reading rows while changing them.
+
+The good news: there is always a rewrite that MySQL accepts, and it is usually just as readable. This guide shows the patterns that trigger the error and four tested ways around it, with output from MySQL 8.4.
+
+## Which queries trigger error 1093
+
+Setup:
+
+```sql
+CREATE TABLE emails (
+  id    INT PRIMARY KEY AUTO_INCREMENT,
+  email VARCHAR(100),
+  score INT
+);
+
+INSERT INTO emails (email, score) VALUES
+  ('a@x.com', 1), ('a@x.com', 5), ('b@x.com', 3),
+  ('a@x.com', 2), ('b@x.com', 9), ('c@x.com', 4);
+```
+
+All of the following fail with 1093:
+
+```sql
+-- IN subquery on the same table
+DELETE FROM emails
+WHERE id IN (SELECT id FROM emails WHERE score < 2);
+
+-- Scalar subquery on the same table
+UPDATE emails
+SET score = score + 1
+WHERE score < (SELECT AVG(score) FROM emails);
+
+-- Correlated EXISTS on the same table
+DELETE FROM emails
+WHERE EXISTS (
+  SELECT 1 FROM emails e2
+  WHERE e2.email = emails.email AND e2.id < emails.id
+);
+```
+
+The rule is simple: inside an `UPDATE` or `DELETE`, a subquery in `WHERE` or `SET` may not select directly from the target table.
+
+`INSERT ... SELECT` from the same table is *not* affected. MySQL buffers the `SELECT` result in a temporary table first:
+
+```sql
+INSERT INTO emails (email, score)
+SELECT email, score FROM emails WHERE id = 2;   -- works
+```
+
+## Fix 1: Use a multi-table UPDATE or DELETE with a JOIN
+
+This is the most idiomatic MySQL rewrite, and the optimizer handles it well.
+
+**Delete duplicates, keeping the lowest `id` per email:**
+
+```sql
+DELETE e
+FROM emails e
+JOIN emails keep
+  ON keep.email = e.email
+ AND keep.id < e.id;
+```
+
+Every row that has an older row with the same email is deleted. Result:
+
+```text
++----+---------+-------+
+| id | email   | score |
++----+---------+-------+
+|  1 | a@x.com |     1 |
+|  3 | b@x.com |     3 |
+|  6 | c@x.com |     4 |
++----+---------+-------+
+```
+
+**Update rows below the average:** join to a derived table that computes the aggregate once:
+
+```sql
+UPDATE emails e
+JOIN (SELECT AVG(score) AS avg_score FROM emails) a
+  ON e.score < a.avg_score
+SET e.score = e.score + 1;
+```
+
+Note the syntax for multi-table `DELETE`: you name the alias to delete from (`DELETE e`) before `FROM`. `ORDER BY` and `LIMIT` are not allowed in multi-table `UPDATE` or `DELETE`. If you need batching, use fix 2 or fix 4.
+
+## Fix 2: Wrap the subquery in a derived table
+
+Putting the subquery one level deeper, inside `FROM (...) AS t`, makes MySQL materialize the result into a temporary table before it changes anything:
+
+```sql
+DELETE FROM emails
+WHERE id IN (
+  SELECT id FROM (
+    SELECT id FROM emails WHERE score < 2
+  ) AS t
+);
+```
+
+The same works for keep-the-first deduplication:
+
+```sql
+DELETE FROM emails
+WHERE id NOT IN (
+  SELECT min_id FROM (
+    SELECT MIN(id) AS min_id FROM emails GROUP BY email
+  ) AS keep_ids
+);
+```
+
+This is the quickest fix when you already have a working subquery from another database.
+
+### Why this sometimes still fails
+
+MySQL 5.7+ has an optimization called *derived table merging*, which can fold a simple derived table back into the outer query. Current MySQL versions detect when merging would reintroduce the target table and materialize instead, so the rewrite above works on MySQL 8.4. If you hit 1093 with a derived table on an older version, prevent the merge explicitly:
+
+```sql
+DELETE /*+ NO_MERGE(t) */ FROM emails
+WHERE id IN (
+  SELECT id FROM (SELECT id FROM emails WHERE score < 2) AS t
+);
+```
+
+Or add something that cannot be merged to the derived table, such as `DISTINCT`, `GROUP BY` or `LIMIT`.
+
+## Fix 3: Use a CTE (MySQL 8.0+)
+
+A common table expression is materialized in the same way and often reads better:
+
+```sql
+WITH low_scores AS (
+  SELECT id FROM emails WHERE score < 2
+)
+DELETE FROM emails
+WHERE id IN (SELECT id FROM low_scores);
+```
+
+For deduplication with a ranking rule (keep the highest score per email, not the lowest id), combine a CTE with a window function:
+
+```sql
+WITH ranked AS (
+  SELECT id,
+         ROW_NUMBER() OVER (PARTITION BY email ORDER BY score DESC, id) AS rn
+  FROM emails
+)
+DELETE FROM emails
+WHERE id IN (SELECT id FROM ranked WHERE rn > 1);
+```
+
+## Fix 4: Use a temporary table for large or repeated changes
+
+When the list of rows is big, or you want to check it before deleting, store the IDs first:
+
+```sql
+CREATE TEMPORARY TABLE to_delete (id INT PRIMARY KEY);
+
+INSERT INTO to_delete (id)
+SELECT e.id
+FROM emails e
+JOIN emails keep ON keep.email = e.email AND keep.id < e.id;
+
+SELECT COUNT(*) FROM to_delete;   -- review before deleting
+
+DELETE emails
+FROM emails
+JOIN to_delete USING (id);
+```
+
+This also makes batching easy, which matters on large production tables:
+
+```sql
+DELETE FROM emails
+WHERE id IN (SELECT id FROM (SELECT id FROM to_delete ORDER BY id LIMIT 1000) AS batch);
+
+DELETE FROM to_delete ORDER BY id LIMIT 1000;
+-- repeat both until to_delete is empty
+```
+
+Small batches keep each transaction short, which limits lock waits and replication lag.
+
+## Which fix should you pick?
+
+| Situation | Best rewrite |
+| --- | --- |
+| Delete duplicates or rows that relate to other rows | Multi-table `DELETE ... JOIN` |
+| Update based on an aggregate of the same table | `UPDATE ... JOIN (SELECT AVG(...) ...)` |
+| Porting a query from PostgreSQL or SQL Server | Wrap the subquery in a derived table |
+| Ranking rules (keep newest, highest, etc.) | CTE with `ROW_NUMBER()` |
+| Millions of rows or a review step needed | Temporary table plus batches |
+
+## Check the result before you commit
+
+`DELETE` and `UPDATE` rewrites are easy to get subtly wrong (`<` vs `<=` in the self-join, for example). Run the same logic as a `SELECT` first, inside a transaction:
+
+```sql
+START TRANSACTION;
+
+SELECT e.*
+FROM emails e
+JOIN emails keep ON keep.email = e.email AND keep.id < e.id;   -- rows that will go
+
+DELETE e
+FROM emails e
+JOIN emails keep ON keep.email = e.email AND keep.id < e.id;
+
+SELECT email, COUNT(*) FROM emails GROUP BY email HAVING COUNT(*) > 1;   -- should be empty
+
+COMMIT;   -- or ROLLBACK
+```
+
+Once duplicates are gone, add a unique index so they cannot come back:
+
+```sql
+ALTER TABLE emails ADD UNIQUE INDEX uq_emails_email (email);
+```
+
+## Summary
+
+Error 1093 is a MySQL limitation, not a bug in your logic. Rewrite the statement so that MySQL reads the rows it needs before it modifies anything: a multi-table `JOIN`, a derived table, a CTE, or a temporary table.
+
+If you work across MySQL and PostgreSQL, [Chat2DB](https://chat2db.ai/download) can help with exactly this kind of dialect difference: paste the query that fails on MySQL into its AI assistant and it rewrites it into a form MySQL accepts, and you can run the preview `SELECT` against your real data before changing anything.

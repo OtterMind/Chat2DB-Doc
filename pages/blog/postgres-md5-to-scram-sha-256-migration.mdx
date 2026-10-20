@@ -1,0 +1,231 @@
+---
+title: "Migrate Postgres Passwords from MD5 to SCRAM"
+description: "Move PostgreSQL roles from MD5 to SCRAM-SHA-256: find MD5 hashes, re-set passwords without plaintext in logs, update pg_hba.conf and check clients."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: October 20, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# Migrate Postgres Passwords from MD5 to SCRAM
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="October 20, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+PostgreSQL has supported SCRAM-SHA-256 password authentication since version 10, and it has been the default `password_encryption` since version 14. Many clusters still carry MD5 password hashes, though: roles created years ago, dumps restored with `pg_dumpall --globals-only`, or provisioning scripts that set `password_encryption = 'md5'` for an old driver.
+
+That debt now comes with a deadline. PostgreSQL 18 deprecates MD5 passwords. When you set one, the server says so:
+
+```text
+WARNING:  setting an MD5-encrypted password
+DETAIL:  MD5 password support is deprecated and will be removed in a future release of PostgreSQL.
+HINT:  Refer to the PostgreSQL documentation for details about migrating to another password type.
+```
+
+This guide walks through a migration you can do role by role with no downtime: find the MD5 hashes, check that clients can do SCRAM, re-set the passwords without leaking plaintext, and finally make `pg_hba.conf` require SCRAM.
+
+## Why MD5 hashes are worth removing
+
+An MD5 password hash in Postgres is `md5` followed by `md5(password || username)`. It has two well-known problems:
+
+- **The hash is the credential.** With the MD5 challenge-response protocol, anyone who reads `pg_authid` (a stolen backup, a leaked dump of globals) can log in without knowing the password.
+- **It is fast to brute-force.** One MD5 round, salted only with the username, is cheap to attack with GPUs.
+
+A SCRAM-SHA-256 verifier stores a random salt, an iteration count and two derived keys. The server never sees the password during login, a stolen verifier cannot be replayed directly, and each guess costs thousands of HMAC rounds.
+
+## Step 1: Find roles that still use MD5
+
+Password hashes live in `pg_authid.rolpassword`, which only superusers can read. The first characters tell you the method:
+
+```sql
+SELECT rolname,
+       CASE
+         WHEN rolpassword IS NULL THEN 'no password'
+         WHEN rolpassword LIKE 'md5%' THEN 'md5'
+         WHEN rolpassword LIKE 'SCRAM-SHA-256$%' THEN 'scram-sha-256'
+         ELSE 'other'
+       END AS password_type,
+       rolcanlogin,
+       rolvaliduntil
+FROM pg_authid
+WHERE rolname NOT LIKE 'pg\_%'
+ORDER BY password_type, rolname;
+```
+
+The `pg\_%` filter skips the built-in `pg_*` roles. On a managed service where you are not a real superuser (RDS, Cloud SQL, Azure), `pg_authid` is usually off-limits. Use the provider's console or audit role passwords from your secrets manager instead.
+
+Also check the current default for new passwords:
+
+```sql
+SHOW password_encryption;
+```
+
+If it says `md5`, find where it is set (`postgresql.conf`, `ALTER SYSTEM`, `ALTER ROLE ... SET`, or `ALTER DATABASE ... SET`) and change it before re-setting any password, or the new hashes will be MD5 again:
+
+```sql
+SELECT name, setting, source, sourcefile
+FROM pg_settings
+WHERE name = 'password_encryption';
+
+SELECT coalesce(r.rolname, '(all roles)') AS role,
+       coalesce(d.datname, '(all databases)') AS database,
+       s.setconfig
+FROM pg_db_role_setting s
+LEFT JOIN pg_roles r ON r.oid = s.setrole
+LEFT JOIN pg_database d ON d.oid = s.setdatabase
+WHERE array_to_string(s.setconfig, ',') LIKE '%password_encryption%';
+```
+
+Then fix it cluster-wide:
+
+```sql
+ALTER SYSTEM SET password_encryption = 'scram-sha-256';
+SELECT pg_reload_conf();
+```
+
+## Step 2: Make sure every client supports SCRAM
+
+SCRAM needs client support. The good news is that anything built in the last several years has it:
+
+| Client | SCRAM-SHA-256 support |
+| --- | --- |
+| libpq (psql, psycopg2, psycopg 3, Ruby pg, PHP pgsql) | libpq 10 and later |
+| PostgreSQL JDBC | 42.2.0 and later |
+| Npgsql (.NET) | supported in current versions |
+| node-postgres (`pg`) | 7.8.0 and later |
+| Go pgx / lib/pq | supported in current versions |
+| PgBouncer | 1.14 and later (needs SCRAM secrets in its auth file or `auth_query`) |
+
+The risky ones are usually forgotten: a reporting tool with a bundled old JDBC driver, a legacy cron job on an old base image, or a connection pooler. Look at who connects:
+
+```sql
+SELECT usename, application_name, client_addr, count(*)
+FROM pg_stat_activity
+WHERE backend_type = 'client backend'
+GROUP BY 1, 2, 3
+ORDER BY 4 DESC;
+```
+
+To test a single client without touching anyone else, change one role to SCRAM first (step 3) and see whether that client still connects. An old client that cannot do SCRAM fails with an error such as `authentication method 10 not supported` (libpq before 10) or `The authentication type 10 is not supported` (old JDBC).
+
+## Step 3: Re-set each password as SCRAM
+
+A hash cannot be converted. Postgres has to see the password once to compute a SCRAM verifier, or you give it a verifier you computed yourself. Changing `password_encryption` does nothing to existing rows; every role keeps its MD5 hash until its password is set again.
+
+You have three ways to do that.
+
+### Option A: psql's \password (interactive)
+
+```text
+postgres=# \password app_user
+Enter new password for user "app_user":
+Enter it again:
+```
+
+psql hashes the password on the client using the server's `password_encryption`, and sends only the verifier. The plaintext never appears in SQL text or server logs. This is the safest manual option.
+
+### Option B: ALTER ROLE with a pre-computed verifier
+
+For automation, compute the verifier outside the database and pass it to `ALTER ROLE`. Postgres recognizes the format and stores it as-is:
+
+```sql
+ALTER ROLE app_user WITH PASSWORD
+  'SCRAM-SHA-256$4096:2iUH8JYeuXw85fp/lpkIgA==$AOXg7DOdJXqwESCgOmcLusZD8sR5HBh5A5DXdheXTC4=:9CNtOlmEwB2JXRq3yJ54eQQfnpmvUBoGdjp4wY8mNfY=';
+```
+
+The format is `SCRAM-SHA-256$<iterations>:<salt>$<StoredKey>:<ServerKey>`, all base64. You can generate one in your browser with the [Postgres SCRAM-SHA-256 Password Hash Generator](https://chat2db.ai/tools/postgres-scram-password-hash-generator), which uses Web Crypto locally and also produces the `CREATE ROLE` / `ALTER ROLE` statement. In application code, libpq exposes the same thing as `PQencryptPasswordConn()`, and psycopg exposes it as `psycopg.pq.PGconn.encrypt_password()`.
+
+### Option C: plain ALTER ROLE ... PASSWORD
+
+```sql
+ALTER ROLE app_user WITH PASSWORD 'new-strong-password';
+```
+
+This works, but the plaintext goes over the wire inside SQL. It can show up in the server log if `log_statement = 'all'` or `'ddl'`, in `log_min_duration_statement` output, and in your shell history. If you must use it, turn off statement logging for the session first (`SET log_statement = 'none';`, which requires superuser) and avoid running it through tools that record query history.
+
+### Verify the result
+
+```sql
+SELECT rolname, left(rolpassword, 14) AS prefix
+FROM pg_authid
+WHERE rolname = 'app_user';
+```
+
+```text
+ rolname  |     prefix
+----------+----------------
+ app_user | SCRAM-SHA-256$
+```
+
+## Step 4: Coordinate the password change with applications
+
+Re-setting a password usually means a new password, which means deploying new credentials. If you want to keep the same password, you can: re-set it to the same value with `\password` or a verifier generated from the same plaintext. The hash changes and the password stays the same, so nothing needs to be redeployed.
+
+When you are also rotating the password, avoid downtime with two login roles that share privileges through a group role:
+
+```sql
+-- Group role that owns the privileges
+CREATE ROLE app_rw NOLOGIN;
+GRANT CONNECT ON DATABASE shop TO app_rw;
+GRANT USAGE ON SCHEMA public TO app_rw;
+GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO app_rw;
+
+-- Two login roles; deploy the new one, then retire the old one
+CREATE ROLE app_user_v2 LOGIN IN ROLE app_rw PASSWORD 'SCRAM-SHA-256$4096:...';
+ALTER ROLE app_user NOLOGIN;  -- after all instances use app_user_v2
+```
+
+## Step 5: Require SCRAM in pg_hba.conf
+
+With method `md5` in `pg_hba.conf`, Postgres already uses SCRAM automatically for any role whose stored password is a SCRAM verifier. So you can leave `md5` in place during the migration while roles are converted one by one.
+
+Once the query from step 1 shows no MD5 hashes left, switch the method to `scram-sha-256` so a role can never fall back:
+
+```text
+# TYPE  DATABASE  USER  ADDRESS        METHOD
+hostssl all       all   10.0.0.0/8     scram-sha-256
+host    all       all   127.0.0.1/32   scram-sha-256
+```
+
+Check for syntax errors before reloading. The `pg_hba_file_rules` view parses the file on disk:
+
+```sql
+SELECT line_number, type, database, user_name, address, auth_method, error
+FROM pg_hba_file_rules
+ORDER BY line_number;
+
+SELECT pg_reload_conf();
+```
+
+A role that still has an MD5 hash will now fail with `password authentication failed for user`, which is exactly what you want to catch in staging first.
+
+## Step 6: Don't forget connection poolers and replicas
+
+- **PgBouncer** needs the SCRAM verifier in `userlist.txt`, or an `auth_query` that reads `pg_shadow`. A plaintext password in `userlist.txt` also works. Set `auth_type = scram-sha-256` once all entries are converted.
+- **Physical replicas** get `pg_authid` from the primary, so they are converted automatically. Their `pg_hba.conf` is a separate file, so update it too.
+- **Replication users** (`primary_conninfo`) authenticate like any other role. Convert them and test a replica reconnect.
+- **Logical replication subscriptions** store a connection string. If it contains a password, nothing changes as long as the password stays the same.
+
+## Tuning the iteration count
+
+PostgreSQL 16 added `scram_iterations` (default 4096). Raising it makes each guess against a stolen verifier more expensive, but it also makes every login slower, which matters for applications that open many short connections without a pool:
+
+```sql
+ALTER SYSTEM SET scram_iterations = 10000;
+SELECT pg_reload_conf();
+```
+
+The setting only affects passwords set afterwards. Each verifier stores its own count, so mixed values work fine.
+
+## Checklist
+
+1. `password_encryption = 'scram-sha-256'` everywhere it is set.
+2. Inventory MD5 roles with the `pg_authid` query.
+3. Confirm drivers and poolers support SCRAM.
+4. Re-set passwords with `\password` or pre-computed verifiers.
+5. Switch `pg_hba.conf` from `md5` to `scram-sha-256` and reload.
+6. Re-run the inventory query; it should return no `md5` rows.
+
+If you manage several clusters, a client such as [Chat2DB](https://chat2db.ai/download) makes the inventory step easier. You can save the `pg_authid` query, run it against each connection, and have the AI assistant draft the `ALTER ROLE` statements for review instead of typing them by hand.

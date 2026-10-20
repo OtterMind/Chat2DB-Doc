@@ -1,0 +1,264 @@
+---
+title: "Fix Postgres: Null Value Violates Not-Null (23502)"
+description: "Fix PostgreSQL null value in column violates not-null constraint (23502): explicit NULLs, INSERT SELECT, ORM defaults and adding NOT NULL to big tables."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: October 20, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# Fix Postgres: Null Value Violates Not-Null (23502)
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="October 20, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+When a row would put `NULL` into a column declared `NOT NULL`, PostgreSQL rejects the whole statement:
+
+```text
+ERROR:  null value in column "email" of relation "customers" violates not-null constraint
+DETAIL:  Failing row contains (2, Bob, null, 2026-10-20 23:11:40.28394+00).
+```
+
+The SQLSTATE is `23502` (`not_null_violation`). Unlike MySQL in non-strict mode, Postgres never silently replaces the `NULL` with an empty string or zero, so the error always means some code path really produced a `NULL`. The job is to find which one.
+
+This guide covers the common sources, how to read the `DETAIL` line, and how to add a `NOT NULL` constraint to an existing large table without a long lock.
+
+## Read the DETAIL line
+
+`DETAIL: Failing row contains (...)` shows the complete row Postgres tried to write, in column order, *after* defaults were applied. That tells you a lot:
+
+- Columns you did not mention show their default value (for example the `now()` timestamp above). So if the failing column shows `null`, either your statement supplied `NULL` explicitly, or the column has no default.
+- In an `UPDATE`, the row shows the new version, so you can see which `SET` produced the `NULL`.
+
+The `DETAIL` line is hidden if the role cannot see every column (column-level privileges), and some drivers drop it. In JDBC, it is in `PSQLException.getServerErrorMessage().getDetail()`. In psycopg it is `e.diag.message_detail`.
+
+To reproduce the examples:
+
+```sql
+CREATE TABLE customers (
+  id          int PRIMARY KEY,
+  first_name  text,
+  email       text NOT NULL,
+  created_at  timestamptz NOT NULL DEFAULT now()
+);
+INSERT INTO customers VALUES (1, 'Ann', 'ann@example.com', now());
+```
+
+## Cause 1: The statement passes NULL explicitly
+
+A default is only used when the column is *omitted* or when you write `DEFAULT`. An explicit `NULL` overrides the default:
+
+```sql
+INSERT INTO customers (id, email, created_at)
+VALUES (4, 'd@example.com', NULL);
+-- ERROR:  null value in column "created_at" of relation "customers" violates not-null constraint
+```
+
+This is very common with ORMs and data mappers that always list every column. If the model attribute is unset, it is sent as `NULL`, and the database default never applies.
+
+**Fixes:**
+
+```sql
+-- Omit the column
+INSERT INTO customers (id, email) VALUES (4, 'd@example.com');
+
+-- Or ask for the default explicitly
+INSERT INTO customers (id, email, created_at)
+VALUES (4, 'd@example.com', DEFAULT);
+```
+
+In the ORM, mark the field as database-generated (`@Generated` / `insertable = false` in JPA, `server_default` in SQLAlchemy, `@default(now())` in Prisma), so it is not included in the `INSERT`.
+
+## Cause 2: INSERT ... SELECT or a migration copies NULLs from the source
+
+Bulk loads fail on the first bad row, and the message does not say which source row it was:
+
+```sql
+CREATE TABLE src (id int, v text);
+INSERT INTO src VALUES (1, 'x'), (2, NULL);
+
+CREATE TABLE target (id int GENERATED ALWAYS AS IDENTITY, v text NOT NULL);
+
+INSERT INTO target (v) SELECT v FROM src;
+-- ERROR:  null value in column "v" of relation "target" violates not-null constraint
+-- DETAIL:  Failing row contains (2, null).
+```
+
+Find the offending rows before loading:
+
+```sql
+SELECT * FROM src WHERE v IS NULL;
+```
+
+Then choose deliberately: substitute a value, or skip the rows.
+
+```sql
+-- Substitute
+INSERT INTO target (v) SELECT coalesce(v, '(none)') FROM src;
+
+-- Skip
+INSERT INTO target (v) SELECT v FROM src WHERE v IS NOT NULL;
+```
+
+With `COPY`, PostgreSQL 17 added `ON_ERROR ignore`, but it only skips rows with data-type conversion errors, not constraint violations. For constraint errors, load into an unconstrained staging table first and clean the data there.
+
+## Cause 3: An UPDATE computes NULL
+
+Expressions that touch `NULL` return `NULL`, and subqueries that find no row return `NULL`:
+
+```sql
+-- No matching row in the subquery -> NULL
+UPDATE orders o
+SET customer_email = (SELECT c.email FROM customers c WHERE c.id = o.customer_id);
+
+-- Concatenation with || returns NULL if any part is NULL
+UPDATE customers SET email = first_name || '@example.com';
+```
+
+Guard against both:
+
+```sql
+UPDATE orders o
+SET customer_email = c.email
+FROM customers c
+WHERE c.id = o.customer_id;          -- only rows that have a match
+
+UPDATE customers
+SET email = concat(first_name, '@example.com')   -- concat() treats NULL as ''
+WHERE first_name IS NOT NULL;
+```
+
+The `UPDATE ... FROM` form only touches rows that join, so it cannot write a `NULL` for a missing match.
+
+## Cause 4: Upserts and triggers
+
+In `INSERT ... ON CONFLICT DO UPDATE`, `excluded.col` is `NULL` when the incoming row did not supply that column, even if the existing row has a value:
+
+```sql
+INSERT INTO customers (id, email)
+VALUES (1, NULL)
+ON CONFLICT (id) DO UPDATE SET email = excluded.email;
+```
+
+This fails before the conflict check: the proposed row itself violates `NOT NULL`. When the incoming value can legitimately be missing, keep the old value:
+
+```sql
+INSERT INTO customers (id, email)
+VALUES (1, 'new@example.com')
+ON CONFLICT (id) DO UPDATE
+SET email = coalesce(excluded.email, customers.email);
+```
+
+`BEFORE` triggers can also set a column to `NULL`. Check them if the statement looks correct:
+
+```sql
+SELECT tgname, pg_get_triggerdef(oid)
+FROM pg_trigger
+WHERE tgrelid = 'customers'::regclass AND NOT tgisinternal;
+```
+
+## Cause 5: Identity and serial columns
+
+An explicit `NULL` for a `serial` or identity column fails just like any other column. For `GENERATED ALWAYS AS IDENTITY`, Postgres rejects any explicit value with a different error:
+
+```text
+ERROR:  cannot insert a non-DEFAULT value into column "id"
+DETAIL:  Column "id" is an identity column defined as GENERATED ALWAYS.
+```
+
+Leave the column out of the column list, or use `DEFAULT`.
+
+## Adding NOT NULL to an existing column safely
+
+This is the other place you meet the error. On a column that already contains `NULL`s, the `ALTER` fails:
+
+```sql
+ALTER TABLE customers ADD COLUMN phone text NOT NULL;
+-- ERROR:  column "phone" of relation "customers" contains null values
+```
+
+Adding a new column with a constant default is instant in PostgreSQL 11+, and avoids the error:
+
+```sql
+ALTER TABLE customers ADD COLUMN tier text NOT NULL DEFAULT 'free';
+```
+
+For an existing column, there are two steps: backfill, then add the constraint. On a big table, `ALTER COLUMN ... SET NOT NULL` scans the whole table while holding an `ACCESS EXCLUSIVE` lock, which blocks reads and writes. Avoid the long lock like this.
+
+### PostgreSQL 12 to 17: use a validated CHECK constraint
+
+```sql
+-- 1. Backfill in batches
+UPDATE customers SET phone = 'unknown'
+WHERE id IN (SELECT id FROM customers WHERE phone IS NULL LIMIT 10000);
+-- repeat until 0 rows
+
+-- 2. Add a CHECK without scanning (brief lock)
+ALTER TABLE customers
+  ADD CONSTRAINT customers_phone_not_null CHECK (phone IS NOT NULL) NOT VALID;
+
+-- 3. Validate (scans, but only takes SHARE UPDATE EXCLUSIVE; reads and writes continue)
+ALTER TABLE customers VALIDATE CONSTRAINT customers_phone_not_null;
+
+-- 4. SET NOT NULL now uses the CHECK as proof and skips the scan
+ALTER TABLE customers ALTER COLUMN phone SET NOT NULL;
+
+-- 5. The CHECK is redundant now
+ALTER TABLE customers DROP CONSTRAINT customers_phone_not_null;
+```
+
+You can confirm step 4 skipped the scan by raising the message level first. Postgres reports:
+
+```text
+DEBUG:  existing constraints on column "customers.phone" are sufficient to prove that it does not contain nulls
+```
+
+### PostgreSQL 18: NOT NULL ... NOT VALID
+
+PostgreSQL 18 stores `NOT NULL` as a real constraint, and it supports `NOT VALID` directly:
+
+```sql
+ALTER TABLE customers ADD CONSTRAINT customers_phone_nn NOT NULL phone NOT VALID;
+-- new rows are checked immediately; existing rows are not scanned
+
+UPDATE customers SET phone = 'unknown' WHERE phone IS NULL;   -- backfill
+
+ALTER TABLE customers VALIDATE CONSTRAINT customers_phone_nn;
+```
+
+New inserts and updates are checked from the moment the constraint is added. That means you can add it *before* the backfill finishes, so no new `NULL`s sneak in while the backfill runs.
+
+In both versions, set a `lock_timeout` before each `ALTER` so a waiting DDL statement does not block all other traffic behind it:
+
+```sql
+SET lock_timeout = '3s';
+```
+
+## Find every NOT NULL column in a table
+
+```sql
+SELECT a.attname AS column_name,
+       format_type(a.atttypid, a.atttypmod) AS data_type,
+       a.attnotnull AS not_null,
+       pg_get_expr(d.adbin, d.adrelid) AS default_value
+FROM pg_attribute a
+LEFT JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum
+WHERE a.attrelid = 'customers'::regclass
+  AND a.attnum > 0
+  AND NOT a.attisdropped
+ORDER BY a.attnum;
+```
+
+`NOT NULL` columns with no default are the ones every `INSERT` must supply. That list is useful when you write import scripts or API validation.
+
+## Summary
+
+- Read `DETAIL: Failing row contains (...)` to see the full row, defaults included.
+- An explicit `NULL` overrides a default; omit the column or use `DEFAULT`.
+- In bulk loads, find `NULL`s in the source first and decide whether to substitute or skip.
+- In updates, watch for empty subqueries and `NULL` concatenation.
+- To add `NOT NULL` to a big table, backfill in batches, then use a validated `CHECK` (PG 12–17) or `NOT NULL ... NOT VALID` (PG 18).
+
+When an import fails halfway, a client like [Chat2DB](https://app.chat2db.ai/) helps you find the bad rows quickly: filter the source table for `IS NULL` in the grid, fix the values in place, and ask the AI assistant to generate the batched backfill and constraint statements for your table.

@@ -1,0 +1,244 @@
+---
+title: "Fix Postgres: Operator Does Not Exist (42883)"
+description: "Fix PostgreSQL operator does not exist: integer = text, uuid = character varying, jsonb = integer and LIKE on numbers, with the right casts for each case."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: October 20, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# Fix Postgres: Operator Does Not Exist (42883)
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="October 20, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+PostgreSQL is strict about types. Where MySQL quietly converts `'42'` to `42` to compare it with a number, Postgres refuses and raises:
+
+```text
+ERROR:  operator does not exist: integer = text
+LINE 1: SELECT * FROM customers WHERE id = '1'::text;
+                                         ^
+HINT:  No operator matches the given name and argument types. You might need to add explicit type casts.
+```
+
+The SQLSTATE is `42883` (`undefined_function`), the same code used for `function ... does not exist`, because in Postgres an operator is just a function with special syntax. The message always tells you the left type, the operator and the right type. The fix is to make those types match, ideally by fixing the data type at its source, not by sprinkling casts everywhere.
+
+This guide covers the variants you will actually meet, with tested fixes for each.
+
+## How Postgres picks an operator
+
+When you write `a = b`, Postgres looks for an `=` operator whose arguments match the types of `a` and `b`. Two rules explain almost every case of this error:
+
+1. **Quoted literals start as type `unknown`**, and Postgres can turn `unknown` into whatever type the other side needs. So `WHERE id = '1'` works, because `'1'` becomes an integer.
+2. **Values with a known type are not converted implicitly** between unrelated categories. A `text` column, a `varchar` bind parameter or an explicit `::text` will not be turned into `integer`, `uuid`, `date` or `jsonb` for you.
+
+```sql
+SELECT * FROM customers WHERE id = '1';        -- works: unknown -> integer
+SELECT * FROM customers WHERE id = '1'::text;  -- fails: integer = text
+```
+
+That is why the same query works in `psql` and fails from application code: the driver sends a typed parameter.
+
+## integer = text (or text = integer)
+
+Typical causes:
+
+- A join between an `int` key and a `text`/`varchar` column that stores the same IDs.
+- A bind parameter sent as a string (`setString` in JDBC, a Python `str`).
+- A value pulled out of JSON with `->>`, which always returns `text`.
+
+**Joining mismatched columns:**
+
+```sql
+-- orders.customer_ref is varchar, customers.id is int
+SELECT o.id, c.email
+FROM orders o
+JOIN customers c ON c.id = o.customer_ref;
+-- ERROR:  operator does not exist: integer = character varying
+```
+
+Cast one side. Which side you cast matters for indexes: cast the side *without* the index you want to use, so Postgres can still use the index on the other column:
+
+```sql
+-- Uses the index on customers.id
+SELECT o.id, c.email
+FROM orders o
+JOIN customers c ON c.id = o.customer_ref::int;
+```
+
+If `customer_ref` contains values that are not valid integers, that cast fails with `invalid input syntax for type integer`. The permanent fix is to give the column the right type:
+
+```sql
+ALTER TABLE orders
+  ALTER COLUMN customer_ref TYPE int USING customer_ref::int;
+```
+
+That rewrites the table and takes an `ACCESS EXCLUSIVE` lock, so plan it for a quiet period on large tables.
+
+## uuid = character varying (Java, .NET and ORMs)
+
+This one is very common with JDBC and Hibernate:
+
+```text
+ERROR:  operator does not exist: uuid = character varying
+HINT:  No operator matches the given name and argument types. You might need to add explicit type casts.
+```
+
+The driver binds the parameter as `varchar` (`setString`), and there is no `uuid = varchar` operator. You can reproduce it in SQL with a prepared statement:
+
+```sql
+CREATE TABLE sessions (id uuid PRIMARY KEY DEFAULT gen_random_uuid(), user_id int);
+
+PREPARE q(varchar) AS SELECT * FROM sessions WHERE id = $1;
+-- ERROR:  operator does not exist: uuid = character varying
+```
+
+Fixes, from best to worst:
+
+1. **Bind the right type.** In JDBC use `setObject(1, uuid)` with a `java.util.UUID`. In Hibernate, map the field as `UUID`. In Npgsql pass a `Guid`.
+2. **Let the server infer the type.** Add `stringtype=unspecified` to the JDBC URL. String parameters are then sent as `unknown`, which Postgres can convert, just like a literal:
+
+```text
+jdbc:postgresql://db:5432/shop?stringtype=unspecified
+```
+
+3. **Cast in the SQL:** `WHERE id = CAST(? AS uuid)` or `WHERE id = ?::uuid`.
+
+Option 2 is a quick global fix, but be aware that it changes how *all* string parameters are typed.
+
+## jsonb = integer and text = integer from JSON
+
+The JSON operators return different types: `->` returns `jsonb` and `->>` returns `text`. Neither compares to a number directly:
+
+```sql
+SELECT '{"a":1}'::jsonb -> 'a' = 1;
+-- ERROR:  operator does not exist: jsonb = integer
+
+SELECT '{"a":1}'::jsonb ->> 'a' = 1;
+-- ERROR:  operator does not exist: text = integer
+```
+
+Pick one of these depending on what you need:
+
+```sql
+-- Compare as a number
+SELECT * FROM events WHERE (payload ->> 'amount')::numeric > 100;
+
+-- Compare as JSON (no cast of the stored value; can use a GIN index with @>)
+SELECT * FROM events WHERE payload @> '{"status": "paid"}';
+
+-- Compare a jsonb value with a jsonb literal
+SELECT * FROM events WHERE payload -> 'a' = '1'::jsonb;
+```
+
+`@>` containment is usually the best choice for filters, because a GIN index on the `jsonb` column can serve it.
+
+Plain `json` (not `jsonb`) has no equality operator at all:
+
+```sql
+SELECT '{"a":1}'::json = '{"a":1}'::json;
+-- ERROR:  operator does not exist: json = json
+```
+
+Cast to `jsonb` to compare, or better, store the column as `jsonb`.
+
+## integer ~~ unknown: LIKE on a number
+
+`LIKE` is the `~~` operator, and it only exists for text types:
+
+```sql
+SELECT * FROM customers WHERE id LIKE '1%';
+-- ERROR:  operator does not exist: integer ~~ unknown
+```
+
+Cast the column to text:
+
+```sql
+SELECT * FROM customers WHERE id::text LIKE '1%';
+```
+
+If you run this often on a large table, a plain index on `id` will not help. Add an expression index that matches the cast:
+
+```sql
+CREATE INDEX customers_id_text_idx ON customers ((id::text) text_pattern_ops);
+```
+
+Very often, though, a prefix search on a number is really a range query in disguise. `id BETWEEN 1000 AND 1999` is faster and uses the normal index.
+
+## Array operators: character varying[] @> text[]
+
+Array literals default to `text[]`, which does not match a `varchar[]` column:
+
+```sql
+CREATE TABLE ev (id int, tags varchar[]);
+
+SELECT * FROM ev WHERE tags @> ARRAY['x'];
+-- ERROR:  operator does not exist: character varying[] @> text[]
+```
+
+Cast the literal to the column's type:
+
+```sql
+SELECT * FROM ev WHERE tags @> ARRAY['x']::varchar[];
+```
+
+Or switch the column to `text[]`. In Postgres, `text` and `varchar` perform the same, and `text[]` avoids this friction.
+
+## The function variant: function round(double precision, integer) does not exist
+
+The same `42883` code appears when a function exists but not for your argument types:
+
+```sql
+SELECT round(1.2345::double precision, 2);
+-- ERROR:  function round(double precision, integer) does not exist
+```
+
+`round(value, digits)` is defined only for `numeric`. Cast first:
+
+```sql
+SELECT round(1.2345::numeric, 2);   -- 1.23
+SELECT round(avg(price)::numeric, 2) FROM products;
+```
+
+Because `avg()` of an integer column returns `numeric` but `avg()` of a `double precision` column returns `double precision`, this error often appears only after someone changes a column type.
+
+## Find out what types you actually have
+
+When the message names a type you did not expect, check it with `pg_typeof`:
+
+```sql
+SELECT pg_typeof(payload ->> 'amount') FROM events LIMIT 1;   -- text
+SELECT pg_typeof(avg(price)) FROM products;                -- double precision
+```
+
+And list which operators exist for a given name and types:
+
+```sql
+SELECT oprname,
+       oprleft::regtype  AS left_type,
+       oprright::regtype AS right_type,
+       oprresult::regtype AS result_type
+FROM pg_operator
+WHERE oprname = '@>'
+ORDER BY 2, 3;
+```
+
+## Should you create a custom operator or implicit cast?
+
+You can, with `CREATE OPERATOR` or `CREATE CAST ... AS IMPLICIT`, but it is rarely a good idea. Extra implicit casts make operator resolution ambiguous elsewhere (you start seeing `operator is not unique` errors), and they hide real data-type bugs. Fix the column type or the parameter type instead.
+
+## Summary
+
+| Error | Fix |
+| --- | --- |
+| `integer = text` / `integer = character varying` | Cast the non-indexed side, or change the column type |
+| `uuid = character varying` | Bind a UUID type, or use `stringtype=unspecified`, or `?::uuid` |
+| `jsonb = integer` / `text = integer` | `(col ->> 'k')::numeric`, or `@>` with a jsonb literal |
+| `json = json` | Cast to `jsonb` or store as `jsonb` |
+| `integer ~~ unknown` | `col::text LIKE ...`, or use a range |
+| `character varying[] @> text[]` | `ARRAY[...]::varchar[]` or use `text[]` |
+| `function round(double precision, integer)` | Cast to `numeric` |
+
+Type errors are easier to avoid when you can see column types while you write the query. In [Chat2DB](https://chat2db.ai/download) the schema panel and autocomplete show each column's type, and the AI assistant can take a failing query plus this error message and rewrite it with the correct casts for your tables.

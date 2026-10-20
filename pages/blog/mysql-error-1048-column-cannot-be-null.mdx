@@ -1,0 +1,239 @@
+---
+title: "Fix MySQL Error 1048: Column Cannot Be Null"
+description: "Fix MySQL ERROR 1048 (23000) Column cannot be null: explicit NULLs from apps and ORMs, INSERT SELECT, upserts, TIMESTAMP columns and non-strict mode quirks."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: October 20, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# Fix MySQL Error 1048: Column Cannot Be Null
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="October 20, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+```text
+ERROR 1048 (23000): Column 'price' cannot be null
+```
+
+MySQL raises error 1048 when a statement explicitly puts `NULL` into a column declared `NOT NULL`. The key word is *explicitly*: the value `NULL` is in your `VALUES` list, your `SET` clause or the result of your `SELECT`. If you leave the column out instead, you get a different error, `1364 Field doesn't have a default value`.
+
+That distinction matters because **a column default does not help with 1048**. An explicit `NULL` is a value, and MySQL will not swap it for the default. This guide covers where the `NULL` usually comes from, how strict and non-strict mode change the behavior, and the fixes. Examples were run on MySQL 8.4.
+
+## Reproduce it
+
+```sql
+CREATE TABLE products (
+  id    INT PRIMARY KEY,
+  name  VARCHAR(50)   NOT NULL,
+  price DECIMAL(10,2) NOT NULL DEFAULT 0
+);
+
+INSERT INTO products VALUES (1, 'Pen', NULL);
+-- ERROR 1048 (23000): Column 'price' cannot be null
+```
+
+Even though `price` has `DEFAULT 0`, the explicit `NULL` is rejected. Either leave the column out or use the `DEFAULT` keyword:
+
+```sql
+INSERT INTO products (id, name) VALUES (1, 'Pen');            -- price = 0.00
+INSERT INTO products VALUES (1, 'Pen', DEFAULT);               -- same result
+```
+
+## Cause 1: The application binds NULL
+
+Most 1048 errors come from application code, not hand-written SQL. Typical paths:
+
+- An optional form field arrives empty and the code maps it to `NULL` (`None` in Python, `null` in Java/JavaScript, `nil` in Go).
+- An ORM includes every mapped column in the `INSERT`, so an unset attribute is sent as `NULL` instead of being omitted.
+- A JSON payload has `"price": null` and is passed straight through.
+
+Fix it at the right layer:
+
+1. **Validate input** before it reaches the database. If the value is required, return a validation error to the caller rather than a database error.
+2. **Let the ORM omit unset columns** that have database defaults. In Hibernate use `@DynamicInsert` on the entity, or mark the field `insertable = false` if the database always sets it. In Laravel, set default values in the model's `$attributes`. In Django, give the field a `default=` or `db_default=` (Django 5.0+).
+3. **Coalesce in SQL** when "missing" really means a specific value:
+
+```sql
+INSERT INTO products (id, name, price)
+VALUES (?, ?, COALESCE(?, 0));
+```
+
+## Cause 2: INSERT ... SELECT copies NULLs from the source
+
+When loading from a staging table or another system, any `NULL` in the source fails the whole statement, and MySQL does not tell you which row:
+
+```sql
+CREATE TABLE staging (id INT, name VARCHAR(50), price DECIMAL(10,2));
+INSERT INTO staging VALUES (2, 'Ink', NULL), (3, NULL, 4.5);
+
+INSERT INTO products (id, name, price)
+SELECT id, name, price FROM staging;
+-- ERROR 1048 (23000): Column 'price' cannot be null
+```
+
+Find the problem rows first:
+
+```sql
+SELECT id FROM staging WHERE name IS NULL OR price IS NULL;
+```
+
+Then decide whether to substitute or skip:
+
+```sql
+-- Substitute values
+INSERT INTO products (id, name, price)
+SELECT id, COALESCE(name, '(unnamed)'), COALESCE(price, 0)
+FROM staging;
+
+-- Or skip incomplete rows
+INSERT INTO products (id, name, price)
+SELECT id, name, price
+FROM staging
+WHERE name IS NOT NULL AND price IS NOT NULL;
+```
+
+Watch out for `LEFT JOIN`s in the `SELECT`. Unmatched rows produce `NULL` for every column of the joined table, which is the most common hidden source of 1048 in reporting and ETL jobs:
+
+```sql
+INSERT INTO order_summary (order_id, customer_name)
+SELECT o.id, COALESCE(c.name, 'unknown')
+FROM orders o
+LEFT JOIN customers c ON c.id = o.customer_id;
+```
+
+## Cause 3: An UPDATE sets NULL
+
+```sql
+UPDATE products SET name = NULL WHERE id = 1;
+-- ERROR 1048 (23000): Column 'name' cannot be null
+```
+
+The `NULL` is often computed rather than written:
+
+- A scalar subquery that matches no row returns `NULL`.
+- `CONCAT()` returns `NULL` if any argument is `NULL` (use `CONCAT_WS()`, which skips `NULL`s, or wrap arguments in `COALESCE`).
+- Arithmetic with a `NULL` operand returns `NULL`.
+
+```sql
+-- Safe version of a lookup update: only touch rows that match
+UPDATE products p
+JOIN price_list pl ON pl.product_id = p.id
+SET p.price = pl.price
+WHERE pl.price IS NOT NULL;
+```
+
+## Cause 4: Upserts with ON DUPLICATE KEY UPDATE
+
+The incoming row is checked before MySQL looks for a duplicate. So an upsert that passes `NULL` fails even if the existing row has a value:
+
+```sql
+INSERT INTO products (id, name, price) VALUES (2, 'Ink', NULL) AS new
+ON DUPLICATE KEY UPDATE price = COALESCE(new.price, products.price);
+-- ERROR 1048 (23000): Column 'price' cannot be null
+```
+
+The `COALESCE` in the update clause comes too late. Handle the `NULL` in the inserted values, or build the column list dynamically so absent fields are not part of the statement at all:
+
+```sql
+INSERT INTO products (id, name, price) VALUES (2, 'Ink', COALESCE(NULL, 0)) AS new
+ON DUPLICATE KEY UPDATE name = new.name;
+```
+
+## Cause 5: TIMESTAMP columns after an upgrade
+
+On old MySQL versions with `explicit_defaults_for_timestamp = OFF`, inserting `NULL` into a `TIMESTAMP NOT NULL` column silently stored the current time. Code written in that era sometimes sends `NULL` on purpose to get "now".
+
+MySQL 8.0 turned `explicit_defaults_for_timestamp` on by default, and the old behavior is deprecated. Now the same insert fails:
+
+```sql
+SELECT @@explicit_defaults_for_timestamp;   -- 1
+
+CREATE TABLE ts (id INT PRIMARY KEY, updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP);
+
+INSERT INTO ts VALUES (1, NULL);
+-- ERROR 1048 (23000): Column 'updated_at' cannot be null
+
+INSERT INTO ts VALUES (1, DEFAULT);   -- works: current time
+```
+
+Fix the code to send `DEFAULT`, `NOW()` or omit the column. For "last modified" columns, let MySQL maintain the value:
+
+```sql
+ALTER TABLE ts
+  MODIFY updated_at TIMESTAMP NOT NULL
+  DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP;
+```
+
+## Strict vs non-strict mode: a surprising difference
+
+With strict mode off (`sql_mode` without `STRICT_TRANS_TABLES` / `STRICT_ALL_TABLES`), MySQL's behavior depends on the *shape* of the statement:
+
+```sql
+SET SESSION sql_mode = '';
+
+-- Single-row INSERT: still an error
+INSERT INTO products VALUES (9, NULL, 1);
+-- ERROR 1048 (23000): Column 'name' cannot be null
+
+-- Multi-row INSERT: warnings, and NULLs replaced with implicit defaults
+INSERT INTO products VALUES (10, NULL, 1), (11, 'ok', NULL);
+SHOW WARNINGS;
+```
+
+```text
++---------+------+-------------------------------+
+| Level   | Code | Message                       |
++---------+------+-------------------------------+
+| Warning | 1048 | Column 'name' cannot be null  |
+| Warning | 1048 | Column 'price' cannot be null |
++---------+------+-------------------------------+
+```
+
+```text
++----+------+-------+
+| id | name | price |
++----+------+-------+
+| 10 |      |  1.00 |
+| 11 | ok   |  0.00 |
++----+------+-------+
+```
+
+An `UPDATE ... SET name = NULL` in non-strict mode also only warns and stores the empty string. So in an application on a non-strict server, single-row inserts fail while batch inserts and updates quietly write empty strings and zeros. If your error logs show 1048 only "sometimes", check whether the failing path uses single-row inserts.
+
+`INSERT IGNORE` and `UPDATE IGNORE` behave like non-strict mode for this error: warning plus implicit default. Avoid them as a fix; they hide bad data instead of handling it.
+
+## Should the column be nullable?
+
+Sometimes the right answer is that the constraint is wrong. If `NULL` honestly means "unknown" for that attribute (a customer's phone number, an optional discount), make the column nullable:
+
+```sql
+ALTER TABLE products MODIFY price DECIMAL(10,2) NULL DEFAULT NULL;
+```
+
+Do not do this just to make an import pass. A `NOT NULL` constraint that rejects bad data is doing its job.
+
+## Find required columns quickly
+
+To see which columns reject `NULL` and which have defaults:
+
+```sql
+SELECT COLUMN_NAME, COLUMN_TYPE, IS_NULLABLE, COLUMN_DEFAULT
+FROM information_schema.COLUMNS
+WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'products'
+ORDER BY ORDINAL_POSITION;
+```
+
+## Summary
+
+| Where the NULL comes from | Fix |
+| --- | --- |
+| Application or ORM binds `NULL` | Validate input, omit unset columns, `COALESCE(?, default)` |
+| `INSERT ... SELECT` / `LEFT JOIN` | Find rows with `IS NULL`, then `COALESCE` or filter |
+| `UPDATE` with a subquery, `CONCAT` or arithmetic | `UPDATE ... JOIN`, `CONCAT_WS`, `COALESCE` |
+| Upsert with `NULL` in `VALUES` | Handle `NULL` in the inserted values |
+| `NULL` into `TIMESTAMP` meaning "now" | Send `DEFAULT` / `NOW()` or use `ON UPDATE CURRENT_TIMESTAMP` |
+
+To find the offending rows in a failed import, [Chat2DB](https://app.chat2db.ai/) lets you filter a staging table by `IS NULL` directly in the result grid, fix values in place, and ask the AI assistant to write the `COALESCE`-based `INSERT ... SELECT` for your column list.
