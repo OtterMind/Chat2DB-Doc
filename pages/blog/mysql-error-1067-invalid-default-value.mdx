@@ -1,0 +1,239 @@
+---
+title: "Fix MySQL Error 1067: Invalid Default Value"
+description: "Fix MySQL ERROR 1067 Invalid default value: zero dates, TIMESTAMP range, ENUM, numbers, expression defaults, and legacy tables that break ALTER TABLE."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: October 21, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# Fix MySQL Error 1067: Invalid Default Value
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="October 21, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+```text
+ERROR 1067 (42000): Invalid default value for 'created_at'
+```
+
+MySQL raises error 1067 when a column's `DEFAULT` cannot be stored in that column under the current SQL mode. The message names the column but not the reason, and the reason is almost always one of a handful of cases. The most common by far is a zero date such as `'0000-00-00 00:00:00'` in a schema written for MySQL 5.6 or earlier.
+
+This guide goes through each cause with the statement that triggers it and a fix, then covers the confusing case where an `ALTER TABLE` that does not touch the date column fails with 1067. All examples were run on MySQL 8.4 with the default SQL mode:
+
+```sql
+SELECT @@sql_mode;
+-- ONLY_FULL_GROUP_BY,STRICT_TRANS_TABLES,NO_ZERO_IN_DATE,NO_ZERO_DATE,ERROR_FOR_DIVISION_BY_ZERO,NO_ENGINE_SUBSTITUTION
+```
+
+## Cause 1: zero dates (NO_ZERO_DATE)
+
+```sql
+CREATE TABLE t1 (created_at DATETIME NOT NULL DEFAULT '0000-00-00 00:00:00');
+-- ERROR 1067 (42000): Invalid default value for 'created_at'
+
+CREATE TABLE t2 (created_at TIMESTAMP NOT NULL DEFAULT '0000-00-00 00:00:00');
+-- ERROR 1067 (42000): Invalid default value for 'created_at'
+```
+
+`NO_ZERO_DATE` and `NO_ZERO_IN_DATE`, both on by default since MySQL 5.7, make all-zero dates and dates with zero parts invalid. Old dumps are full of these defaults, because MySQL 5.5 and 5.6 accepted them, and `TIMESTAMP NOT NULL` columns often received a zero default automatically.
+
+**The right fix** is to choose a real default:
+
+```sql
+-- "when was this row created"
+CREATE TABLE t1 (created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP);
+
+-- "last modified" that updates itself
+CREATE TABLE t2 (
+  updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+);
+
+-- "unknown" is NULL, not zero
+CREATE TABLE t3 (shipped_at DATETIME NULL DEFAULT NULL);
+```
+
+`NOW()` is accepted as a synonym: `DATETIME DEFAULT NOW()` works.
+
+**The workaround** is to relax the SQL mode for the session that loads an old dump:
+
+```sql
+SET SESSION sql_mode = REPLACE(REPLACE(@@sql_mode, 'NO_ZERO_DATE', ''), 'NO_ZERO_IN_DATE', '');
+SOURCE legacy_dump.sql;
+SET SESSION sql_mode = DEFAULT;
+```
+
+That gets the dump loaded, but the zero defaults remain in the schema and will cause trouble later (see the `ALTER TABLE` section below). Avoid changing the global `sql_mode` to make this go away. Strict mode also protects you from silently truncated data.
+
+## Cause 2: TIMESTAMP outside its range
+
+`TIMESTAMP` stores UTC seconds from `1970-01-01 00:00:01` to `2038-01-19 03:14:07`. A default outside that range is invalid, and the check is done in the session time zone:
+
+```sql
+SELECT @@time_zone, @@system_time_zone;   -- SYSTEM, UTC
+CREATE TABLE t11 (ts TIMESTAMP DEFAULT '1970-01-01 00:00:00');
+-- ERROR 1067 (42000): Invalid default value for 'ts'
+CREATE TABLE t12 (ts TIMESTAMP DEFAULT '1970-01-01 00:00:01');   -- OK in UTC
+```
+
+In a time zone east of UTC, such as `+08:00`, `'1970-01-01 00:00:01'` is before the epoch in UTC and fails as well. The same schema can work on one server and fail on another. Use `DATETIME` for "beginning of time" sentinel values, or better, use `NULL`.
+
+## Cause 3: an impossible date
+
+```sql
+CREATE TABLE t3 (d DATE DEFAULT '2026-02-30');
+-- ERROR 1067 (42000): Invalid default value for 'd'
+```
+
+Use a real calendar date.
+
+## Cause 4: ENUM default not in the list
+
+```sql
+CREATE TABLE t4 (status ENUM('new', 'paid') DEFAULT 'shipped');
+-- ERROR 1067 (42000): Invalid default value for 'status'
+```
+
+The default must be one of the listed values. The match follows the column's collation, so with the default case-insensitive collation `DEFAULT 'NEW'` is accepted and stored as `'new'`, but a different spelling is not. Trailing spaces in enum values are removed when the table is created. When you add a new status, put it in the `ENUM(...)` list in the same `ALTER TABLE` that changes the default.
+
+## Cause 5: numbers that do not fit, or strings in numeric columns
+
+```sql
+CREATE TABLE t5 (qty TINYINT DEFAULT 300);
+-- ERROR 1067 (42000): Invalid default value for 'qty'
+
+CREATE TABLE t6 (price INT DEFAULT 'abc');
+-- ERROR 1067 (42000): Invalid default value for 'price'
+
+CREATE TABLE t15 (v VARCHAR(3) DEFAULT 'toolong');
+-- ERROR 1067 (42000): Invalid default value for 'v'
+```
+
+`TINYINT` holds -128 to 127 (0 to 255 when `UNSIGNED`). A default string must fit within the declared `VARCHAR` length. Widen the column or shorten the default.
+
+## Cause 6: function defaults that need parentheses
+
+Since MySQL 8.0.13, a column default can be an expression, but it must be written in parentheses. Only `CURRENT_TIMESTAMP` and its synonyms are allowed without them, and only for `DATETIME` and `TIMESTAMP` columns:
+
+```sql
+CREATE TABLE t10 (d DATE DEFAULT CURRENT_TIMESTAMP);
+-- ERROR 1067 (42000): Invalid default value for 'd'
+CREATE TABLE t10b (d DATE DEFAULT (CURRENT_DATE));     -- OK
+
+CREATE TABLE t8 (id CHAR(36) DEFAULT UUID());
+-- ERROR 1064 (42000): You have an error in your SQL syntax; ... near 'UUID())'
+CREATE TABLE t8b (id CHAR(36) DEFAULT (UUID()));        -- OK
+```
+
+The precision of `CURRENT_TIMESTAMP` must match the column's fractional seconds precision:
+
+```sql
+CREATE TABLE t13 (ts TIMESTAMP(3) DEFAULT CURRENT_TIMESTAMP(6));
+-- ERROR 1067 (42000): Invalid default value for 'ts'
+CREATE TABLE t13 (ts TIMESTAMP(3) DEFAULT CURRENT_TIMESTAMP(3));   -- OK
+```
+
+### TEXT, BLOB and JSON give error 1101, not 1067
+
+A literal default on these types fails with a different error:
+
+```sql
+CREATE TABLE t7  (notes TEXT DEFAULT '');
+-- ERROR 1101 (42000): BLOB, TEXT, GEOMETRY or JSON column 'notes' can't have a default value
+CREATE TABLE t14 (j JSON DEFAULT '{}');
+-- ERROR 1101 (42000): BLOB, TEXT, GEOMETRY or JSON column 'j' can't have a default value
+```
+
+An expression default in parentheses works on MySQL 8.0.13 and later:
+
+```sql
+CREATE TABLE t7b  (notes TEXT DEFAULT (''));
+CREATE TABLE t14b (j JSON DEFAULT ('{}'));
+```
+
+## ALTER TABLE fails on a column you did not touch
+
+This is the version of 1067 that confuses people most. A table created long ago, or in a session with a relaxed SQL mode, has a zero-date default. Under the normal strict mode, **any** `ALTER TABLE` that rebuilds the table validates all column defaults again:
+
+```sql
+-- created in the past under a permissive sql_mode
+CREATE TABLE legacy_orders (
+  id INT PRIMARY KEY,
+  created_at DATETIME  NOT NULL DEFAULT '0000-00-00 00:00:00',
+  updated_at TIMESTAMP NOT NULL DEFAULT '0000-00-00 00:00:00'
+);
+
+-- today, default sql_mode
+ALTER TABLE legacy_orders ADD COLUMN note VARCHAR(100);
+-- ERROR 1067 (42000): Invalid default value for 'created_at'
+```
+
+You wanted to add `note`, and MySQL complains about `created_at`. The fix is to correct the legacy defaults first. Find them across the schema:
+
+```sql
+SELECT TABLE_NAME, COLUMN_NAME, DATA_TYPE, COLUMN_DEFAULT
+FROM information_schema.COLUMNS
+WHERE TABLE_SCHEMA = DATABASE()
+  AND COLUMN_DEFAULT LIKE '0000-00-00%';
+```
+
+Then fix every flagged column in one statement:
+
+```sql
+ALTER TABLE legacy_orders
+  MODIFY created_at DATETIME  NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  MODIFY updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP;
+
+ALTER TABLE legacy_orders ADD COLUMN note VARCHAR(100);   -- now works
+```
+
+### Clean up the zero values too
+
+Fixing the default does not change existing rows. Rows that already hold `'0000-00-00 00:00:00'` cause other strict-mode errors when you query or update them:
+
+```sql
+SELECT COUNT(*) FROM legacy_orders WHERE created_at = '0000-00-00 00:00:00';
+-- ERROR 1525 (HY000): Incorrect DATETIME value: '0000-00-00 00:00:00'
+
+UPDATE legacy_orders SET created_at = '1970-01-01 00:00:00' WHERE created_at = '0000-00-00';
+-- ERROR 1292 (22007): Incorrect datetime value: '0000-00-00' for column 'created_at' at row 1
+```
+
+Relax the mode for the cleanup session only, then restore it:
+
+```sql
+SET SESSION sql_mode = REPLACE(REPLACE(@@sql_mode, 'NO_ZERO_DATE', ''), 'NO_ZERO_IN_DATE', '');
+
+SELECT COUNT(*) FROM legacy_orders WHERE created_at = '0000-00-00 00:00:00';   -- 1
+UPDATE legacy_orders
+SET created_at = '1970-01-01 00:00:00'          -- or NULL, if the column allows it
+WHERE created_at = '0000-00-00 00:00:00';
+
+SET SESSION sql_mode = DEFAULT;
+```
+
+`NULL` is usually the more honest replacement. Change the column to allow it first if needed. Check the application before you do, because some code treats a zero date as "not set" and has to be updated to check for `NULL`.
+
+## Migrating old dumps
+
+When restoring a dump from MySQL 5.x into MySQL 8:
+
+1. Search the dump for `DEFAULT '0000-00-00` and replace those defaults with `NULL` or `CURRENT_TIMESTAMP`. A `sed` on the schema-only part of the dump is usually enough.
+2. If you cannot edit the dump, load it with the relaxed session mode shown above, then fix the defaults immediately with `information_schema` and `ALTER TABLE ... MODIFY`.
+3. Clean zero values in the data, then run your normal migrations under the default SQL mode.
+
+## Summary
+
+| Default | Problem | Fix |
+| --- | --- | --- |
+| `'0000-00-00 ...'` | `NO_ZERO_DATE` | `CURRENT_TIMESTAMP` or `NULL` |
+| `TIMESTAMP '1970-01-01 00:00:00'` | Before the TIMESTAMP range (time zone dependent) | `DATETIME`, or `NULL` |
+| `'2026-02-30'` | Not a real date | Use a valid date |
+| `ENUM` value not in list | Not a member | Add it to the list |
+| `TINYINT DEFAULT 300`, too-long string | Does not fit | Widen the column |
+| `DATE DEFAULT CURRENT_TIMESTAMP` | Not allowed for `DATE` | `DEFAULT (CURRENT_DATE)` |
+| `CURRENT_TIMESTAMP(6)` on `TIMESTAMP(3)` | Precision mismatch | Match the precision |
+| `ALTER TABLE` fails on another column | Legacy zero default | `MODIFY` that column first |
+
+Finding every legacy default by hand is tedious on a large schema. In [Chat2DB](https://chat2db.ai/download) you can run the `information_schema` query above, review the flagged columns in a grid, and ask the AI assistant to generate the matching `ALTER TABLE ... MODIFY` statements for each table, then review them before running.

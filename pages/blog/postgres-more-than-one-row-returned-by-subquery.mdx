@@ -1,0 +1,271 @@
+---
+title: "Postgres: More Than One Row Returned by Subquery"
+description: "Fix PostgreSQL error 21000, more than one row returned by a subquery used as an expression, with LIMIT, IN, LATERAL, DISTINCT ON and STRICT."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: October 21, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# Postgres: More Than One Row Returned by Subquery
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="October 21, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+```text
+ERROR:  more than one row returned by a subquery used as an expression
+```
+
+PostgreSQL raises this error (SQLSTATE `21000`, `cardinality_violation`) when a scalar subquery, a `(SELECT ...)` used where a single value is expected, produces two or more rows. A scalar subquery may return zero rows, which becomes NULL, or one row. Anything more is an error, because Postgres will not pick one for you.
+
+The error has no `LINE` pointer and, unlike most errors, it is raised at run time, not when the query is parsed. A query can work for months and start failing the day a second matching row is inserted. This guide shows where the error comes from and how to choose the right fix. All examples were run on PostgreSQL 18.
+
+## Sample data
+
+A product can have several prices over time. Product 1 has two:
+
+```sql
+CREATE TABLE products (id int PRIMARY KEY, name text, price numeric);
+CREATE TABLE prices   (product_id int, price numeric, valid_from date);
+
+INSERT INTO products VALUES (1, 'Widget', NULL), (2, 'Gadget', NULL), (3, 'Gizmo', NULL);
+INSERT INTO prices VALUES
+  (1, 10, '2026-01-01'),
+  (1, 12, '2026-06-01'),
+  (2,  7, '2026-01-01');
+```
+
+## Where it happens
+
+**A correlated subquery in SELECT:**
+
+```sql
+SELECT p.id, p.name,
+       (SELECT price FROM prices pr WHERE pr.product_id = p.id) AS current_price
+FROM products p;
+-- ERROR:  more than one row returned by a subquery used as an expression
+```
+
+It fails as soon as it reaches product 1. Product 3 has no price rows and would have returned NULL.
+
+**UPDATE ... SET col = (SELECT ...):**
+
+```sql
+UPDATE products p
+SET price = (SELECT price FROM prices pr WHERE pr.product_id = p.id);
+-- ERROR:  more than one row returned by a subquery used as an expression
+```
+
+The whole statement is rolled back, including the rows that would have worked.
+
+**A comparison in WHERE:**
+
+```sql
+SELECT * FROM products
+WHERE id = (SELECT product_id FROM prices WHERE price > 5);
+-- ERROR:  more than one row returned by a subquery used as an expression
+```
+
+**PL/pgSQL assignments:**
+
+```sql
+CREATE FUNCTION g() RETURNS int LANGUAGE plpgsql AS $$
+DECLARE v int;
+BEGIN
+  v := (SELECT product_id FROM prices);
+  RETURN v;
+END $$;
+
+SELECT g();
+-- ERROR:  more than one row returned by a subquery used as an expression
+-- CONTEXT:  PL/pgSQL assignment "v := (SELECT product_id FROM prices)"
+```
+
+## Step 1: find the duplicates
+
+Before changing the query, decide whether multiple rows are expected. Run the subquery's condition as a grouped query:
+
+```sql
+SELECT product_id, count(*)
+FROM prices
+GROUP BY product_id
+HAVING count(*) > 1;
+```
+
+```text
+ product_id | count
+------------+-------
+          1 |     2
+```
+
+If those duplicates should never exist, the query is fine and the data is wrong. Clean it up and add a constraint so it cannot happen again:
+
+```sql
+ALTER TABLE prices ADD CONSTRAINT prices_product_from_uniq UNIQUE (product_id, valid_from);
+```
+
+If several rows per key are legitimate, as with price history here, the query has to say which row it wants. The fixes below cover the common intents.
+
+## Fix 1: "the latest one" with ORDER BY and LIMIT 1
+
+```sql
+SELECT p.id,
+       (SELECT price FROM prices pr
+        WHERE pr.product_id = p.id
+        ORDER BY valid_from DESC
+        LIMIT 1) AS current_price
+FROM products p;
+```
+
+```text
+ id | current_price
+----+---------------
+  1 |            12
+  2 |             7
+  3 |
+```
+
+Always pair `LIMIT 1` with an `ORDER BY` that expresses the rule, such as latest, cheapest or highest priority. `LIMIT 1` alone makes the error go away, but it returns whichever row the executor happens to read first. That can change after a `VACUUM`, an index change or an upgrade, so it is a silent correctness bug. Add a tie-breaker column if two rows can share the sort value.
+
+An index on `prices (product_id, valid_from DESC)` turns each lookup into a single index probe.
+
+## Fix 2: more than one column, use LATERAL
+
+When you need several columns from the chosen row, one scalar subquery per column repeats the lookup. Use `LEFT JOIN LATERAL` instead:
+
+```sql
+SELECT p.id, lp.price, lp.valid_from
+FROM products p
+LEFT JOIN LATERAL (
+  SELECT price, valid_from
+  FROM prices pr
+  WHERE pr.product_id = p.id
+  ORDER BY valid_from DESC
+  LIMIT 1
+) lp ON true
+ORDER BY p.id;
+```
+
+```text
+ id | price | valid_from
+----+-------+------------
+  1 |    12 | 2026-06-01
+  2 |     7 | 2026-01-01
+  3 |       |
+```
+
+`LEFT JOIN ... ON true` keeps products with no prices, like a scalar subquery returning NULL. With a plain `JOIN LATERAL`, product 3 would disappear.
+
+## Fix 3: "any of them" with IN, ANY or EXISTS
+
+In a `WHERE` clause, `=` asks for one value. If you mean "matches any of the returned values," use `IN` or `= ANY`:
+
+```sql
+SELECT * FROM products
+WHERE id IN (SELECT product_id FROM prices WHERE price > 5);
+
+SELECT * FROM products
+WHERE id = ANY (SELECT product_id FROM prices WHERE price > 5);
+```
+
+Both return Widget and Gadget. `EXISTS` is often the clearest form for a correlated check:
+
+```sql
+SELECT * FROM products p
+WHERE EXISTS (SELECT 1 FROM prices pr WHERE pr.product_id = p.id AND pr.price > 5);
+```
+
+Watch out for `NOT IN` with a subquery that can return NULL. If any value is NULL, `NOT IN` returns no rows at all. Prefer `NOT EXISTS`.
+
+## Fix 4: all of them, aggregate
+
+If you want every matching value, aggregate them into one value:
+
+```sql
+SELECT p.id,
+       (SELECT array_agg(price ORDER BY valid_from) FROM prices pr WHERE pr.product_id = p.id) AS price_history,
+       (SELECT max(price) FROM prices pr WHERE pr.product_id = p.id) AS max_price
+FROM products p;
+```
+
+An aggregate without `GROUP BY` always returns exactly one row, so the subquery can never fail. Choose the aggregate that matches what you meant: `max`, `sum`, `count`, `array_agg`, `string_agg` or `jsonb_agg`.
+
+## Fix 5: UPDATE from a derived table
+
+For updates, put the "one row per key" logic in a derived table and join it with `UPDATE ... FROM`. `DISTINCT ON` picks the latest price per product:
+
+```sql
+UPDATE products p
+SET price = pr.price
+FROM (
+  SELECT DISTINCT ON (product_id) product_id, price
+  FROM prices
+  ORDER BY product_id, valid_from DESC
+) pr
+WHERE pr.product_id = p.id;
+-- UPDATE 2
+```
+
+```text
+ id |  name  | price
+----+--------+-------
+  1 | Widget |    12
+  2 | Gadget |     7
+  3 | Gizmo  |
+```
+
+Unlike `SET price = (SELECT ...)`, this form leaves rows with no match untouched instead of setting them to NULL. Usually that is what you want.
+
+Make sure the derived table has at most one row per key. If `UPDATE ... FROM` finds two matching rows, Postgres does not raise an error. It updates the target row using one of them, and which one is not defined. Hence the `DISTINCT ON`.
+
+## In PL/pgSQL: SELECT INTO STRICT
+
+In functions, `SELECT ... INTO` silently takes the first row when several match. `STRICT` turns that into an error with a clearer message:
+
+```sql
+CREATE FUNCTION f() RETURNS int LANGUAGE plpgsql AS $$
+DECLARE v int;
+BEGIN
+  SELECT product_id INTO STRICT v FROM prices;
+  RETURN v;
+END $$;
+
+SELECT f();
+-- ERROR:  query returned more than one row
+-- HINT:  Make sure the query returns a single row, or use LIMIT 1.
+```
+
+`STRICT` also raises an error when no row is found. Both cases can be caught by name:
+
+```sql
+EXCEPTION
+  WHEN no_data_found THEN ...
+  WHEN too_many_rows THEN ...
+```
+
+Use `STRICT` when exactly one row is part of the function's contract, such as a lookup by unique key. A wrong assumption then fails loudly instead of returning an arbitrary row.
+
+## Why it worked yesterday
+
+Since the check happens at run time, the error usually appears after a data change, not a code change:
+
+- A unique constraint was never created, and a second "unique" row was inserted.
+- A soft-delete flag was added, and the subquery does not filter deleted rows.
+- A history or audit table, which was one row per key until the first edit, is now used for lookups.
+- A join inside the subquery multiplies rows. Run the subquery alone for one key to check.
+
+## Summary
+
+| Intent | Rewrite |
+| --- | --- |
+| Duplicates are a bug | Clean the data and add a `UNIQUE` constraint |
+| The latest or highest row | `ORDER BY ... LIMIT 1` inside the subquery |
+| Several columns from that row | `LEFT JOIN LATERAL (... LIMIT 1) ON true` |
+| Matches any value | `IN`, `= ANY`, or `EXISTS` |
+| All values | `array_agg`, `max`, `sum` and so on |
+| Bulk update from history | `UPDATE ... FROM (SELECT DISTINCT ON ...)` |
+| Exactly one row in PL/pgSQL | `SELECT ... INTO STRICT` |
+
+To find which keys have duplicates, it helps to run the subquery on its own and look at the results. [Chat2DB](https://chat2db.ai/download) lets you select part of a statement and run just that part, and its AI assistant can rewrite a failing scalar subquery as a `LATERAL` join or `DISTINCT ON` query once you say which row should win.

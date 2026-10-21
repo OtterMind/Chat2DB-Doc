@@ -1,0 +1,317 @@
+---
+title: "Postgres Bytea: Encode, Decode and Convert to Text"
+description: "Work with PostgreSQL bytea: hex and escape formats, encode() and decode() for base64 and hex, convert_from() to text, and fixing invalid byte sequence errors."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: October 21, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# Postgres Bytea: Encode, Decode and Convert to Text
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="October 21, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+`bytea` is PostgreSQL's type for raw bytes: file contents, hashes, encrypted payloads, protobuf messages, images. It looks simple until you try to read it. `SELECT data FROM files` prints something like `\x48656c6c6f`, casting to `text` does not decode it, and `convert_from()` sometimes fails with `invalid byte sequence for encoding "UTF8"`.
+
+This guide covers how bytea values are written and printed, the functions that convert between bytea, hex, base64 and text, and the errors you are most likely to hit. Every example was run on PostgreSQL 18.
+
+## A table to work with
+
+```sql
+CREATE TABLE files (
+  id   serial PRIMARY KEY,
+  name text,
+  data bytea
+);
+
+INSERT INTO files (name, data) VALUES
+  ('hello.txt', '\x48656c6c6f2c20776f726c64'),        -- hex input
+  ('hi.txt',    convert_to('héllo ✓', 'UTF8')),      -- text encoded as UTF-8
+  ('bin',       '\x89504e470d0a1a0a');               -- first 8 bytes of a PNG
+
+SELECT id, name, data FROM files;
+```
+
+```text
+ id |   name    |            data
+----+-----------+----------------------------
+  1 | hello.txt | \x48656c6c6f2c20776f726c64
+  2 | hi.txt    | \x68c3a96c6c6f20e29c93
+  3 | bin       | \x89504e470d0a1a0a
+```
+
+Notice that the second row is 10 bytes for 7 characters: `é` takes two bytes in UTF-8 and `✓` takes three.
+
+## Hex format and escape format
+
+PostgreSQL has two text representations for bytea.
+
+**Hex format** is the default output since PostgreSQL 9.0. It is `\x` followed by two hex digits per byte. On input, Postgres accepts upper- or lower-case digits and whitespace between byte pairs, but the prefix must be a lowercase `\x`:
+
+```sql
+SELECT '\x 48 65'::bytea;   -- \x4865
+SELECT '\x486'::bytea;
+-- ERROR:  invalid hexadecimal data: odd number of digits
+SELECT '\x4G'::bytea;
+-- ERROR:  invalid hexadecimal digit: "G"
+```
+
+**Escape format** is the older representation. Printable ASCII stays as-is, a backslash is written as `\\`, and any other byte is a backslash plus three octal digits. You see it when `bytea_output` is set to `escape`:
+
+```sql
+SET bytea_output = 'escape';
+SELECT data FROM files WHERE id = 3;
+--  \211PNG\015\012\032\012
+RESET bytea_output;
+```
+
+Any string that does not start with `\x` is read as escape format on input. Plain text works, `\\` becomes one backslash, `\ooo` becomes a byte, and any other backslash sequence is an error:
+
+```sql
+SELECT 'ab\000c\\d\101'::bytea;   -- \x616200635c6441
+SELECT 'a\b'::bytea;
+-- ERROR:  invalid input syntax for type bytea
+```
+
+`bytea_output` only changes how values are printed. It does not change what is stored, and Postgres accepts both formats on input no matter how it is set. Most drivers expect hex, so leave the default alone unless an old application needs escape.
+
+### A note on standard_conforming_strings
+
+The literals above assume `standard_conforming_strings = on`, the default since PostgreSQL 9.1. With it on, a backslash in `'...'` is an ordinary character, so `'\x48'` reaches the bytea parser intact. In an `E'...'` string the backslash is an escape character, so you have to double it: `E'\\x48'`.
+
+## Converting bytea to text: convert_from()
+
+A cast does not decode bytes. `data::text` returns the hex representation as a string:
+
+```sql
+SELECT data::text FROM files WHERE id = 1;
+-- \x48656c6c6f2c20776f726c64
+```
+
+To read bytes as text, tell Postgres which encoding they are in:
+
+```sql
+SELECT name, convert_from(data, 'UTF8') FROM files WHERE id IN (1, 2);
+```
+
+```text
+   name    | convert_from
+-----------+--------------
+ hello.txt | Hello, world
+ hi.txt    | héllo ✓
+```
+
+The reverse is `convert_to(text, encoding)`, which returns bytea:
+
+```sql
+SELECT convert_to('Hello, world', 'UTF8');
+-- \x48656c6c6f2c20776f726c64
+```
+
+`length()` on bytea counts bytes; on text it counts characters. That difference is a quick way to see whether a column holds multi-byte characters:
+
+```sql
+SELECT length(data) AS bytes, length(convert_from(data, 'UTF8')) AS chars
+FROM files WHERE id = 2;
+--  bytes | chars
+--     10 |     7
+```
+
+## Fixing "invalid byte sequence for encoding UTF8"
+
+`convert_from` validates the bytes. If they are not valid in the encoding you named, it fails and tells you which bytes it rejected:
+
+```sql
+SELECT convert_from(data, 'UTF8') FROM files WHERE id = 3;
+-- ERROR:  invalid byte sequence for encoding "UTF8": 0x89
+```
+
+There are three common causes.
+
+**The data is binary, not text.** A PNG, a gzip stream or a hash is not meant to be decoded as characters. Use `encode()` (next section) to get a printable hex or base64 string instead.
+
+**The text is in a different encoding.** Bytes written by a Windows or legacy application are often Latin-1 or Windows-1252. In those encodings `é` is the single byte `0xe9`, which is not valid UTF-8 on its own:
+
+```sql
+SELECT convert_from('\x68e96c6c6f'::bytea, 'UTF8');
+-- ERROR:  invalid byte sequence for encoding "UTF8": 0xe9 0x6c 0x6c
+SELECT convert_from('\x68e96c6c6f'::bytea, 'LATIN1');
+-- héllo
+```
+
+If you are not sure what encoding the source used, test a few rows with `LATIN1`, `WIN1252` and `UTF8` and look at the accented characters.
+
+**There is a NUL byte.** PostgreSQL `text` cannot contain `0x00`, so even otherwise valid UTF-8 fails:
+
+```sql
+SELECT convert_from('\x6100'::bytea, 'UTF8');
+-- ERROR:  invalid byte sequence for encoding "UTF8": 0x00
+```
+
+Either keep that data in bytea, or strip the NUL bytes before converting if they are padding:
+
+```sql
+SELECT convert_from(rtrim(data, '\x00'::bytea), 'UTF8') FROM files;
+```
+
+## encode() and decode(): hex and base64
+
+`encode(bytea, format)` returns text and `decode(text, format)` returns bytea. The formats are `hex`, `base64` and `escape`.
+
+```sql
+SELECT name,
+       encode(data, 'hex')    AS hex,
+       encode(data, 'base64') AS b64
+FROM files;
+```
+
+```text
+   name    |           hex            |       b64
+-----------+--------------------------+------------------
+ hello.txt | 48656c6c6f2c20776f726c64 | SGVsbG8sIHdvcmxk
+ hi.txt    | 68c3a96c6c6f20e29c93     | aMOpbGxvIOKckw==
+ bin       | 89504e470d0a1a0a         | iVBORw0KGgo=
+```
+
+Going the other way:
+
+```sql
+SELECT decode('SGVsbG8sIHdvcmxk', 'base64');
+-- \x48656c6c6f2c20776f726c64
+SELECT convert_from(decode('SGVsbG8sIHdvcmxk', 'base64'), 'UTF8');
+-- Hello, world
+SELECT encode(convert_to('Hello, world', 'UTF8'), 'base64');
+-- SGVsbG8sIHdvcmxk
+```
+
+Two details trip people up.
+
+First, `encode(..., 'base64')` inserts a newline every 76 characters, following the MIME convention. If you need one long line for a JSON payload or a URL, remove them:
+
+```sql
+SELECT replace(encode(data, 'base64'), E'\n', '') FROM files;
+```
+
+`decode(..., 'base64')` ignores whitespace, so wrapped input decodes fine.
+
+Second, `decode` is strict about padding and alphabet:
+
+```sql
+SELECT decode('SGVsbG8', 'base64');
+-- ERROR:  invalid base64 end sequence
+-- HINT:  Input data is missing padding, is truncated, or is otherwise corrupted.
+SELECT decode('ab-c', 'base64');
+-- ERROR:  invalid symbol "-" found while decoding base64 sequence
+```
+
+The second error usually means the input is base64url (JWT segments, many web APIs), which uses `-` and `_` instead of `+` and `/` and often drops padding. PostgreSQL 18 has no `base64url` format, so translate the alphabet and add the padding back first:
+
+```sql
+SELECT decode(
+  rpad(translate('SGVsbG8', '-_', '+/'),
+       ((length('SGVsbG8') + 3) / 4) * 4, '='),
+  'base64');
+-- \x48656c6c6f
+```
+
+`decode(..., 'hex')` also skips whitespace between byte pairs, but it does not accept a `0x` or `\x` prefix:
+
+```sql
+SELECT decode('48 65', 'hex');   -- \x4865
+SELECT decode('0x48', 'hex');
+-- ERROR:  invalid hexadecimal digit: "x"
+```
+
+If you do this conversion by hand often, the [Postgres Bytea Converter](https://chat2db.ai/tools/postgres-bytea-converter) turns hex, escape format, base64 and text into each other in the browser and shows the same errors Postgres would.
+
+## Working with bytes inside SQL
+
+Many string functions have bytea versions:
+
+```sql
+SELECT get_byte(data, 0),                          -- 137
+       substring(data FROM 1 FOR 4),               -- \x89504e47
+       position('\x0d0a'::bytea IN data)           -- 5
+FROM files WHERE id = 3;
+```
+
+That makes it easy to sniff file types by their magic bytes:
+
+```sql
+SELECT name
+FROM files
+WHERE substring(data FROM 1 FOR 8) = '\x89504e470d0a1a0a'::bytea;   -- PNG
+```
+
+Other useful ones:
+
+```sql
+SELECT data || '\x00'::bytea FROM files WHERE id = 1;                  -- append
+SELECT overlay(data PLACING '\x4a'::bytea FROM 1 FOR 1) FROM files WHERE id = 1;  -- replace bytes
+SELECT set_byte('\x0000'::bytea, 1, 255);                              -- \x00ff
+SELECT string_agg(data, '\x2c'::bytea) FROM files WHERE id <= 2;       -- aggregate
+```
+
+Hashing works directly on bytea. `sha256()` returns bytea, so encode it for display; `md5()` returns text:
+
+```sql
+SELECT encode(sha256(data), 'hex'), md5(data) FROM files WHERE id = 1;
+```
+
+### New in PostgreSQL 18
+
+PostgreSQL 18 added `reverse(bytea)` and casts between bytea and integer types. On PostgreSQL 17 both of these fail (`function reverse(bytea) does not exist` and `cannot cast type bytea to integer`):
+
+```sql
+SELECT reverse('\x010203'::bytea);        -- \x030201
+SELECT ('\x00000102'::bytea)::int;        -- 258 (big-endian)
+```
+
+On older versions, the usual workaround for bytes-to-integer is to go through a bit string:
+
+```sql
+SELECT ('x' || encode('\x00000102'::bytea, 'hex'))::bit(32)::int;   -- 258
+```
+
+## Storage size and performance
+
+`octet_length()` returns the number of bytes in the value. `pg_column_size()` returns how much space the stored datum takes, including its header and any compression:
+
+```sql
+SELECT name, octet_length(data), pg_column_size(data) FROM files;
+```
+
+```text
+   name    | octet_length | pg_column_size
+-----------+--------------+----------------
+ hello.txt |           12 |             13
+ hi.txt    |           10 |             11
+ bin       |            8 |              9
+```
+
+Small values carry a 1-byte header. Values larger than about 2 kB are compressed and moved out of line into TOAST storage automatically. A bytea value can be up to 1 GB, but storing large files in the database makes backups and replication heavier. A common pattern is to keep large objects in object storage and store only the key and a `sha256` checksum in Postgres.
+
+Some practical rules:
+
+- **Insert with parameters, not literals.** Every driver can bind a byte array as bytea directly. Building `'\x...'` strings in application code doubles the size of the SQL text and invites quoting bugs.
+- **Index hashes, not blobs.** To find duplicates, store `sha256(data)` in its own column and index that; a B-tree on large bytea values is slow and may exceed the index row size limit.
+- **Ask for hex or base64 only at the edge.** Keep data as bytea in the table and call `encode()` in the query that feeds an API response.
+
+## Quick reference
+
+| Task | SQL |
+| --- | --- |
+| Hex literal to bytea | `'\x48656c6c6f'::bytea` |
+| Text to bytea | `convert_to('Hello', 'UTF8')` |
+| bytea to text | `convert_from(data, 'UTF8')` |
+| bytea to hex string | `encode(data, 'hex')` |
+| bytea to base64 | `encode(data, 'base64')` (wraps at 76 chars) |
+| base64 to bytea | `decode(b64, 'base64')` |
+| Byte count | `octet_length(data)` or `length(data)` |
+| Read one byte | `get_byte(data, 0)` |
+| Hash | `encode(sha256(data), 'hex')` |
+
+Binary columns are hard to read in most result grids. [Chat2DB](https://chat2db.ai/download) shows bytea values alongside the rest of your query results, and its AI assistant can write the `encode()`, `decode()` and `convert_from()` calls for you when you describe what you want to see.

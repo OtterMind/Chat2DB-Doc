@@ -1,0 +1,208 @@
+---
+title: "Fix Postgres Integer Out of Range (22003)"
+description: "Fix PostgreSQL integer out of range: int overflow in arithmetic, serial ids near 2147483647, bigint sequences on int columns, and bigint migrations."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: October 21, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# Fix Postgres Integer Out of Range (22003)
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="October 21, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+```text
+ERROR:  integer out of range
+```
+
+PostgreSQL raises `integer out of range` (SQLSTATE `22003`, `numeric_value_out_of_range`) when a value does not fit in a 4-byte `integer`, whose range is -2,147,483,648 to 2,147,483,647. The message is short and gives no table or column, so the first job is to work out which of three situations you are in:
+
+1. **Arithmetic overflow.** An expression on `integer` values produces a result that is too large.
+2. **A value that is too large for the column or cast.** For example, an id from another system or a Unix timestamp in milliseconds.
+3. **An id sequence that has run past the int limit.** This is the one that takes production down.
+
+All examples below were run on PostgreSQL 18.
+
+## The integer types
+
+| Type | Bytes | Maximum |
+| --- | --- | --- |
+| `smallint` (`int2`) | 2 | 32,767 |
+| `integer` (`int4`) | 4 | 2,147,483,647 |
+| `bigint` (`int8`) | 8 | 9,223,372,036,854,775,807 |
+| `numeric` | variable | up to 131,072 digits before the decimal point |
+
+Each type has its own message: `smallint out of range`, `integer out of range` and `bigint out of range`.
+
+## Situation 1: arithmetic overflow
+
+Postgres does integer math in the type of the operands. If both are `integer`, the result must fit in `integer`, even when you only want to compare it or store it in a `bigint` column:
+
+```sql
+SELECT 100000 * 100000;
+-- ERROR:  integer out of range
+
+SELECT 2147483647 + 1;
+-- ERROR:  integer out of range
+```
+
+The fix is to cast one operand to `bigint` before the operation, not after:
+
+```sql
+SELECT 100000::bigint * 100000;      -- 10000000000
+SELECT 2147483647::bigint + 1;       -- 2147483648
+SELECT (100000 * 100000)::bigint;    -- still fails: the multiply happens first
+```
+
+Typical real-world cases are `quantity * unit_price_cents`, `size_kb * 1024` and `seconds * 1000` on integer columns. `sum()` is safe: `sum(integer)` returns `bigint`, and `sum(bigint)` returns `numeric`:
+
+```sql
+SELECT sum(x) FROM (VALUES (2147483647), (1)) v(x);   -- 2147483648
+SELECT pg_typeof(sum(x)) FROM (VALUES (1)) v(x);      -- bigint
+```
+
+`smallint` overflows much sooner. Adding two `smallint` values gives `smallint out of range` once the result passes 32,767.
+
+## Situation 2: the value does not fit
+
+Converting a too-large string gives a more descriptive message that includes the value:
+
+```sql
+SELECT '3000000000'::int;
+-- ERROR:  value "3000000000" is out of range for type integer
+```
+
+A numeric constant gives the short form:
+
+```sql
+SELECT 3000000000::int;
+-- ERROR:  integer out of range
+```
+
+Common sources:
+
+- **Unix timestamps.** Seconds since 1970 fit in `integer` until 2038-01-19 03:14:07 UTC. The next second does not, and millisecond timestamps never fit:
+
+  ```sql
+  SELECT extract(epoch FROM timestamptz '2038-01-19 03:14:08+00')::int;
+  -- ERROR:  integer out of range
+  SELECT extract(epoch FROM timestamptz '2038-01-19 03:14:08+00')::bigint;
+  -- 2147483648
+  ```
+
+  Store times as `timestamptz`. If you must store epochs, use `bigint`.
+- **External ids.** Twitter/X snowflake ids, Discord ids, many payment provider ids and phone numbers are larger than 2^31. Store ids as `bigint`, or as `text` if you never do math on them. Phone numbers belong in `text`.
+- **ORM type mismatches.** A Java `long` or a JavaScript number bound to an `integer` parameter works until the first large value arrives.
+
+## Situation 3: the id sequence ran out
+
+This is the dangerous one. A table created with `serial` or `integer GENERATED ... AS IDENTITY` stops accepting inserts after about 2.1 billion ids, and the exact error tells you how the sequence was set up.
+
+**When the sequence is also integer** (the default for `serial` and integer identity columns since PostgreSQL 10), the sequence itself hits its maximum:
+
+```sql
+CREATE TABLE ev (id serial PRIMARY KEY, note text);
+SELECT setval('ev_id_seq', 2147483646);   -- simulate years of inserts
+
+INSERT INTO ev (note) VALUES ('a');   -- gets id 2147483647
+INSERT INTO ev (note) VALUES ('b');
+-- ERROR:  nextval: reached maximum value of sequence "ev_id_seq" (2147483647)
+```
+
+**When the sequence is bigint but the column is integer**, which is common in databases created before PostgreSQL 10 and later upgraded, or when a sequence was created by hand, the sequence keeps going and the insert fails on the column:
+
+```sql
+CREATE SEQUENCE old_seq AS bigint;
+CREATE TABLE legacy_ev (id int PRIMARY KEY DEFAULT nextval('old_seq'), note text);
+SELECT setval('old_seq', 2147483647);
+
+INSERT INTO legacy_ev (note) VALUES ('boom');
+-- ERROR:  integer out of range
+```
+
+Ids are not reused after a rollback, so failed inserts, `INSERT ... ON CONFLICT DO NOTHING` and large deletes all use up the sequence faster than the row count suggests. A table with 300 million rows can be close to the limit.
+
+### Check how close you are
+
+Run this regularly, or add it to monitoring:
+
+```sql
+SELECT schemaname, sequencename, data_type::text,
+       last_value,
+       round(100.0 * last_value / 2147483647, 1) AS pct_of_int_max
+FROM pg_sequences
+WHERE last_value IS NOT NULL
+ORDER BY pct_of_int_max DESC;
+```
+
+Also look at the columns themselves, because a `bigint` sequence feeding an `integer` column only shows up there:
+
+```sql
+SELECT table_schema, table_name, column_name
+FROM information_schema.columns
+WHERE data_type = 'integer'
+  AND (column_default LIKE 'nextval%' OR is_identity = 'YES');
+```
+
+Anything above about 50% deserves a migration plan. Changing the type of a large primary key takes time to prepare.
+
+### The fix: move to bigint
+
+For an identity column, changing the column type also changes the sequence type:
+
+```sql
+ALTER TABLE ev2 ALTER COLUMN id TYPE bigint;
+-- the identity sequence is now bigint, max 9223372036854775807
+```
+
+For a `serial` column, change the column and then the sequence:
+
+```sql
+ALTER TABLE ev ALTER COLUMN id TYPE bigint;
+ALTER SEQUENCE ev_id_seq AS bigint;
+
+INSERT INTO ev (note) VALUES ('b') RETURNING id;   -- 2147483648
+```
+
+Do not forget the foreign keys. Every column that references this id must also become `bigint`, otherwise inserts into the child tables fail with the same error.
+
+### Doing it without long downtime
+
+`ALTER COLUMN ... TYPE bigint` rewrites the whole table and its indexes while holding an `ACCESS EXCLUSIVE` lock. On a large table, that can block reads and writes for a long time. The usual online approach is:
+
+1. Add a new `bigint` column, for example `id_new`, with no default.
+2. Add a trigger that copies `id` into `id_new` on every insert and update.
+3. Backfill existing rows in small batches, such as `UPDATE ... WHERE id BETWEEN x AND y`, with pauses so replication can keep up.
+4. Build a unique index on `id_new` with `CREATE UNIQUE INDEX CONCURRENTLY`.
+5. In one short transaction: swap the column names, attach the sequence to the new column, convert the unique index into the primary key with `ADD CONSTRAINT ... PRIMARY KEY USING INDEX`, and drop the trigger.
+6. Repeat for the referencing foreign key columns.
+
+If you are already out of ids and need inserts working immediately, an emergency option is to restart the sequence at the negative end of the range, which gives you another 2.1 billion values while the real migration runs:
+
+```sql
+ALTER SEQUENCE ev_id_seq MINVALUE -2147483648 RESTART WITH -2147483648;
+```
+
+Only do this if nothing in the application assumes ids are positive or increase over time, and treat it as temporary.
+
+## Prevention
+
+- Use `bigint` for every new surrogate key: `id bigint GENERATED ALWAYS AS IDENTITY`. The extra 4 bytes per row are cheap next to a forced migration.
+- Use `bigint` for counters, byte sizes, money in cents, and anything multiplied.
+- Cast to `bigint` before multiplying integer columns.
+- Alert on sequence usage, using the query above.
+
+## Summary
+
+| Message | Cause | Fix |
+| --- | --- | --- |
+| `integer out of range` in a calculation | Overflow in `int * int` or `int + int` | Cast an operand to `bigint` first |
+| `value "..." is out of range for type integer` | Input larger than int | Use `bigint`, `numeric` or `text` |
+| `integer out of range` on `INSERT` with a default id | `bigint` sequence feeding an `int` column | `ALTER COLUMN id TYPE bigint` |
+| `nextval: reached maximum value of sequence` | `int` sequence exhausted | Column to `bigint`, then `ALTER SEQUENCE ... AS bigint` |
+| `smallint out of range` | Small column or arithmetic | Widen to `integer` or `bigint` |
+
+Spotting an integer key before it becomes a problem is easier when you can see column types across the schema. [Chat2DB](https://chat2db.ai/download) shows column types for every table, lets you save the sequence check above and rerun it, and its AI assistant can draft the batched `bigint` migration steps for your specific table and foreign keys.

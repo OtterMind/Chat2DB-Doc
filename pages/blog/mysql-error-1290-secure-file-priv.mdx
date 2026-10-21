@@ -1,0 +1,190 @@
+---
+title: "Fix MySQL Error 1290: secure-file-priv"
+description: "Fix MySQL ERROR 1290 --secure-file-priv for INTO OUTFILE and LOAD DATA INFILE: find the allowed directory, change it, or use LOAD DATA LOCAL."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: October 21, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# Fix MySQL Error 1290: secure-file-priv
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="October 21, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+```text
+ERROR 1290 (HY000): The MySQL server is running with the --secure-file-priv option so it cannot execute this statement
+```
+
+MySQL error 1290 is a generic "the server's configuration forbids this" error. By far the most common version is the one above. It appears when `SELECT ... INTO OUTFILE`, `LOAD DATA INFILE` or `LOAD_FILE()` tries to use a file outside the directory allowed by the `secure_file_priv` system variable.
+
+The setting exists for good reasons. Those statements read and write files as the operating system user that runs `mysqld`, so an unrestricted server could be used to read sensitive files or write files in unexpected places. This guide shows how to find the allowed directory, how to work within it, when and how to change it, and the alternative that avoids server-side files altogether. Examples were run on MySQL 8.4.
+
+## Step 1: check the setting
+
+```sql
+SHOW VARIABLES LIKE 'secure_file_priv';
+```
+
+```text
+Variable_name     Value
+secure_file_priv  /var/lib/mysql-files/
+```
+
+There are three possible kinds of value:
+
+| Value | Meaning |
+| --- | --- |
+| A directory, for example `/var/lib/mysql-files/` | File import and export are allowed only in this directory |
+| `NULL` | File import and export are disabled completely |
+| Empty string | No restriction. Any path the `mysqld` process can access is allowed (insecure) |
+
+The default depends on how MySQL was installed. Official Linux packages and the Docker image use `/var/lib/mysql-files/`. Some other packages use `NULL`.
+
+## Step 2: write or read inside the allowed directory
+
+With the default setting, exporting to `/tmp` fails:
+
+```sql
+SELECT * FROM orders INTO OUTFILE '/tmp/orders.csv';
+-- ERROR 1290 (HY000): The MySQL server is running with the --secure-file-priv option so it cannot execute this statement
+```
+
+Using the directory from `secure_file_priv` works:
+
+```sql
+SELECT * FROM orders
+INTO OUTFILE '/var/lib/mysql-files/orders.csv'
+FIELDS TERMINATED BY ',' OPTIONALLY ENCLOSED BY '"'
+LINES TERMINATED BY '\n';
+```
+
+The file is created on the **database server**, owned by the `mysql` user, not on the machine where you ran the client. On a remote server or in a container, you then have to copy it out, for example with `docker cp` or `scp`.
+
+Loading works the same way:
+
+```sql
+LOAD DATA INFILE '/var/lib/mysql-files/orders.csv'
+INTO TABLE orders
+FIELDS TERMINATED BY ',' OPTIONALLY ENCLOSED BY '"';
+```
+
+A few details that cause confusion:
+
+- **Subdirectories must already exist.** Writing to `/var/lib/mysql-files/sub/orders.csv` when `sub` does not exist also returns error 1290, not a "no such directory" error.
+- **`INTO OUTFILE` never overwrites.** If the file already exists, you get `ERROR 1086 (HY000): File '/var/lib/mysql-files/orders.csv' already exists`. Delete it or use a new name, such as one with a date in it.
+- **`LOAD_FILE()` returns NULL instead of an error.** `SELECT LOAD_FILE('/etc/hostname')` returns `NULL` when the path is outside the allowed directory, which is easy to mistake for an empty file.
+- **The `FILE` privilege is still required.** Even inside the allowed directory, the account needs `GRANT FILE ON *.* TO 'user'@'host'`. Grant it only to accounts that really need it.
+
+## Step 3 (optional): change the directory
+
+`secure_file_priv` is read-only at run time:
+
+```sql
+SET GLOBAL secure_file_priv = '';
+-- ERROR 1238 (HY000): Variable 'secure_file_priv' is a read only variable
+```
+
+`SET PERSIST` does not work for it either. Change it in the server configuration and restart:
+
+```ini
+# /etc/mysql/my.cnf, /etc/my.cnf or a file in conf.d/
+[mysqld]
+secure_file_priv = /srv/mysql-exchange
+```
+
+Then create the directory and give it to the `mysql` user:
+
+```bash
+sudo mkdir -p /srv/mysql-exchange
+sudo chown mysql:mysql /srv/mysql-exchange
+sudo chmod 750 /srv/mysql-exchange
+sudo systemctl restart mysql
+```
+
+On systems with AppArmor (Ubuntu) or SELinux (RHEL, Rocky, Alma), the new directory must also be allowed by the security policy. Otherwise MySQL starts but cannot write to it, and the statements fail with an operating system "Permission denied" error instead of 1290.
+
+With Docker, pass it as a server option and mount a volume:
+
+```bash
+docker run -d --name mysql \
+  -e MYSQL_ROOT_PASSWORD=secret \
+  -v "$PWD/exchange:/var/lib/mysql-files" \
+  mysql:8.4
+```
+
+Mounting a host directory at the default path is usually simpler than changing the setting. Files written by `INTO OUTFILE` appear in `./exchange` on the host.
+
+### Should you set it to an empty string?
+
+Setting `secure_file_priv = ""` removes the restriction, and the export to `/tmp` then works. On a development laptop that may be acceptable. On a shared or production server, avoid it. Any account with the `FILE` privilege could then read any file the `mysql` user can read, and write new files anywhere it can write. A dedicated directory gives you the same convenience without that risk.
+
+## The alternative: LOAD DATA LOCAL
+
+Often you do not want a file on the server at all. You have a CSV on your laptop and want it in a table. `LOAD DATA LOCAL INFILE` has the **client** read the file and send it to the server, so `secure_file_priv` does not apply. It is controlled by `local_infile` instead, which is off by default in MySQL 8:
+
+```sql
+LOAD DATA LOCAL INFILE '/tmp/new.csv' INTO TABLE orders FIELDS TERMINATED BY ',';
+-- ERROR 3948 (42000): Loading local data is disabled; this must be enabled on both the client and server sides
+```
+
+As the message says, both sides must allow it. On the server:
+
+```sql
+SET GLOBAL local_infile = ON;
+```
+
+On the client, start `mysql` with `--local-infile=1`. Without it, even with the server setting on, the client refuses:
+
+```text
+ERROR 2068 (HY000): LOAD DATA LOCAL INFILE file request rejected due to restrictions on access.
+```
+
+With both enabled, the load works:
+
+```bash
+mysql --local-infile=1 -u app -p shop \
+  -e "LOAD DATA LOCAL INFILE '/tmp/new.csv' INTO TABLE orders FIELDS TERMINATED BY ','"
+```
+
+In drivers the option has different names, for example `allowLoadLocalInfile=true` in Connector/J and `local_infile=True` in some Python drivers. `local_infile` is a dynamic variable, so you can turn it on for an import and off again afterwards.
+
+## Exporting without INTO OUTFILE
+
+For exports, the client can also do the work, which avoids both settings:
+
+```bash
+# Tab-separated output from the mysql client
+mysql -u app -p --batch -e "SELECT * FROM orders" shop > orders.tsv
+
+# A logical dump of one table
+mysqldump -u app -p shop orders > orders.sql
+```
+
+MySQL Shell's `util.exportTable()` and `util.importTable()` are another option. They write and read files on the client side and can load in parallel.
+
+For one-off exports and imports, a GUI client is often the simplest route. [Chat2DB](https://chat2db.ai/download) can export a query result to CSV or Excel and import a CSV into a table from your own machine, without the server's `secure_file_priv` or `local_infile` settings getting involved.
+
+## Other forms of error 1290
+
+Error 1290 is reused for other "server option" restrictions, and the message names the option:
+
+- `The MySQL server is running with the --read-only option so it cannot execute this statement`: the server, often a replica or a failover target, is read-only. Connect to the primary.
+- `The MySQL server is running with the --super-read-only option ...`: the same, and it also applies to accounts with `SUPER`.
+- `The MySQL server is running with the --skip-grant-tables option ...`: the server was started in recovery mode and account statements are disabled. Run `FLUSH PRIVILEGES` first, or restart normally.
+
+The fix depends on the option named in the message, so read it before changing anything.
+
+## Summary
+
+| Situation | Fix |
+| --- | --- |
+| `INTO OUTFILE '/tmp/...'` fails | Write into the `secure_file_priv` directory |
+| `secure_file_priv` is `NULL` | Set a directory in `my.cnf` and restart |
+| File is needed on your own machine | `LOAD DATA LOCAL INFILE` with `local_infile` enabled on both sides |
+| Error 3948 | `SET GLOBAL local_infile = ON` |
+| Error 2068 | Start the client with `--local-infile=1` |
+| Error 1086 file already exists | Use a new file name |
+| `LOAD_FILE()` returns NULL | The path is outside the allowed directory, or the file is unreadable |

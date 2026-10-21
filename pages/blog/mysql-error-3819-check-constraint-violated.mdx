@@ -1,0 +1,209 @@
+---
+title: "Fix MySQL Error 3819: Check Constraint Violated"
+description: "Fix MySQL ERROR 3819 Check constraint is violated: find the rule behind names like products_chk_1, fix data and upserts, and manage CHECK constraints."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: October 21, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# Fix MySQL Error 3819: Check Constraint Violated
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="October 21, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+```text
+ERROR 3819 (HY000): Check constraint 'chk_price_positive' is violated.
+```
+
+MySQL raises error 3819 when an `INSERT` or `UPDATE` would store a row for which a `CHECK` constraint evaluates to false. It also appears when you add a constraint that existing rows do not satisfy. `CHECK` constraints have been enforced since MySQL 8.0.16. Earlier versions parsed and ignored them, which is why the error often shows up for the first time after an upgrade, or when a schema written for PostgreSQL or SQL Server is moved to MySQL.
+
+The fix is almost never to remove the constraint. It is to find out which rule failed and why the row breaks it. This guide shows how, using examples run on MySQL 8.4.
+
+## Sample table
+
+```sql
+CREATE TABLE products (
+  id             INT PRIMARY KEY,
+  price          DECIMAL(10,2) NOT NULL,
+  discount_price DECIMAL(10,2),
+  stock          INT NOT NULL DEFAULT 0,
+  CONSTRAINT chk_price_positive CHECK (price > 0),
+  CONSTRAINT chk_discount CHECK (discount_price IS NULL OR discount_price < price),
+  CHECK (stock >= 0)
+);
+```
+
+The third constraint has no name, so MySQL generates one: `<table>_chk_<n>`, here `products_chk_1`.
+
+## Step 1: find the rule behind the name
+
+The message only gives the constraint name. Look up its expression in `information_schema`:
+
+```sql
+SELECT CONSTRAINT_NAME, CHECK_CLAUSE
+FROM information_schema.CHECK_CONSTRAINTS
+WHERE CONSTRAINT_SCHEMA = DATABASE();
+```
+
+```text
+CONSTRAINT_NAME     CHECK_CLAUSE
+chk_price_positive  (`price` > 0)
+chk_discount        ((`discount_price` is null) or (`discount_price` < `price`))
+products_chk_1      (`stock` >= 0)
+```
+
+`SHOW CREATE TABLE products` shows the same expressions next to the column definitions. If you have a generated name such as `products_chk_1`, this lookup is the only way to know which rule it is. That is a good reason to always name your constraints.
+
+## Step 2: see which value breaks it
+
+Each of these violates a different constraint:
+
+```sql
+INSERT INTO products VALUES (1, 0, NULL, 5);
+-- ERROR 3819 (HY000): Check constraint 'chk_price_positive' is violated.
+
+INSERT INTO products VALUES (2, 10, 12, 5);
+-- ERROR 3819 (HY000): Check constraint 'chk_discount' is violated.
+
+INSERT INTO products VALUES (3, 10, NULL, -1);
+-- ERROR 3819 (HY000): Check constraint 'products_chk_1' is violated.
+```
+
+With the rule in front of you, compare it with the values your statement sends. When the data comes from an application, log the actual parameter values. The bug is usually a default of `0`, a sign error, or two fields set in the wrong order.
+
+Some details of how checks are evaluated:
+
+- **NULL passes.** A check fails only when the expression is false. `NULL` (unknown) is accepted. `CHECK (price > 0)` allows `price = NULL`; that is what `NOT NULL` is for. In the table above, inserting `NULL` into `stock` fails with error 1048 (`Column 'stock' cannot be null`), not 3819.
+- **Checks can compare columns in the same row**, like `chk_discount`, but cannot look at other rows or other tables. Use a foreign key or a trigger for that.
+- **All constraints are checked for every inserted or updated row**, so a single statement can fail on a constraint for a column it did not mention.
+
+## Updates that cross the limit
+
+`UPDATE` statements violate checks as easily as inserts. A typical inventory bug:
+
+```sql
+INSERT INTO products VALUES (4, 10, NULL, 5);
+UPDATE products SET stock = stock - 10 WHERE id = 4;
+-- ERROR 3819 (HY000): Check constraint 'products_chk_1' is violated.
+```
+
+That is the constraint doing its job: it stopped an oversell. Make the condition part of the update so it affects zero rows instead of failing, then check the affected-row count in the application:
+
+```sql
+UPDATE products
+SET stock = stock - 10
+WHERE id = 4 AND stock >= 10;
+-- 0 rows affected: not enough stock
+```
+
+This is also safe under concurrency. Two sessions cannot both pass the `stock >= 10` condition for the same last ten units, because the row lock serializes them.
+
+## Upserts: the UPDATE branch is checked too
+
+`INSERT ... ON DUPLICATE KEY UPDATE` runs the check on whichever row is finally written:
+
+```sql
+INSERT INTO products VALUES (5, 10, NULL, 5);   -- row 5 exists now
+
+INSERT INTO products VALUES (5, 10, NULL, 5)
+ON DUPLICATE KEY UPDATE stock = -1;
+-- ERROR 3819 (HY000): Check constraint 'products_chk_1' is violated.
+```
+
+The inserted values were valid, but the update branch was not. When an upsert fails with 3819, check the expressions in the `UPDATE` part, especially anything computed from `VALUES()` or a row alias and the existing value.
+
+## INSERT IGNORE hides the error
+
+`IGNORE` turns the error into a warning and skips the row:
+
+```sql
+INSERT IGNORE INTO products VALUES (9, -1, NULL, 1);
+SHOW WARNINGS;
+```
+
+```text
+Level    Code  Message
+Warning  3819  Check constraint 'chk_price_positive' is violated.
+```
+
+The row is not inserted, and many applications never read warnings. Do not use `INSERT IGNORE` to silence constraint errors in batch loads unless you also collect the warnings, or you will lose data without noticing.
+
+## Adding a constraint to a table with existing data
+
+`ALTER TABLE ... ADD CONSTRAINT ... CHECK` validates every existing row and fails if any of them violate the new rule:
+
+```sql
+ALTER TABLE products ADD CONSTRAINT chk_stock_cap CHECK (stock <= 3);
+-- ERROR 3819 (HY000): Check constraint 'chk_stock_cap' is violated.
+```
+
+Find the offending rows with the negated condition. Remember that NULL passes, so exclude rows where the expression is unknown:
+
+```sql
+SELECT * FROM products WHERE NOT (stock <= 3);
+```
+
+Fix or remove those rows, then add the constraint. For large tables, run the `SELECT` first. The `ALTER TABLE` has to scan the whole table either way, and it is better to find out before a long operation fails.
+
+## Temporarily disabling a constraint
+
+MySQL can keep a constraint defined without enforcing it:
+
+```sql
+ALTER TABLE products ALTER CHECK chk_price_positive NOT ENFORCED;
+INSERT INTO products VALUES (8, 0, NULL, 1);   -- allowed now
+```
+
+Turning it back on validates existing rows again, so it fails while row 8 is still there:
+
+```sql
+ALTER TABLE products ALTER CHECK chk_price_positive ENFORCED;
+-- ERROR 3819 (HY000): Check constraint 'chk_price_positive' is violated.
+
+DELETE FROM products WHERE id = 8;
+ALTER TABLE products ALTER CHECK chk_price_positive ENFORCED;   -- OK
+```
+
+You can see the current state in `information_schema.TABLE_CONSTRAINTS`, in the `ENFORCED` column. Use `NOT ENFORCED` for a planned data migration window, not as a permanent fix. A constraint that is not enforced is just documentation.
+
+## Related errors when creating constraints
+
+These come up while writing `CHECK` constraints, and they are easy to confuse with 3819:
+
+```sql
+CREATE TABLE ev (id INT, starts DATETIME, CHECK (starts > NOW()));
+-- ERROR 3814 (HY000): An expression of a check constraint 'ev_chk_1' contains disallowed function: now.
+
+CREATE TABLE ev2 (id INT AUTO_INCREMENT PRIMARY KEY, CHECK (id > 0));
+-- ERROR 3818 (HY000): Check constraint 'ev2_chk_1' cannot refer to an auto-increment column.
+
+CREATE TABLE ord2 (id INT, qty INT, CONSTRAINT chk_qty CHECK (qty > 0));
+CREATE TABLE ord3 (id INT, qty INT, CONSTRAINT chk_qty CHECK (qty > 0));
+-- ERROR 3822 (HY000): Duplicate check constraint name 'chk_qty'.
+```
+
+- Checks must be deterministic, so `NOW()`, `RAND()`, user variables and subqueries are not allowed. "Must be in the future" belongs in application logic or a trigger.
+- Constraint names are unique **per schema**, not per table. Prefix them with the table name, for example `products_chk_price_positive`.
+
+## Coming from other databases
+
+- **PostgreSQL** also lets NULL pass a check and names unnamed constraints `<table>_<column>_check`. Its `NOT VALID` option (add without checking existing rows) has no direct MySQL equivalent. In MySQL, `NOT ENFORCED` skips both old and new rows.
+- **MySQL 5.7 and earlier** accepted `CHECK` syntax and discarded it, so tables created there have no check constraints even after an upgrade. The same `CREATE TABLE` scripts run on 8.0.16 or later do create and enforce them, which is how a test environment built from scripts starts failing while production does not. Test with production-like data first.
+- **MariaDB** has enforced checks since 10.2 and uses a different error code (4025), so error-handling code that matches on codes needs both values.
+
+## Summary
+
+| Situation | What to do |
+| --- | --- |
+| Unknown constraint name | Look it up in `information_schema.CHECK_CONSTRAINTS` |
+| Bad value from the application | Fix the value; log parameters to find it |
+| `UPDATE` would cross a limit | Move the condition into `WHERE` |
+| Upsert fails | Check the `ON DUPLICATE KEY UPDATE` expressions |
+| Adding a constraint fails | `SELECT ... WHERE NOT (condition)`, then fix the rows |
+| Need a temporary bypass | `ALTER CHECK ... NOT ENFORCED`, then re-enable |
+| Errors 3814, 3818, 3822 | Non-deterministic expression, auto-increment column, duplicate name |
+
+Constraint names are only helpful if you can see their definitions quickly. [Chat2DB](https://chat2db.ai/download) shows each table's DDL, including its `CHECK` constraints, next to your query. You can paste a failing statement and the 3819 message into its AI assistant to find which value breaks which rule, or try it in the browser at [app.chat2db.ai](https://app.chat2db.ai).

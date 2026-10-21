@@ -1,0 +1,237 @@
+---
+title: "Fix Postgres: Must Appear in GROUP BY Clause"
+description: "Fix PostgreSQL 42803 column must appear in the GROUP BY clause or be used in an aggregate function: primary keys, DISTINCT ON, window functions and ORDER BY."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: October 21, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# Fix Postgres: Must Appear in GROUP BY Clause
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="October 21, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+```text
+ERROR:  column "orders.customer_name" must appear in the GROUP BY clause or be used in an aggregate function
+LINE 1: SELECT customer_id, customer_name, sum(amount) FROM orders G...
+                            ^
+```
+
+This error (SQLSTATE `42803`, `grouping_error`) is PostgreSQL refusing to guess. After `GROUP BY`, each output row stands for a group of input rows. A column that is not grouped and not aggregated could have a different value in each row of the group, so Postgres cannot know which one to show.
+
+MySQL users meet it often, because older MySQL versions, and MySQL with `ONLY_FULL_GROUP_BY` turned off, silently pick a value from some row in the group. Postgres has never done that. The good news is that there is a correct rewrite for every case, and most of them are short. All examples were run on PostgreSQL 18.
+
+## Sample data
+
+```sql
+CREATE TABLE customers (id int PRIMARY KEY, name text, country text);
+CREATE TABLE orders (
+  id int, customer_id int, customer_name text,
+  amount numeric, created_at timestamptz
+);
+
+INSERT INTO customers VALUES (1, 'Ada', 'UK'), (2, 'Linus', 'FI');
+INSERT INTO orders VALUES
+  (1, 1, 'Ada',   10, '2026-10-01'),
+  (2, 1, 'Ada',   20, '2026-10-02'),
+  (3, 2, 'Linus',  5, '2026-10-02');
+```
+
+## The rule
+
+In a grouped query, every expression in `SELECT`, `HAVING` and `ORDER BY` must be one of these:
+
+1. An expression listed in `GROUP BY`
+2. Inside an aggregate function (`sum`, `count`, `max`, `array_agg`, ...)
+3. A column that is functionally dependent on the grouped columns, which in Postgres means the table's primary key is in `GROUP BY`
+
+The third rule is the one most people do not know about, and it removes a lot of noise.
+
+## Fix 1: group by the primary key
+
+When you join a dimension table and group by its primary key, you can select any of its columns:
+
+```sql
+SELECT c.id, c.name, c.country, sum(o.amount)
+FROM customers c
+JOIN orders o ON o.customer_id = c.id
+GROUP BY c.id;
+```
+
+```text
+ id | name  | country | sum
+----+-------+---------+-----
+  2 | Linus | FI      |   5
+  1 | Ada   | UK      |  30
+```
+
+This works because `c.id` is the primary key of `customers`, so `name` and `country` cannot vary within a group. It must be the primary key of the table the columns come from. Grouping by the foreign key on the other side of the join does not count:
+
+```sql
+SELECT o.customer_id, c.name, sum(o.amount)
+FROM customers c
+JOIN orders o ON o.customer_id = c.id
+GROUP BY o.customer_id;
+-- ERROR:  column "c.name" must appear in the GROUP BY clause or be used in an aggregate function
+```
+
+A `UNIQUE NOT NULL` column does not count either. Postgres only uses primary keys for this check:
+
+```sql
+CREATE TABLE u (email text UNIQUE NOT NULL, name text);
+SELECT email, name FROM u GROUP BY email;
+-- ERROR:  column "u.name" must appear in the GROUP BY clause or be used in an aggregate function
+```
+
+Group by `c.id` instead of `o.customer_id`, or add the extra column to `GROUP BY`.
+
+## Fix 2: add the column to GROUP BY
+
+In the first query, `customer_name` is the same for every row of a customer, because it was denormalized into `orders`. Postgres cannot know that, but you can tell it:
+
+```sql
+SELECT customer_id, customer_name, sum(amount)
+FROM orders
+GROUP BY customer_id, customer_name;
+```
+
+The result is the same as long as the data really is consistent. If one customer's orders have two different spellings of the name, you now get two rows for that customer. That is a data problem the original query would have hidden.
+
+## Fix 3: aggregate the column
+
+If you only need one value from the group and do not care which, say so. PostgreSQL 16 added `any_value()`:
+
+```sql
+SELECT customer_id, any_value(customer_name), sum(amount)
+FROM orders
+GROUP BY customer_id;
+```
+
+On older versions, `min(customer_name)` or `max(customer_name)` gives a deterministic result. `(array_agg(customer_name))[1]` also works. To see every distinct value, use `string_agg(DISTINCT customer_name, ', ')`.
+
+## Fix 4: you wanted the latest row, not an aggregate
+
+A very common version of the error comes from trying to get "the latest order per customer" like this:
+
+```sql
+SELECT customer_id, max(created_at), amount
+FROM orders
+GROUP BY customer_id;
+-- ERROR:  column "orders.amount" must appear in the GROUP BY clause or be used in an aggregate function
+```
+
+What the query means is "the amount from the row with the latest `created_at`." `GROUP BY` cannot express that, but `DISTINCT ON` can, and it is a Postgres feature built for this:
+
+```sql
+SELECT DISTINCT ON (customer_id) customer_id, created_at, amount
+FROM orders
+ORDER BY customer_id, created_at DESC;
+```
+
+```text
+ customer_id |       created_at       | amount
+-------------+------------------------+--------
+           1 | 2026-10-02 00:00:00+00 |     20
+           2 | 2026-10-02 00:00:00+00 |      5
+```
+
+`DISTINCT ON` keeps the first row of each group in `ORDER BY` order, so the `ORDER BY` must start with the `DISTINCT ON` columns. Add a tie-breaker such as `id DESC` if two rows can have the same timestamp.
+
+For "top N per group," or for SQL that also runs on other databases, use a window function:
+
+```sql
+SELECT customer_id, created_at, amount
+FROM (
+  SELECT o.*, row_number() OVER (PARTITION BY customer_id ORDER BY created_at DESC) AS rn
+  FROM orders o
+) ranked
+WHERE rn = 1;
+```
+
+## Fix 5: you wanted detail rows with a group total
+
+If you want every order and the customer's total next to it, you do not want `GROUP BY` at all. Use a window aggregate:
+
+```sql
+SELECT customer_id, amount,
+       sum(amount) OVER (PARTITION BY customer_id) AS customer_total
+FROM orders;
+```
+
+```text
+ customer_id | amount | customer_total
+-------------+--------+----------------
+           1 |     10 |             30
+           1 |     20 |             30
+           2 |      5 |              5
+```
+
+## The same error from ORDER BY and HAVING
+
+The rule applies to every clause evaluated after grouping, not only `SELECT`:
+
+```sql
+SELECT customer_id, sum(amount) FROM orders
+GROUP BY customer_id
+ORDER BY created_at;
+-- ERROR:  column "orders.created_at" must appear in the GROUP BY clause or be used in an aggregate function
+
+SELECT customer_id, sum(amount) FROM orders
+GROUP BY customer_id
+HAVING amount > 5;
+-- ERROR:  column "orders.amount" must appear in the GROUP BY clause or be used in an aggregate function
+```
+
+Order by an aggregate such as `max(created_at)`. Move row-level conditions to `WHERE`, which runs before grouping, and keep `HAVING` for conditions on aggregates:
+
+```sql
+SELECT customer_id, sum(amount) FROM orders
+WHERE amount > 5
+GROUP BY customer_id
+ORDER BY max(created_at) DESC;
+```
+
+## Grouping by expressions
+
+When you group by an expression, select the same expression. Postgres also accepts an output column alias or an ordinal position in `GROUP BY`, which saves repeating long expressions:
+
+```sql
+SELECT date_trunc('day', created_at) AS day, sum(amount)
+FROM orders
+GROUP BY day;          -- or GROUP BY 1, or GROUP BY date_trunc('day', created_at)
+```
+
+```text
+          day           | sum
+------------------------+-----
+ 2026-10-02 00:00:00+00 |  25
+ 2026-10-01 00:00:00+00 |  10
+```
+
+The reverse does not work. If you group by the raw `created_at` and select `date_trunc('day', created_at)`, it is allowed, because the expression only uses a grouped column. But you get one row per distinct timestamp, not one per day. Group by exactly what you want one row per.
+
+If an alias has the same name as a real column, `GROUP BY` uses the input column, not your alias. Use a different alias name to avoid surprises.
+
+## Migrating queries from MySQL
+
+MySQL 5.7 and later enable `ONLY_FULL_GROUP_BY` by default and detect functional dependencies in a similar way, so modern MySQL queries usually run on Postgres unchanged. Queries written for older MySQL, or for servers where the mode was turned off, rely on "pick any row" behavior. When porting them:
+
+- Where MySQL code uses `ANY_VALUE(col)`, Postgres 16+ has `any_value(col)`. On older versions use `min(col)`.
+- Where a query relied on getting "the row with the max value," rewrite it with `DISTINCT ON` or `row_number()`. MySQL never guaranteed that the value came from the max row anyway.
+- Where the extra columns come from a joined table, group by that table's primary key.
+
+## Summary
+
+| You want | Write |
+| --- | --- |
+| Columns of a joined table | `GROUP BY` that table's primary key |
+| A column that is constant per group | Add it to `GROUP BY` |
+| Any one value per group | `any_value(col)` (16+) or `min(col)` |
+| The whole latest row per group | `DISTINCT ON (...) ... ORDER BY ..., ts DESC` |
+| Detail rows plus a group total | `sum(...) OVER (PARTITION BY ...)` |
+| A row-level filter | `WHERE`, not `HAVING` |
+
+Grouped queries are easier to get right when you can see table keys while you write them. [Chat2DB](https://chat2db.ai/download) shows primary keys in the schema tree, and its AI assistant can turn a failing `GROUP BY` query into a `DISTINCT ON` or window-function version when you explain which row you want per group. You can also try it in the browser at [app.chat2db.ai](https://app.chat2db.ai).

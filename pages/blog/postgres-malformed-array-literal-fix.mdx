@@ -1,0 +1,248 @@
+---
+title: "Fix Postgres Malformed Array Literal (22P02)"
+description: "Fix PostgreSQL malformed array literal errors from JSON arrays, comma lists, ANY() parameters, the || operator, bad quoting and uneven sub-arrays."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: October 21, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# Fix Postgres Malformed Array Literal (22P02)
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="October 21, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+```text
+ERROR:  malformed array literal: "sql,pg"
+LINE 1: INSERT INTO posts VALUES (1, 'sql,pg');
+                                     ^
+DETAIL:  Array value must start with "{" or dimension information.
+```
+
+PostgreSQL raises `malformed array literal` (SQLSTATE `22P02`, the same code as `invalid input syntax`) when it has to turn a string into an array and the string is not in array syntax. The first line repeats the string it received. The `DETAIL` line says which rule failed, and it is the most useful part of the message.
+
+This guide explains the array literal syntax, then goes through the situations that produce the error, each with the exact `DETAIL` text from PostgreSQL 18 and a fix.
+
+## The array literal syntax in one minute
+
+An array literal is a string in braces with comma-separated elements:
+
+```sql
+SELECT '{1,2,3}'::int[];
+SELECT '{red,green,blue}'::text[];
+SELECT '{{1,2},{3,4}}'::int[];      -- two dimensions
+SELECT '{}'::text[];                -- empty array
+```
+
+An element needs double quotes when it is empty, contains a comma, whitespace, a brace, a double quote or a backslash, or is the word `NULL` meant as text. Inside quotes, escape `"` and `\` with a backslash. An unquoted `NULL` (any case) is a SQL NULL:
+
+```sql
+SELECT '{a,"b c","","NULL",NULL,"x\"y"}'::text[];
+-- {a,"b c","","NULL",NULL,"x\"y"}
+```
+
+Postgres reads a string as an array whenever the target type is an array: an explicit `::text[]` cast, an insert into a `text[]` column, a `$1` parameter typed `int[]`, or the right-hand side of `= ANY(...)` and `@>`. That is why the error often appears in code that never writes a cast.
+
+## Cause 1: passing a JSON array
+
+```sql
+CREATE TABLE posts (id int PRIMARY KEY, tags text[]);
+
+INSERT INTO posts VALUES (1, '["sql","pg"]');
+-- ERROR:  malformed array literal: "["sql","pg"]"
+-- DETAIL:  "[" must introduce explicitly-specified array dimensions.
+```
+
+The `DETAIL` is confusing until you know that a leading `[` in an array literal introduces dimension bounds such as `[0:1]={7,8}`. The string is JSON, which uses square brackets. This happens when an application serializes a list with `JSON.stringify` or `json.dumps` and sends the result as a string.
+
+Fix it in the application by binding a real array parameter. node-postgres, psycopg, JDBC (`createArrayOf`) and most ORMs map native lists to Postgres arrays. If the JSON has to be converted in SQL:
+
+```sql
+SELECT ARRAY(SELECT jsonb_array_elements_text('["sql","pg"]'::jsonb));
+-- {sql,pg}
+```
+
+## Cause 2: a comma-separated string or a single value
+
+```sql
+INSERT INTO posts VALUES (1, 'sql,pg');
+-- DETAIL:  Array value must start with "{" or dimension information.
+
+INSERT INTO posts VALUES (1, 'sql');
+-- DETAIL:  Array value must start with "{" or dimension information.
+```
+
+The braces are required, even for one element. Either add them, or split the string explicitly:
+
+```sql
+INSERT INTO posts VALUES (1, '{sql,pg}');
+SELECT string_to_array('sql,pg', ',');      -- {sql,pg}
+```
+
+`string_to_array` does not trim spaces, so `'sql, pg'` produces `{sql," pg"}`. Use `regexp_split_to_array(s, '\s*,\s*')` when the input may contain spaces after commas.
+
+## Cause 3: ANY() and IN with a string parameter
+
+A frequent version of cause 2 is passing a list of ids as a single string:
+
+```sql
+SELECT * FROM posts WHERE id = ANY('1,2');
+-- ERROR:  malformed array literal: "1,2"
+-- DETAIL:  Array value must start with "{" or dimension information.
+```
+
+The same thing happens with a prepared statement. A parameter typed `int[]` accepts `'{1,2}'` but not a Python tuple rendered as `'(1,2)'`:
+
+```sql
+PREPARE p(int[]) AS SELECT count(*) FROM posts WHERE id = ANY($1);
+EXECUTE p('{1,2}');    -- works
+EXECUTE p('(1,2)');
+-- ERROR:  malformed array literal: "(1,2)"
+-- DETAIL:  Array value must start with "{" or dimension information.
+```
+
+Fixes, best first:
+
+1. Bind a native list as the parameter so the driver sends an array.
+2. Send the literal form `{1,2}`.
+3. Convert in SQL: `id = ANY(string_to_array($1, ',')::int[])`.
+
+Avoid building `IN (...)` by concatenating strings. `= ANY($1)` with one array parameter is safer and keeps a single prepared statement for any list length.
+
+## Cause 4: appending an element with ||
+
+`||` has both `text[] || text` and `text[] || text[]` versions. With an untyped string literal on the right, Postgres picks the array-to-array version and tries to parse your string as an array:
+
+```sql
+UPDATE posts SET tags = tags || 'new' WHERE id = 1;
+-- ERROR:  malformed array literal: "new"
+-- DETAIL:  Array value must start with "{" or dimension information.
+```
+
+Make the intent explicit:
+
+```sql
+UPDATE posts SET tags = tags || 'new'::text WHERE id = 1;
+UPDATE posts SET tags = array_append(tags, 'new2') WHERE id = 1;
+```
+
+The same thing happens with `@>` (contains). `tags @> 'sql'` fails for the same reason; write `tags @> '{sql}'` or `tags @> ARRAY['sql']`. To test a single element, `'sql' = ANY(tags)` is usually clearer.
+
+## Cause 5: broken quoting
+
+When the braces are there but the quoting is wrong, the `DETAIL` points at the problem:
+
+```sql
+SELECT '{sql,"pg'::text[];
+-- DETAIL:  Unexpected end of input.          (unclosed quote)
+
+SELECT '{a"b"}'::text[];
+-- DETAIL:  Incorrectly quoted array element.  (quote in the middle of an element)
+
+SELECT '{"a" "b"}'::text[];
+-- DETAIL:  Incorrectly quoted array element.  (missing comma)
+
+SELECT '{a,}'::text[];
+-- DETAIL:  Unexpected "}" character.          (trailing comma)
+
+SELECT '{1,,2}'::int[];
+-- DETAIL:  Unexpected "," character.          (empty element)
+
+SELECT '{a,b}c'::text[];
+-- DETAIL:  Junk after closing right brace.
+```
+
+These almost always come from building the literal by hand with string concatenation. A value like `O"Brien` or `C:\temp` breaks it. Let the driver bind the array, use the `ARRAY[...]` constructor (which takes normal SQL literals), or let `array_agg` build it:
+
+```sql
+SELECT ARRAY['a b', 'x"y', 'C:\temp'];
+-- {"a b","x\"y","C:\\temp"}
+```
+
+If you must produce a literal string outside the database, the [Postgres Array Literal Builder](https://chat2db.ai/tools/postgres-array-literal-builder) quotes each element the same way Postgres does, and its Parse mode reports the same `DETAIL` messages, so you can test a string before sending it.
+
+## Cause 6: sub-arrays of different lengths
+
+Postgres arrays are rectangular. Every inner array must have the same length:
+
+```sql
+SELECT '{{1,2},{3}}'::int[];
+-- ERROR:  malformed array literal: "{{1,2},{3}}"
+-- DETAIL:  Multidimensional arrays must have sub-arrays with matching dimensions.
+```
+
+The constructor form gives a similar error without the `malformed` prefix:
+
+```sql
+SELECT ARRAY[ARRAY[1,2], ARRAY[3]];
+-- ERROR:  multidimensional arrays must have array expressions with matching dimensions
+```
+
+If your data is jagged, such as a list of lists with different lengths, store it as `jsonb`, or pad shorter rows with `NULL`.
+
+## Cause 7: explicit dimension bounds
+
+Strings that start with `[` are parsed as dimension bounds. They are rare in practice, but here are the messages:
+
+```sql
+SELECT '[0:1]={7,8}'::int[];     -- valid: lower bound 0
+SELECT '[1:2]{a,b}'::text[];
+-- DETAIL:  Missing "=" after array dimensions.
+SELECT '[1:2]={a}'::text[];
+-- DETAIL:  Specified array dimensions do not match array contents.
+SELECT '[1,2]'::int[];
+-- DETAIL:  Missing "]" after array dimensions.
+```
+
+The last one is again a JSON-style array in disguise. Treat it as cause 1.
+
+## When the literal is fine but an element is not
+
+If the structure is correct but one element is not valid for the element type, the error is not `malformed array literal`:
+
+```sql
+SELECT '{1,a}'::int[];
+-- ERROR:  invalid input syntax for type integer: "a"
+```
+
+That is an element-level problem. Clean the data or choose a different element type. On PostgreSQL 16 and later you can test a value without raising an error:
+
+```sql
+SELECT pg_input_is_valid('{1,a}', 'int[]');   -- false
+SELECT pg_input_is_valid('{1,2}', 'int[]');   -- true
+```
+
+`pg_input_is_valid` is useful for finding bad rows before running an `ALTER TABLE ... TYPE text[] USING ...` migration.
+
+## Converting text columns to arrays safely
+
+Teams often hit this error while migrating a comma-separated `text` column to `text[]`. Check first, then convert:
+
+```sql
+-- Which rows would fail if read directly as an array?
+SELECT id, tags_csv
+FROM legacy_posts
+WHERE NOT pg_input_is_valid(tags_csv, 'text[]');
+
+-- Convert by splitting instead of casting
+ALTER TABLE legacy_posts
+  ALTER COLUMN tags_csv TYPE text[]
+  USING regexp_split_to_array(nullif(trim(tags_csv), ''), '\s*,\s*');
+```
+
+`nullif(trim(...), '')` turns empty strings into NULL. Otherwise they become a one-element array containing an empty string.
+
+## Summary
+
+| DETAIL | Usual cause | Fix |
+| --- | --- | --- |
+| `"[" must introduce explicitly-specified array dimensions.` | JSON array `["a","b"]` | Bind an array, or `jsonb_array_elements_text` |
+| `Array value must start with "{" ...` | `'a,b'`, `'a'`, `'(1,2)'`, appending an untyped string | Add braces, `string_to_array`, or `::text` on the element |
+| `Unexpected end of input.` | Unclosed quote or brace | Let the driver or `ARRAY[...]` build it |
+| `Incorrectly quoted array element.` | Quote inside an element, missing comma | Escape `"` as `\"`, or use `ARRAY[...]` |
+| `Unexpected "}" / "," character.` | Trailing or double comma | Remove empty elements |
+| `Multidimensional arrays must have sub-arrays with matching dimensions.` | Jagged nested lists | Pad with NULL or use `jsonb` |
+
+When you are not sure what type a parameter or column is, check it before you debug the string. In [Chat2DB](https://chat2db.ai/download) the schema view shows array column types, and you can paste the failing statement with its error into the AI assistant to get a corrected query that uses `ANY()`, `ARRAY[...]` or `array_append` correctly for your table.

@@ -1,0 +1,256 @@
+---
+title: "Fix Postgres Invalid Input Syntax for Type Error"
+description: "Fix PostgreSQL 22P02 invalid input syntax for type integer, numeric, uuid and boolean: empty strings, COPY imports, text columns and safe casts."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: October 21, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# Fix Postgres Invalid Input Syntax for Type Error
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="October 21, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+```text
+ERROR:  invalid input syntax for type integer: "abc"
+LINE 1: SELECT 'abc'::integer;
+               ^
+```
+
+PostgreSQL raises `invalid input syntax for type X` (SQLSTATE `22P02`) when it has to turn a string into type `X` and the string is not a valid value of that type. The value in quotes at the end is exactly what Postgres received. Read it carefully: very often it is `""`, an empty string, rather than the bad value you expected.
+
+This article shows the common forms of the error, where the bad strings come from (application parameters, CSV imports, text columns) and how to convert data safely. All output is from PostgreSQL 18.
+
+## What Postgres accepts for common types
+
+Most of these errors come from assuming a type accepts more than it does.
+
+```sql
+SELECT ' 42 '::integer;      -- 42     (surrounding spaces are fine)
+SELECT '1_000'::integer;     -- 1000   (underscores, PostgreSQL 16+)
+SELECT '0x1F'::integer;      -- 31     (hex/octal/binary prefixes, PostgreSQL 16+)
+SELECT '42.5'::integer;
+-- ERROR:  invalid input syntax for type integer: "42.5"
+SELECT '1e3'::integer;
+-- ERROR:  invalid input syntax for type integer: "1e3"
+SELECT ''::integer;
+-- ERROR:  invalid input syntax for type integer: ""
+```
+
+`integer` rejects decimals and exponents even when the value is a whole number. `numeric` is stricter about formatting than people expect:
+
+```sql
+SELECT '12,50'::numeric;
+-- ERROR:  invalid input syntax for type numeric: "12,50"
+SELECT '$12.50'::numeric;
+-- ERROR:  invalid input syntax for type numeric: "$12.50"
+```
+
+Other types have their own rules:
+
+```sql
+SELECT 'not-a-uuid'::uuid;
+-- ERROR:  invalid input syntax for type uuid: "not-a-uuid"
+SELECT 'yes please'::boolean;
+-- ERROR:  invalid input syntax for type boolean: "yes please"
+SELECT '{bad json'::jsonb;
+-- ERROR:  invalid input syntax for type json
+-- DETAIL:  Token "bad" is invalid.
+-- CONTEXT:  JSON data, line 1: {bad...
+```
+
+`boolean` accepts `true/false`, `t/f`, `yes/no`, `y/n`, `on/off` and `1/0` (case-insensitive), plus unique prefixes such as `tr` or `fa`.
+
+Dates are a little different. A well-formed but impossible date gives a separate error code:
+
+```sql
+SELECT '2026-02-30'::date;
+-- ERROR:  date/time field value out of range: "2026-02-30"
+SELECT '13/01/2026'::date;
+-- ERROR:  date/time field value out of range: "13/01/2026"
+-- HINT:  Perhaps you need a different "DateStyle" setting.
+```
+
+The second one is a day-first date read with the default `DateStyle` of `ISO, MDY`. Send ISO 8601 (`2026-01-13`), or parse explicitly with `to_date('13/01/2026', 'DD/MM/YYYY')`.
+
+## Cause 1: empty strings from forms and APIs
+
+An empty form field usually reaches the database as `''`, not `NULL`. Postgres does not convert one into the other:
+
+```sql
+SELECT ''::integer;
+-- ERROR:  invalid input syntax for type integer: ""
+```
+
+Fix it where the value is created, by sending `null` for missing numbers. If you cannot, convert in SQL:
+
+```sql
+INSERT INTO orders (qty) VALUES (NULLIF($1, '')::integer);
+```
+
+`NULLIF($1, '')` returns NULL when the parameter is an empty string, and casting NULL to any type is allowed.
+
+## Cause 2: CSV imports with COPY
+
+`COPY` reports the line and column, which makes the bad row easy to find:
+
+```sql
+CREATE TABLE imp (id int, qty int, price numeric);
+
+\copy imp FROM 'orders.csv' WITH (FORMAT csv)
+-- ERROR:  invalid input syntax for type integer: ""
+-- CONTEXT:  COPY imp, line 2, column qty: ""
+```
+
+In CSV format, an unquoted empty field is NULL, but a quoted empty field `""` is an empty string. Spreadsheets and export tools often quote every field. `FORCE_NULL` tells `COPY` to treat quoted empty strings as NULL for the listed columns:
+
+```sql
+\copy imp FROM 'orders.csv' WITH (FORMAT csv, FORCE_NULL (qty))
+```
+
+For values that are actually wrong, such as `n/a`, PostgreSQL 17 added `ON_ERROR ignore`, which skips rows that fail type conversion instead of aborting the whole load:
+
+```sql
+\copy imp FROM 'orders.csv' WITH (FORMAT csv, ON_ERROR ignore, LOG_VERBOSITY verbose)
+-- NOTICE:  skipping row due to data type incompatibility at line 2 for column "qty": "n/a"
+-- NOTICE:  skipping row due to data type incompatibility at line 3 for column "price": "abc"
+-- NOTICE:  2 rows were skipped due to data type incompatibility
+-- COPY 1
+```
+
+PostgreSQL 18 adds `REJECT_LIMIT`, so a file with too many bad rows still fails instead of loading quietly with large gaps:
+
+```sql
+\copy imp FROM 'orders.csv' WITH (FORMAT csv, ON_ERROR ignore, REJECT_LIMIT 10)
+-- ERROR:  skipped more than REJECT_LIMIT (10) rows due to data type incompatibility
+```
+
+Skipped rows are gone, so for important data the safer pattern is to load into a staging table where every column is `text`, inspect it, and then insert with explicit conversions.
+
+## Cause 3: converting a text column
+
+Legacy schemas often store numbers in `text` or `varchar` columns. Converting them in one step fails on the first bad row:
+
+```sql
+CREATE TABLE legacy (id int, amount text);
+INSERT INTO legacy VALUES
+  (1, '100'), (2, ' 250 '), (3, ''), (4, 'N/A'), (5, '1,200'), (6, '7.5');
+
+ALTER TABLE legacy ALTER COLUMN amount TYPE integer USING amount::integer;
+-- ERROR:  invalid input syntax for type integer: ""
+```
+
+The error only shows the first bad value. On PostgreSQL 16 and later, `pg_input_is_valid` lists all of them without raising an error:
+
+```sql
+SELECT id, amount
+FROM legacy
+WHERE NOT pg_input_is_valid(amount, 'integer');
+```
+
+```text
+ id | amount
+----+--------
+  3 |
+  4 | N/A
+  5 | 1,200
+  6 | 7.5
+```
+
+Now you can decide what each kind of bad value should become. Here, thousands separators are removed, decimals are kept by moving to `numeric`, and everything else becomes NULL:
+
+```sql
+ALTER TABLE legacy ALTER COLUMN amount TYPE numeric
+USING CASE
+  WHEN pg_input_is_valid(replace(amount, ',', ''), 'numeric')
+  THEN replace(amount, ',', '')::numeric
+END;
+
+SELECT * FROM legacy ORDER BY id;
+```
+
+```text
+ id | amount
+----+--------
+  1 |    100
+  2 |    250
+  3 |
+  4 |
+  5 |   1200
+  6 |    7.5
+```
+
+`pg_input_error_info` also shows the message an invalid value would produce, which helps when several types are involved:
+
+```sql
+SELECT * FROM pg_input_error_info('2026-02-30', 'date');
+--  message: date/time field value out of range: "2026-02-30" | sql_error_code: 22008
+```
+
+On PostgreSQL 15 and earlier, use a regular expression such as `amount ~ '^\s*-?\d+\s*$'` as the test instead.
+
+## Cause 4: filtering text columns in WHERE
+
+A query that casts a text column fails if any row it evaluates is not a number:
+
+```sql
+CREATE TABLE t2 (v text);
+INSERT INTO t2 VALUES ('10'), ('abc');
+
+SELECT * FROM t2 WHERE v::int > 5;
+-- ERROR:  invalid input syntax for type integer: "abc"
+```
+
+Adding a guard with `AND` often seems to work:
+
+```sql
+SELECT * FROM t2 WHERE v ~ '^\d+$' AND v::int > 5;
+```
+
+But SQL does not guarantee the order in which `AND` conditions are evaluated. The planner may reorder them, for example to use an index on the cast expression, and the query can start failing after a plan change. `CASE` does guarantee the order:
+
+```sql
+SELECT * FROM t2
+WHERE CASE WHEN v ~ '^\d+$' THEN v::int > 5 END;
+```
+
+The long-term fix is to store numbers in numeric columns.
+
+## Cause 5: comparing a column to a string parameter
+
+When an application sends every parameter as text, the error appears on the comparison:
+
+```sql
+SELECT * FROM users WHERE id = 'abc';
+-- ERROR:  invalid input syntax for type integer: "abc"
+```
+
+The fix is in the application. Validate input before querying, return a 400-style error for an id that is not a number, and bind parameters with their real types. With UUID primary keys, the same problem shows up as `invalid input syntax for type uuid` when a route like `/users/me` is matched by `/users/:id`.
+
+## Decimals into integers: round explicitly
+
+`'42.5'::integer` fails, but `42.5::numeric::integer` rounds, half away from zero:
+
+```sql
+SELECT '42.5'::numeric::integer, '42.4'::numeric::integer, '-2.5'::numeric::integer;
+--  43 | 42 | -3
+```
+
+If you want truncation, say so with `trunc()`. Silent rounding of money or quantities is a common source of off-by-one bugs.
+
+## Summary
+
+| You see | Likely cause | Fix |
+| --- | --- | --- |
+| `for type integer: ""` | Empty string from a form, API or CSV | `NULLIF(x, '')`, or `FORCE_NULL` in `COPY` |
+| `for type integer: "42.5"` | Decimal into integer | Use `numeric`, or round explicitly |
+| `for type numeric: "1,200"` | Thousands separator or currency sign | `replace()` or `to_number()` |
+| `for type uuid: "me"` | Route or parameter that is not an id | Validate before querying |
+| `for type boolean: "..."` | Unsupported word | Map values with `CASE` |
+| `date/time field value out of range` | Impossible date or day-first format | ISO 8601 or `to_date()` |
+| Many bad rows in a column | Legacy text data | `pg_input_is_valid` to find them, `CASE` to convert |
+
+Data-type errors are easier to find when you can see the offending rows. In [Chat2DB](https://chat2db.ai/download) you can run the `pg_input_is_valid` checks above against a legacy table, look through the bad values in a grid, and ask the AI assistant to write the `USING` clause that converts them the way you decide.
