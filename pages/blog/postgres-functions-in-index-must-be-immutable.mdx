@@ -1,0 +1,246 @@
+---
+title: "Fix Postgres: Functions Must Be Marked IMMUTABLE"
+description: "Fix 'functions in index expression must be marked IMMUTABLE' (42P17) in PostgreSQL: timestamptz casts, to_char, concat, jsonb dates and safe wrapper functions."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: October 22, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# Fix Postgres: Functions Must Be Marked IMMUTABLE
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="October 22, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+You want to speed up a query that filters by day, so you add an expression index:
+
+```sql
+CREATE INDEX ON events ((created_at::date));
+```
+
+```
+ERROR:  functions in index expression must be marked IMMUTABLE
+```
+
+The SQLSTATE is `42P17` (`invalid_object_definition`). Related messages appear for partial index predicates (`functions in index predicate must be marked IMMUTABLE`) and for generated columns (`generation expression is not immutable`). They all have the same cause: the expression's result could change even though the row does not, and PostgreSQL will not store such a value.
+
+This guide explains volatility, shows which everyday expressions are not immutable and why, and gives fixes that keep your index correct. All examples were run on PostgreSQL 18 with this table:
+
+```sql
+CREATE TABLE events (
+  id            bigserial PRIMARY KEY,
+  user_email    text,
+  created_at    timestamptz NOT NULL,
+  created_local timestamp,
+  payload       jsonb,
+  first_name    text,
+  last_name     text
+);
+```
+
+## IMMUTABLE, STABLE and VOLATILE
+
+Every function and operator in PostgreSQL has a volatility class:
+
+- **IMMUTABLE**: always returns the same result for the same arguments, forever. `lower(text)`, `abs()`, `md5()`, `text || text`.
+- **STABLE**: returns the same result within a single statement, but can change between statements because it depends on session settings or the database. `now()`, `to_char()`, `concat()`.
+- **VOLATILE**: can change on every call. `random()`, `clock_timestamp()`, `nextval()`.
+
+An index stores the computed value of its expression for each row. If the expression could later produce a different answer for the same row, the index would point to the wrong rows and queries would silently miss data. So PostgreSQL requires every function in an index expression, index predicate or stored generated column to be IMMUTABLE.
+
+You can check any function's class in `pg_proc`:
+
+```sql
+SELECT proname, provolatile
+FROM pg_proc
+WHERE proname IN ('lower', 'concat', 'to_char', 'now', 'random')
+ORDER BY 1;
+```
+
+`i` means immutable, `s` stable and `v` volatile. Some names have several overloads with different classes; `date_trunc` is a good example, as you will see below.
+
+## Why created_at::date is not immutable
+
+The cast from `timestamptz` to `date` depends on the session's `TimeZone` setting. The same instant falls on different calendar days in different places:
+
+```sql
+SET timezone = 'America/Los_Angeles';
+SELECT created_at, created_at::date FROM events WHERE user_email = 'late@example.com';
+```
+
+```
+       created_at       | created_at
+------------------------+------------
+ 2026-05-31 19:30:00-07 | 2026-05-31
+```
+
+That row was inserted as `2026-06-01 02:30+00`. In UTC its date is June 1; in Los Angeles it is May 31. Because the result depends on a setting, the cast is STABLE, and the index is refused.
+
+The same reasoning rejects many expressions that look harmless:
+
+| Expression | Why it is not immutable |
+| --- | --- |
+| `created_at::date`, `created_at::text` | Depend on `TimeZone` (and `DateStyle` for text) |
+| `extract(year FROM created_at)` | The year boundary depends on `TimeZone` |
+| `date_trunc('day', created_at)` | The two-argument form for `timestamptz` uses the session time zone |
+| `to_char(created_at, 'YYYY-MM')` | Depends on `TimeZone` and `lc_time` |
+| `age(created_at)` | Uses the current date |
+| `concat(first_name, ' ', last_name)` | `concat` is STABLE because it converts arguments with type output functions |
+| `(payload->>'ts')::timestamptz` | Text-to-timestamp parsing depends on `TimeZone` and `DateStyle` |
+| `(payload->>'ts')::timestamp` | Also STABLE: input like `'now'` or `'today'` depends on the current time |
+
+Each one of these fails with `functions in index expression must be marked IMMUTABLE`. So does concatenating text with a non-text value, such as `first_name || ' ' || id`: that `||` operator (`text || anynonarray`) is STABLE for the same reason as `concat`.
+
+## Fix 1: pin the time zone
+
+For dates and timestamps, make the expression independent of the session by naming the time zone explicitly. `timestamptz AT TIME ZONE 'UTC'` returns a plain `timestamp`, and from there the cast to `date` is immutable:
+
+```sql
+CREATE INDEX events_utc_day ON events (((created_at AT TIME ZONE 'UTC')::date));
+```
+
+This succeeds. PostgreSQL 12 and later also have a three-argument `date_trunc` that takes the zone and is immutable:
+
+```sql
+CREATE INDEX ON events ((date_trunc('day', created_at, 'UTC')));
+CREATE INDEX ON events ((extract(year FROM created_at AT TIME ZONE 'UTC')));
+```
+
+The important part is that **queries must use the same expression** to benefit from the index:
+
+```sql
+EXPLAIN (COSTS OFF)
+SELECT * FROM events WHERE (created_at AT TIME ZONE 'UTC')::date = '2026-02-01';
+```
+
+```
+Index Scan using events_utc_day on events
+  Index Cond: (((created_at AT TIME ZONE 'UTC'::text))::date = '2026-02-01'::date)
+```
+
+`WHERE created_at::date = '2026-02-01'` does not match the indexed expression and falls back to a sequential scan.
+
+If your business really uses one local time zone, pin that one instead, for example `AT TIME ZONE 'Europe/Berlin'`. Time zone rules can change when the tz database is updated, which in theory affects stored values; for UTC that never happens.
+
+Columns of type `timestamp` (without time zone) do not have this problem: `created_local::date` and `date_trunc('day', created_local)` are immutable and can be indexed directly.
+
+## Fix 2: index the column and rewrite the query
+
+Often you do not need an expression index at all. A plain B-tree index on `created_at` answers "all events on February 1" if you write the filter as a range:
+
+```sql
+CREATE INDEX events_created_at ON events (created_at);
+
+EXPLAIN (COSTS OFF)
+SELECT * FROM events
+WHERE created_at >= '2026-02-01 00:00+00'
+  AND created_at <  '2026-02-02 00:00+00';
+```
+
+```
+Index Scan using events_created_at on events
+  Index Cond: ((created_at >= '2026-02-01 00:00:00+00'::timestamp with time zone) AND (created_at < '2026-02-02 00:00:00+00'::timestamp with time zone))
+```
+
+The same index serves ranges of hours, weeks or months, so this is usually the best choice. Use an expression index when you group or join by the derived value, not just filter by it.
+
+## Fix 3: use immutable operators and explicit casts for text
+
+For string expressions, avoid `concat()` and mixed-type `||`. The `text || text` operator is immutable, and casts from integers to text are immutable, so spell the expression out:
+
+```sql
+CREATE INDEX ON events ((first_name || ' ' || last_name));   -- works
+CREATE INDEX ON events ((first_name || ' ' || id::text));    -- works
+CREATE INDEX ON events ((first_name || ' ' || id));          -- fails: text || bigint is STABLE
+```
+
+`coalesce`, `lower`, `upper`, `md5` and `->>` on `jsonb` are all fine:
+
+```sql
+CREATE INDEX ON events ((lower(user_email)));
+CREATE INDEX ON events ((payload->>'ts'));
+CREATE INDEX ON events (((payload->>'amount')::int));
+```
+
+The last one works because text-to-integer conversion does not depend on any setting.
+
+## Fix 4: a wrapper function, but only when it is truly immutable
+
+You can create your own function and declare it IMMUTABLE. PostgreSQL trusts the declaration and does not verify it. That is useful when the function really is immutable but uses something PostgreSQL cannot prove, such as a fixed time zone:
+
+```sql
+CREATE FUNCTION utc_day(ts timestamptz) RETURNS date
+LANGUAGE sql IMMUTABLE PARALLEL SAFE
+AS $$ SELECT (ts AT TIME ZONE 'UTC')::date $$;
+
+CREATE INDEX ON events (utc_day(created_at));
+```
+
+It is dangerous when you use it to hide a dependency. Here is a wrapper that lies:
+
+```sql
+CREATE FUNCTION day_of(ts timestamptz) RETURNS date
+LANGUAGE sql IMMUTABLE AS $$ SELECT ts::date $$;   -- not really immutable
+
+SET timezone = 'UTC';
+INSERT INTO events (user_email, created_at) VALUES ('late@example.com', '2026-06-01 02:30+00');
+CREATE INDEX events_day_of ON events (day_of(created_at));
+```
+
+The index was built in UTC, so it stores June 1 for that row. Now a session in Los Angeles asks for May 31:
+
+```sql
+SET timezone = 'America/Los_Angeles';
+
+-- planner uses the index
+SELECT count(*) FROM events
+WHERE day_of(created_at) = '2026-05-31' AND user_email = 'late@example.com';
+-- 0
+
+-- same query with index scans disabled
+SELECT count(*) FROM events
+WHERE day_of(created_at) = '2026-05-31' AND user_email = 'late@example.com';
+-- 1
+```
+
+The same query returns different results depending on the plan. No error is raised; the data is simply wrong. Only mark a function IMMUTABLE if its result depends on nothing but its arguments.
+
+The same applies to `to_char`-based wrappers (they depend on `lc_time`) and to extensions like `unaccent`, whose result depends on a dictionary that can change. For `unaccent`, the common pattern is a wrapper that passes the dictionary explicitly, for example `unaccent('public.unaccent', text)`, and you accept that changing the dictionary requires a `REINDEX`.
+
+## Generated columns and partial indexes
+
+Stored generated columns follow the same rule, with a different message:
+
+```sql
+ALTER TABLE events ADD COLUMN created_day date
+  GENERATED ALWAYS AS (created_at::date) STORED;
+-- ERROR:  generation expression is not immutable
+
+ALTER TABLE events ADD COLUMN created_day date
+  GENERATED ALWAYS AS ((created_at AT TIME ZONE 'UTC')::date) STORED;
+-- works
+```
+
+A partial index predicate cannot use `now()`, because "the last 30 days" moves every second:
+
+```sql
+CREATE INDEX ON events (created_at) WHERE created_at > now() - interval '30 days';
+-- ERROR:  functions in index predicate must be marked IMMUTABLE
+```
+
+Use a fixed boundary instead (`WHERE created_at > '2026-10-01'`) and recreate the index periodically, or rely on a plain index on `created_at` or on partitioning by time.
+
+## Checking an expression before you index it
+
+Two quick ways to test whether an expression is acceptable:
+
+- Try it as a generated column on a scratch table; the error tells you immediately.
+- Look up each function and operator: `SELECT provolatile FROM pg_proc WHERE oid = 'to_char(timestamptz, text)'::regprocedure;` and, for operators, join `pg_operator.oprcode` to `pg_proc`.
+
+When you work in a client such as [Chat2DB](https://chat2db.ai/download), you can also ask its AI assistant why an index definition is rejected; it explains which function is STABLE and suggests an equivalent immutable expression or a range query that uses a plain index.
+
+## Summary
+
+`functions in index expression must be marked IMMUTABLE` means part of your expression depends on something other than the row: the time zone, locale, date style or the current time. For timestamps, pin the zone with `AT TIME ZONE 'UTC'` or the three-argument `date_trunc`, or index the column and filter by range. For text, use `||` with explicit casts instead of `concat`. Write your own IMMUTABLE wrapper only when the result truly depends on its arguments alone, because a wrapper that lies produces an index that silently returns wrong answers.

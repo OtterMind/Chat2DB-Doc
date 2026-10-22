@@ -1,0 +1,254 @@
+---
+title: "Fix MySQL Error 1136: Column Count Doesn't Match"
+description: "Fix MySQL ERROR 1136 (21S01) 'Column count doesn't match value count at row 1': column lists, multi-row inserts, INSERT ... SELECT, triggers and schema drift."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: October 22, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# Fix MySQL Error 1136: Column Count Doesn't Match
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="October 22, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+```
+ERROR 1136 (21S01): Column count doesn't match value count at row 1
+```
+
+MySQL raises error 1136 when an `INSERT` or `REPLACE` supplies a different number of values than the number of columns it is writing to. The SQLSTATE is `21S01`. The message is precise once you know how to read it, and the fix is almost always to add or correct the column list. This guide walks through every way to trigger it, including two that are easy to miss: multi-row inserts and triggers. All examples were run on MySQL 8.4.
+
+## The table
+
+```sql
+CREATE DATABASE shop;
+USE shop;
+
+CREATE TABLE customers (
+  id         int AUTO_INCREMENT PRIMARY KEY,
+  name       varchar(50) NOT NULL,
+  email      varchar(100),
+  created_at datetime DEFAULT CURRENT_TIMESTAMP
+);
+```
+
+The table has four columns. Keep that number in mind: it is what MySQL counts against when you leave the column list out.
+
+## Cause 1: no column list
+
+```sql
+INSERT INTO customers VALUES ('Ada', 'ada@example.com');
+```
+
+```
+ERROR 1136 (21S01): Column count doesn't match value count at row 1
+```
+
+Without a column list, MySQL expects a value for **every** column in table order, including `id` and `created_at`. It does not skip columns that have defaults or `AUTO_INCREMENT`. Two values for four columns is a mismatch.
+
+The best fix is to name the columns you are setting. The rest get their defaults:
+
+```sql
+INSERT INTO customers (name, email) VALUES ('Ada', 'ada@example.com');
+```
+
+If you really want to omit the list, supply all four values and use `DEFAULT` (or `NULL` for the auto-increment column) where you want MySQL to fill in the value:
+
+```sql
+INSERT INTO customers VALUES (DEFAULT, 'Barbara', 'bl@example.com', DEFAULT);
+INSERT INTO customers VALUES (NULL, 'Margaret', 'mh@example.com', DEFAULT);
+```
+
+Both work, but they break the next time someone adds a column. An explicit column list is also self-documenting, so it is worth writing even when the counts happen to match today.
+
+To see the exact columns and their order, query the data dictionary:
+
+```sql
+SELECT GROUP_CONCAT(column_name ORDER BY ordinal_position)
+FROM information_schema.columns
+WHERE table_schema = 'shop' AND table_name = 'customers';
+-- id,name,email,created_at
+```
+
+`SHOW CREATE TABLE customers;` or `DESCRIBE customers;` give the same information with types.
+
+## Cause 2: too many or too few values for the column list
+
+The column list and the values must have the same length:
+
+```sql
+INSERT INTO customers (name, email) VALUES ('Ada', 'ada@example.com', NOW());
+-- ERROR 1136 (21S01): Column count doesn't match value count at row 1
+
+INSERT INTO customers (name, email) VALUES ('Ada');
+-- ERROR 1136 (21S01): Column count doesn't match value count at row 1
+```
+
+In the first statement, the extra `NOW()` was meant for `created_at`, which is missing from the column list. Either add `created_at` to the list or drop the value and let the default apply.
+
+## Cause 3: one bad row in a multi-row insert
+
+The "row" in the message is the position of the tuple inside the `VALUES` clause, starting at 1. That makes it easy to find the broken one in a long batch:
+
+```sql
+INSERT INTO customers (name, email) VALUES
+  ('Ada', 'ada@example.com'),
+  ('Linus');
+-- ERROR 1136 (21S01): Column count doesn't match value count at row 2
+
+INSERT INTO customers (name, email) VALUES
+  ('Ada', 'ada@example.com'),
+  ('Linus', 'linus@example.com'),
+  ('Grace');
+-- ERROR 1136 (21S01): Column count doesn't match value count at row 3
+```
+
+Every row must have the same number of values. MySQL checks the tuples before it writes anything, so **no rows** from the batch are inserted, not even the valid ones. Fix the tuple the message points to and rerun the whole statement.
+
+This variant is common in generated SQL: a script that builds `VALUES` lists from a CSV produces a short row whenever a line has an empty trailing field or an unescaped delimiter.
+
+## Cause 4: a comma inside a value
+
+A comma that should be part of a string but is outside the quotes splits one value into two:
+
+```sql
+INSERT INTO customers (name, email) VALUES ('Smith', 'John', 'js@example.com');
+-- ERROR 1136 (21S01): Column count doesn't match value count at row 1
+
+INSERT INTO customers (name, email) VALUES ('Smith, John', 'js@example.com');
+-- Query OK
+```
+
+The same happens when values are concatenated into SQL from user input or a CSV file. Use prepared statements with placeholders instead: the driver sends each value separately, so commas and quotes inside a value can never change the number of values (and the query is safe from SQL injection). For bulk loads from files, `LOAD DATA` with proper `FIELDS TERMINATED BY` and `ENCLOSED BY` settings handles quoting for you.
+
+## Cause 5: INSERT ... SELECT with a different number of columns
+
+When the values come from a query, the select list must match the target columns:
+
+```sql
+CREATE TABLE customers_archive LIKE customers;
+ALTER TABLE customers_archive ADD COLUMN archived_at datetime;
+
+INSERT INTO customers_archive SELECT * FROM customers;
+-- ERROR 1136 (21S01): Column count doesn't match value count at row 1
+```
+
+The archive table has five columns and `SELECT *` returns four. You can add the missing value in the select list, which works because the new column is last:
+
+```sql
+INSERT INTO customers_archive SELECT *, NOW() FROM customers;
+```
+
+The safer version names both sides, so it keeps working if either table changes:
+
+```sql
+INSERT INTO customers_archive (id, name, email, created_at, archived_at)
+SELECT id, name, email, created_at, NOW()
+FROM customers;
+```
+
+`SELECT *` in `INSERT ... SELECT` is the most common source of 1136 errors after a schema change: the statement worked for months, then a migration added a column to one table and not the other.
+
+## Cause 6: a trigger with its own INSERT
+
+Sometimes the `INSERT` in the error message is correct, and the problem is somewhere you cannot see:
+
+```sql
+CREATE TABLE audit (
+  id          int AUTO_INCREMENT PRIMARY KEY,
+  customer_id int,
+  action      varchar(20),
+  at          datetime
+);
+
+CREATE TRIGGER trg_ai AFTER INSERT ON customers
+FOR EACH ROW
+  INSERT INTO audit VALUES (NEW.id, 'insert', NOW());
+
+INSERT INTO customers (name, email) VALUES ('Trigger', 't@example.com');
+```
+
+```
+ERROR 1136 (21S01): Column count doesn't match value count at row 1
+```
+
+The `INSERT INTO customers` is fine. The trigger's `INSERT INTO audit` supplies three values for a four-column table. MySQL accepted the trigger when it was created, because the body is only checked when it runs, and the error makes the whole statement fail, so the customer row is not inserted either.
+
+If an insert that looks correct fails with 1136, list the triggers on the table:
+
+```sql
+SHOW TRIGGERS FROM shop WHERE `Table` = 'customers';
+```
+
+Then fix the trigger body with an explicit column list:
+
+```sql
+DROP TRIGGER trg_ai;
+
+CREATE TRIGGER trg_ai AFTER INSERT ON customers
+FOR EACH ROW
+  INSERT INTO audit (customer_id, action, at) VALUES (NEW.id, 'insert', NOW());
+```
+
+Stored procedures behave the same way: an `INSERT` inside a procedure is checked only when the procedure executes.
+
+After fixing the trigger, the next insert succeeds and the audit row appears. Look at the ids, though:
+
+```sql
+INSERT INTO customers (name, email) VALUES ('Trigger', 't@example.com');
+SELECT * FROM audit;
+```
+
+```
++----+-------------+--------+---------------------+
+| id | customer_id | action | at                  |
++----+-------------+--------+---------------------+
+|  1 |          10 | insert | 2026-10-22 23:32:44 |
++----+-------------+--------+---------------------+
+```
+
+The new customer got id 10, not 9. The failed attempt had already reserved an `AUTO_INCREMENT` value before the trigger raised the error, and InnoDB does not give reserved values back when a statement fails. Gaps like this are normal and harmless; do not try to "fix" them by resetting the counter.
+
+## Cause 7: REPLACE and INSERT ... SET
+
+`REPLACE` follows the same rules as `INSERT`:
+
+```sql
+REPLACE INTO customers VALUES (1, 'Ada L');
+-- ERROR 1136 (21S01): Column count doesn't match value count at row 1
+```
+
+If you set only a few columns, the `INSERT ... SET` form avoids counting altogether, because each value sits next to its column name:
+
+```sql
+INSERT INTO customers SET name = 'Alan', email = 'alan@example.com';
+```
+
+It is MySQL-specific, but it makes long inserts much easier to review.
+
+## How ORMs and migrations cause it
+
+In application code, error 1136 usually means the code and the schema disagree:
+
+- **Raw SQL with `VALUES` and no column list** in a repository class, written when the table had fewer columns.
+- **Migrations applied in a different order** on two environments, so `INSERT ... SELECT *` between tables works in staging and fails in production.
+- **Seed or fixture files** generated from an old schema.
+
+The fix is the same in every case: list the columns explicitly. When you are not sure what the live schema looks like, compare it against what the code expects. A database client such as [Chat2DB](https://chat2db.ai/download) shows each table's columns side by side with your query, and its AI assistant can rewrite an `INSERT` with the correct column list for the current table definition.
+
+## Quick reference
+
+| Symptom | Cause | Fix |
+| --- | --- | --- |
+| `INSERT INTO t VALUES (...)` fails | Fewer values than table columns | Add a column list |
+| Column list present, still fails | List and values have different lengths | Match them one to one |
+| `at row N` with N greater than 1 | One tuple in a multi-row insert is short or long | Fix tuple N; nothing was inserted |
+| Value contains a comma | Value split by an unquoted comma | Quote it, or use placeholders |
+| `INSERT ... SELECT *` fails | Tables have different column counts | Name columns on both sides |
+| A correct-looking insert fails | Trigger or procedure inserts with the wrong count | Fix the trigger body |
+
+## Summary
+
+MySQL error 1136 means the number of values does not match the number of target columns, and `at row N` tells you which tuple is wrong. Without a column list, MySQL counts every column in the table, including auto-increment and defaulted ones. Name your columns in every `INSERT`, `REPLACE` and `INSERT ... SELECT`, use placeholders instead of string-built `VALUES`, and check triggers when the statement in the error looks correct.

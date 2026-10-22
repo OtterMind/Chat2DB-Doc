@@ -1,0 +1,322 @@
+---
+title: "MySQL Error 1242: Subquery Returns More Than 1 Row"
+description: "Fix MySQL ERROR 1242 (21000) 'Subquery returns more than 1 row' in SELECT, WHERE, UPDATE and SET with IN, ANY, aggregates, ORDER BY LIMIT, joins or LATERAL."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: October 22, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# MySQL Error 1242: Subquery Returns More Than 1 Row
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="October 22, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+```
+ERROR 1242 (21000): Subquery returns more than 1 row
+```
+
+MySQL raises error 1242 when a subquery is used where a **single value** is expected, such as after `=`, in a select list or on the right side of `SET`, and at run time it returns two or more rows. The SQLSTATE is `21000` (cardinality violation). The query is syntactically fine; it is the data that breaks it, which is why this error often appears suddenly in code that has worked for months.
+
+This guide shows the common places it occurs and the right fix for each: `IN`, `ANY` and `ALL`, aggregates, `ORDER BY ... LIMIT 1`, joins, `LATERAL` and window functions. All examples were run on MySQL 8.4.
+
+## Sample data
+
+```sql
+CREATE TABLE customers (
+  id    int AUTO_INCREMENT PRIMARY KEY,
+  name  varchar(50) NOT NULL,
+  email varchar(100)
+);
+INSERT INTO customers (name, email) VALUES
+  ('Ada', 'ada@example.com'), ('Linus', 'linus@example.com'), ('Grace', 'grace@example.com');
+
+CREATE TABLE orders (
+  id          int AUTO_INCREMENT PRIMARY KEY,
+  customer_id int NOT NULL,
+  total       decimal(10,2),
+  status      varchar(20),
+  created_at  datetime
+);
+INSERT INTO orders (customer_id, total, status, created_at) VALUES
+  (1, 120.00, 'paid',     '2026-10-01 10:00'),
+  (1,  80.00, 'paid',     '2026-10-05 12:00'),
+  (2,  45.50, 'pending',  '2026-10-06 09:00'),
+  (3, 300.00, 'paid',     '2026-10-07 15:30'),
+  (3,  20.00, 'refunded', '2026-10-08 11:00');
+
+CREATE TABLE customer_emails (
+  customer_id int,
+  email       varchar(100),
+  is_primary  tinyint
+);
+INSERT INTO customer_emails VALUES
+  (1, 'ada@example.com', 1), (1, 'ada@work.example', 0), (2, 'linus@example.com', 1);
+```
+
+Customers 1 and 3 have two orders each, and customer 1 has two email addresses. Those duplicates are what trigger the error below.
+
+## Case 1: comparing with = in WHERE
+
+```sql
+SELECT * FROM customers
+WHERE id = (SELECT customer_id FROM orders WHERE status = 'paid');
+```
+
+```
+ERROR 1242 (21000): Subquery returns more than 1 row
+```
+
+Three orders are paid, so the subquery returns three `customer_id` values, and `id = (three values)` has no meaning. The same query with `status = 'pending'` works, because only one order is pending. That is the data dependence: the bug was always there, and it surfaces when a second matching row appears.
+
+If you want customers that match **any** of the values, use `IN`:
+
+```sql
+SELECT * FROM customers
+WHERE id IN (SELECT customer_id FROM orders WHERE status = 'paid');
+```
+
+```
++----+-------+-------------------+
+| id | name  | email             |
++----+-------+-------------------+
+|  1 | Ada   | ada@example.com   |
+|  3 | Grace | grace@example.com |
++----+-------+-------------------+
+```
+
+`= ANY (subquery)` is equivalent to `IN`. Note that Ada appears once even though she has two paid orders: `IN` tests membership, it does not join. For large subqueries, `EXISTS` expresses the same thing and is often what the optimizer turns `IN` into anyway:
+
+```sql
+SELECT * FROM customers c
+WHERE EXISTS (SELECT 1 FROM orders o WHERE o.customer_id = c.id AND o.status = 'paid');
+```
+
+## Case 2: comparing with greater than or less than
+
+```sql
+SELECT * FROM orders
+WHERE total > (SELECT total FROM orders WHERE status = 'paid');
+-- ERROR 1242 (21000): Subquery returns more than 1 row
+```
+
+Decide what you are comparing against. "Greater than every paid order" and "greater than at least one" are different questions, and SQL has a keyword for each:
+
+```sql
+-- larger than every pending order
+SELECT * FROM orders
+WHERE total > ALL (SELECT total FROM orders WHERE status = 'pending');
+
+-- the same thing with an aggregate, often clearer
+SELECT * FROM orders
+WHERE total > (SELECT MAX(total) FROM orders WHERE status = 'pending');
+```
+
+Use `> ANY` or `> MIN(...)` for "larger than at least one". One difference to remember: if the subquery returns no rows, `> ALL` is true for every row, while `> (SELECT MAX(...))` compares with `NULL` and returns nothing.
+
+## Case 3: a scalar subquery in the select list
+
+A correlated subquery that fetches one value per row is a common pattern:
+
+```sql
+SELECT c.id, c.name,
+       (SELECT o.total FROM orders o WHERE o.customer_id = c.id) AS last_total
+FROM customers c;
+-- ERROR 1242 (21000): Subquery returns more than 1 row
+```
+
+The intent is "the total of the customer's latest order", but the subquery returns all of their orders. Make it return exactly one row by sorting and limiting:
+
+```sql
+SELECT c.id, c.name,
+       (SELECT o.total
+          FROM orders o
+         WHERE o.customer_id = c.id
+         ORDER BY o.created_at DESC
+         LIMIT 1) AS last_total
+FROM customers c;
+```
+
+```
++----+-------+------------+
+| id | name  | last_total |
++----+-------+------------+
+|  1 | Ada   |      80.00 |
+|  2 | Linus |      45.50 |
+|  3 | Grace |      20.00 |
++----+-------+------------+
+```
+
+**Always pair `LIMIT 1` with `ORDER BY`.** `SELECT ... LIMIT 1` without an order makes the error go away, but MySQL is free to return any of the matching rows, and the one you get can change after an index is added or the table is rebuilt. That replaces a loud error with a silent bug.
+
+If you want all the values, aggregate them instead. `GROUP_CONCAT` returns one string per customer:
+
+```sql
+SELECT c.id,
+       (SELECT GROUP_CONCAT(email ORDER BY is_primary DESC SEPARATOR ', ')
+          FROM customer_emails e WHERE e.customer_id = c.id) AS emails
+FROM customers c;
+```
+
+```
++----+-----------------------------------+
+| id | emails                            |
++----+-----------------------------------+
+|  1 | ada@example.com, ada@work.example |
+|  2 | linus@example.com                 |
+|  3 | NULL                              |
++----+-----------------------------------+
+```
+
+`JSON_ARRAYAGG(email)` does the same if your application prefers a JSON array.
+
+## Case 4: UPDATE ... SET col = (subquery)
+
+```sql
+UPDATE customers
+SET email = (SELECT email FROM customer_emails e WHERE e.customer_id = customers.id);
+-- ERROR 1242 (21000): Subquery returns more than 1 row
+```
+
+Customer 1 has two addresses, so MySQL cannot decide which one to write. The whole statement fails and no rows are changed. Add the condition that identifies the one row you want:
+
+```sql
+UPDATE customers
+SET email = (SELECT email FROM customer_emails e
+             WHERE e.customer_id = customers.id AND e.is_primary = 1);
+```
+
+Or use MySQL's multi-table `UPDATE`, which is usually faster and makes the join explicit:
+
+```sql
+UPDATE customers c
+JOIN customer_emails e ON e.customer_id = c.id AND e.is_primary = 1
+SET c.email = e.email;
+```
+
+Be aware that the join form does not fail when there are duplicates: if two rows matched, MySQL would update the customer once with one of them. The condition in the `ON` clause has to make the match unique. A `UNIQUE` index that enforces "one primary email per customer" is the real fix, because it stops the duplicates from appearing in the first place.
+
+## Case 5: INSERT ... VALUES and variables
+
+The error also appears outside queries, anywhere a subquery stands in for a single value:
+
+```sql
+INSERT INTO audit (customer_id, action, at)
+VALUES ((SELECT customer_id FROM orders WHERE status = 'paid'), 'x', NOW());
+-- ERROR 1242 (21000): Subquery returns more than 1 row
+
+SET @cid = (SELECT customer_id FROM orders WHERE status = 'paid');
+-- ERROR 1242 (21000): Subquery returns more than 1 row
+```
+
+For inserting one row per match, use `INSERT ... SELECT` instead of `VALUES`:
+
+```sql
+INSERT INTO audit (customer_id, action, at)
+SELECT customer_id, 'paid-order', NOW() FROM orders WHERE status = 'paid';
+```
+
+The `SELECT ... INTO` form of variable assignment has its own error number for the same problem:
+
+```sql
+SELECT customer_id INTO @cid FROM orders WHERE status = 'paid';
+-- ERROR 1172 (42000): Result consisted of more than one row
+```
+
+In stored procedures, you will see 1172 from `SELECT ... INTO` and 1242 from `SET var = (subquery)`. Both are fixed the same way.
+
+## Case 6: row constructors
+
+Comparing several columns at once with a subquery also requires a single row:
+
+```sql
+SELECT * FROM customers
+WHERE (id, name) = (SELECT customer_id, 'Ada' FROM orders WHERE status = 'paid');
+-- ERROR 1242 (21000): Subquery returns more than 1 row
+```
+
+Use `(id, name) IN (SELECT ...)` for membership.
+
+## Better alternatives to correlated scalar subqueries
+
+For "latest order per customer", a join is usually clearer and scales better than a subquery in the select list. MySQL 8.0.14 and later support `LATERAL` derived tables:
+
+```sql
+SELECT c.id, c.name, x.total AS last_total
+FROM customers c
+LEFT JOIN LATERAL (
+  SELECT o.total
+  FROM orders o
+  WHERE o.customer_id = c.id
+  ORDER BY o.created_at DESC
+  LIMIT 1
+) x ON TRUE;
+```
+
+A window function does the same in one pass and lets you return several columns from the chosen row:
+
+```sql
+SELECT id, name, last_total
+FROM (
+  SELECT c.id, c.name, o.total AS last_total,
+         ROW_NUMBER() OVER (PARTITION BY c.id ORDER BY o.created_at DESC) AS rn
+  FROM customers c
+  LEFT JOIN orders o ON o.customer_id = c.id
+) t
+WHERE rn = 1;
+```
+
+Both return the same three rows as the `ORDER BY ... LIMIT 1` version. An index on `orders (customer_id, created_at)` makes all three fast.
+
+## Finding the duplicates
+
+When an existing query starts failing, find the rows that broke the "one row" assumption:
+
+```sql
+SELECT customer_id, COUNT(*)
+FROM customer_emails
+GROUP BY customer_id
+HAVING COUNT(*) > 1;
+```
+
+```
++-------------+----------+
+| customer_id | COUNT(*) |
++-------------+----------+
+|           1 |        2 |
++-------------+----------+
+```
+
+Then decide whether the data is wrong (add a unique constraint and clean it up) or the query is wrong (use one of the fixes above). Running the inner query on its own, with the outer values filled in, is the fastest way to see what it returns. In [Chat2DB](https://chat2db.ai/download) you can select just the subquery and run it, and the AI assistant can rewrite a failing scalar subquery as a `LATERAL` join or window function for your schema.
+
+## Why it breaks in production but not in development
+
+Error 1242 is a run-time check. MySQL does not analyze whether a subquery *could* return several rows; it raises the error the first time one actually does, for the outer row being processed. A development database with one email per customer never fails. In production, the first customer who adds a second address breaks the page, and only for queries that touch that customer.
+
+That has two consequences. First, tests need data with duplicates, otherwise they cannot catch this class of bug. Second, when you fix it, decide which kind of fix you need:
+
+- **The query is wrong**: the business rule allows several rows, and the query must pick one or handle all of them. Use `ORDER BY ... LIMIT 1`, an aggregate, `IN`, or a join.
+- **The data is wrong**: the business rule says there is only one row, and duplicates slipped in. Clean them up and add a constraint so they cannot come back.
+
+For the second case, MySQL 8.0.13 and later can enforce "at most one primary email per customer" with a functional unique index. The `CASE` expression is `NULL` for non-primary rows, and a unique index allows any number of `NULL` values:
+
+```sql
+ALTER TABLE customer_emails
+  ADD UNIQUE KEY one_primary_email ((CASE WHEN is_primary = 1 THEN customer_id END));
+
+INSERT INTO customer_emails VALUES (1, 'ada2@example.com', 1);
+-- ERROR 1062 (23000): Duplicate entry '1' for key 'customer_emails.one_primary_email'
+
+INSERT INTO customer_emails VALUES (1, 'ada3@example.com', 0);
+-- Query OK: secondary addresses are still allowed
+```
+
+With the constraint in place, `WHERE e.customer_id = c.id AND e.is_primary = 1` can never match more than one row, so the subquery is safe by design rather than by luck.
+
+PostgreSQL reports the same situation as `more than one row returned by a subquery used as an expression`; see [our PostgreSQL guide](/blog/postgres-more-than-one-row-returned-by-subquery) for its variants.
+
+## Summary
+
+MySQL error 1242 means a subquery that must produce one value produced several. Use `IN`, `EXISTS` or `ANY` for membership, `ALL` or an aggregate for comparisons, `ORDER BY ... LIMIT 1` to pick a specific row, `GROUP_CONCAT` or `JSON_ARRAYAGG` to return all values, and `INSERT ... SELECT` or a multi-table `UPDATE` for writes. Avoid `LIMIT 1` without `ORDER BY`, and add unique constraints where the data should only ever have one match.

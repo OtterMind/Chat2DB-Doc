@@ -1,0 +1,262 @@
+---
+title: "Fix Postgres Cannot Change Return Type (42P13)"
+description: "Why CREATE OR REPLACE FUNCTION fails with 'cannot change return type of existing function' in PostgreSQL, and how to drop, recreate and keep views and grants."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: October 22, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# Fix Postgres Cannot Change Return Type (42P13)
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="October 22, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+`CREATE OR REPLACE FUNCTION` looks like it should overwrite whatever is there. It does not. PostgreSQL only lets you replace a function's **body** and some of its properties; the moment you change what it returns, it stops you:
+
+```
+ERROR:  cannot change return type of existing function
+HINT:  Use DROP FUNCTION customer_count() first.
+```
+
+The SQLSTATE is `42P13` (`invalid_function_definition`). The same code covers a family of related messages: renaming an input parameter, removing a default, adding an output column. This guide explains why PostgreSQL refuses, shows each variant, and gives a safe way to make the change in a migration without losing dependent views or privileges. All examples were run on PostgreSQL 18.
+
+## Reproducing the error
+
+```sql
+CREATE TABLE customers (
+  id         int PRIMARY KEY,
+  name       text,
+  email      text,
+  created_at timestamptz DEFAULT now()
+);
+
+CREATE FUNCTION customer_count() RETURNS int
+LANGUAGE sql AS $$ SELECT count(*)::int FROM customers $$;
+```
+
+Later you decide the count should be `bigint`, which is what `count(*)` returns anyway:
+
+```sql
+CREATE OR REPLACE FUNCTION customer_count() RETURNS bigint
+LANGUAGE sql AS $$ SELECT count(*) FROM customers $$;
+```
+
+```
+ERROR:  cannot change return type of existing function
+HINT:  Use DROP FUNCTION customer_count() first.
+```
+
+## Why PostgreSQL refuses
+
+A function is identified by its name and **input** argument types, `customer_count()` here. `CREATE OR REPLACE` finds the existing function with that signature and updates it in place, keeping its OID. Anything else in the database that references the function, such as views, other SQL functions, triggers, column defaults, check constraints and indexes, points at that OID and was validated against the old return type.
+
+If PostgreSQL silently changed `int` to `bigint`, a view built on the function would suddenly produce a column of a different type than its definition says, and a column default could produce values that no longer fit the column. Rather than chase every dependency, PostgreSQL forbids changes that alter the function's external shape. Changing the body, the language, volatility, `SECURITY DEFINER`, cost or `SET` options is fine; changing the shape is not.
+
+## The variants of 42P13
+
+### Changing the columns of RETURNS TABLE or OUT parameters
+
+`RETURNS TABLE (...)` is shorthand for `OUT` parameters, so adding a column changes the row type:
+
+```sql
+CREATE FUNCTION get_customer(p_id int)
+RETURNS TABLE (id int, name text)
+LANGUAGE sql AS $$ SELECT id, name FROM customers WHERE id = p_id $$;
+
+CREATE OR REPLACE FUNCTION get_customer(p_id int)
+RETURNS TABLE (id int, name text, email text)
+LANGUAGE sql AS $$ SELECT id, name, email FROM customers WHERE id = p_id $$;
+```
+
+```
+ERROR:  cannot change return type of existing function
+DETAIL:  Row type defined by OUT parameters is different.
+HINT:  Use DROP FUNCTION get_customer(integer) first.
+```
+
+The `DETAIL` line tells you it was the column list, not the scalar type. Renaming an output column, changing its type, or adding an `OUT` parameter triggers the same message when the function has two or more output columns. A single-column `RETURNS TABLE (x int)` is treated as a plain `SETOF int`, so you can rename its column freely, but changing its type fails with the scalar version of the error (no `DETAIL` line).
+
+### Renaming an input parameter
+
+```sql
+CREATE OR REPLACE FUNCTION get_customer(customer_id int)
+RETURNS TABLE (id int, name text)
+LANGUAGE sql AS $$ SELECT id, name FROM customers WHERE id = customer_id $$;
+```
+
+```
+ERROR:  cannot change name of input parameter "p_id"
+HINT:  Use DROP FUNCTION get_customer(integer) first.
+```
+
+Parameter names are part of the interface because callers can use named notation, `get_customer(p_id => 1)`, which would break after a rename.
+
+### Removing a parameter default
+
+```sql
+CREATE FUNCTION add_tax(amount numeric, rate numeric DEFAULT 0.2)
+RETURNS numeric LANGUAGE sql AS $$ SELECT amount * (1 + rate) $$;
+
+CREATE OR REPLACE FUNCTION add_tax(amount numeric, rate numeric)
+RETURNS numeric LANGUAGE sql AS $$ SELECT amount * (1 + rate) $$;
+```
+
+```
+ERROR:  cannot remove parameter defaults from existing function
+HINT:  Use DROP FUNCTION add_tax(numeric,numeric) first.
+```
+
+Existing calls such as `add_tax(100)` rely on the default. Adding a default to a parameter that had none is allowed.
+
+### Procedures and output parameters
+
+Procedures have their own version:
+
+```sql
+CREATE OR REPLACE PROCEDURE p1(a int) LANGUAGE sql AS $$ SELECT 1 $$;
+CREATE OR REPLACE PROCEDURE p1(a int, OUT b int)
+LANGUAGE plpgsql AS $$ BEGIN b := 1; END $$;
+```
+
+```
+ERROR:  cannot change whether a procedure has output parameters
+HINT:  Use DROP PROCEDURE p1(integer) first.
+```
+
+## What CREATE OR REPLACE can and cannot change
+
+It helps to know the rules before you write the migration. Everything in the left column can be done with `CREATE OR REPLACE`; everything in the right column needs a drop or a new function name.
+
+| Allowed with CREATE OR REPLACE | Needs DROP FUNCTION first |
+| --- | --- |
+| The function body | The scalar return type (`int` to `bigint`) |
+| The language (`sql` to `plpgsql`) | The columns of `RETURNS TABLE` or `OUT` parameters (two or more) |
+| Volatility (`VOLATILE`, `STABLE`, `IMMUTABLE`) | The name of an input parameter |
+| `SECURITY DEFINER` / `INVOKER`, `COST`, `ROWS`, `SET` options | Removing a parameter default |
+| Adding a default to a parameter | Turning a procedure's output parameters on or off |
+| Renaming the only column of a one-column `RETURNS TABLE` | Changing input argument types (this creates an overload instead) |
+
+Changing the owner, the schema or the name of a function is done with `ALTER FUNCTION`, not `CREATE OR REPLACE`, and keeps the OID, so dependents survive. For example, `ALTER FUNCTION customer_count() RENAME TO customer_total;` updates the views that call it, because they reference the function by OID rather than by name.
+
+## The trap: adding an input parameter does not replace anything
+
+If you add an **input** parameter, `CREATE OR REPLACE` succeeds, which feels like the problem is solved. It is not: the signature is different, so PostgreSQL creates a second, overloaded function and leaves the old one in place.
+
+```sql
+CREATE OR REPLACE FUNCTION add_tax(amount numeric, rate numeric DEFAULT 0.2, round_to int DEFAULT 2)
+RETURNS numeric LANGUAGE sql AS $$ SELECT round(amount * (1 + rate), round_to) $$;
+
+SELECT proname, pg_get_function_identity_arguments(oid)
+FROM pg_proc WHERE proname = 'add_tax';
+```
+
+```
+ proname |          pg_get_function_identity_arguments
+---------+-------------------------------------------------------
+ add_tax | amount numeric, rate numeric
+ add_tax | amount numeric, rate numeric, round_to integer
+```
+
+Now both versions match a one-argument call, and existing code breaks:
+
+```sql
+SELECT add_tax(100);
+```
+
+```
+ERROR:  function add_tax(integer) is not unique
+LINE 1: SELECT add_tax(100);
+               ^
+HINT:  Could not choose a best candidate function. You might need to add explicit type casts.
+```
+
+When you change a function's input arguments, drop the old signature explicitly: `DROP FUNCTION add_tax(numeric, numeric);`. After that, `SELECT add_tax(100)` returns `120.0` again.
+
+## The fix: DROP and CREATE in one transaction
+
+The hint is right: drop the function and create it again. Because PostgreSQL DDL is transactional, you can do both atomically so that callers never see the function missing:
+
+```sql
+BEGIN;
+DROP FUNCTION customer_count();
+CREATE FUNCTION customer_count() RETURNS bigint
+LANGUAGE sql AS $$ SELECT count(*) FROM customers $$;
+GRANT EXECUTE ON FUNCTION customer_count() TO web_app;
+COMMIT;
+```
+
+Two things are lost when you drop a function, and the transaction above handles one of them:
+
+1. **Privileges.** `CREATE OR REPLACE` keeps existing grants. `DROP` + `CREATE` produces a new function with default privileges, so any `GRANT EXECUTE` must be repeated. Check the current grants before dropping:
+
+   ```sql
+   SELECT proacl FROM pg_proc WHERE proname = 'customer_count';
+   -- {=X/postgres,postgres=X/postgres,web_app=X/postgres}
+   ```
+
+   After the drop and create, `proacl` is empty (default privileges) until you grant again. Comments (`COMMENT ON FUNCTION`) and ownership changes are also lost.
+
+2. **Dependent objects.** If a view uses the function, the drop fails:
+
+   ```sql
+   CREATE VIEW customer_summary AS SELECT * FROM get_customer(1);
+   DROP FUNCTION get_customer(int);
+   ```
+
+   ```
+   ERROR:  cannot drop function get_customer(integer) because other objects depend on it
+   DETAIL:  view customer_summary depends on function get_customer(integer)
+   HINT:  Use DROP ... CASCADE to drop the dependent objects too.
+   ```
+
+## Handling views and other dependents
+
+`DROP ... CASCADE` removes the dependent views, so you must recreate them in the same transaction. First find out what depends on the function:
+
+```sql
+SELECT DISTINCT v.oid::regclass AS view_name
+FROM pg_depend d
+JOIN pg_rewrite r ON r.oid = d.objid
+JOIN pg_class v ON v.oid = r.ev_class
+WHERE d.refobjid = 'get_customer(int)'::regprocedure;
+```
+
+```
+    view_name
+------------------
+ customer_summary
+```
+
+Save each view's definition with `pg_get_viewdef('customer_summary'::regclass, true)`, then rebuild everything at once:
+
+```sql
+BEGIN;
+DROP FUNCTION get_customer(int) CASCADE;   -- NOTICE:  drop cascades to view customer_summary
+
+CREATE FUNCTION get_customer(p_id int)
+RETURNS TABLE (id int, name text, email text)
+LANGUAGE sql AS $$ SELECT id, name, email FROM customers WHERE id = p_id $$;
+
+CREATE VIEW customer_summary AS SELECT * FROM get_customer(1);
+COMMIT;
+```
+
+Be careful with `CASCADE` on a busy database: it can reach further than you expect (a view on a view, for example), and you only find out from the `NOTICE` lines. Run it in a transaction, read the notices, and roll back if the list is longer than the views you prepared.
+
+For functions used by many objects, it is often simpler to avoid the drop entirely: create the new version under a new name (`get_customer_v2`), move callers over, and drop the old one later.
+
+## Avoiding the problem in future
+
+- **Return a table's row type** when the function returns whole rows. `RETURNS SETOF customers` follows the table: after `ALTER TABLE customers ADD COLUMN phone text`, the function returns the new column without any change, because the row type is the table's.
+- **Pick the final type up front.** `count(*)` is `bigint`, `sum()` of integers is `bigint`, and `avg()` is `numeric`. Declaring the natural type avoids the most common reason for a later change.
+- **Write migrations as `DROP FUNCTION IF EXISTS` + `CREATE FUNCTION`** with the grants and dependent views in the same file, instead of relying on `CREATE OR REPLACE` for signature changes. Tools like Flyway and Liquibase run each migration in a transaction on PostgreSQL by default, which gives you the atomic swap for free.
+- **Always name the argument types in `DROP FUNCTION`**, so you do not drop an overload you did not intend to.
+
+Before changing a function in production, it helps to see its definition, overloads and dependents together. `pg_get_functiondef('customer_count'::regproc)` prints the full `CREATE OR REPLACE` statement. A database client such as [Chat2DB](https://chat2db.ai/download) shows functions and their source in the schema tree, and its AI assistant can generate the drop, recreate and re-grant script for a signature change, which you review before running.
+
+## Summary
+
+`cannot change return type of existing function` (42P13) means you tried to change a function's external shape with `CREATE OR REPLACE`: its return type, its `OUT` or `RETURNS TABLE` columns, its parameter names, or its defaults. PostgreSQL blocks this to protect the views, defaults and other objects that depend on the old shape. Drop and recreate the function in one transaction, re-grant `EXECUTE`, recreate dependent views, and drop old overloads explicitly so a new parameter does not leave two ambiguous versions behind.

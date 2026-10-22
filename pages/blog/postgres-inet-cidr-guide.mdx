@@ -1,0 +1,260 @@
+---
+title: "Postgres inet vs cidr: IP Address Types Explained"
+description: "How PostgreSQL inet and cidr store IPv4 and IPv6 addresses, why 'invalid cidr value' happens, subnet functions, containment operators and GiST indexes."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: October 22, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# Postgres inet vs cidr: IP Address Types Explained
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="October 22, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+Many applications store IP addresses: login audit tables, API rate limiters, firewall allow lists, device inventories. The easy choice is a `varchar(45)` column, and it works until someone asks "which of these requests came from our office network?" At that point you are parsing strings in SQL, and you cannot index the question.
+
+PostgreSQL has two native network address types, `inet` and `cidr`, plus a full set of functions and operators for subnet math. This guide explains the difference between them, the errors you will run into, and how to index containment queries. Every example was run on PostgreSQL 18.
+
+## inet and cidr in one sentence each
+
+- **`inet`** holds a host address and, optionally, the netmask of the network it lives in. `192.168.10.21` and `192.168.10.22/24` are both valid.
+- **`cidr`** holds a network. Every bit to the right of the mask must be zero, so `192.168.10.0/24` is valid but `192.168.10.37/24` is not.
+
+Both types accept IPv4 and IPv6 in the same column, and both take 7 bytes for IPv4 or 19 bytes for IPv6. That is smaller than the text form of most addresses.
+
+## Creating tables
+
+Here is a small inventory of devices and a list of networks that are allowed to reach an internal service:
+
+```sql
+CREATE TABLE devices (
+  id   serial PRIMARY KEY,
+  name text,
+  ip   inet NOT NULL
+);
+
+INSERT INTO devices (name, ip) VALUES
+  ('web-1',          '192.168.10.21'),
+  ('web-2',          '192.168.10.22/24'),
+  ('db-1',           '10.20.0.5'),
+  ('vpn',            '2001:db8::7'),
+  ('office-printer', '192.168.11.40');
+
+CREATE TABLE allowed_networks (
+  id    serial PRIMARY KEY,
+  label text,
+  net   cidr NOT NULL
+);
+
+INSERT INTO allowed_networks (label, net) VALUES
+  ('office',     '192.168.10.0/24'),
+  ('datacenter', '10.20.0.0/16'),
+  ('ipv6-lab',   '2001:db8::/32');
+```
+
+Notice that `web-2` was stored with a `/24`. An `inet` value remembers the mask you gave it, and when there is no mask it is a single host (`/32` for IPv4, `/128` for IPv6).
+
+## The "invalid cidr value" error
+
+Try to store a host address in the `cidr` column:
+
+```sql
+INSERT INTO allowed_networks (label, net) VALUES ('bad', '192.168.10.37/24');
+```
+
+```
+ERROR:  invalid cidr value: "192.168.10.37/24"
+LINE 1: ... INTO allowed_networks (label, net) VALUES ('bad','192.168.1...
+                                                             ^
+DETAIL:  Value has bits set to right of mask.
+```
+
+The SQLSTATE is `22P02` (`invalid_text_representation`). PostgreSQL rejects the value because `.37` is a host bit inside a `/24` network. You have three ways to fix it:
+
+1. **Store the network address instead.** `network()` computes it for you:
+
+   ```sql
+   SELECT network('192.168.10.37/24'::inet);
+   -- 192.168.10.0/24
+   ```
+
+   Casting an `inet` to `cidr` does the same thing: `'192.168.10.21/24'::inet::cidr` returns `192.168.10.0/24`.
+
+2. **Shorten the mask** if you meant a single host: `192.168.10.37/32`.
+
+3. **Use `inet` for the column** if you really want to keep both the host and its mask, for example for an interface address.
+
+When you import data from a CSV, you can check the rows before inserting them. `pg_input_is_valid()` and `pg_input_error_info()` (PostgreSQL 16 and later) test a string without raising an error:
+
+```sql
+SELECT * FROM pg_input_error_info('192.168.10.37/24', 'cidr');
+```
+
+```
+                message                 |               detail                | hint | sql_error_code
+----------------------------------------+-------------------------------------+------+----------------
+ invalid cidr value: "192.168.10.37/24" | Value has bits set to right of mask. |      | 22P02
+```
+
+The other common error is plain bad input. Both of these fail with `invalid input syntax for type inet`:
+
+```sql
+SELECT 'not-an-ip'::inet;
+SELECT '192.168.1.300'::inet;
+```
+
+Leading or trailing spaces are rejected too, so `' 10.0.0.2'` from a sloppy export fails. Trim the text before casting.
+
+## cidr shorthand and classful defaults
+
+The `cidr` type accepts abbreviated input. If you leave out the mask, PostgreSQL infers one from the old address classes, and missing octets are filled with zeros:
+
+```sql
+SELECT '10'::cidr, '192.168'::cidr, '128'::cidr, '10.1.2'::cidr;
+-- 10.0.0.0/8 | 192.168.0.0/24 | 128.0.0.0/16 | 10.1.2.0/24
+```
+
+That is convenient in a psql session but surprising in application code, so always write the mask explicitly. `inet` is stricter: without a mask it requires all four octets, so `'10.1.2'::inet` is an error.
+
+The reverse direction is `abbrev()`, which prints a `cidr` in its shortest form:
+
+```sql
+SELECT abbrev('10.20.0.0/16'::cidr);   -- 10.20/16
+```
+
+## Functions you will use every day
+
+```sql
+SELECT ip, host(ip), masklen(ip), network(ip), broadcast(ip), netmask(ip), family(ip)
+FROM devices ORDER BY id;
+```
+
+```
+        ip        |     host      | masklen |     network      |     broadcast     |                 netmask                 | family
+------------------+---------------+---------+------------------+-------------------+-----------------------------------------+--------
+ 192.168.10.21    | 192.168.10.21 |      32 | 192.168.10.21/32 | 192.168.10.21     | 255.255.255.255                         |      4
+ 192.168.10.22/24 | 192.168.10.22 |      24 | 192.168.10.0/24  | 192.168.10.255/24 | 255.255.255.0                           |      4
+ 10.20.0.5        | 10.20.0.5     |      32 | 10.20.0.5/32     | 10.20.0.5         | 255.255.255.255                         |      4
+ 2001:db8::7      | 2001:db8::7   |     128 | 2001:db8::7/128  | 2001:db8::7       | ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff |      6
+ 192.168.11.40    | 192.168.11.40 |      32 | 192.168.11.40/32 | 192.168.11.40     | 255.255.255.255                         |      4
+```
+
+A few details matter in practice:
+
+- `host()` returns text without the mask. Use it when you need the bare address in output.
+- `text()` always includes the mask: `text('10.0.0.1'::inet)` returns `10.0.0.1/32`. A plain cast `'10.0.0.1'::inet::text` returns the same thing, which is why string comparisons against `ip::text` often fail.
+- `set_masklen()` changes the mask. On `inet` it keeps the host bits (`set_masklen('192.168.10.21/24'::inet, 16)` is `192.168.10.21/16`); on `cidr` it zeroes them (`192.168.0.0/16`).
+- `inet_merge(a, b)` returns the smallest network that contains both addresses: `inet_merge('192.168.10.21', '192.168.11.40')` is `192.168.10.0/23`.
+
+If you want to check any value without opening psql, the free [Postgres inet & cidr calculator](https://chat2db.ai/tools/postgres-inet-cidr-calculator) shows all of these results in the browser and reproduces Postgres error messages exactly.
+
+## Containment operators
+
+This is the reason to use the native types. PostgreSQL defines five subnet operators:
+
+| Operator | Meaning |
+| --- | --- |
+| `a << b` | `a` is strictly contained by `b` |
+| `a <<= b` | `a` is contained by or equal to `b` |
+| `a >> b` | `a` strictly contains `b` |
+| `a >>= b` | `a` contains or equals `b` |
+| `a && b` | either contains the other |
+
+Which devices are on an allowed network?
+
+```sql
+SELECT d.name, d.ip, a.label
+FROM devices d
+LEFT JOIN allowed_networks a ON d.ip <<= a.net
+ORDER BY d.id;
+```
+
+```
+      name      |        ip        |   label
+----------------+------------------+------------
+ web-1          | 192.168.10.21    | office
+ web-2          | 192.168.10.22/24 | office
+ db-1           | 10.20.0.5        | datacenter
+ vpn            | 2001:db8::7      | ipv6-lab
+ office-printer | 192.168.11.40    |
+```
+
+The printer at `192.168.11.40` is outside `192.168.10.0/24`, so it has no match. Mixing IPv4 and IPv6 in one query is safe: an IPv4 address is never contained by an IPv6 network, and the operators simply return false.
+
+Equality is different from containment. `'192.168.10.21'::inet = '192.168.10.21/24'::inet` is **false**, because the masks differ, while `'192.168.10.21'::inet << '192.168.10.0/24'` is true. If you deduplicate addresses, compare `host(ip)` or normalize the mask on insert.
+
+## Indexing containment queries
+
+A B-tree index on an `inet` column supports `=` and ordering, and the planner can use it for `<<` and `<<=` with a constant on the right by turning the condition into a range (`ip >= '192.168.10.0/24' AND ip <= '192.168.10.255'`). For general containment, including joins and `>>=` lookups against a table of networks, use a GiST index with the `inet_ops` operator class:
+
+```sql
+CREATE INDEX devices_ip_gist ON devices USING gist (ip inet_ops);
+
+EXPLAIN (COSTS OFF)
+SELECT * FROM devices WHERE ip <<= '192.168.10.0/24';
+```
+
+```
+Index Scan using devices_ip_gist on devices
+  Index Cond: (ip <<= '192.168.10.0/24'::inet)
+```
+
+(On a five-row table the planner prefers a sequential scan; the plan above was taken with `enable_seqscan = off` to show that the index is usable.) For the "which network does this address belong to" lookup, index the `cidr` column the same way:
+
+```sql
+CREATE INDEX allowed_networks_net_gist ON allowed_networks USING gist (net inet_ops);
+
+SELECT label FROM allowed_networks WHERE net >>= '10.20.3.4';
+```
+
+`inet_ops` is not the default GiST operator class for these types, so you must name it explicitly. Leaving it out fails with:
+
+```
+ERROR:  data type inet has no default operator class for access method "gist"
+HINT:  You must specify an operator class for the index or define a default operator class for the data type.
+```
+
+## Arithmetic and sorting
+
+You can add and subtract integers and compute the distance between two addresses:
+
+```sql
+SELECT '10.0.0.1'::inet + 5,                      -- 10.0.0.6
+       '10.0.0.10'::inet - '10.0.0.1'::inet,     -- 9
+       '192.168.1.5'::inet & '255.255.255.0',     -- 192.168.1.0
+       inet '192.168.0.1' + 256;                  -- 192.168.1.1
+```
+
+Overflowing the address space raises `ERROR: result is out of range` (`'255.255.255.255'::inet + 1`).
+
+Sorting is numeric, not alphabetical, which is another advantage over text. `ORDER BY ip` puts `10.20.0.5` before `192.168.10.22/24`, and all IPv4 values sort before IPv6. Note that `192.168.10.22/24` sorts before `192.168.10.21` because addresses with a shorter mask sort first when their network parts are compared.
+
+## Migrating from a text column
+
+If you already store addresses as text, convert them in place:
+
+```sql
+-- Find rows that will not convert
+SELECT ip FROM devices_text WHERE NOT pg_input_is_valid(trim(ip), 'inet');
+
+-- Convert once the data is clean
+ALTER TABLE devices_text
+  ALTER COLUMN ip TYPE inet USING trim(ip)::inet;
+```
+
+Fix or delete the rows the first query returns before running the `ALTER TABLE`, because a single bad value aborts the whole conversion. On large tables, the `ALTER` rewrites the table under an `ACCESS EXCLUSIVE` lock, so schedule it accordingly.
+
+## inet, cidr or macaddr?
+
+- Use **`inet`** for addresses of clients, servers and devices, including when you want to remember the interface's netmask.
+- Use **`cidr`** for anything that is a network: allow lists, routing tables, GeoIP ranges.
+- Use **`macaddr`** or **`macaddr8`** for hardware addresses; they are separate types with their own functions.
+
+Tools like [Chat2DB](https://chat2db.ai/download) display `inet` and `cidr` columns as readable addresses and let you ask the AI assistant for queries such as "list devices outside every allowed network", which it turns into the `<<=` joins shown above.
+
+## Summary
+
+`inet` stores a host with an optional mask, `cidr` stores a network whose host bits are zero, and the "Value has bits set to right of mask" error is PostgreSQL enforcing that rule. Use `network()` or a cast to `cidr` to normalize values, prefer explicit masks over classful shorthand, use `<<=` and `>>=` for subnet checks, and back them with a GiST index using `inet_ops`. With those pieces, IP questions that are painful with text columns become one indexed query.

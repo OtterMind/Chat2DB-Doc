@@ -1,0 +1,225 @@
+---
+title: "Fix Postgres FATAL: Role Does Not Exist"
+description: "Fix PostgreSQL 'FATAL: role does not exist' and 'role does not exist' (42704): default user names, Docker and Homebrew setups, case-sensitive names and GRANT."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: October 22, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# Fix Postgres FATAL: Role Does Not Exist
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="October 22, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+PostgreSQL reports a missing role in two different situations, and they need different fixes:
+
+```
+psql: error: connection to server on socket "/var/run/postgresql/.s.PGSQL.5432" failed: FATAL:  role "root" does not exist
+```
+
+```
+ERROR:  role "reporting" does not exist
+```
+
+The first, with `FATAL`, happens while you **connect**: the server cannot find the user name the client sent, so the session is refused. The second, with `ERROR`, happens **inside a session** when a statement such as `GRANT`, `ALTER ... OWNER TO` or `SET ROLE` names a role that has not been created. Its SQLSTATE is `42704` (`undefined_object`).
+
+This guide covers both. All commands were run against PostgreSQL 18 in the official Docker image.
+
+## Roles and users are the same thing
+
+PostgreSQL has no separate "user" object. `CREATE USER` is simply `CREATE ROLE` with the `LOGIN` attribute turned on, and every role lives at the cluster level, shared by all databases on the server. So "role does not exist" and "user does not exist" mean the same thing: there is no row for that name in `pg_roles`.
+
+List the roles that do exist:
+
+```sql
+SELECT rolname, rolcanlogin
+FROM pg_roles
+WHERE rolname !~ '^pg_'
+ORDER BY 1;
+```
+
+In psql, `\du` shows the same list with attributes. Check this first, because most cases turn out to be a different name than the one you expected.
+
+## FATAL: role "root" does not exist (or your OS user name)
+
+When you run `psql` without `-U`, it uses your operating system user name as the database role. That is why the error names `root`, `ubuntu`, `ec2-user` or your laptop login:
+
+```
+$ psql
+psql: error: connection to server on socket "/var/run/postgresql/.s.PGSQL.5432" failed: FATAL:  role "root" does not exist
+```
+
+Nothing is wrong with the server. Tell psql which role to use:
+
+```bash
+psql -U postgres
+# or, on Linux packages where only the postgres OS user may connect via peer auth:
+sudo -u postgres psql
+```
+
+If you want plain `psql` to work for your account, create a role with the same name, as a superuser:
+
+```sql
+CREATE ROLE ubuntu LOGIN CREATEDB;
+```
+
+You can also set `PGUSER=postgres` in your shell profile so every client tool picks it up.
+
+## FATAL: role "postgres" does not exist
+
+This version usually comes from installs that never created a role called `postgres`:
+
+- **Homebrew on macOS** initializes the cluster with your macOS user name as the superuser. Scripts that assume `postgres` fail until you create it: `createuser -s postgres`.
+- **Docker** creates the superuser from the `POSTGRES_USER` environment variable. If you started the container with `POSTGRES_USER=app`, the superuser is `app` and there is no `postgres` role.
+- **Managed services** such as Amazon RDS or Azure use the admin name you chose when creating the instance.
+
+The Docker case has a second trap. The image only runs its initialization when the data directory is empty. If you change `POSTGRES_USER` or `POSTGRES_PASSWORD` and restart with an existing volume, nothing is re-created, and the new name does not exist. Either connect with the original name and create the role yourself, or remove the volume (destroying its data) and initialize again.
+
+## Why you sometimes see "password authentication failed" instead
+
+With the official Docker image, connecting to a missing role from another host does not mention the role at all:
+
+```
+psql: error: connection to server at "172.17.0.4", port 5432 failed: FATAL:  password authentication failed for user "app"
+```
+
+That is deliberate. With password authentication (`scram-sha-256` or `md5` in `pg_hba.conf`), PostgreSQL never tells the client whether the user exists, because that would let an attacker probe for valid names. The real reason is only written to the server log:
+
+```
+FATAL:  password authentication failed for user "app"
+DETAIL:  Role "app" does not exist.
+	Connection matched file "/var/lib/postgresql/18/docker/pg_hba.conf" line 128: "host all all all scram-sha-256"
+```
+
+You only see the explicit `role "app" does not exist` message on the client when the matching `pg_hba.conf` line uses `trust` or `peer`, as local connections in the Docker image do. So if a password error makes no sense, check the server log for a `DETAIL: Role ... does not exist` line. Our guide to [password authentication failed](/blog/postgres-password-authentication-failed-fix) covers the other causes of that message.
+
+## Case sensitivity: "App" is not "app"
+
+Unquoted identifiers in SQL are folded to lowercase, quoted ones are kept exactly. Roles follow the same rule:
+
+```sql
+CREATE ROLE Reporting2 LOGIN;   -- creates "reporting2"
+CREATE ROLE "App" LOGIN;        -- creates "App"
+```
+
+On the command line there is no folding. `psql -U App` asks for `App`, and `psql -U app` asks for `app`:
+
+```
+$ psql -U app -d postgres
+psql: error: ... FATAL:  role "app" does not exist
+```
+
+That fails even though `"App"` exists. Find near-matches with a case-insensitive search:
+
+```sql
+SELECT rolname FROM pg_roles WHERE lower(rolname) = lower('APP');
+```
+
+Then either connect with the exact spelling or rename the role to lowercase so nobody has to think about it:
+
+```sql
+ALTER ROLE "App" RENAME TO app_admin;
+```
+
+Note that renaming a role that uses MD5 passwords clears the password, because the MD5 hash includes the role name. SCRAM passwords are not affected.
+
+## The next error: database "app" does not exist
+
+After you create the role, you often hit a second error immediately:
+
+```sql
+CREATE ROLE app LOGIN PASSWORD 'secret';
+```
+
+```
+$ psql -U app
+psql: error: ... FATAL:  database "app" does not exist
+```
+
+The role exists now. psql also defaults the **database** name to the user name, and there is no database called `app`. Pass `-d postgres`, or create a database for the role:
+
+```sql
+CREATE DATABASE app OWNER app;
+```
+
+```
+$ psql -U app -c "SELECT current_user, current_database()"
+ current_user | current_database
+--------------+------------------
+ app          | app
+```
+
+## ERROR: role does not exist inside a session
+
+The non-fatal version appears when a statement refers to a role that is not there:
+
+```sql
+GRANT SELECT ON orders TO reporting;
+-- ERROR:  role "reporting" does not exist
+
+ALTER TABLE orders OWNER TO deploy;
+-- ERROR:  role "deploy" does not exist
+
+SET ROLE analyst;
+-- ERROR:  role "analyst" does not exist
+
+CREATE POLICY p ON orders TO support USING (true);
+-- ERROR:  role "support" does not exist
+
+DROP ROLE ghost;
+-- ERROR:  role "ghost" does not exist
+```
+
+This shows up most often in two places:
+
+1. **Restoring a dump on a new server.** `pg_dump` writes `ALTER ... OWNER TO` and `GRANT` statements for the roles that owned objects on the source, but it does not dump roles, because they belong to the cluster rather than the database. Dump them separately with `pg_dumpall --roles-only` and load that file first, or restore with `pg_restore --no-owner --no-privileges` and assign ownership yourself.
+2. **Migrations that assume a role exists.** A migration written on a developer laptop grants to `readonly`, which exists there but not in CI.
+
+`CREATE ROLE` has no `IF NOT EXISTS` clause; writing it is a syntax error. Make role creation idempotent with a `DO` block instead:
+
+```sql
+DO $$
+BEGIN
+  IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'reporting') THEN
+    CREATE ROLE reporting NOLOGIN;
+  END IF;
+END
+$$;
+
+GRANT SELECT ON orders TO reporting;
+```
+
+`DROP ROLE` does support `IF EXISTS`, which turns the error into a notice:
+
+```
+NOTICE:  role "ghost" does not exist, skipping
+```
+
+## Connection strings and environment variables
+
+When an application reports `FATAL: role ... does not exist`, the name it sent is not always the one in your config file. Check, in order:
+
+- The `user` part of the connection URL (`postgresql://app@db:5432/app`).
+- `PGUSER` in the environment, which libpq-based drivers read when no user is given.
+- A `.pgpass` or service file (`PGSERVICE`) that supplies defaults.
+- Poolers such as PgBouncer, which authenticate the client and then connect to PostgreSQL with their own configured user.
+
+Inside a working session, `SELECT current_user, session_user;` and psql's `\conninfo` show who you really are. A GUI client also makes this visible: [Chat2DB](https://chat2db.ai/download) shows the connected role on each connection and lists roles and their privileges, so you can confirm a role exists before a migration grants to it.
+
+## Quick fixes by symptom
+
+| Message | Likely cause | Fix |
+| --- | --- | --- |
+| `FATAL: role "root"` / OS user | psql defaulted to your OS name | `psql -U postgres` or create that role |
+| `FATAL: role "postgres"` | Homebrew, Docker `POSTGRES_USER`, managed service | Use the real admin name, or `createuser -s postgres` |
+| `password authentication failed`, log says role does not exist | Password auth hides the reason | Create the role or fix the user name |
+| `FATAL: database "x" does not exist` right after creating role `x` | psql defaults the database to the user name | `-d postgres` or `CREATE DATABASE x` |
+| `ERROR: role "x" does not exist` during restore | Dumps do not include roles | `pg_dumpall --roles-only`, or `--no-owner --no-privileges` |
+| Role exists but still "does not exist" | Case mismatch, wrong server or port | Check exact spelling in `pg_roles`, check host and port |
+
+## Summary
+
+"Role does not exist" means PostgreSQL found no role with that exact name in the cluster you reached. At connect time, the culprit is usually a default (your OS user name, a Docker variable, a Homebrew install) or a capitalization mismatch; with password authentication the reason is hidden in the server log. Inside a session, it means a `GRANT`, owner change or restore refers to a role that was never created on this server. Create the role, use the right name, or restore roles before the objects that depend on them.

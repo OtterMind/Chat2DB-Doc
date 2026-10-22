@@ -1,0 +1,282 @@
+---
+title: "Fix Postgres Syntax Error at or Near (42601)"
+description: "Fix PostgreSQL 'syntax error at or near' and 'at end of input' (SQLSTATE 42601): reserved words, quotes, trailing commas, MySQL syntax and placeholders."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: October 22, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# Fix Postgres Syntax Error at or Near (42601)
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="October 22, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+`ERROR: syntax error at or near "..."` is the most common PostgreSQL error message, and one of the least descriptive. It means the parser reached a token it did not expect and gave up. The word in quotes is where it stopped, which is usually right after the real mistake, not at it.
+
+This guide shows how to read the message, then walks through the causes that account for almost every case: reserved words, quoting mix-ups, stray commas, syntax copied from MySQL or SQL Server, and placeholders that never got replaced. All examples were run on PostgreSQL 18 with this table:
+
+```sql
+CREATE TABLE orders (
+  id         serial PRIMARY KEY,
+  customer   text,
+  total      numeric,
+  status     text,
+  created_at timestamptz DEFAULT now()
+);
+```
+
+## How to read the error
+
+```sql
+SELECT id, customer, FROM orders;
+```
+
+```
+ERROR:  syntax error at or near "FROM"
+LINE 1: SELECT id, customer, FROM orders;
+                             ^
+```
+
+Three pieces of information are here:
+
+1. **The token**, `"FROM"`. The parser accepted everything before it.
+2. **The line**, `LINE 1`. In a long script this tells you which line to open.
+3. **The caret**, which points at the exact character position.
+
+The real mistake is the comma before `FROM`: after a comma the parser expects another column, and `FROM` is not one. So the rule of thumb is: **look at the token in the message, then look immediately to its left.**
+
+The SQLSTATE for every variant of this error is `42601` (`syntax_error`). Drivers expose it as the error code, and in psql you can see it with `\set VERBOSITY verbose`:
+
+```
+ERROR:  42601: syntax error at or near "FROM"
+LINE 1: SELECT id, FROM orders;
+                   ^
+LOCATION:  scanner_yyerror, scan.l:1236
+```
+
+## "syntax error at end of input"
+
+The same error without a token means the statement stopped before it was complete:
+
+```sql
+SELECT * FROM orders WHERE
+```
+
+```
+ERROR:  syntax error at end of input
+LINE 1: SELECT * FROM orders WHERE
+                                  ^
+```
+
+Typical causes are a missing closing parenthesis, a dangling `AND`, `WHERE` or `ORDER BY`, or a query string that your application built by concatenation and cut short. With a semicolon at the end, the same mistakes are reported as `at or near ";"`:
+
+```sql
+SELECT * FROM orders WHERE (status = 'paid';
+-- ERROR:  syntax error at or near ";"
+
+SELECT * FROM orders WHERE status = 'paid' AND;
+-- ERROR:  syntax error at or near ";"
+```
+
+## Cause 1: a reserved word used as a name
+
+`order`, `user`, `group`, `limit`, `offset`, `table`, `window` and about 70 other words are fully reserved in PostgreSQL 18. Using one as a table or column name without quotes breaks the parser:
+
+```sql
+CREATE TABLE order (id int);
+-- ERROR:  syntax error at or near "order"
+-- LINE 1: CREATE TABLE order (id int);
+--                      ^
+
+SELECT * FROM order;
+-- ERROR:  syntax error at or near "order"
+```
+
+Fix it by quoting the identifier with double quotes every time you use it, or by qualifying it with a schema, which also removes the ambiguity:
+
+```sql
+CREATE TABLE public."order" (id int);
+SELECT * FROM "order";
+SELECT * FROM public.order;   -- also works
+```
+
+The better fix is to rename it (`orders`, `app_user`) so nobody has to remember the quotes.
+
+`user` is a special trap because it does *not* raise an error. `user` is a reserved function that returns the current role, so this query succeeds and returns something unexpected:
+
+```sql
+SELECT * FROM user;
+```
+
+```
+   user
+----------
+ postgres
+```
+
+If you created a table called `"user"`, you have to write `SELECT * FROM "user"` to read it.
+
+You can ask PostgreSQL which words are reserved:
+
+```sql
+SELECT word, catdesc, baredesc
+FROM pg_get_keywords()
+WHERE word IN ('order', 'user', 'end', 'select', 'limit', 'offset', 'window');
+```
+
+```
+  word  | catdesc  |     baredesc
+--------+----------+-------------------
+ end    | reserved | can be bare label
+ limit  | reserved | requires AS
+ offset | reserved | requires AS
+ order  | reserved | requires AS
+ select | reserved | can be bare label
+ user   | reserved | can be bare label
+ window | reserved | requires AS
+```
+
+The `baredesc` column explains another quirk: as a column alias, words marked "can be bare label" work without `AS` (`SELECT 1 end` is legal), while the others need `AS` or quotes.
+
+## Cause 2: quotes in the wrong place
+
+PostgreSQL follows the SQL standard: **single quotes are string literals, double quotes are identifiers.** Mixing them up produces two different errors.
+
+Double quotes around a value turn it into a column name. That is not a syntax error, but it fails right after parsing:
+
+```sql
+SELECT * FROM orders WHERE status = "paid";
+-- ERROR:  column "paid" does not exist
+```
+
+An unescaped single quote inside a string ends the string early, and the rest of the text becomes garbage to the parser:
+
+```sql
+SELECT * FROM orders WHERE customer = 'O'Brien';
+-- ERROR:  syntax error at or near "Brien"
+```
+
+Escape a single quote by doubling it, use an `E''` string with a backslash, or use dollar quoting:
+
+```sql
+SELECT * FROM orders WHERE customer = 'O''Brien';
+SELECT * FROM orders WHERE customer = E'O\'Brien';
+SELECT $$O'Brien$$;
+```
+
+In application code, do not escape by hand. Pass the value as a bind parameter and the driver handles it, which also protects you from SQL injection.
+
+Backticks, which MySQL uses for identifiers, are not quotes at all in PostgreSQL. `` SELECT `id` FROM orders `` fails with `syntax error at or near "FROM"`. Replace them with double quotes or remove them.
+
+## Cause 3: commas
+
+A trailing comma in a select list or `SET` clause is the single most frequent typo:
+
+```sql
+UPDATE orders SET total = 10, WHERE id = 1;
+-- ERROR:  syntax error at or near "WHERE"
+```
+
+A missing comma is subtler, because PostgreSQL lets you alias a column without `AS`. In `SELECT id customer total FROM orders`, the parser reads `customer` as an alias for `id` and then fails on `total`:
+
+```
+ERROR:  syntax error at or near "total"
+```
+
+With only two columns, `SELECT id customer FROM orders` runs without error and returns one column named `customer`. If a column seems to be missing from your result, look for a missing comma.
+
+An empty list is also invalid: `WHERE status IN ()` fails with `syntax error at or near ")"`. Your code must skip the condition, or use `status = ANY($1)` with an array parameter, which accepts an empty array.
+
+## Cause 4: syntax from another database
+
+Queries ported from MySQL or SQL Server are a constant source of 42601 errors. These are the ones we see most often, with the PostgreSQL version:
+
+| Other database | Error in PostgreSQL | PostgreSQL syntax |
+| --- | --- | --- |
+| `LIMIT 10, 20` | `LIMIT #,# syntax is not supported` | `LIMIT 20 OFFSET 10` |
+| `SELECT TOP 5 *` | `syntax error at or near "5"` | `SELECT * ... LIMIT 5` |
+| `id int AUTO_INCREMENT` | `syntax error at or near "AUTO_INCREMENT"` | `id int GENERATED ALWAYS AS IDENTITY` |
+| `ON DUPLICATE KEY UPDATE` | `syntax error at or near "DUPLICATE"` | `ON CONFLICT (id) DO UPDATE SET ...` |
+| `ADD COLUMN note text AFTER status` | `syntax error at or near "AFTER"` | `ADD COLUMN note text` (column order cannot be chosen) |
+| `interval 1 day` | `syntax error at or near "1"` | `interval '1 day'` |
+| `USING id` | `syntax error at or near "id"` | `USING (id)` |
+
+The `LIMIT` case is the friendliest: PostgreSQL recognizes the MySQL form and adds `HINT: Use separate LIMIT and OFFSET clauses.` The others need you to know the translation. If you are migrating a whole schema, a converter helps; Chat2DB's free [MySQL to PostgreSQL converter](https://chat2db.ai/tools/mysql-to-postgresql-converter) rewrites DDL and common query syntax.
+
+## Cause 5: placeholders that were never bound
+
+Each driver has its own placeholder style, and sending the raw text to the server fails in different ways:
+
+```sql
+SELECT * FROM orders WHERE id = ?;
+-- ERROR:  syntax error at or near ";"
+
+SELECT * FROM orders WHERE id = :id;
+-- ERROR:  syntax error at or near ":"
+
+SELECT * FROM orders WHERE id = $1;
+-- ERROR:  there is no parameter $1
+```
+
+`$1` is PostgreSQL's native placeholder, so it parses but has no value. `?` comes from JDBC and ODBC, and `:id` from ORMs and psql variables. If you see these errors, the query was sent as plain text instead of going through the driver's prepared statement API, or you copied it from a log and ran it by hand. Substitute real values when testing, or use `PREPARE` and `EXECUTE` in psql:
+
+```sql
+PREPARE get_order(int) AS SELECT * FROM orders WHERE id = $1;
+EXECUTE get_order(42);
+```
+
+## Cause 6: two statements run together
+
+A missing semicolon between statements makes the parser treat the second statement as part of the first:
+
+```sql
+SELECT * FROM orders ORDER BY id DESC LIMIT 5
+SELECT 1;
+-- ERROR:  syntax error at or near "SELECT"
+```
+
+The same happens in migration files when a function body is not closed properly. If the error points at the first word of a statement that looks correct, check the end of the previous one.
+
+## Syntax errors in dynamic SQL
+
+Inside PL/pgSQL, `EXECUTE` builds a string and parses it at run time, so a syntax error appears with a `QUERY` line showing the generated text:
+
+```sql
+DO $$ BEGIN EXECUTE 'SELECT * FROM ' || 'order'; END $$;
+```
+
+```
+ERROR:  syntax error at or near "order"
+LINE 1: SELECT * FROM order
+                      ^
+QUERY:  SELECT * FROM order
+CONTEXT:  PL/pgSQL function inline_code_block line 1 at EXECUTE
+```
+
+Build identifiers with `format()` and `%I`, which adds quotes when needed, and pass values with `%L` or `USING`:
+
+```sql
+SELECT format('SELECT * FROM %I', 'order');
+-- SELECT * FROM "order"
+```
+
+## A checklist
+
+When you see `syntax error at or near`, work through these in order:
+
+1. Look at the token in quotes and the text just before it.
+2. Is any table or column name a reserved word? Quote it or rename it.
+3. Are strings in single quotes, identifiers in double quotes, and inner quotes doubled?
+4. Look for trailing or missing commas, especially before `FROM`, `WHERE` and `)`.
+5. Was the query written for another database? Translate `LIMIT x, y`, `TOP`, `AUTO_INCREMENT`, backticks and `ON DUPLICATE KEY`.
+6. Do you see `?`, `:name` or `$1`? Bind the parameters.
+7. For "at end of input", find the unclosed parenthesis, quote or clause.
+
+An editor that highlights syntax as you type catches most of these before you run anything. [Chat2DB](https://chat2db.ai/download) does that for PostgreSQL, and when a query fails you can ask its AI assistant to explain the error and propose the corrected statement against your actual schema.
+
+## Summary
+
+SQLSTATE 42601 means PostgreSQL could not parse your statement. The quoted token marks where parsing stopped, so the mistake is almost always just before it. Reserved words, quote confusion, commas, foreign syntax, unbound placeholders and missing semicolons cover nearly every case, and each has a small, mechanical fix.

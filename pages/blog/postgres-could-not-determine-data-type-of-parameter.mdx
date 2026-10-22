@@ -1,0 +1,234 @@
+---
+title: "Fix Postgres: Could Not Determine Parameter Type"
+description: "Fix PostgreSQL 'could not determine data type of parameter $1' (42P18): optional filters with IS NULL, concat, jsonb_build_object and untyped driver parameters."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: October 22, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# Fix Postgres: Could Not Determine Parameter Type
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="October 22, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+A query works in psql with literal values, then fails as soon as your application runs it with bind parameters:
+
+```
+ERROR:  could not determine data type of parameter $1
+```
+
+The SQLSTATE is `42P18` (`indeterminate_datatype`). It means PostgreSQL was asked to plan a statement in which a parameter's type could not be worked out from the SQL alone, and the client did not say what the type is. This guide explains when that happens, shows the expressions that trigger it, and gives fixes that work with any driver. Every example was run on PostgreSQL 18, using psql's `\bind` command to send parameters the way an application driver does.
+
+## How PostgreSQL types a parameter
+
+When a driver uses the extended query protocol, it sends the SQL text with placeholders (`$1`, `$2`, ...) and, optionally, a type OID for each parameter. Many drivers send OID 0, meaning "unspecified", and let the server decide. The server then looks at how each parameter is used:
+
+- `price > $1`: `price` is `numeric`, so `$1` must be `numeric`.
+- `category = $1`: `$1` is `text`.
+- `upper($1)`: `upper` takes `text`, so `$1` is `text`.
+
+As long as some operator, function or column gives a clue, the parameter gets a type. The error appears when nothing does. Use this table for the examples:
+
+```sql
+CREATE TABLE products (
+  id         serial PRIMARY KEY,
+  name       text,
+  price      numeric,
+  category   text,
+  tags       text[],
+  created_at timestamptz DEFAULT now()
+);
+
+INSERT INTO products (name, price, category, tags) VALUES
+  ('Desk', 199, 'office', '{wood}'),
+  ('Chair', 89, 'office', '{fabric}'),
+  ('Lamp', 25, NULL, NULL);
+```
+
+## Why the same query works with literal values
+
+When you debug, you probably paste the query into psql with the values filled in, and it runs:
+
+```sql
+SELECT concat('hi', '!'), jsonb_build_object('name', 'x'), pg_typeof('x'), 'x' IS NULL;
+```
+
+```
+ concat | jsonb_build_object | pg_typeof | ?column?
+--------+--------------------+-----------+----------
+ hi!    | {"name": "x"}      | unknown   | f
+```
+
+A quoted literal also starts with the pseudo-type `unknown`, but PostgreSQL knows its value at parse time and has a fallback rule: an `unknown` literal that nothing else constrains is treated as `text` (that is why `pg_typeof('x')` reports `unknown` rather than failing). A parameter is different. Its value arrives later, in a separate protocol message, and the plan has to be built before that, so the same fallback is not applied in every position. This is also why the error often appears only after switching from string-built SQL to bind parameters, which is otherwise the right move for safety and performance.
+
+## The most common case: optional filters with IS NULL
+
+Search screens often pass `NULL` to mean "no filter", and the SQL looks like this:
+
+```sql
+SELECT * FROM products WHERE ($1 IS NULL OR category = $1) \bind 'office' \g
+```
+
+```
+ERROR:  could not determine data type of parameter $1
+LINE 1: SELECT * FROM products WHERE ($1 IS NULL OR category = $1)
+                                      ^
+```
+
+`IS NULL` accepts a value of any type, so it gives no hint, and PostgreSQL assigns parameter types at the **first** place each parameter appears. Swap the two conditions and the same query works:
+
+```sql
+SELECT * FROM products WHERE category = $1 OR $1 IS NULL \bind 'office' \g
+```
+
+That is fragile, though: an ORM or a teammate can reorder the conditions. The robust fix is an explicit cast at the first use:
+
+```sql
+SELECT * FROM products WHERE ($1::text IS NULL OR category = $1) \bind 'office' \g
+```
+
+```
+ id | name  | price | category |  tags
+----+-------+-------+----------+----------
+  1 | Desk  |   199 | office   | {wood}
+  2 | Chair |    89 | office   | {fabric}
+```
+
+With a server-side prepared statement, you can declare the types up front instead:
+
+```sql
+PREPARE q2(text) AS
+  SELECT * FROM products WHERE $1 IS NULL OR category = $1;
+
+EXECUTE q2(NULL);     -- all three rows
+EXECUTE q2('office'); -- two rows
+```
+
+Without the `(text)`, the same `PREPARE` fails with the 42P18 error.
+
+## Functions that accept any type
+
+Functions declared with polymorphic `"any"` or `anyelement` arguments cannot type a parameter either. These all fail:
+
+```sql
+SELECT concat($1, '!') \bind 'hi' \g
+SELECT format('%s', $1) \bind 'x' \g
+SELECT jsonb_build_object('name', $1) \bind 'x' \g
+SELECT json_build_object('a', $1) \bind 'x' \g
+SELECT pg_typeof($1) \bind 'a' \g
+```
+
+```
+ERROR:  could not determine data type of parameter $1
+```
+
+`jsonb_build_object` is the one people meet most, because building JSON from request fields is common in APIs. Add a cast for every parameter:
+
+```sql
+SELECT jsonb_build_object('name', $1::text, 'price', $2::numeric) \bind 'Desk' 199 \g
+```
+
+The cast also decides the JSON type: `$2::numeric` produces a JSON number, `$2::text` would produce a string.
+
+By contrast, functions and operators with concrete argument types are fine without casts:
+
+```sql
+SELECT $1 || '!'          \bind 'hi' \g   -- hi!
+SELECT coalesce($1, 'none') \bind 'x' \g  -- x
+SELECT length($1)         \bind 'abc' \g  -- 3
+SELECT upper($1)          \bind 'abc' \g  -- ABC
+SELECT $1 + 1             \bind 2 \g      -- 3
+SELECT ARRAY[$1]          \bind 'a' \g    -- {a}
+```
+
+A bare `SELECT $1` also works; a parameter with no context at the top level of a select list is resolved as `text`.
+
+## A related trap: the type is guessed, but wrong
+
+Sometimes PostgreSQL does find a type, just not the one you meant. Consider "products created in the last N":
+
+```sql
+SELECT * FROM products WHERE created_at > now() - $1 \bind '1 day' \g
+```
+
+```
+ERROR:  operator does not exist: timestamp with time zone > interval
+LINE 1: SELECT * FROM products WHERE created_at > now() - $1
+                                                ^
+HINT:  No operator matches the given name and argument types. You might need to add explicit type casts.
+```
+
+The parser saw `timestamptz - $1` and preferred the `timestamptz - timestamptz` operator, so `$1` became a timestamp and the subtraction produced an `interval`, which cannot be compared with `created_at`. The error message talks about operators, but the cause is the same missing type information. Cast the parameter:
+
+```sql
+SELECT * FROM products WHERE created_at > now() - $1::interval \bind '1 day' \g
+```
+
+Another silent version is `ORDER BY $1`. It does not fail; it sorts by the constant value of the parameter, which means not sorting at all. Column names cannot be parameters. If users choose the sort column, map their choice to a fixed list of column names in your code, or build the SQL with `format('%I', ...)` on the server.
+
+## Arrays and IN lists
+
+Array parameters are usually typed by context:
+
+```sql
+SELECT * FROM products WHERE category = ANY($1) \bind '{office}' \g
+SELECT * FROM products WHERE $1 = ANY(tags)     \bind 'wood' \g
+```
+
+Both work, because `category` and `tags` supply the element type. A polymorphic array function has nothing to go on, and reports it with a slightly different message:
+
+```sql
+SELECT array_length($1, 1) \bind '{a,b}' \g
+-- ERROR:  could not determine polymorphic type because input has type unknown
+
+SELECT array_length($1::text[], 1) \bind '{a,b}' \g
+-- 2
+```
+
+Treat it the same way: cast the parameter to the array type you mean.
+
+## Which drivers send untyped parameters
+
+Whether you see this error depends on the driver and on how you call it:
+
+- **node-postgres (`pg`)** sends every parameter without a type, so any of the expressions above fails exactly as in psql.
+- **asyncpg** prepares every statement on the server and asks PostgreSQL for the parameter types, so an `IS NULL` filter without a cast fails at prepare time.
+- **pgJDBC** sends a type for most setter methods, for example `setInt` as an integer. `setString` sends `varchar` by default, but with the connection option `stringtype=unspecified` strings are sent untyped and the server infers them. Passing `null` through generic methods can also leave the type unspecified.
+- **psql** with `\bind` (PostgreSQL 16 and later) sends untyped parameters, which makes it a convenient way to reproduce application errors.
+
+The fix is the same everywhere: put the cast in the SQL. It documents the intended type, it works no matter how the driver binds values, and it costs nothing at run time.
+
+## Writing optional filters cleanly
+
+If your application builds search queries with many optional filters, cast each parameter once:
+
+```sql
+SELECT *
+FROM products
+WHERE ($1::text    IS NULL OR category = $1)
+  AND ($2::numeric IS NULL OR price >= $2)
+  AND ($3::numeric IS NULL OR price <= $3)
+  AND ($4::text    IS NULL OR name ILIKE '%' || $4 || '%')
+ORDER BY name;
+```
+
+This works, but the planner has to produce one plan that serves every combination of present and missing filters, which can be slow on large tables. When performance matters, build the `WHERE` clause in application code from only the filters the user actually set, still with bind parameters for the values. Each combination then gets a simple plan that can use the right index.
+
+Testing these queries is easier when you can run them with real values and see the parameter types. [Chat2DB](https://chat2db.ai/download) lets you run parameterized SQL against PostgreSQL, and its AI assistant can rewrite a query with explicit casts when you paste in a 42P18 error.
+
+## Checklist
+
+When you get `could not determine data type of parameter $N`:
+
+1. Find the first place `$N` appears in the statement. That is where PostgreSQL tries to type it.
+2. If that place is `IS NULL`, `IS NOT NULL`, `concat`, `format`, `json_build_object`, `jsonb_build_object` or another polymorphic function, add a cast there: `$N::text`, `$N::int`, `$N::timestamptz`.
+3. For server-side prepared statements, declare the types: `PREPARE name(text, int) AS ...`.
+4. If the error mentions an operator instead, check that the parameter was not inferred as the wrong type, as in `now() - $1`.
+5. Never use parameters for identifiers such as column names in `ORDER BY`.
+
+## Summary
+
+SQLSTATE 42P18 means a parameter reached the planner without a type and its surroundings did not imply one. It happens with untyped driver parameters in `IS NULL` checks, polymorphic functions like `concat` and `jsonb_build_object`, and prepared statements without declared types. Add an explicit cast at the parameter's first use, or declare types in `PREPARE`, and the query will work with every driver.
