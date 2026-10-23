@@ -1,0 +1,190 @@
+---
+title: "Fix MySQL 1690: BIGINT UNSIGNED Out of Range"
+description: "Fix MySQL error 1690 'BIGINT UNSIGNED value is out of range' when subtracting unsigned columns: CAST AS SIGNED, safe UPDATEs and schema fixes."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: October 23, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# Fix MySQL 1690: BIGINT UNSIGNED Out of Range
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="October 23, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+A simple subtraction between two small numbers fails:
+
+```
+ERROR 1690 (22003): BIGINT UNSIGNED value is out of range in '(`app`.`stock`.`qty` - `app`.`stock`.`reserved`)'
+```
+
+The values might be 5 and 8, nowhere near the limits of `BIGINT`. The problem is not their size but their sign: at least one operand is `UNSIGNED`, so MySQL computes the result as an unsigned 64-bit integer, and an unsigned integer cannot be negative. The expression inside the quotes, as MySQL rewrote it, shows exactly which calculation failed.
+
+This guide explains the rule, then shows how to fix reads, updates and the schema so the error does not come back. All examples were run on MySQL 8.4.
+
+## Reproducing the error
+
+```sql
+CREATE TABLE stock (
+  sku      VARCHAR(10) PRIMARY KEY,
+  qty      INT UNSIGNED,
+  reserved INT UNSIGNED,
+  big      BIGINT UNSIGNED
+);
+INSERT INTO stock VALUES ('a', 5, 8, 1);
+
+SELECT qty - reserved FROM stock;
+-- ERROR 1690 (22003): BIGINT UNSIGNED value is out of range in
+--   '(`app`.`stock`.`qty` - `app`.`stock`.`reserved`)'
+```
+
+The columns are `INT UNSIGNED`, yet the message says `BIGINT UNSIGNED`. MySQL performs integer arithmetic in 64 bits, so every integer expression is evaluated as `BIGINT`, and it is unsigned if any operand is unsigned.
+
+## The rule
+
+For `+`, `-` and `*` on integers, MySQL uses unsigned arithmetic when either operand is unsigned. The result must then lie between 0 and 18,446,744,073,709,551,615. Anything outside that range raises error 1690 in the default SQL mode, instead of silently wrapping around.
+
+That has some surprising consequences. Casting only one side is not enough:
+
+```sql
+SELECT CAST(qty AS SIGNED) - reserved FROM stock;
+-- ERROR 1690 (22003): BIGINT UNSIGNED value is out of range in
+--   '(cast(`app`.`stock`.`qty` as signed) - `app`.`stock`.`reserved`)'
+
+SELECT qty - CAST(reserved AS SIGNED) FROM stock;
+-- ERROR 1690 (22003): BIGINT UNSIGNED value is out of range in
+--   '(`app`.`stock`.`qty` - cast(`app`.`stock`.`reserved` as signed))'
+```
+
+The other operand is still unsigned, so the subtraction is still unsigned. Literals work the same way: `5 - CAST(8 AS UNSIGNED)` fails too.
+
+Signed arithmetic has its own limit, reported with a slightly different message:
+
+```sql
+SELECT 9223372036854775807 + 1;
+-- ERROR 1690 (22003): BIGINT value is out of range in '(9223372036854775807 + 1)'
+```
+
+If the message says `BIGINT` without `UNSIGNED`, a signed result exceeded about 9.22 quintillion. That is a genuine overflow, usually from multiplying large values; it has nothing to do with negative numbers.
+
+## Fix 1: cast both operands to SIGNED
+
+For a calculation that can legitimately be negative, convert both sides:
+
+```sql
+SELECT CAST(qty AS SIGNED) - CAST(reserved AS SIGNED) AS available FROM stock;
+--  available
+-- -----------
+--         -3
+```
+
+`CAST(x AS SIGNED)` produces a signed `BIGINT`. That is safe for every `INT UNSIGNED`, `SMALLINT UNSIGNED` and `TINYINT UNSIGNED` value. For `BIGINT UNSIGNED` columns holding values above 9,223,372,036,854,775,807, the cast is wrong without any error: in our test `CAST(18446744073709551615 AS SIGNED)` returned `-1`. If you store values that large, use `CAST(x AS DECIMAL(20,0))` instead, which handles the full unsigned range and negative results.
+
+`ABS(CAST(qty AS SIGNED) - CAST(reserved AS SIGNED))` is a common way to get an absolute difference without errors; it returns `3` here.
+
+## Fix 2: compare instead of subtracting
+
+Conditions such as "rows where reserved is more than in stock" are often written as a subtraction compared with zero. That raises the error as soon as any row would go negative:
+
+```sql
+SELECT * FROM stock WHERE qty - reserved < 0;
+-- ERROR 1690 (22003): BIGINT UNSIGNED value is out of range in
+--   '(`app`.`stock`.`qty` - `app`.`stock`.`reserved`)'
+```
+
+Rewrite the condition as a comparison, which never overflows and can use an index:
+
+```sql
+SELECT * FROM stock WHERE qty < reserved;
+```
+
+The same goes for sorting by a difference or aggregating it. `SUM(qty - reserved)` fails on the first row where `reserved > qty`. `SUM(qty) - SUM(reserved)` works as written, because `SUM` over integers returns a `DECIMAL`, so the outer subtraction is not unsigned; it returned `-3` here. Per-row casts, `SUM(CAST(qty AS SIGNED) - CAST(reserved AS SIGNED))`, work too.
+
+## Fix 3: guard UPDATEs that decrement a counter
+
+Decrementing an unsigned counter is the most common source of this error in applications:
+
+```sql
+UPDATE stock SET qty = qty - 10 WHERE sku = 'a';
+-- ERROR 1690 (22003): BIGINT UNSIGNED value is out of range in '(`app`.`stock`.`qty` - 10)'
+```
+
+Here the error is doing you a favour: the stock would go negative. Decide what the business rule is and write it explicitly.
+
+To refuse the decrement when there is not enough stock, put the condition in `WHERE` and check the number of affected rows in the application:
+
+```sql
+UPDATE stock SET qty = qty - 10 WHERE sku = 'a' AND qty >= 10;
+-- 0 rows affected means insufficient stock
+```
+
+This is also the correct pattern under concurrency. The check and the decrement happen in one atomic statement, so two requests cannot both pass a separate `SELECT` check and then oversell.
+
+To clamp at zero instead, compute the new value without ever producing a negative intermediate result:
+
+```sql
+UPDATE stock SET qty = GREATEST(qty, 10) - 10 WHERE sku = 'a';
+-- or
+UPDATE stock SET qty = IF(qty >= 10, qty - 10, 0) WHERE sku = 'a';
+```
+
+Both ran without error and left `qty` at `0`. Note that `GREATEST(qty - 10, 0)` would not work, because `qty - 10` is evaluated, and fails, before `GREATEST` sees it.
+
+## Fix 4: the NO_UNSIGNED_SUBTRACTION SQL mode
+
+MySQL has a mode that makes the result of a subtraction signed even when an operand is unsigned:
+
+```sql
+SET SESSION sql_mode = CONCAT(@@sql_mode, ',NO_UNSIGNED_SUBTRACTION');
+SELECT qty - reserved FROM stock;
+--  qty - reserved
+-- ----------------
+--              -3
+```
+
+It is convenient for reports and ad hoc queries, but think twice before setting it globally. It changes the semantics of every subtraction for every application on the server, it does not help with addition or multiplication, and it hides the overflow in decrement `UPDATE`s that you probably want to catch. Assigning a negative result to an unsigned column in strict mode still fails, with a different error: with the mode set, `UPDATE stock SET qty = qty - 10` returned `ERROR 1264 (22003): Out of range value for column 'qty' at row 1`.
+
+## Fix 5: reconsider UNSIGNED in the schema
+
+`UNSIGNED` is often added to quantity or count columns to express "never negative". The arithmetic behaviour above is the price. If a column takes part in subtraction regularly, the simplest permanent fix is a signed type with a `CHECK` constraint, which MySQL enforces since 8.0.16:
+
+```sql
+ALTER TABLE stock
+  MODIFY qty INT NOT NULL,
+  MODIFY reserved INT NOT NULL,
+  ADD CONSTRAINT chk_qty CHECK (qty >= 0),
+  ADD CONSTRAINT chk_reserved CHECK (reserved >= 0);
+
+SELECT qty - reserved FROM stock;   -- -3, no error
+```
+
+The column still rejects negative values on insert and update (`UPDATE stock SET qty = qty - 10` now fails with `ERROR 3819 (HY000): Check constraint 'chk_qty' is violated.`), but expressions that compute differences behave normally. Changing an `INT UNSIGNED` column to `INT` halves its maximum value, so check `MAX(qty)` first; for auto-increment keys near the signed limit, move to `BIGINT` instead.
+
+`UNSIGNED` makes the most sense for identifiers and bit masks, values you never subtract.
+
+## Other places 1690 shows up
+
+- **Timestamps and IDs cast to unsigned.** `CAST(UNIX_TIMESTAMP('2026-01-01') AS UNSIGNED) - CAST(UNIX_TIMESTAMP('2026-02-01') AS UNSIGNED)` fails because the earlier date comes first. Use `TIMESTAMPDIFF(SECOND, a, b)` for date differences.
+- **Bitwise results.** `~0` is the largest unsigned value, and `~0 + 1` overflows with error 1690.
+- **Negating an unsigned value** is allowed: `SELECT -big FROM stock` returns `-1`. Only results that do not fit the unsigned range of a `+`, `-` or `*` fail.
+- **ORMs and migrations.** Frameworks that create integer columns as unsigned by default, a common choice for primary and foreign keys, carry the behaviour into any query that subtracts IDs or counters.
+
+## A quick way to find the culprit
+
+The text inside the quotes in the error message is the expression MySQL was evaluating, fully qualified with database and table. Search your query for that expression, then check each operand's type:
+
+```sql
+SELECT COLUMN_NAME, COLUMN_TYPE
+FROM information_schema.COLUMNS
+WHERE TABLE_SCHEMA = 'app' AND TABLE_NAME = 'stock';
+```
+
+Any `unsigned` in `COLUMN_TYPE` on either side of a subtraction is the cause.
+
+If you work with these tables often, a client that shows column types next to the editor saves the lookup. In [Chat2DB](https://chat2db.ai/download) you can paste the 1690 message and ask the AI assistant to rewrite the query with the right casts or a guarded `UPDATE`, using your real column definitions. The web version at [app.chat2db.ai](https://app.chat2db.ai/) needs no installation.
+
+## Summary
+
+`BIGINT UNSIGNED value is out of range` means an integer expression with at least one unsigned operand produced a negative result, or one above 18,446,744,073,709,551,615. Cast both operands to `SIGNED` (or `DECIMAL` for huge values) when a negative result is valid, compare columns directly instead of subtracting them in `WHERE`, guard decrementing `UPDATE`s with a `WHERE qty >= n` condition or clamp them with `GREATEST(qty, n) - n`, and consider replacing `UNSIGNED` with a signed type and a `CHECK` constraint for columns you do arithmetic on. Use `NO_UNSIGNED_SUBTRACTION` only per session, for reporting.

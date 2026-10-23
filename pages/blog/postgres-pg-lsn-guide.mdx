@@ -1,0 +1,209 @@
+---
+title: "Postgres LSN Explained: pg_lsn and WAL File Names"
+description: "What a PostgreSQL LSN like 16/B374D848 means, how to subtract LSNs, map an LSN to its WAL file with pg_walfile_name, and measure replication lag in bytes."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: October 23, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# Postgres LSN Explained: pg_lsn and WAL File Names
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="October 23, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+Values like `0/190C858` and `16/B374D848` show up all over PostgreSQL: in `pg_stat_replication`, in `pg_replication_slots`, in checkpoint log lines, in `pg_controldata` output and in error messages from logical decoding. They are log sequence numbers (LSNs), and once you know how to read them, a lot of replication and WAL troubleshooting becomes simple arithmetic.
+
+This guide explains what an LSN is, how the `pg_lsn` type works, how to turn an LSN into a WAL file name and back, and how to use LSN differences to measure replication lag and slot retention. All queries were run on PostgreSQL 18, with a few comparisons against PostgreSQL 16 where behaviour changed.
+
+## What an LSN is
+
+The write-ahead log (WAL) is one long, append-only stream of bytes. An LSN is a byte position in that stream: a 64-bit unsigned integer counting from the start of the log. PostgreSQL prints it as two hexadecimal numbers separated by a slash. The part before the slash is the high 32 bits and the part after is the low 32 bits.
+
+So `16/B374D848` means `0x16 * 2^32 + 0xB374D848`, which is byte 97,500,059,720 of the WAL. You can confirm that in SQL by subtracting the zero LSN:
+
+```sql
+SELECT '16/B374D848'::pg_lsn - '0/0' AS bytes;
+--     bytes
+-- -------------
+--  97500059720
+```
+
+Because LSNs only grow, comparing two of them tells you which event happened first, and subtracting them tells you how much WAL was written in between.
+
+## The pg_lsn data type
+
+PostgreSQL has a dedicated type for LSNs. Use it rather than `text`, because text comparison gives wrong answers:
+
+```sql
+SELECT '9/0'::pg_lsn < '10/0'::pg_lsn AS as_lsn,
+       '9/0' < '10/0'                 AS as_text;
+--  as_lsn | as_text
+-- --------+---------
+--  t      | f
+```
+
+As text, `'9/0'` sorts after `'10/0'` because `9` is greater than `1`. As `pg_lsn` the comparison is numeric. The same applies to `max()` and `min()`, which work directly on `pg_lsn` columns.
+
+Input rules are strict. Each half must be one to eight hex digits, upper or lower case, and there must be no surrounding spaces:
+
+```sql
+SELECT '16/b374d848'::pg_lsn;     -- 16/B374D848
+SELECT '16/B374D848 '::pg_lsn;
+-- ERROR:  invalid input syntax for type pg_lsn: "16/B374D848 "
+```
+
+Trailing whitespace from a copied log line is the usual cause of that error (SQLSTATE `22P02`). Trim the value before casting.
+
+### Arithmetic
+
+Subtracting two `pg_lsn` values returns a `numeric` number of bytes. Since PostgreSQL 14 you can also add or subtract a byte count:
+
+```sql
+SELECT '16/B374D848'::pg_lsn - '16/B2000000'::pg_lsn AS diff,
+       pg_wal_lsn_diff('16/B374D848', '16/B2000000');
+--    diff   | pg_wal_lsn_diff
+-- ----------+-----------------
+--  24434760 |        24434760
+
+SELECT '16/B374D848'::pg_lsn + 1024, '16/B374D848'::pg_lsn - 1024::numeric;
+--  16/B374DC48 | 16/B374D448
+```
+
+`pg_wal_lsn_diff(a, b)` is the same as `a - b` and is common in older monitoring queries. Going below `0/0` or above `FFFFFFFF/FFFFFFFF` raises `pg_lsn out of range`.
+
+Wrap the difference in `pg_size_pretty()` for a readable value:
+
+```sql
+SELECT pg_size_pretty('16/B374D848'::pg_lsn - '16/B2000000'::pg_lsn);
+--  23 MB
+```
+
+## Where LSNs come from
+
+On a primary, these functions return the current positions:
+
+```sql
+SELECT pg_current_wal_lsn(),        -- written by the server
+       pg_current_wal_insert_lsn(), -- inserted into WAL buffers
+       pg_current_wal_flush_lsn();  -- flushed to durable storage
+```
+
+On an idle server all three are usually equal. Under load the insert position runs ahead of the write position, which runs ahead of the flush position.
+
+On a standby, use `pg_last_wal_receive_lsn()` and `pg_last_wal_replay_lsn()`. They return `NULL` on a primary. Other places you will see LSNs:
+
+- `pg_stat_replication`: `sent_lsn`, `write_lsn`, `flush_lsn`, `replay_lsn` for each connected standby.
+- `pg_replication_slots`: `restart_lsn` (the oldest WAL the slot still needs) and, for logical slots, `confirmed_flush_lsn`.
+- `pg_control_checkpoint()`: `checkpoint_lsn` and `redo_lsn` of the last checkpoint.
+- `pg_stat_subscription` on a logical replication subscriber.
+
+## From an LSN to a WAL file name
+
+WAL is stored on disk in segment files, 16 MB each by default (set at `initdb` time with `--wal-segsize`). Each file is named with 24 hexadecimal characters: eight for the timeline ID, eight for the high 32 bits of the LSN (the 4 GB "log" the segment belongs to), and eight for the number of the segment within that 4 GB range.
+
+`pg_walfile_name()` does the conversion, and `pg_walfile_name_offset()` also returns the byte offset inside the file:
+
+```sql
+SELECT pg_walfile_name(pg_current_wal_lsn()),
+       pg_walfile_name_offset(pg_current_wal_lsn());
+--      pg_walfile_name      |       pg_walfile_name_offset
+-- --------------------------+------------------------------------
+--  000000010000000000000001 | (000000010000000000000001,9488472)
+```
+
+You can do the same by hand. With 16 MB segments, the segment number is the byte position divided by 16,777,216. There are 256 segments per 4 GB, so for `16/B374D848` the segment number is `0x16B3`, the middle part of the name is `00000016`, the last part is `000000B3`, and on timeline 1 the file is `0000000100000016000000B3`. The offset inside the file is `0x74D848`, or 7,657,544 bytes.
+
+### The segment-boundary change in PostgreSQL 17
+
+An LSN that falls exactly on the first byte of a segment is a special case, and its answer depends on the version. We ran the same query on both:
+
+```sql
+SELECT pg_walfile_name('0/1000000'), pg_walfile_name_offset('0/1000000');
+-- PostgreSQL 18:  000000010000000000000001 | (000000010000000000000001,0)
+-- PostgreSQL 16:  000000010000000000000000 | (000000010000000000000000,0)
+```
+
+PostgreSQL 16 and older reported the previous segment. The function was historically used with backup end locations, where a position exactly on a boundary marks the end of the previous file. PostgreSQL 17 changed it to return the segment that actually contains the byte. If a script compares WAL file names computed on servers of different major versions, keep this in mind.
+
+### Not available on a standby
+
+`pg_walfile_name()` needs the server's current timeline, so it refuses to run during recovery:
+
+```sql
+-- on a standby
+SELECT pg_walfile_name(pg_last_wal_replay_lsn());
+-- ERROR:  recovery is in progress
+-- HINT:  pg_walfile_name() cannot be executed during recovery.
+```
+
+Compute the name yourself on a standby, or run the query on the primary.
+
+## From a WAL file name back to an LSN
+
+PostgreSQL 16 added `pg_split_walfile_name()`, which returns the segment number and timeline of a file name. Combined with `pg_ls_waldir()` you can list the files in `pg_wal` with their segment numbers:
+
+```sql
+SELECT name, size FROM pg_ls_waldir() ORDER BY name;
+--            name           |   size
+-- --------------------------+----------
+--  000000010000000000000001 | 16777216
+--  000000010000000000000002 | 16777216
+
+SELECT * FROM pg_split_walfile_name('000000010000000000000001');
+--  segment_number | timeline_id
+-- ----------------+-------------
+--               1 |           1
+```
+
+The first LSN in a file is the segment number multiplied by the segment size, so file `...01` covers `0/1000000` up to `0/1FFFFFF`. This is handy when an archive command fails on a specific file and you want to know which transactions it contains, or when `pg_waldump` reports a position and you need the matching file.
+
+## Measuring replication lag in bytes
+
+Time-based lag columns (`write_lag`, `flush_lag`, `replay_lag`) are useful but they reset to `NULL` when a standby is idle. Byte lag is always defined:
+
+```sql
+SELECT application_name, state,
+       sent_lsn, write_lsn, flush_lsn, replay_lsn,
+       pg_wal_lsn_diff(pg_current_wal_lsn(), replay_lsn) AS replay_lag_bytes
+FROM pg_stat_replication;
+```
+
+On our test pair, right after inserting 100,000 rows on the primary, this returned `replay_lag_bytes = 6418936`: the standby had already received part of the burst but had not replayed it yet. Comparing the four columns tells you where the lag sits. A gap between the primary's current LSN and `sent_lsn` points at the network or the WAL sender, a gap between `flush_lsn` and `replay_lsn` points at replay on the standby.
+
+## How much WAL a replication slot is holding
+
+A replication slot prevents the server from removing WAL that its consumer has not confirmed. If the consumer disappears, `pg_wal` grows until the disk fills. Measure the retained amount by subtracting `restart_lsn` from the current position:
+
+```sql
+SELECT slot_name, restart_lsn,
+       pg_size_pretty(pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn)) AS retained
+FROM pg_replication_slots;
+--  slot_name | restart_lsn | retained
+-- -----------+-------------+----------
+--  standby1  | 0/1894888   | 23 MB
+```
+
+Alert on this value, and set `max_slot_wal_keep_size` so a dead slot is invalidated before it can fill the disk. The `wal_status` and `safe_wal_size` columns of the same view show how close a slot is to that limit.
+
+## Converting an LSN to a plain integer
+
+Some monitoring systems want a number rather than a `pg_lsn`. Subtract `'0/0'` and cast:
+
+```sql
+SELECT (pg_current_wal_lsn() - '0/0')::bigint;
+```
+
+The cast to `bigint` works up to `7FFFFFFF/FFFFFFFF`, which no real cluster reaches. Do not cast the text form directly: `'16/B374D848'::pg_lsn::text::bigint` fails with `invalid input syntax for type bigint`.
+
+## Doing the math without a server
+
+When you are reading a log file or an incident ticket, you often have an LSN but no convenient database session on the right server. The [Postgres LSN Calculator](https://chat2db.ai/tools/postgres-lsn-calculator) converts an LSN to its byte position, WAL file name and offset for any segment size and timeline, maps a WAL file name back to its LSN range, and computes the difference between two LSNs with the same rounding as `pg_size_pretty`. It also lets you pick the pre-17 or 17+ boundary rule.
+
+For live investigation, connect a client to the primary and keep the lag and slot queries above as saved snippets. In [Chat2DB](https://chat2db.ai/download) you can ask the AI assistant to build those queries for your setup, for example "show replay lag in MB per standby and the WAL retained by each slot", and run them side by side.
+
+## Summary
+
+An LSN is a byte offset into the WAL, printed as two 32-bit hex halves. Store and compare it as `pg_lsn`, not text. Subtract two LSNs to get bytes, and use `pg_size_pretty` to read them. Map an LSN to its segment file with `pg_walfile_name()` on a primary (noting the boundary change in PostgreSQL 17), and map a file back with `pg_split_walfile_name()`. With those few operations you can measure replication lag, size the WAL a slot is retaining, and find the exact file that holds a given record.

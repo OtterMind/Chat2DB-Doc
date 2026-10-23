@@ -1,0 +1,199 @@
+---
+title: "Fix Postgres 42804: Expression Is of Type Text"
+description: "Fix 'column is of type integer but expression is of type text' (42804) in PostgreSQL: INSERT SELECT, JDBC varchar parameters, jsonb, enums, booleans and CASE."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: October 23, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# Fix Postgres 42804: Expression Is of Type Text
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="October 23, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+An `INSERT` or `UPDATE` that looks harmless fails with:
+
+```
+ERROR:  column "user_id" is of type integer but expression is of type text
+LINE 1: insert into events (id, user_id) select 2, '42'::text;
+                                                   ^
+HINT:  You will need to rewrite or cast the expression.
+```
+
+The SQLSTATE is `42804` (`datatype_mismatch`). The wording varies with the types involved: `is of type jsonb but expression is of type text`, `is of type boolean but expression is of type integer`, `is of type timestamp with time zone but expression is of type text`, `is of type integer but expression is of type character varying`. The cause is always the same. You are storing a value whose type PostgreSQL will not convert to the column's type automatically.
+
+What confuses people is that a very similar statement often works. `INSERT ... VALUES (1, '42')` succeeds while `INSERT ... SELECT 2, '42'::text` fails. This guide explains why, and gives the right fix for each situation. Every example was run on PostgreSQL 18.
+
+## Why one version works and the other does not
+
+```sql
+CREATE TABLE events (
+  id          int PRIMARY KEY,
+  user_id     int,
+  happened_at timestamptz,
+  payload     jsonb,
+  tags        text[],
+  active      boolean
+);
+
+INSERT INTO events (id, user_id) VALUES (1, '42');                -- works
+INSERT INTO events (id, user_id) SELECT 2, '42'::text;            -- 42804
+INSERT INTO events (id, user_id) SELECT 3, v FROM (VALUES ('42')) t(v);  -- 42804
+```
+
+In the first statement, `'42'` is a string literal of type `unknown`. PostgreSQL delays deciding its type until it sees where the value goes, then parses it directly as an `integer`. No conversion between types is involved.
+
+In the second statement the value already has the type `text`, because of the explicit cast. In the third it is `text` because a column of a `VALUES` list is resolved to `text` when nothing else determines its type. Storing a `text` value in an `integer` column requires a cast from `text` to `integer`, and PostgreSQL only applies casts automatically on assignment when they are marked as assignment or implicit casts. `text` to `integer` is neither, because not every string is a number.
+
+So the rule to remember: literals adapt to the column, typed values do not. The error appears when a value has acquired a concrete type before it reaches the column.
+
+## Which conversions happen automatically on assignment
+
+Assignment is more permissive than comparisons or function calls. These all succeed when storing into a column:
+
+- Numeric types into other numeric types, for example `numeric` into `integer` (the value is rounded) or `integer` into `bigint`.
+- Almost any type into `text` or `varchar`, through the type's output function.
+- `timestamp` into `timestamptz` and vice versa.
+
+These do not, and produce `42804`:
+
+- `text` or `varchar` into numbers, dates, timestamps, `jsonb`, `uuid`, `inet`, enums or arrays.
+- `integer` into `boolean`. There is an explicit cast `1::boolean`, but no assignment cast.
+- Between unrelated types, such as `timestamptz` into `integer`.
+
+## Fix 1: cast the expression explicitly
+
+The direct fix, as the HINT says, is an explicit cast on the expression:
+
+```sql
+INSERT INTO events (id, user_id) SELECT 2, '42'::text::int;
+UPDATE events SET active = 1::boolean WHERE id = 1;
+```
+
+An explicit cast can still fail at run time if the value cannot be converted, for example `'abc'::int` raises `invalid input syntax for type integer`. That is a data problem rather than a type problem, and it is easier to diagnose because the message shows the bad value.
+
+## Fix 2: INSERT ... SELECT from a staging table
+
+Loading data through a staging table whose columns are all `text` is the most common source of this error:
+
+```sql
+CREATE TABLE staging (id text, user_id text, happened_at text);
+INSERT INTO staging VALUES ('9', '7', '2026-10-23 08:00:00+00');
+
+INSERT INTO events (id, user_id, happened_at)
+SELECT id, user_id, happened_at FROM staging;
+-- ERROR:  column "id" is of type integer but expression is of type text
+-- HINT:  You will need to rewrite or cast the expression.
+```
+
+Only the first mismatched column is reported. Fix all of them at once by casting every column in the select list:
+
+```sql
+INSERT INTO events (id, user_id, happened_at)
+SELECT id::int, user_id::int, happened_at::timestamptz FROM staging;
+```
+
+If some rows contain values that do not convert, PostgreSQL 16 and newer let you test first with `pg_input_is_valid('abc', 'integer')`, which returns `false` instead of raising an error. Use it in a `WHERE` clause to find the bad rows before the real load.
+
+## Fix 3: application parameters sent as varchar
+
+Drivers that send parameters with a declared type can trigger the error even though the SQL text contains no cast. The PostgreSQL JDBC driver, for instance, sends `setString()` values typed as `varchar` by default. We reproduced the effect with a prepared statement that declares the parameter type the same way:
+
+```sql
+PREPARE p(varchar) AS INSERT INTO events (id, user_id) VALUES (100, $1);
+-- ERROR:  column "user_id" is of type integer but expression is of type character varying
+-- HINT:  You will need to rewrite or cast the expression.
+```
+
+A parameter with no declared type behaves like a literal and adapts to the column:
+
+```sql
+PREPARE p2 AS INSERT INTO events (id, user_id) VALUES (101, $1);
+EXECUTE p2('5');   -- INSERT 0 1
+```
+
+Fixes, from best to worst:
+
+1. Bind the value with the right type in the application: `setInt`, `setObject(..., Types.OTHER)` for `jsonb` and `uuid`, or the equivalent in your ORM.
+2. Add a cast in the SQL text: `VALUES (?, ?::int)` or `CAST(? AS jsonb)`.
+3. For JDBC only, the connection property `stringtype=unspecified` makes the driver send strings untyped, so PostgreSQL infers the type from the column. It fixes many cases at once, but it also changes how ambiguous function calls resolve, so test it.
+
+## Fix 4: jsonb columns
+
+```sql
+INSERT INTO events (id, payload) SELECT 5, '{"a":1}'::text;
+-- ERROR:  column "payload" is of type jsonb but expression is of type text
+```
+
+Cast the text with `::jsonb`, or build the value with JSON functions such as `jsonb_build_object` or `to_jsonb`. A plain literal works, because it is still `unknown`: `UPDATE events SET payload = '{"a":1}' WHERE id = 1`. In application code, ORMs usually need the column mapped as JSON so the parameter is sent with the right type, rather than as a string.
+
+## Fix 5: boolean columns and 0/1 values
+
+Code ported from MySQL often stores `1` and `0` in boolean columns:
+
+```sql
+UPDATE events SET active = 1 WHERE id = 1;
+-- ERROR:  column "active" is of type boolean but expression is of type integer
+```
+
+Use `true` and `false`, string literals such as `'yes'`, `'t'` or `'1'` (which are converted because they are literals), or an explicit `1::boolean`. If many statements are affected, fix the generator rather than each query.
+
+## Fix 6: enum columns
+
+```sql
+CREATE TYPE mood AS ENUM ('happy', 'sad');
+CREATE TABLE people (name text, m mood);
+
+INSERT INTO people SELECT 'a', 'happy'::text;
+-- ERROR:  column "m" is of type mood but expression is of type text
+
+INSERT INTO people VALUES ('a', 'happy');   -- works
+```
+
+Cast to the enum type (`'happy'::mood` or `value::mood`). Drivers that bind enum values as strings need the same treatment as integers in Fix 3.
+
+## Fix 7: arrays from delimited strings
+
+A comma-separated string is not an array literal. A plain literal gives a different error, and a typed text value gives `42804`:
+
+```sql
+INSERT INTO events (id, tags) VALUES (8, 'a,b');
+-- ERROR:  malformed array literal: "a,b"
+-- DETAIL:  Array value must start with "{" or dimension information.
+
+INSERT INTO events (id, tags) SELECT 9, 'a,b'::text;
+-- ERROR:  column "tags" is of type text[] but expression is of type text
+```
+
+Even a correctly formatted value such as `'{a,b}'::text` fails the second way, because the problem is the type, not the content. Split the string with `string_to_array('a,b', ',')`, or write a real array literal such as `'{a,b}'` or `ARRAY['a','b']`.
+
+## Related messages with the same root cause
+
+The same type rule produces a few differently worded errors:
+
+- **Default values:** `CREATE TABLE t2 (n int DEFAULT 'abc'::text)` fails with `column "n" is of type integer but default expression is of type text`. Drop the cast: `DEFAULT '5'`.
+- **Changing a column type:** `ALTER TABLE staging ALTER COLUMN user_id TYPE int` fails with `column "user_id" cannot be cast automatically to type integer` and the hint `You might need to specify "USING user_id::integer"`. Add the `USING` clause.
+- **WHERE conditions:** `SELECT * FROM events WHERE id` fails with `argument of WHERE must be type boolean, not type integer`. Write the comparison you mean, such as `WHERE id <> 0`.
+- **CASE and UNION:** `CASE WHEN ... THEN id ELSE now() END` gives `CASE types timestamp with time zone and integer cannot be matched`, and `SELECT id ... UNION SELECT 'x'::text` gives `UNION types integer and text cannot be matched`. All branches must share a type, so cast them to a common one, usually `text`.
+
+A related trap is `CASE WHEN id > 1 THEN id ELSE 'none' END`. Here `'none'` is an untyped literal, so PostgreSQL tries to read it as an integer and fails with `invalid input syntax for type integer: "none"`. Cast the other branch instead: `THEN id::text ELSE 'none'`. The same applies to `coalesce(user_id, 'unknown')`.
+
+## Finding the column types quickly
+
+When a statement inserts into many columns, it helps to see the target types side by side:
+
+```sql
+SELECT column_name, data_type
+FROM information_schema.columns
+WHERE table_name = 'events'
+ORDER BY ordinal_position;
+```
+
+In [Chat2DB](https://chat2db.ai/download), the table structure is shown next to the editor, and the AI assistant can take a failing `INSERT ... SELECT` and add the casts each column needs, based on the real types of both tables. That is especially helpful for wide staging tables, where PostgreSQL reports only the first mismatched column at a time.
+
+## Summary
+
+`column "x" is of type A but expression is of type B` means a value with a definite type is being stored in a column of another type, and no automatic assignment cast exists between them. String literals are not affected because they have no type until they reach the column; typed values, such as columns from a text staging table, `varchar` parameters from a driver, or anything with an explicit `::text`, are. Cast the expression to the column's type, bind application parameters with the correct type, and use `USING` when changing a column's type.

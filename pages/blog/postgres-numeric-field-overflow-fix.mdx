@@ -1,0 +1,228 @@
+---
+title: "Fix Postgres Numeric Field Overflow (22003)"
+description: "Fix 'numeric field overflow' in PostgreSQL: how numeric(p,s) limits work, why 999.995 fails in numeric(5,2), rounding rules, and safe ways to widen the column."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: October 23, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# Fix Postgres Numeric Field Overflow (22003)
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="October 23, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+You insert a price, an exchange rate or an invoice total, and PostgreSQL refuses it:
+
+```
+ERROR:  numeric field overflow
+DETAIL:  A field with precision 5, scale 2 must round to an absolute value less than 10^3.
+```
+
+The SQLSTATE is `22003` (`numeric_value_out_of_range`), the same code PostgreSQL uses for `integer out of range`. The message is short, but the DETAIL line contains everything you need: the declared precision, the declared scale, and the largest magnitude the column can hold. This guide explains how to read it, why values that look like they fit still fail, and how to fix the column or the data without losing anything. Every example was run on PostgreSQL 18.
+
+## What precision and scale actually mean
+
+A column declared as `numeric(p, s)` stores at most `p` significant digits in total, of which `s` are after the decimal point. That leaves `p - s` digits before the decimal point. So:
+
+| Declared type | Digits after the point | Digits before the point | Largest value |
+|---|---|---|---|
+| `numeric(5,2)` | 2 | 3 | 999.99 |
+| `numeric(10,2)` | 2 | 8 | 99999999.99 |
+| `numeric(4,4)` | 4 | 0 | 0.9999 |
+| `numeric(7,0)` | 0 | 7 | 9999999 |
+
+The DETAIL line states the same limit as a power of ten: "must round to an absolute value less than 10^3" means the value has to be smaller than 1000 after rounding. When `p - s` is zero, PostgreSQL prints "less than 1" instead of `10^0`.
+
+A plain `numeric` with no modifiers has no such limit. It accepts up to 131072 digits before the decimal point and 16383 after, and it never raises `numeric field overflow`. The error only happens when a type modifier is present, either on a column or in a cast such as `::numeric(5,2)`.
+
+## Reproducing the error
+
+```sql
+CREATE TABLE prices (id int PRIMARY KEY, amount numeric(5,2));
+
+INSERT INTO prices VALUES (1, 1234.5);
+-- ERROR:  numeric field overflow
+-- DETAIL:  A field with precision 5, scale 2 must round to an absolute value less than 10^3.
+
+INSERT INTO prices VALUES (1, 999.994) RETURNING amount;
+--  amount
+-- --------
+--  999.99
+```
+
+`1234.5` has four digits before the point and the column allows three. `999.994` fits: it is rounded to two decimals and stored as `999.99`.
+
+## Rounding happens first, and it can push a value over the limit
+
+PostgreSQL does not truncate extra decimals. It rounds them to the declared scale, and only then checks the magnitude. Ties are rounded away from zero:
+
+```sql
+SELECT 12.5::numeric(3,0), 13.5::numeric(3,0), (-12.5)::numeric(3,0);
+--  13 | 14 | -13
+```
+
+That order of operations explains a common surprise:
+
+```sql
+INSERT INTO prices VALUES (2, 999.995);
+-- ERROR:  numeric field overflow
+-- DETAIL:  A field with precision 5, scale 2 must round to an absolute value less than 10^3.
+
+SELECT 99999.999::numeric(8,2);
+--   100000.00
+```
+
+`999.995` rounds to `1000.00`, which needs four integer digits, so it fails even though the original value is below 1000. In the second query `numeric(8,2)` has room for six integer digits, so the rounded value `100000.00` is stored.
+
+Note that `round()` on a `double precision` value behaves differently: `round(12.5::float8)` returns `12` because floating-point rounding goes to the nearest even number. If your application computes a value as a float and then casts it to `numeric(p,s)`, you can see results that differ by one unit in the last place from what the same calculation gives in `numeric`.
+
+## The places this error usually comes from
+
+### Arithmetic that grows past the column size
+
+Each input can be valid while the result is not. A line total of 300 units at 4999.99 is 1,499,997, which does not fit a column sized for unit prices:
+
+```sql
+CREATE TABLE invoice (qty int, unit_price numeric(6,2), line_total numeric(6,2));
+INSERT INTO invoice VALUES (300, 4999.99, 300 * 4999.99);
+-- ERROR:  numeric field overflow
+-- DETAIL:  A field with precision 6, scale 2 must round to an absolute value less than 10^4.
+```
+
+The same happens with sums. An aggregate over `numeric(5,2)` values returns unconstrained `numeric`, so `SUM` itself never overflows. The error appears only when you write the sum back into a constrained column or cast it.
+
+### Rates and percentages stored with no integer digits
+
+A column such as `numeric(4,4)` is a natural choice for a tax rate like `0.0825`, but it rejects `1.0`:
+
+```sql
+CREATE TABLE t_tax (rate numeric(4,4));
+INSERT INTO t_tax VALUES (0.0825), (1.0);
+-- ERROR:  numeric field overflow
+-- DETAIL:  A field with precision 4, scale 4 must round to an absolute value less than 1.
+```
+
+If a rate of 100% is possible (a fully discounted item, a full refund), the column needs at least one integer digit: `numeric(5,4)`.
+
+### Shrinking a column with ALTER TABLE
+
+Changing the type runs every existing row through the new modifier. One large row is enough to fail the whole statement:
+
+```sql
+CREATE TABLE orders (id int, total numeric(12,2));
+INSERT INTO orders VALUES (1, 1234567.89), (2, 99.5);
+
+ALTER TABLE orders ALTER COLUMN total TYPE numeric(8,2);
+-- ERROR:  numeric field overflow
+-- DETAIL:  A field with precision 8, scale 2 must round to an absolute value less than 10^6.
+```
+
+### Infinity
+
+Since PostgreSQL 14, `numeric` supports `Infinity` and `-Infinity`, but a constrained column cannot hold them. `NaN` is allowed:
+
+```sql
+SELECT 'Infinity'::numeric(10,2);
+-- ERROR:  numeric field overflow
+-- DETAIL:  A field with precision 10, scale 2 cannot hold an infinite value.
+
+SELECT 'NaN'::numeric(10,2);
+--  NaN
+```
+
+This one usually comes from a division by a very small float, or from an application that serializes an infinite double as the string `Infinity`.
+
+### Casting floats
+
+A `double precision` value can be enormous. Casting `1e20::float8` to `numeric(10,2)` fails the same way, with the DETAIL showing `10^8`. Check the float before the cast, or store it in an unconstrained `numeric` first.
+
+## How to fix it
+
+### 1. Find the rows that do not fit
+
+Before changing anything, look at the data. To find rows that would not fit `numeric(p,s)`, compare the rounded value with the limit from the DETAIL line:
+
+```sql
+SELECT * FROM orders WHERE abs(round(total, 2)) >= 1e6;
+--  id |   total
+-- ----+------------
+--   1 | 1234567.89
+```
+
+Replace `2` with the target scale and `1e6` with `10^(p - s)`. If the result is empty, the change is safe.
+
+### 2. Widen the column
+
+If the values are legitimate, the column is too small. Increase the precision, keeping the scale:
+
+```sql
+ALTER TABLE orders ALTER COLUMN total TYPE numeric(9,2);
+```
+
+Increasing the precision while keeping the same scale is cheap: PostgreSQL knows every existing value still fits, so it only updates the catalog and does not rewrite the table (we confirmed this on PostgreSQL 18 by checking that `pg_relation_filenode('orders')` did not change). It still takes an `ACCESS EXCLUSIVE` lock for a moment, so it waits behind long-running queries on the table. Changing the scale is different: `numeric(9,2)` to `numeric(9,3)` rewrites every row and rebuilds the indexes, which can take a long time on a large table.
+
+### 3. Or drop the modifier
+
+For many applications the cleanest fix is plain `numeric`, which has no precision limit and keeps whatever scale the value arrives with. Removing the modifier also avoids a table rewrite. Add a `CHECK` constraint if you still want a business limit:
+
+```sql
+ALTER TABLE orders ALTER COLUMN total TYPE numeric;
+ALTER TABLE orders ADD CONSTRAINT total_range CHECK (total >= 0 AND total < 1e12);
+```
+
+The trade-off is that plain `numeric` does not force a fixed number of decimals, so `10.5` and `10.50` are stored and displayed as typed. If you need exactly two decimals for display, round in the query or in the application.
+
+### 4. Fix the calculation instead of the column
+
+When a computed result is wrong rather than large, the column is doing its job. A common example is a unit mix-up where cents are multiplied by 100 a second time, or a currency conversion applied twice. In that case keep the column, fix the expression, and add a `CHECK` constraint so the next bug is caught at the same place.
+
+### 5. Clamp or reject explicitly
+
+If out-of-range input should be rejected with a clear message, validate it before it reaches the cast. In PL/pgSQL you can catch the condition by name:
+
+```sql
+DO $$
+BEGIN
+  PERFORM 12345.678::numeric(5,2);
+EXCEPTION WHEN numeric_value_out_of_range THEN
+  RAISE NOTICE 'amount too large for numeric(5,2)';
+END $$;
+```
+
+Do not silently clamp money values to the maximum. A total that quietly becomes 999.99 is worse than an error.
+
+## Choosing precision and scale
+
+A few rules of thumb help avoid this error from the start:
+
+- **Money:** pick the scale your currency needs (2 for most, 0 for JPY, 3 for some dinars) and give the integer part generous headroom. `numeric(14,2)` holds values up to just under one trillion and costs only a few bytes more than `numeric(8,2)`. Storage size depends on the digits actually stored, not on the declared precision.
+- **Rates:** leave at least one integer digit so 100% is representable.
+- **Quantities and measurements:** if the precision is not a business rule, use plain `numeric` or `double precision` and round on output.
+- **Scale larger than precision, negative scale:** since PostgreSQL 15 you can declare `numeric(2,3)` for values below 0.1 with three decimals, or `numeric(3,-3)` to round to thousands. `SELECT 123456::numeric(3,-3)` returns `123000`. These are rarely needed, but the overflow rule is the same: after rounding, the value must be below `10^(p - s)`.
+
+You can see the declared modifiers of existing columns with `format_type`:
+
+```sql
+SELECT attname, format_type(atttypid, atttypmod)
+FROM pg_attribute
+WHERE attrelid = 'prices'::regclass AND attnum > 0;
+```
+
+## Related errors that look similar
+
+- `integer out of range` (also `22003`): an `int` or `bigint` overflow, for example `3000000000::numeric::int`. The fix is a wider integer type, not a numeric modifier.
+- `value overflows numeric format` (`22003`): a plain `numeric` result that exceeds the absolute limits of the type, such as `10::numeric ^ 131072`. This is almost always a runaway calculation.
+- `invalid input syntax for type numeric` (`22P02`): the input is not a number at all, for example `'abc'` or `'1.2.3'`.
+
+## Check values before they reach the database
+
+To test a list of values against a type without running SQL, paste them into the [Postgres numeric(p,s) Precision Checker](https://chat2db.ai/tools/postgres-numeric-precision-checker). It applies the same rounding and overflow rules, shows the exact error for each value that fails, and suggests the smallest `numeric(p,s)` that stores all of them without rounding.
+
+When you are investigating a real table, a database client with an AI assistant speeds up the loop. In [Chat2DB](https://chat2db.ai/download) you can paste the error, ask which rows are too large for the target type, and get the `SELECT` and `ALTER TABLE` statements for your actual table and column names.
+
+## Summary
+
+`numeric field overflow` means a value, after being rounded to the column's scale, has more digits before the decimal point than `numeric(p,s)` allows. Read the DETAIL line to get the limit, remember that rounding can push values like 999.995 over it, and check computed results as well as inputs. Then either widen the column, switch to unconstrained `numeric` with a `CHECK` constraint, or fix the calculation that produced the value.

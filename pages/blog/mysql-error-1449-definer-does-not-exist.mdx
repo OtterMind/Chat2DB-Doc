@@ -1,0 +1,206 @@
+---
+title: "Fix MySQL 1449: Definer User Does Not Exist"
+description: "Fix MySQL error 1449 'The user specified as a definer does not exist' for views, procedures and triggers: find orphaned definers, change them, and fix dumps."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: October 23, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# Fix MySQL 1449: Definer User Does Not Exist
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="October 23, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+A view that worked yesterday, a stored procedure, or even a plain `INSERT` suddenly fails with:
+
+```
+ERROR 1449 (HY000): The user specified as a definer ('deployer'@'%') does not exist
+```
+
+Nothing in your query mentions `deployer`. The account belongs to a view, routine, trigger or event that the statement uses, and that account has since been dropped, renamed, or was never created on this server. This guide explains why MySQL needs the definer, how to find every object with a missing one, and the safe ways to fix them, including dumps that fail to import or export because of it. All examples were run on MySQL 8.4.
+
+## Why stored objects have a definer
+
+Views, stored procedures, stored functions, triggers and events are created with a `DEFINER` attribute: the account that owns the object. By default it is the account that ran the `CREATE` statement. Objects also have an `SQL SECURITY` characteristic (triggers and events always behave as `DEFINER`):
+
+- `SQL SECURITY DEFINER` (the default): the object runs with the privileges of the definer account, not of the user who calls it. This is how you give an application access to a view without granting it the underlying tables.
+- `SQL SECURITY INVOKER`: the object runs with the caller's privileges, and the definer only matters for ownership.
+
+When an object with definer security runs, MySQL must look up the definer's privileges. If that account no longer exists, there are no privileges to check, and the statement fails with error 1449.
+
+## Reproducing it
+
+```sql
+CREATE USER 'deployer'@'%' IDENTIFIED BY '...';
+GRANT ALL ON app.* TO 'deployer'@'%';
+
+CREATE DEFINER='deployer'@'%' VIEW v_accounts AS SELECT id, email FROM accounts;
+CREATE DEFINER='deployer'@'%' PROCEDURE p_count() SELECT COUNT(*) FROM accounts;
+CREATE DEFINER='deployer'@'%' TRIGGER trg_acc BEFORE INSERT ON accounts
+  FOR EACH ROW SET NEW.email = LOWER(NEW.email);
+
+SELECT * FROM v_accounts;   -- works
+
+DROP USER 'deployer'@'%';
+
+SELECT * FROM v_accounts;
+-- ERROR 1449 (HY000): The user specified as a definer ('deployer'@'%') does not exist
+CALL p_count();
+-- ERROR 1449 (HY000): The user specified as a definer ('deployer'@'%') does not exist
+INSERT INTO accounts VALUES (2, 'LINUS@example.com');
+-- ERROR 1449 (HY000): The user specified as a definer ('deployer'@'%') does not exist
+```
+
+The last case is the most confusing in production. The `INSERT` fails because the table has a trigger owned by the missing account. Applications report it as a failed write on an ordinary table, with no obvious connection to a user that was removed weeks ago.
+
+## Common ways it happens
+
+- **A user was dropped or renamed** during an access review or when someone left the team, and their objects were not reassigned.
+- **A dump was restored on another server.** `mysqldump` preserves the `DEFINER` clauses. Restoring a production dump into staging, a developer laptop or a managed cloud instance creates objects owned by accounts that only exist in production.
+- **The host part differs.** `'app'@'10.0.%'` and `'app'@'%'` are different accounts. Recreating a user with a different host does not satisfy a definer that names the old one.
+- **Objects were created with a placeholder definer.** An administrator with sufficient privileges can create an object with any definer; MySQL only warns. We created `CREATE DEFINER='nobody'@'%' VIEW v_nobody AS SELECT 1` as root, got `Note 1449 The user specified as a definer ('nobody'@'%') does not exist` in `SHOW WARNINGS`, and the view failed on first use.
+
+## Step 1: find every object with a missing definer
+
+The error names one account, but there are usually several objects. The `information_schema` views list definers for each object type. To find everything owned by one account:
+
+```sql
+SELECT TABLE_SCHEMA, TABLE_NAME, DEFINER, SECURITY_TYPE
+FROM information_schema.VIEWS WHERE DEFINER = 'deployer@%';
+
+SELECT ROUTINE_SCHEMA, ROUTINE_NAME, ROUTINE_TYPE, DEFINER
+FROM information_schema.ROUTINES WHERE DEFINER = 'deployer@%';
+
+SELECT TRIGGER_SCHEMA, TRIGGER_NAME, DEFINER
+FROM information_schema.TRIGGERS WHERE DEFINER = 'deployer@%';
+
+SELECT EVENT_SCHEMA, EVENT_NAME, DEFINER
+FROM information_schema.EVENTS WHERE DEFINER = 'deployer@%';
+```
+
+Note that the `DEFINER` column is formatted as `user@host`, without quotes. To find objects whose definer does not exist at all, whichever account it is, compare against `mysql.user`:
+
+```sql
+SELECT 'VIEW' AS type, TABLE_SCHEMA AS db, TABLE_NAME AS name, DEFINER
+FROM information_schema.VIEWS
+WHERE DEFINER NOT IN (SELECT CONCAT(User, '@', Host) FROM mysql.user)
+UNION ALL
+SELECT ROUTINE_TYPE, ROUTINE_SCHEMA, ROUTINE_NAME, DEFINER
+FROM information_schema.ROUTINES
+WHERE DEFINER NOT IN (SELECT CONCAT(User, '@', Host) FROM mysql.user)
+UNION ALL
+SELECT 'TRIGGER', TRIGGER_SCHEMA, TRIGGER_NAME, DEFINER
+FROM information_schema.TRIGGERS
+WHERE DEFINER NOT IN (SELECT CONCAT(User, '@', Host) FROM mysql.user)
+UNION ALL
+SELECT 'EVENT', EVENT_SCHEMA, EVENT_NAME, DEFINER
+FROM information_schema.EVENTS
+WHERE DEFINER NOT IN (SELECT CONCAT(User, '@', Host) FROM mysql.user);
+```
+
+Reading `mysql.user` requires the `SELECT` privilege on the `mysql` schema, which an administrator normally has. Run this after every restore into a new environment.
+
+## Step 2: choose the fix
+
+There are two families of fixes: give the objects an existing owner, or recreate the missing account.
+
+### Option A: change the definer of views
+
+Views can be changed in place with `ALTER VIEW`, which takes a new `DEFINER` and the full view definition:
+
+```sql
+ALTER DEFINER='root'@'localhost' VIEW v_accounts AS SELECT id, email FROM accounts;
+SELECT * FROM v_accounts;   -- works again
+```
+
+Use `SHOW CREATE VIEW v_accounts` first to copy the exact current definition. `DEFINER=CURRENT_USER` is also accepted and assigns the account running the statement.
+
+Choose the new owner carefully. With `SQL SECURITY DEFINER`, everyone who can query the view gets the owner's access to the underlying tables through it. A dedicated account with only the needed privileges is better than `root`.
+
+### Option B: switch views to SQL SECURITY INVOKER
+
+If callers already have privileges on the underlying tables, invoker security removes the dependency on the definer entirely:
+
+```sql
+ALTER DEFINER='root'@'localhost' SQL SECURITY INVOKER VIEW v_accounts AS
+  SELECT id, email FROM accounts;
+```
+
+In our test, an `SQL SECURITY INVOKER` view whose definer had been dropped still worked, because MySQL checks the caller's privileges instead. This is a good default for views that exist for convenience rather than access control.
+
+### Option C: recreate procedures, functions and triggers
+
+`ALTER PROCEDURE` and `ALTER FUNCTION` can change characteristics such as `SQL SECURITY` and `COMMENT`, but not the definer; `ALTER DEFINER=... PROCEDURE` is a syntax error. Triggers have no `ALTER` statement at all. Drop and recreate them with the new definer:
+
+```sql
+SHOW CREATE PROCEDURE p_count;   -- copy the body
+
+DROP PROCEDURE p_count;
+CREATE DEFINER='app_owner'@'%' PROCEDURE p_count()
+  SELECT COUNT(*) FROM accounts;
+
+DROP TRIGGER trg_acc;
+CREATE DEFINER='app_owner'@'%' TRIGGER trg_acc BEFORE INSERT ON accounts
+  FOR EACH ROW SET NEW.email = LOWER(NEW.email);
+```
+
+Do this in a maintenance window: between the `DROP` and the `CREATE` the procedure is missing, and inserts on the table run without the trigger. Re-grant `EXECUTE` on the routine to the accounts that call it, since privileges granted on a specific routine are removed when it is dropped.
+
+Events can be changed in place, but `ALTER EVENT` needs at least one clause besides the definer; `ALTER DEFINER='app_owner'@'%' EVENT ev1` on its own is a syntax error. Restate an existing property, for example `ALTER DEFINER='app_owner'@'%' EVENT ev1 ENABLE;`.
+
+### Option D: recreate the missing account
+
+Creating an account with the exact name and host makes all the objects work again without touching them. It fits well when the account represents a role, such as `deployer`, rather than a person. The account needs the privileges the objects use. In our test, after recreating `deployer` with only `SELECT`, the error changed rather than disappearing:
+
+```sql
+CALL p_count();
+-- ERROR 1370 (42000): execute command denied to user 'deployer'@'%' for routine 'app.p_count'
+INSERT INTO accounts VALUES (3, 'X@example.com');
+-- ERROR 1142 (42000): TRIGGER command denied to user 'deployer'@'%' for table 'accounts'
+```
+
+A definer that exists but lacks privileges fails just as hard. If the account should never log in, create it with `ACCOUNT LOCK`; definer privileges still apply to the objects it owns. We recreated `deployer` locked, with `SELECT, INSERT, TRIGGER, EXECUTE` on the schema, and `CALL p_count()` worked again. The trigger still failed, with `ERROR 1143: UPDATE command denied to user 'deployer'@'%' for column 'email'`, because a trigger that assigns `NEW.email` needs the `UPDATE` privilege on that column. Grant exactly what the objects do, and test each one.
+
+## Fixing dumps
+
+Error 1449 also breaks `mysqldump` itself. A dump of a schema containing a view with a missing definer fails when the tool reads the view:
+
+```
+mysqldump: Got error: 1449: The user specified as a definer ('nobody'@'%') does not exist when using LOCK TABLES
+```
+
+Fix the definers in the source as described above, then dump again.
+
+When restoring a dump into an environment with different accounts, the `DEFINER` clauses are the problem. In the dump they look like this:
+
+```
+/*!50013 DEFINER=`root`@`localhost` SQL SECURITY DEFINER */
+CREATE DEFINER=`deployer`@`%` PROCEDURE `p_count`()
+/*!50003 CREATE*/ /*!50017 DEFINER=`deployer`@`%`*/ /*!50003 TRIGGER `trg_acc` ...
+```
+
+A common approach is to rewrite them during import so the restoring account becomes the owner:
+
+```bash
+sed -E 's/DEFINER=`[^`]+`@`[^`]+`/DEFINER=CURRENT_USER/g' dump.sql | mysql app
+```
+
+Review the result before using it in production, since every object then belongs to whoever ran the import. Restoring objects with a definer other than yourself also requires the `SET_ANY_DEFINER` privilege (or the older `SET_USER_ID`), which many managed MySQL services do not grant, so rewriting the definers is often the only way to import there.
+
+## Preventing it
+
+- Own shared objects with a dedicated, locked service account rather than a personal login, so access reviews never remove the owner.
+- Use `SQL SECURITY INVOKER` for views that do not need to grant extra access.
+- Run the orphaned-definer query after restores and before dropping any account.
+- Keep definers out of migration scripts, or set them explicitly to the service account.
+
+## Do it from a client
+
+Finding and recreating objects is easier when you can see their definitions next to the query results. In [Chat2DB](https://chat2db.ai/download) you can open a view or procedure to see its `CREATE` statement with the definer, run the orphaned-definer query against each environment, and ask the AI assistant to generate the `ALTER VIEW` or `DROP`/`CREATE` statements with a new owner. It is also available in the browser at [app.chat2db.ai](https://app.chat2db.ai/).
+
+## Summary
+
+Error 1449 means a view, routine, trigger or event is owned by an account that no longer exists, so MySQL cannot check the privileges it should run with. Find every affected object in `information_schema`, then either assign an existing owner (`ALTER VIEW` for views, `ALTER EVENT` for events, drop and recreate for routines and triggers), switch views to `SQL SECURITY INVOKER`, or recreate the account with the right privileges. When moving dumps between servers, rewrite the `DEFINER` clauses so the objects belong to an account that exists on the target.

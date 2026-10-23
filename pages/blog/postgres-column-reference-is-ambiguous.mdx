@@ -1,0 +1,244 @@
+---
+title: "Fix Postgres: Column Reference Is Ambiguous"
+description: "Fix 'column reference is ambiguous' (42702) in PostgreSQL: joins, ORDER BY, UPDATE FROM, ON CONFLICT and PL/pgSQL RETURNS TABLE variable conflicts."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: October 23, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# Fix Postgres: Column Reference Is Ambiguous
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="October 23, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+You join two tables, run the query, and PostgreSQL stops at the first column name:
+
+```
+ERROR:  column reference "id" is ambiguous
+LINE 1: select id, name, total from customers join orders on orders....
+               ^
+```
+
+The SQLSTATE is `42702` (`ambiguous_column`). It means a column name you wrote, without a table prefix, exists in more than one of the tables or variables visible at that point, and PostgreSQL will not guess which one you meant. The caret under `LINE 1` points at the exact reference.
+
+The fix is almost always to qualify the column. The interesting part is recognising the less obvious places where the ambiguity comes from: `ORDER BY`, `UPDATE ... FROM`, `ON CONFLICT DO UPDATE`, and PL/pgSQL functions whose output columns share names with table columns. This guide walks through each case with queries run on PostgreSQL 18.
+
+## The example schema
+
+```sql
+CREATE TABLE customers (
+  id         int PRIMARY KEY,
+  name       text,
+  created_at timestamptz DEFAULT now()
+);
+
+CREATE TABLE orders (
+  id          int PRIMARY KEY,
+  customer_id int REFERENCES customers,
+  total       numeric(10,2),
+  status      text,
+  created_at  timestamptz DEFAULT now()
+);
+
+INSERT INTO customers VALUES (1, 'Ada'), (2, 'Linus');
+INSERT INTO orders VALUES (10, 1, 50, 'paid'), (11, 1, 20, 'new'), (12, 2, 99, 'paid');
+```
+
+Both tables have `id` and `created_at`. Those two names are where every ambiguity below comes from. Columns that exist in only one table, such as `name`, `total` and `customer_id`, are never ambiguous, even in a join.
+
+## Case 1: an unqualified column in a join
+
+```sql
+SELECT id, name, total
+FROM customers JOIN orders ON orders.customer_id = customers.id;
+-- ERROR:  column reference "id" is ambiguous
+```
+
+Both tables contribute an `id`. Qualify it with the table name or, better, with a short alias:
+
+```sql
+SELECT c.id, c.name, o.total
+FROM customers c
+JOIN orders o ON o.customer_id = c.id;
+```
+
+The error is raised in any clause, not only the select list. Filtering on a shared column fails in exactly the same way:
+
+```sql
+SELECT c.id, name, total
+FROM customers c JOIN orders o ON o.customer_id = c.id
+WHERE created_at > now() - interval '1 day';
+-- ERROR:  column reference "created_at" is ambiguous
+```
+
+Here the question is real: do you want recent customers or recent orders? Write `o.created_at` or `c.created_at` depending on what the query is for. This is the main reason PostgreSQL refuses to guess; picking the wrong one would return plausible but incorrect results.
+
+A good habit is to qualify every column in any query with more than one table, even the unique ones. It makes the query readable, and it stops a future `ALTER TABLE ... ADD COLUMN` from turning a working query into an error. For example, adding a `name` column to `orders` would break every query that uses an unqualified `name` alongside a join to `orders`.
+
+## Case 2: USING and NATURAL joins merge the column
+
+When you join with `USING`, the join column appears once in the output and can be referenced without a prefix:
+
+```sql
+SELECT id FROM customers JOIN orders USING (id);
+```
+
+This runs without error, because `USING (id)` merges the two `id` columns into one. Be careful, though: this query joins customer IDs to order IDs, which is almost never what you want. `USING` is convenient when the shared name really is the join key, such as a `customer_id` present in both tables. It is a trap when unrelated columns share a generic name like `id` or `created_at`.
+
+## Case 3: ORDER BY with duplicate output names
+
+`ORDER BY` first looks for a matching output column name. If two output columns have the same name, you get a slightly different message:
+
+```sql
+SELECT c.id AS id, o.id AS id
+FROM customers c JOIN orders o ON o.customer_id = c.id
+ORDER BY id;
+-- ERROR:  ORDER BY "id" is ambiguous
+```
+
+Give the output columns distinct aliases (`c.id AS customer_id, o.id AS order_id`) and order by one of them, or order by the qualified input column, `ORDER BY o.id`.
+
+## Case 4: subqueries in FROM add more candidates
+
+Every relation in the `FROM` clause adds its column names, including derived tables and set-returning functions:
+
+```sql
+SELECT id
+FROM customers c
+JOIN orders o ON o.customer_id = c.id
+JOIN (SELECT 1 AS id) x ON true;
+-- ERROR:  column reference "id" is ambiguous
+```
+
+If you add a lateral subquery or a CTE to an existing query, check that its output column names do not collide with columns you reference unqualified elsewhere.
+
+## Case 5: UPDATE ... FROM and DELETE ... USING
+
+An `UPDATE` with a `FROM` clause is a join between the target table and the other tables, so the same rule applies:
+
+```sql
+UPDATE orders SET status = 'vip'
+FROM customers
+WHERE customer_id = customers.id AND name = 'Ada' AND id = 10;
+-- ERROR:  column reference "id" is ambiguous
+```
+
+Alias the target table and qualify everything:
+
+```sql
+UPDATE orders o
+SET status = 'vip'
+FROM customers c
+WHERE o.customer_id = c.id
+  AND c.name = 'Ada'
+  AND o.id = 10;
+```
+
+The column names on the left of `SET` are the exception. They always refer to the target table and must not be qualified; writing `SET o.status = ...` gives a different error with the hint `SET target columns cannot be qualified with the relation name`.
+
+## Case 6: ON CONFLICT DO UPDATE
+
+An upsert sees two versions of the row: the existing one, under the table's name, and the proposed one, under the special name `excluded`. Both have every column, so any unqualified column on the right-hand side of `SET` is ambiguous:
+
+```sql
+CREATE TABLE stock (sku text PRIMARY KEY, qty int);
+
+INSERT INTO stock VALUES ('a', 1)
+ON CONFLICT (sku) DO UPDATE SET qty = qty + excluded.qty;
+-- ERROR:  column reference "qty" is ambiguous
+```
+
+Qualify the existing value with the table name (or the alias given by `INSERT INTO stock AS s`):
+
+```sql
+INSERT INTO stock VALUES ('a', 1)
+ON CONFLICT (sku) DO UPDATE SET qty = stock.qty + excluded.qty
+RETURNING qty;
+```
+
+## Case 7: PL/pgSQL variables with the same name as a column
+
+Inside PL/pgSQL, function parameters and variables are visible in the SQL statements you write. If one has the same name as a column, PostgreSQL raises the error with an extra DETAIL line:
+
+```sql
+CREATE FUNCTION order_count(customer_id int) RETURNS bigint
+LANGUAGE plpgsql AS $$
+BEGIN
+  RETURN (SELECT count(*) FROM orders WHERE orders.customer_id = customer_id);
+END $$;
+
+SELECT order_count(1);
+-- ERROR:  column reference "customer_id" is ambiguous
+-- DETAIL:  It could refer to either a PL/pgSQL variable or a table column.
+```
+
+Note that `orders.customer_id` was qualified, but the right-hand `customer_id` was not, and it matches both the parameter and the column. The function is created without complaint; the error appears only when the statement is first executed.
+
+The trap is even easier to fall into with `RETURNS TABLE`, because the output column names are also variables:
+
+```sql
+CREATE FUNCTION get_orders(p_customer int)
+RETURNS TABLE (id int, total numeric)
+LANGUAGE plpgsql AS $$
+BEGIN
+  RETURN QUERY SELECT id, total FROM orders WHERE customer_id = p_customer;
+END $$;
+
+SELECT * FROM get_orders(1);
+-- ERROR:  column reference "id" is ambiguous
+-- DETAIL:  It could refer to either a PL/pgSQL variable or a table column.
+```
+
+There are three fixes, in order of preference:
+
+1. **Qualify the table columns with an alias.** This is explicit and works everywhere:
+
+   ```sql
+   RETURN QUERY SELECT o.id, o.total FROM orders o WHERE o.customer_id = p_customer;
+   ```
+
+2. **Use a naming convention for parameters and variables**, such as a `p_` prefix for parameters and `v_` for local variables. Then a collision with a column cannot happen. For `RETURNS TABLE` columns you usually want the clean names in the output, so combine this with option 1.
+
+3. **Tell PL/pgSQL how to resolve the conflict** with a compiler option at the top of the function body:
+
+   ```sql
+   CREATE OR REPLACE FUNCTION get_orders(p_customer int)
+   RETURNS TABLE (id int, total numeric)
+   LANGUAGE plpgsql AS $$
+   #variable_conflict use_column
+   BEGIN
+     RETURN QUERY SELECT id, total FROM orders WHERE customer_id = p_customer;
+   END $$;
+   ```
+
+   `use_column` prefers the table column, `use_variable` prefers the variable. The server-wide setting `plpgsql.variable_conflict` does the same for every function. These options make the error go away, but they also hide real mistakes, so prefer explicit qualification for new code.
+
+SQL-language functions (`LANGUAGE sql`) follow different rules: a column name takes precedence over a parameter of the same name, so the error does not occur there. That is not necessarily good news. We rewrote `order_count` as a SQL function with the same body, and `order_count(2)` returned `3`, the total number of orders, because `orders.customer_id = customer_id` compared the column with itself. In SQL functions, refer to a parameter unambiguously as `function_name.parameter_name` (here `order_count.customer_id`) or by position as `$1`.
+
+## A checklist for finding the culprit
+
+When the message names a column, ask:
+
+- Which relations in this statement's `FROM`, `JOIN`, `USING`, `UPDATE ... FROM` or `DELETE ... USING` have a column with this name? Include subqueries, CTEs and functions in `FROM`.
+- Is this an upsert? Then the target table and `excluded` both have it.
+- Is this inside a PL/pgSQL function? Then check the parameters, `DECLARE` variables and `RETURNS TABLE` / `OUT` columns too.
+- Did a recent migration add a column with this name to one of the tables? That explains why a query that used to work now fails.
+
+You can list which tables in a schema contain a given column name with:
+
+```sql
+SELECT table_name
+FROM information_schema.columns
+WHERE table_schema = 'public' AND column_name = 'created_at';
+```
+
+## Let your editor qualify columns for you
+
+Most ambiguity errors come from typing column names by hand. A client with schema-aware autocompletion inserts the alias for you. In [Chat2DB](https://chat2db.ai/download), completions are qualified with the alias from your `FROM` clause, and the AI assistant can rewrite an existing query to fully qualify every column, or explain which tables a failing reference matches. You can also try it in the browser at [app.chat2db.ai](https://app.chat2db.ai/).
+
+## Summary
+
+`column reference "x" is ambiguous` means the name exists in more than one place that is visible to the statement, and PostgreSQL will not choose for you. Qualify the column with a table alias. Remember the less obvious sources of duplicates: derived tables in `FROM`, duplicate output names in `ORDER BY`, the target and `FROM` tables of an `UPDATE`, the table and `excluded` in an upsert, and PL/pgSQL variables, especially `RETURNS TABLE` columns. Qualifying every column in multi-table queries prevents the error and keeps queries working when tables gain new columns.

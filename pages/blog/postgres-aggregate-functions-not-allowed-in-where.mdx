@@ -1,0 +1,265 @@
+---
+title: "Fix Postgres: Aggregates Not Allowed in WHERE"
+description: "Fix 'aggregate functions are not allowed in WHERE' (42803) and window functions in WHERE (42P20) in PostgreSQL using HAVING, subqueries and CTEs."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: October 23, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# Fix Postgres: Aggregates Not Allowed in WHERE
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="October 23, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+You want customers who spent more than 60, so you write the condition the way you would say it:
+
+```sql
+SELECT customer_id, sum(total)
+FROM orders
+WHERE sum(total) > 60
+GROUP BY customer_id;
+```
+
+```
+ERROR:  aggregate functions are not allowed in WHERE
+LINE 1: select customer_id, sum(total) from orders where sum(total) ...
+                                                         ^
+```
+
+The SQLSTATE is `42803` (`grouping_error`). Its close relative, for `row_number()`, `rank()` and other window functions, is:
+
+```
+ERROR:  window functions are not allowed in WHERE
+```
+
+with SQLSTATE `42P20` (`windowing_error`). Both errors come from the order in which SQL evaluates a query, and both have short, standard fixes. This guide explains the evaluation order, then shows the right rewrite for each kind of question. Every query was run on PostgreSQL 18.
+
+## Why WHERE cannot see aggregates
+
+A `SELECT` statement is written in one order but evaluated in another. Logically, PostgreSQL processes the clauses like this:
+
+1. `FROM` and `JOIN`: build the input rows.
+2. `WHERE`: keep or discard each individual row.
+3. `GROUP BY`: collect the remaining rows into groups.
+4. Aggregates such as `sum`, `count`, `avg` are computed per group.
+5. `HAVING`: keep or discard each group.
+6. Window functions are computed over the remaining rows.
+7. `SELECT` list, `DISTINCT`, `ORDER BY`, `LIMIT`.
+
+`WHERE` runs at step 2. At that point no groups exist, so there is nothing for `sum(total)` to add up. Window functions are computed even later, at step 6, after `WHERE` has already decided which rows exist. A condition in `WHERE` cannot depend on a value that is calculated from its own result.
+
+The sample data used below:
+
+```sql
+CREATE TABLE orders (
+  id          int PRIMARY KEY,
+  customer_id int,
+  total       numeric(10,2),
+  created_at  date
+);
+INSERT INTO orders VALUES
+  (1, 1, 50, '2026-10-01'), (2, 1, 20, '2026-10-02'), (3, 2, 99, '2026-10-03'),
+  (4, 3, 500, '2026-10-04'), (5, 3, 10, '2026-10-05');
+```
+
+## Fix 1: filter groups with HAVING
+
+If the condition is about a group, it belongs in `HAVING`, which runs after aggregation:
+
+```sql
+SELECT customer_id, sum(total)
+FROM orders
+GROUP BY customer_id
+HAVING sum(total) > 60
+ORDER BY 1;
+--  customer_id |  sum
+-- -------------+--------
+--            1 |  70.00
+--            2 |  99.00
+--            3 | 510.00
+```
+
+`HAVING` can use any aggregate, not just the ones in the select list. For example, customers with more than one order:
+
+```sql
+SELECT customer_id, sum(total)
+FROM orders
+GROUP BY customer_id
+HAVING count(*) > 1;
+```
+
+You can still use `WHERE` in the same query for conditions on individual rows. Row conditions in `WHERE` make the query faster, because rows are discarded before they are grouped. A good rule: if a condition can be checked on a single row, put it in `WHERE`; if it needs the whole group, put it in `HAVING`.
+
+### HAVING cannot use a select-list alias
+
+A natural next attempt fails with a different message:
+
+```sql
+SELECT customer_id, sum(total) AS spent
+FROM orders
+GROUP BY customer_id
+HAVING spent > 60;
+-- ERROR:  column "spent" does not exist
+```
+
+PostgreSQL evaluates `HAVING` before the select list, so output aliases are not available there (they are available in `ORDER BY`). Repeat the aggregate expression: `HAVING sum(total) > 60`. The aggregate is computed once even when it appears twice.
+
+## Fix 2: compare rows with an aggregate over the whole table
+
+Sometimes the question is about individual rows, compared with an aggregate of all rows: "orders above the average order value".
+
+```sql
+SELECT * FROM orders WHERE total > avg(total);
+-- ERROR:  aggregate functions are not allowed in WHERE
+```
+
+Compute the aggregate in a scalar subquery. It runs once, and its single value is available to every row:
+
+```sql
+SELECT * FROM orders WHERE total > (SELECT avg(total) FROM orders);
+--  id | customer_id | total  | created_at
+-- ----+-------------+--------+------------
+--   4 |           3 | 500.00 | 2026-10-04
+```
+
+The same pattern fixes `UPDATE` and `DELETE` statements, which have the same restriction:
+
+```sql
+UPDATE orders SET total = total * 0.9 WHERE total > avg(total);
+-- ERROR:  aggregate functions are not allowed in WHERE
+
+BEGIN;
+UPDATE orders SET total = total * 0.9
+WHERE total > (SELECT avg(total) FROM orders);
+-- UPDATE 1
+ROLLBACK;  -- keep the sample data unchanged for the next examples
+```
+
+## Fix 3: compare rows with an aggregate of their own group
+
+"Each customer's largest order" compares each row with the maximum of its group. A subquery correlated on the group key works:
+
+```sql
+SELECT *
+FROM orders o
+WHERE total = (SELECT max(total) FROM orders i WHERE i.customer_id = o.customer_id)
+ORDER BY id;
+```
+
+For "one row per group", PostgreSQL's `DISTINCT ON` is shorter and usually faster:
+
+```sql
+SELECT DISTINCT ON (customer_id) *
+FROM orders
+ORDER BY customer_id, total DESC;
+```
+
+Note the difference when there are ties: the subquery version returns every order that equals the maximum, `DISTINCT ON` returns exactly one per customer.
+
+## Fix 4: filter on a window function in an outer query
+
+Window functions are the usual way to rank or number rows, and it is tempting to filter on them directly:
+
+```sql
+SELECT id, row_number() OVER (ORDER BY total DESC) AS rn
+FROM orders
+WHERE row_number() OVER (ORDER BY total DESC) <= 2;
+-- ERROR:  window functions are not allowed in WHERE
+```
+
+Compute the window function in a subquery or CTE, then filter in the outer query, where it is an ordinary column:
+
+```sql
+SELECT *
+FROM (
+  SELECT id, total, row_number() OVER (ORDER BY total DESC) AS rn
+  FROM orders
+) t
+WHERE rn <= 2;
+--  id | total  | rn
+-- ----+--------+----
+--   4 | 500.00 |  1
+--   3 |  99.00 |  2
+```
+
+This is also the standard way to get the top N rows per group: add `PARTITION BY customer_id` to the window and filter `rn <= N` outside.
+
+Some other databases support a `QUALIFY` clause that filters on window functions directly. PostgreSQL does not; `SELECT * FROM orders QUALIFY row_number() OVER (ORDER BY total) = 1` is a syntax error. Use the subquery form.
+
+For a plain overall top N, you do not need a window function at all. `ORDER BY total DESC LIMIT 2` works, and `FETCH FIRST 2 ROWS WITH TIES` includes rows that tie with the last one.
+
+## Fix 5: conditional aggregation with FILTER
+
+Sometimes the aggregate in `WHERE` is really an attempt to aggregate only some rows, for example "sum of orders since October 3, per customer", while still listing every customer. A `WHERE created_at >= ...` would drop customers with no recent orders. Use the `FILTER` clause on the aggregate instead:
+
+```sql
+SELECT customer_id,
+       sum(total) FILTER (WHERE created_at >= '2026-10-03') AS recent_total
+FROM orders
+GROUP BY customer_id
+ORDER BY 1;
+--  customer_id | recent_total
+-- -------------+--------------
+--            1 |
+--            2 |        99.00
+--            3 |       510.00
+```
+
+Customer 1 still appears, with `NULL` because no rows matched the filter. Wrap it in `coalesce(..., 0)` if you prefer zero.
+
+## Performance notes on the rewrites
+
+The rewrites are not just workarounds; each has a predictable cost, and `EXPLAIN` shows it clearly.
+
+- **WHERE before HAVING.** Any condition that only looks at single-row columns, such as a date range or a status, should stay in `WHERE`. PostgreSQL can then use indexes and discard rows before the grouping step. Moving it into `HAVING` still gives correct results for conditions on the grouping key, but the planner may have to aggregate every row first.
+- **Uncorrelated scalar subqueries run once.** `(SELECT avg(total) FROM orders)` appears in the plan as an `InitPlan` that is evaluated a single time, no matter how many rows the outer query reads.
+- **Correlated subqueries run per row**, unless the planner can transform them. With an index on `(customer_id, total)`, the per-group maximum in Fix 3 becomes a fast index lookup for each row. Without it, a window function such as `max(total) OVER (PARTITION BY customer_id)` in a subquery, filtered outside, reads the table only once and is usually the better choice for large tables.
+- **Window functions need sorted input.** An index matching the `PARTITION BY` and `ORDER BY` columns lets PostgreSQL skip the sort.
+
+## The same error in other clauses
+
+The rule extends beyond `WHERE`. PostgreSQL rejects aggregates anywhere they would have to be evaluated before grouping, and the message names the clause:
+
+```sql
+SELECT * FROM orders JOIN (SELECT 1) x ON sum(total) > 0;
+-- ERROR:  aggregate functions are not allowed in JOIN conditions
+
+SELECT customer_id FROM orders GROUP BY sum(total);
+-- ERROR:  aggregate functions are not allowed in GROUP BY
+```
+
+Aggregates also cannot be nested, because the inner aggregate would need groups of its own:
+
+```sql
+SELECT sum(avg(total)) FROM orders;
+-- ERROR:  aggregate function calls cannot be nested
+```
+
+Compute the inner aggregate in a subquery and aggregate its result:
+
+```sql
+SELECT avg(s) FROM (SELECT sum(total) AS s FROM orders GROUP BY customer_id) t;
+```
+
+Window functions, on the other hand, can be applied on top of aggregates in the same query, because they run after grouping. `sum(sum(total)) OVER ()` gives the grand total alongside per-group sums. Using a window over a raw column in a grouped query fails, though: `SELECT customer_id, sum(total) OVER () FROM orders GROUP BY customer_id` reports `column "orders.total" must appear in the GROUP BY clause or be used in an aggregate function`.
+
+## Choosing the right rewrite
+
+| What you want | Use |
+|---|---|
+| Keep groups whose aggregate meets a condition | `HAVING` |
+| Keep rows compared with a table-wide aggregate | Scalar subquery in `WHERE` |
+| Keep rows compared with their group's aggregate | Correlated subquery, or `DISTINCT ON` for one row per group |
+| Keep rows by rank or row number | Window function in a subquery or CTE, filter outside |
+| Aggregate only some rows but keep all groups | `FILTER (WHERE ...)` |
+
+## Let the editor suggest the rewrite
+
+These rewrites are mechanical once you know the evaluation order, but they are easy to get subtly wrong, for example by moving a row condition into `HAVING` and making the query slower, or by using `DISTINCT ON` where ties matter. In [Chat2DB](https://chat2db.ai/download) you can paste the failing query and ask the AI assistant to rewrite it; it chooses between `HAVING`, a subquery and a window function based on what the query is trying to return, and you can compare the results side by side before keeping the change.
+
+## Summary
+
+`aggregate functions are not allowed in WHERE` and `window functions are not allowed in WHERE` both happen because `WHERE` filters individual rows before any grouping or windowing takes place. Move group conditions to `HAVING` (repeating the aggregate rather than its alias), compute table-wide or per-group aggregates in subqueries, filter window function results in an outer query, and use `FILTER` when you only want to aggregate some of the rows.

@@ -1,0 +1,201 @@
+---
+title: "Fix MySQL Error 1267: Illegal Mix of Collations"
+description: "Fix MySQL error 1267 Illegal mix of collations (utf8mb4_unicode_ci vs utf8mb4_0900_ai_ci): find mismatched columns, use COLLATE, fix procedures."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: October 23, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# Fix MySQL Error 1267: Illegal Mix of Collations
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="October 23, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+A join between two tables that has worked in development fails in production with:
+
+```
+ERROR 1267 (HY000): Illegal mix of collations (utf8mb4_unicode_ci,IMPLICIT) and (utf8mb4_0900_ai_ci,IMPLICIT) for operation '='
+```
+
+MySQL is comparing two strings that use different collations, and it has no rule for deciding which collation should win. The two pairs in parentheses tell you exactly what clashed: the collation of each side and its coercibility, a label that says where the collation came from. The last part names the operation, usually `'='`, but also `'IN'`, `'like'`, `'case'` or `'UNION'` (the latter reported as error 1271).
+
+This error became much more common after MySQL 8.0 changed the default collation for `utf8mb4` to `utf8mb4_0900_ai_ci`. Tables created on MySQL 5.7, or by tools and frameworks that set `utf8mb4_unicode_ci` or `utf8mb4_general_ci` explicitly, now live next to tables created with the new default. This guide shows how to read the message, how to find every mismatched column, and how to fix the error in queries, stored procedures and the schema itself. All examples were run on MySQL 8.4.
+
+## Reproducing the error
+
+```sql
+CREATE TABLE customers (id INT PRIMARY KEY, email VARCHAR(100))
+  CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci;
+
+CREATE TABLE legacy_users (id INT PRIMARY KEY, email VARCHAR(100))
+  CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
+
+INSERT INTO customers VALUES (1, 'ada@example.com'), (2, 'linus@example.com');
+INSERT INTO legacy_users VALUES (1, 'ADA@example.com');
+
+SELECT c.id FROM customers c JOIN legacy_users l ON l.email = c.email;
+-- ERROR 1267 (HY000): Illegal mix of collations (utf8mb4_unicode_ci,IMPLICIT)
+--   and (utf8mb4_0900_ai_ci,IMPLICIT) for operation '='
+```
+
+Both columns are `utf8mb4`, and both collations are case-insensitive. The problem is only that they are different collations with equal priority. The same mismatch breaks `IN` subqueries and `UNION`:
+
+```sql
+SELECT c.id FROM customers c WHERE c.email IN (SELECT email FROM legacy_users);
+-- ERROR 1267 (HY000): Illegal mix of collations (utf8mb4_0900_ai_ci,IMPLICIT)
+--   and (utf8mb4_unicode_ci,IMPLICIT) for operation '='
+
+SELECT email FROM customers UNION SELECT email FROM legacy_users;
+-- ERROR 1271 (HY000): Illegal mix of collations for operation 'UNION'
+```
+
+Not every combination fails. `CONCAT(c.email, l.email)` across the two tables ran without error in our test, and a join between the `utf8mb4_0900_ai_ci` column and a `latin1` column also succeeded, because MySQL can convert `latin1` to `utf8mb4` without loss and uses the superset collation.
+
+## Reading the coercibility labels
+
+When two strings with different collations meet, MySQL picks the collation of the side with the lower coercibility value, meaning the stronger claim:
+
+| Label | Source | Strength |
+|---|---|---|
+| `EXPLICIT` | A `COLLATE` clause in the query | Strongest |
+| `IMPLICIT` | A column, a stored routine parameter or local variable, a user variable | |
+| `SYSCONST` | Return value of functions such as `USER()` or `VERSION()` | |
+| `COERCIBLE` | A string literal | |
+| `NUMERIC`, `IGNORABLE` | Numbers, temporal values, `NULL` | Weakest |
+
+If one side is stronger, its collation is used and there is no error. That is why comparing a column with a literal (`WHERE email = 'ada@example.com'`) almost never fails: the column is `IMPLICIT`, the literal is `COERCIBLE`, and the column wins. The error appears when both sides have the same strength and different collations: two columns (`IMPLICIT`, `IMPLICIT`), or two explicit `COLLATE` clauses (`EXPLICIT`, `EXPLICIT`).
+
+In other words, `(x,IMPLICIT) and (y,IMPLICIT)` means "two columns or variables disagree", and the fix is either to make them agree or to make one side `EXPLICIT`.
+
+## Find every mismatched column
+
+Before changing anything, list the collation of every string column in the schema. Mismatches between columns that are joined to each other are the ones that matter:
+
+```sql
+SELECT TABLE_NAME, COLUMN_NAME, CHARACTER_SET_NAME, COLLATION_NAME
+FROM information_schema.COLUMNS
+WHERE TABLE_SCHEMA = 'shop' AND COLLATION_NAME IS NOT NULL
+ORDER BY COLLATION_NAME, TABLE_NAME;
+--  customers    | email | utf8mb4 | utf8mb4_0900_ai_ci
+--  latin_tbl    | email | latin1  | latin1_swedish_ci
+--  legacy_users | email | utf8mb4 | utf8mb4_unicode_ci
+```
+
+Also check the defaults that new objects inherit:
+
+```sql
+SELECT @@character_set_server, @@collation_server, @@collation_connection;
+SELECT SCHEMA_NAME, DEFAULT_COLLATION_NAME FROM information_schema.SCHEMATA;
+```
+
+## Fix 1: convert the odd table to the common collation
+
+The permanent fix is to make the columns use the same collation. Pick one standard for the whole database. On MySQL 8.0 and later, `utf8mb4_0900_ai_ci` is the default and the usual choice. Convert the tables that differ:
+
+```sql
+ALTER TABLE legacy_users CONVERT TO CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci;
+
+SELECT c.id FROM customers c JOIN legacy_users l ON l.email = c.email;
+--  1
+```
+
+`CONVERT TO` changes every string column in the table and the table default. It rebuilds the table, so on large tables run it in a maintenance window or with an online schema change tool. Indexes on the changed columns are rebuilt too, which matters for unique indexes: if two values are distinct in the old collation but equal in the new one, the conversion fails with a duplicate key error. Check before converting.
+
+The collations also differ in behaviour, which you should verify for your data. One example we confirmed: `utf8mb4_0900_ai_ci` is a NO PAD collation and `utf8mb4_unicode_ci` is PAD SPACE, so `'a ' = 'a'` returns `0` under the first and `1` under the second. Trailing spaces in stored values will compare differently after the change.
+
+Change the database default as well, so new tables do not reintroduce the mismatch:
+
+```sql
+ALTER DATABASE shop CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci;
+```
+
+## Fix 2: add COLLATE to the query
+
+When you cannot change the schema right away, make one side `EXPLICIT`:
+
+```sql
+SELECT c.id
+FROM customers c
+JOIN legacy_users l ON l.email = c.email COLLATE utf8mb4_unicode_ci;
+```
+
+This works immediately, but it has a cost: an index on `c.email` cannot be used for the comparison, because the index is ordered by the column's own collation. Put the `COLLATE` on the side whose index you do not need, usually the smaller table, and treat it as a temporary measure.
+
+Two explicit collations still clash:
+
+```sql
+SELECT 'a' COLLATE utf8mb4_unicode_ci = 'A' COLLATE utf8mb4_0900_ai_ci;
+-- ERROR 1267 (HY000): Illegal mix of collations (utf8mb4_unicode_ci,EXPLICIT)
+--   and (utf8mb4_0900_ai_ci,EXPLICIT) for operation '='
+```
+
+## Fix 3: stored procedures and functions
+
+Stored routines are a frequent and confusing source of error 1267, because the parameter collation is not taken from the table. A string parameter declared without a collation gets the default collation of the database at the time the routine is created:
+
+```sql
+CREATE DATABASE app CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
+USE app;
+CREATE TABLE accounts (id INT PRIMARY KEY, email VARCHAR(100)) COLLATE utf8mb4_0900_ai_ci;
+INSERT INTO accounts VALUES (1, 'ada@example.com');
+
+DELIMITER //
+CREATE PROCEDURE find_account(IN p_email VARCHAR(100))
+BEGIN
+  SELECT id FROM accounts WHERE email = p_email;
+END//
+DELIMITER ;
+
+CALL find_account('ada@example.com');
+-- ERROR 1267 (HY000): Illegal mix of collations (utf8mb4_0900_ai_ci,IMPLICIT)
+--   and (utf8mb4_unicode_ci,IMPLICIT) for operation '='
+```
+
+The parameter is `IMPLICIT` with the database's `utf8mb4_unicode_ci`, the column is `IMPLICIT` with `utf8mb4_0900_ai_ci`. Declare the collation on the parameter. MySQL 8.4 requires the character set to be named as well; `VARCHAR(100) COLLATE utf8mb4_0900_ai_ci` alone fails with error 1235, `This version of MySQL doesn't yet support 'COLLATE with no CHARACTER SET in SP parameters, RETURNS, DECLARE'`:
+
+```sql
+CREATE PROCEDURE find_account3(
+  IN p_email VARCHAR(100) CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci)
+BEGIN
+  SELECT id FROM accounts WHERE email = p_email;
+END
+```
+
+Changing the database default afterwards does not fix existing routines. In our test, `ALTER DATABASE app COLLATE utf8mb4_0900_ai_ci` followed by `CALL find_account(...)` still failed; only after `DROP PROCEDURE` and `CREATE PROCEDURE` did the call succeed. Routines store the collation context they were created with, visible in `information_schema.ROUTINES.DATABASE_COLLATION`, so recreate them after changing collations.
+
+## Fix 4: session variables and the connection collation
+
+String user variables take their collation from the connection. If an application sets `SET NAMES utf8mb4 COLLATE utf8mb4_unicode_ci` and then compares a variable with a `utf8mb4_0900_ai_ci` column, the variable and the column clash:
+
+```sql
+SET NAMES utf8mb4 COLLATE utf8mb4_unicode_ci;
+SET @e2 = 'ada@example.com';
+SELECT id FROM customers WHERE email = @e2;
+-- ERROR 1267 (HY000): Illegal mix of collations (utf8mb4_0900_ai_ci,IMPLICIT)
+--   and (utf8mb4_unicode_ci,IMPLICIT) for operation '='
+```
+
+Make the connection collation match the schema standard, in the driver's connection settings or with `SET NAMES utf8mb4` (which uses the default collation for `utf8mb4`). Check `@@collation_connection` from inside the application, not from your desktop client, because they often differ.
+
+## A migration checklist
+
+Collation mismatches usually appear after an upgrade or a partial migration. To clear them for good:
+
+1. Choose one collation for the database.
+2. List the columns that differ with the `information_schema.COLUMNS` query above.
+3. Check unique indexes on those columns for values that would collide under the new collation.
+4. Convert the tables with `ALTER TABLE ... CONVERT TO CHARACTER SET ... COLLATE ...`.
+5. Change the database default with `ALTER DATABASE`.
+6. Recreate stored procedures, functions, triggers and views so they pick up the new defaults.
+7. Align the application's connection collation.
+
+## Inspect collations without memorising the queries
+
+A database client that shows column collations in the table designer makes mismatches easy to spot. In [Chat2DB](https://chat2db.ai/download) you can open both tables side by side, and the AI assistant can explain a 1267 message for your schema and generate the `ALTER TABLE ... CONVERT TO` statements for every table that differs from the database default. The web version at [app.chat2db.ai](https://app.chat2db.ai/) works the same way without installation.
+
+## Summary
+
+Error 1267 means MySQL is comparing two strings whose collations differ and have equal priority, most often two columns or a column and a routine parameter. Read the two collations from the message, find every column that differs, and convert them to one standard collation with `ALTER TABLE ... CONVERT TO`. Use `COLLATE` in a query only as a stopgap, declare collations on stored routine parameters (with the character set), recreate routines after changing defaults, and keep the connection collation consistent with the schema.
