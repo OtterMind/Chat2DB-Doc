@@ -1,0 +1,173 @@
+---
+title: "MySQL Error 1114: The Table Is Full (How to Fix)"
+description: "Fix MySQL ERROR 1114 'The table is full': MEMORY tables and max_heap_table_size, internal temporary tables in /tmp, TempTable limits and full disks."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: October 24, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# MySQL Error 1114: The Table Is Full (How to Fix)
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="October 24, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+MySQL error 1114 looks alarming because it rarely means what it says. You see one of these:
+
+```
+ERROR 1114 (HY000): The table 'sess' is full
+ERROR 1114 (HY000): The table '/tmp/#sql1_21_0' is full
+```
+
+Neither MySQL nor InnoDB has a fixed row limit that a normal table runs into. Error 1114 (`ER_RECORD_FILE_FULL`) means that the storage behind a table could not grow: a `MEMORY` table reached its size cap, an internal temporary table ran out of room, or the disk or tablespace holding an InnoDB table is full. The table name tells you which case you are in, and each case has a different fix.
+
+We reproduced every case on MySQL 8.4 to show the real messages and log lines. The same causes apply to MySQL 8.0 and MariaDB, though the temporary table settings differ slightly between versions.
+
+## Step 1: Read the Table Name
+
+| Name in the error | What filled up | Go to |
+|---|---|---|
+| A real table name, table uses `ENGINE=MEMORY` | `max_heap_table_size` / `MAX_ROWS` | Case 1 |
+| A path like `/tmp/#sql...` or `#sql...` | An internal temporary table for a query | Case 2 |
+| A real table name, InnoDB | The disk, or a capped tablespace | Case 3 |
+
+Find the engine of a named table with:
+
+```sql
+SELECT table_name, engine, data_length, max_data_length
+FROM information_schema.tables
+WHERE table_schema = 't' AND table_name = 'sess';
+```
+
+## Case 1: A MEMORY Table Reached max_heap_table_size
+
+`MEMORY` tables live entirely in RAM and are capped by `max_heap_table_size` (16 MB by default). The value that counts is the one in effect when the table was created or last rebuilt. To reproduce it quickly, we lowered the limit for one session:
+
+```sql
+SET SESSION max_heap_table_size = 16384;
+SET SESSION cte_max_recursion_depth = 100000;
+
+CREATE TABLE sess (id int PRIMARY KEY, payload char(200)) ENGINE = MEMORY;
+
+INSERT INTO sess
+WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 5000)
+SELECT i, repeat('x', 200) FROM n;
+-- ERROR 1114 (HY000): The table 'sess' is full
+```
+
+Two details matter here. First, the failed insert did not roll back:
+
+```sql
+SELECT count(*) FROM sess;
+-- 20
+```
+
+`MEMORY` is not transactional, so the 20 rows that fit before the error stay in the table. If your application retries the batch, you get duplicates or a duplicate key error on the retry. Second, `MEMORY` tables store `CHAR` and `VARCHAR` columns at their full declared width in bytes, using the maximum bytes per character, so a `char(200)` column in utf8mb4 takes 800 bytes in every row, whatever the value. Rows are much bigger than the data suggests.
+
+### Fix
+
+Raising the variable alone does not help an existing table:
+
+```sql
+SET SESSION max_heap_table_size = 67108864;
+INSERT INTO sess ... ;
+-- ERROR 1114 (HY000): The table 'sess' is full
+```
+
+The table keeps the limit it was created with until it is rebuilt. Raise the limit, then rebuild the table in the same session:
+
+```sql
+SET SESSION max_heap_table_size = 67108864;   -- 64 MB
+ALTER TABLE sess ENGINE = MEMORY;             -- rebuild with the new cap
+INSERT INTO sess ... ;
+-- Query OK
+```
+
+To make it permanent, set `max_heap_table_size` in the server configuration (`my.cnf`, or `SET PERSIST max_heap_table_size = 67108864`). The new value applies to tables created or rebuilt after the change, and all `MEMORY` tables are emptied on restart anyway.
+
+Before raising limits, ask whether the table should be `MEMORY` at all. InnoDB with a large enough buffer pool keeps hot data in RAM too, survives restarts, supports transactions, and has no size cap. `ALTER TABLE sess ENGINE = InnoDB` is usually the better fix for session stores, caches and staging tables.
+
+## Case 2: An Internal Temporary Table Is Full
+
+When the name is a path such as `/tmp/#sql1_21_0`, the table is not one of yours. MySQL creates internal temporary tables to run `GROUP BY`, `DISTINCT`, `UNION`, derived tables, some `ORDER BY` operations and window functions. In MySQL 8.0 and 8.4 they start in memory, in the TempTable engine, and move to disk, as InnoDB tables in the session temporary tablespaces, when they get too big. Error 1114 means the on-disk part could not grow.
+
+We reproduced it by giving the temporary directory a 24 MB tmpfs and running a large `GROUP BY` over 131,072 rows of long URLs. The server ran with `tmpdir` and `innodb_temp_tablespaces_dir` both pointing at that mount and `temptable_max_ram` at its 2 MB minimum, so the error shows `/ttmp` instead of the default `/tmp`:
+
+```sql
+SELECT url, count(*) AS c FROM events GROUP BY url ORDER BY c DESC LIMIT 3;
+-- ERROR 1114 (HY000): The table '/ttmp/#sql1_21_0' is full
+```
+
+The error log explains what really happened:
+
+```
+[ERROR] [MY-012144] [InnoDB] posix_fallocate(): Failed to preallocate data for file /ttmp/temp_10.ibt, desired size 1048576 bytes. Operating system error number 28. Check that the disk is not full or a disk quota exceeded. ...
+[ERROR] [MY-012640] [InnoDB] Error number 28 means 'No space left on device'
+[ERROR] [MY-013132] [Server] The table '/ttmp/#sql1_21_0' is full!
+```
+
+`temp_10.ibt` is a session temporary tablespace. When the query fails, MySQL truncates the file back to its initial size, so by the time you run `df -h`, the disk looks fine. This is why the error seems random: the space is only exhausted for a few seconds while the big query runs. The error log, the `Created_tmp_disk_tables` status counter and your monitoring history are what show it.
+
+A related symptom from the same cause is an OS error instead of 1114. A `COUNT(DISTINCT ...)` or a filesort that needs scratch files in `tmpdir` fails with:
+
+```
+ERROR 3 (HY000): Error writing file '/ttmp/MYfd=35' (OS errno 28 - No space left on device)
+```
+
+### Fix
+
+Work through these from the cheapest to the most invasive:
+
+1. **Make the query need less temporary space.** Run `EXPLAIN` and look for `Using temporary` and `Using filesort`. An index that matches the `GROUP BY` columns often removes the temporary table entirely. Selecting fewer and shorter columns, filtering before grouping and avoiding `SELECT DISTINCT` over wide rows all shrink it.
+2. **Give the temporary directory more space.** Point `tmpdir` and `innodb_temp_tablespaces_dir` at a volume with enough free space. A small `/tmp` partition, or a container with a small writable layer, is the most common root cause. Both settings need a restart.
+3. **Check the in-memory limits.** `temptable_max_ram` (1 GB by default in 8.4) is the total RAM TempTable uses across all sessions, and `tmp_table_size` (16 MB) caps one internal temporary table in memory. Raising them keeps more work in RAM, which helps speed, but on a server with many concurrent heavy queries it can use a lot of memory.
+
+```sql
+SELECT @@tmpdir, @@innodb_temp_tablespaces_dir, @@temptable_max_ram, @@tmp_table_size;
+
+SELECT id, path, size, state, purpose
+FROM information_schema.innodb_session_temp_tablespaces;
+
+SHOW GLOBAL STATUS LIKE 'Created_tmp%';
+```
+
+A high `Created_tmp_disk_tables` count compared with `Created_tmp_tables` means many queries spill to disk. Those are the queries to optimise first.
+
+## Case 3: An InnoDB Table, Disk or Tablespace Is Full
+
+For a real InnoDB table the error almost always means that the file system holding the data directory is full. The error log shows the same `Operating system error number 28` lines, naming the table's `.ibd` file or `ibdata1`. Check with:
+
+```sql
+SELECT @@datadir, @@innodb_data_file_path, @@innodb_file_per_table;
+```
+
+and `df -h` on that directory. Free space, add disk, or move large tables to another volume. Old binary logs are a frequent hidden consumer: check them with `SHOW BINARY LOGS` and set `binlog_expire_logs_seconds`.
+
+Less often, the system tablespace was configured with a maximum size, for example `innodb_data_file_path = ibdata1:12M:autoextend:max:2G`. With `innodb_file_per_table = OFF` (or tables created when it was off), every table lives in `ibdata1` and stops growing at that cap. The default on 8.4 is `ibdata1:12M:autoextend` with no maximum. If you find a cap, raise it in the configuration and restart, or move tables to their own files with `ALTER TABLE ... ENGINE = InnoDB` while `innodb_file_per_table` is on.
+
+On managed services such as Amazon RDS or Cloud SQL, error 1114 on an InnoDB table usually means the instance's allocated storage is used up. Enable storage autoscaling or increase the allocation, then check what grew.
+
+## Preventing It
+
+- Alert on free disk space for the data directory and the temporary directory separately, with a margin large enough for your biggest report query.
+- Watch `Created_tmp_disk_tables` over time and investigate queries that spill.
+- Avoid `MEMORY` tables for anything that can grow without bound.
+- Test large batch jobs against production-sized data before the night they run.
+
+When you are hunting for the query that spills, a client that shows `EXPLAIN` output next to the SQL saves time. [Chat2DB](https://chat2db.ai/download) runs `EXPLAIN` and shows the plan in a readable view, and its AI assistant can suggest an index or a rewrite that removes `Using temporary` from a slow `GROUP BY`.
+
+## FAQ
+
+### Is there a maximum number of rows in a MySQL table?
+
+Not in practice for InnoDB. The limit is the tablespace size, 64 TB with the default 16 KB page size, and long before that, your disk. Error 1114 on an ordinary InnoDB table is a storage problem, not a row count problem.
+
+### Why does error 1114 appear only sometimes for the same query?
+
+Internal temporary tables share the temporary directory with every other session. The query fails when it runs at the same time as other large queries, or when a backup or log file has temporarily filled the volume. The space is released when the query fails, so check the error log timestamps rather than current free space.
+
+### Does increasing tmp_table_size fix "The table '/tmp/#sql...' is full"?
+
+Only indirectly. It lets each internal temporary table stay in memory longer, so fewer go to disk. If the query's temporary table is larger than any reasonable memory limit, it still spills, and you need more space in the temporary directory or a query that needs less of it.

@@ -1,0 +1,261 @@
+---
+title: "Fix Postgres Error: Relation Already Exists"
+description: "Fix 'relation already exists' (42P07) in PostgreSQL: IF NOT EXISTS, index and constraint name clashes after a rename, sequences, migrations and race conditions."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: October 24, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# Fix Postgres Error: Relation Already Exists
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="October 24, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+You run a migration or a setup script and PostgreSQL stops at the first `CREATE`:
+
+```
+ERROR:  relation "orders" already exists
+```
+
+The SQLSTATE is `42P07` (`duplicate_table`). The obvious reading is "you already created this table", and often that is the whole story. But the error also appears when the name you are creating clashes with an index, a sequence or a view, when a constraint name is reused after a table rename, and when two sessions race to create the same table. In those cases `IF NOT EXISTS` does not always help.
+
+This guide walks through each cause with output from PostgreSQL 18, shows how to find the object that holds the name, and gives the right fix for each situation.
+
+## What "Relation" Means Here
+
+In PostgreSQL's catalog, a relation is anything stored in `pg_class`: tables, indexes, sequences, views, materialized views, composite types' backing entries, foreign tables and partitioned tables. They all share one namespace per schema. That is the key fact behind most of the surprising variants of this error: an index called `orders` blocks a table called `orders`, and a table called `orders_pkey` blocks the primary key index of another table.
+
+```sql
+CREATE TABLE orders (id serial PRIMARY KEY, total numeric);
+
+CREATE INDEX orders ON orders (total);
+-- ERROR:  relation "orders" already exists
+
+CREATE TABLE orders_pkey (x int);
+-- ERROR:  relation "orders_pkey" already exists
+```
+
+The second statement fails because `orders_pkey` is the name of the index that backs the primary key of `orders`.
+
+## Cause 1: The Table Really Exists
+
+Running the same `CREATE TABLE` twice is the simplest case:
+
+```sql
+CREATE TABLE orders (id serial PRIMARY KEY, total numeric);
+CREATE TABLE orders (id serial PRIMARY KEY, total numeric);
+-- ERROR:  relation "orders" already exists
+```
+
+For idempotent setup scripts, use `IF NOT EXISTS`, which turns the error into a notice:
+
+```sql
+CREATE TABLE IF NOT EXISTS orders (id serial PRIMARY KEY, total numeric);
+-- NOTICE:  relation "orders" already exists, skipping
+-- CREATE TABLE
+```
+
+Be aware of what `IF NOT EXISTS` does not do: it checks the name only. If the existing `orders` table has different columns, the statement still succeeds and your script carries on with the old structure. For schema changes, use a migration tool that records which steps have run, rather than relying on `IF NOT EXISTS` everywhere.
+
+The same clause exists for most object types:
+
+```sql
+CREATE INDEX IF NOT EXISTS orders_total_idx ON orders (total);
+-- NOTICE:  relation "orders_total_idx" already exists, skipping
+CREATE SEQUENCE IF NOT EXISTS s1;
+CREATE SCHEMA IF NOT EXISTS reporting;
+```
+
+Views have `CREATE OR REPLACE VIEW` instead, which replaces the definition as long as the existing columns keep their names and types. A plain second `CREATE VIEW orders_v` fails with the same `relation "orders_v" already exists` error.
+
+### Check Before You Create
+
+To test whether a name is taken from SQL, use `to_regclass`, which returns NULL instead of raising an error:
+
+```sql
+SELECT to_regclass('b3.orders'), to_regclass('b3.nope');
+```
+
+```
+ to_regclass | to_regclass
+-------------+-------------
+ orders      |
+```
+
+## Cause 2: An Index or Constraint Name Left Behind by a Rename
+
+This is the variant that confuses people most. A common pattern for rebuilding a table is: rename the old one, create a new one with the same name, copy the data, drop the old one. With explicitly named constraints it fails:
+
+```sql
+CREATE TABLE orders (
+  id    bigint GENERATED ALWAYS AS IDENTITY,
+  total numeric,
+  CONSTRAINT orders_pkey PRIMARY KEY (id)
+);
+
+ALTER TABLE orders RENAME TO orders_old;
+
+CREATE TABLE orders (
+  id    bigint GENERATED ALWAYS AS IDENTITY,
+  total numeric,
+  CONSTRAINT orders_pkey PRIMARY KEY (id)
+);
+-- ERROR:  relation "orders_pkey" already exists
+```
+
+`ALTER TABLE ... RENAME` renames the table only. Its primary key index is still called `orders_pkey`, and so is its identity or serial sequence (`orders_id_seq`). The new table asks for the same index name, which is taken.
+
+If you let PostgreSQL choose the names, it avoids the clash silently by appending a number:
+
+```sql
+CREATE TABLE orders (id bigint GENERATED ALWAYS AS IDENTITY, total numeric, PRIMARY KEY (id));
+
+SELECT relname, relkind FROM pg_class
+WHERE relnamespace = 'b3'::regnamespace ORDER BY 1;
+```
+
+```
+    relname     | relkind
+----------------+---------
+ orders         | r
+ orders_id_seq  | S
+ orders_id_seq1 | S
+ orders_old     | r
+ orders_pkey    | i
+ orders_pkey1   | i
+```
+
+That works, but now the new table owns `orders_pkey1` and `orders_id_seq1`, and the old names belong to the old table. After you drop `orders_old`, the odd names stay. Migration tools and ORMs that expect `orders_pkey` will then break later.
+
+The clean fix is to rename the old table's dependent objects together with the table:
+
+```sql
+ALTER TABLE orders RENAME TO orders_old;
+ALTER INDEX orders_pkey RENAME TO orders_old_pkey;      -- also renames the constraint
+ALTER SEQUENCE orders_id_seq RENAME TO orders_old_id_seq;
+```
+
+Renaming the index that backs a primary key or unique constraint renames the constraint as well, so one statement covers both. After that, the original `CREATE TABLE` with `CONSTRAINT orders_pkey` succeeds.
+
+To list everything that still carries the old prefix:
+
+```sql
+SELECT c.relname, c.relkind
+FROM pg_class c
+WHERE c.relnamespace = 'b3'::regnamespace
+  AND c.relname LIKE 'orders%'
+ORDER BY 1;
+```
+
+`relkind` tells you what each object is: `r` table, `i` index, `S` sequence, `v` view, `m` materialized view, `p` partitioned table, `f` foreign table.
+
+## Cause 3: Renaming Onto an Existing Name
+
+`ALTER TABLE ... RENAME TO` raises the same error when the target name is taken:
+
+```sql
+CREATE TABLE invoices (id int);
+ALTER TABLE invoices RENAME TO orders;
+-- ERROR:  relation "orders" already exists
+```
+
+Rename or drop the current holder of the name first, inside one transaction, so that no other session sees an intermediate state:
+
+```sql
+BEGIN;
+ALTER TABLE orders RENAME TO orders_archive;
+ALTER TABLE invoices RENAME TO orders;
+COMMIT;
+```
+
+## Cause 4: The Object Is in the Same Schema, but You Did Not Look There
+
+Names are unique per schema, not per database. If your `search_path` puts a different schema first, `\dt` may not show the table that blocks you. Search all schemas:
+
+```sql
+SELECT n.nspname, c.relname, c.relkind
+FROM pg_class c
+JOIN pg_namespace n ON n.oid = c.relnamespace
+WHERE c.relname = 'orders_pkey';
+```
+
+```
+ nspname |   relname   | relkind
+---------+-------------+---------
+ b1      | orders_pkey | i
+ b3      | orders_pkey | i
+```
+
+Two objects with the same name in different schemas are fine. Only the schema the `CREATE` targets matters, which is the first schema in `search_path` that exists, unless you qualify the name. Two more details:
+
+- **Quoted identifiers are case-sensitive.** `CREATE TABLE "Orders"` succeeds next to `orders`, because unquoted names are folded to lower case. Mixing the two styles across tools is a common source of "it exists, but it doesn't" confusion.
+- **Temporary tables** live in a per-session schema. Creating the same temp table twice in one session fails with `relation "tmp1" already exists`. Use `CREATE TEMP TABLE IF NOT EXISTS`, or `ON COMMIT DROP` so each transaction starts clean.
+
+## Cause 5: Types Share Names With Tables
+
+Every table has a composite row type with the same name, so a table and a type cannot share a name either. The message is different, but the fix is the same:
+
+```sql
+CREATE TYPE status AS ENUM ('a');
+CREATE TABLE status (x int);
+-- ERROR:  type "status" already exists
+-- HINT:  A relation has an associated type of the same name, so you must use a name that doesn't conflict with any existing type.
+```
+
+Constraint names are scoped per table and produce their own wording: `constraint "orders_total_check" for relation "orders" already exists`. To make adding a constraint idempotent, drop it first with `ALTER TABLE ... DROP CONSTRAINT IF EXISTS`, or check `pg_constraint` before adding it.
+
+## Cause 6: Two Sessions Create the Same Table at Once
+
+`IF NOT EXISTS` is not safe against concurrency. If two sessions run it at the same moment, both see that the name is free, both try to insert a catalog row, and the loser fails with a lower-level error:
+
+```sql
+-- session 1
+BEGIN;
+CREATE TABLE IF NOT EXISTS race (id int);
+SELECT pg_sleep(2);
+COMMIT;
+
+-- session 2, while session 1 is still open
+CREATE TABLE IF NOT EXISTS race (id int);
+-- ERROR:  duplicate key value violates unique constraint "pg_type_typname_nsp_index"
+-- DETAIL:  Key (typname, typnamespace)=(race, 16544) already exists.
+```
+
+Session 2 waited for session 1's lock on the catalog row and then hit the unique index on `pg_type`. You may also see the same message with `pg_class_relname_nsp_index`. This shows up when several application instances run start-up DDL in parallel, or in test suites that create shared tables from parallel workers.
+
+Fixes, from best to simplest:
+
+1. Run DDL from one place: a migration job that runs before the application starts, not from every instance.
+2. Serialise the DDL with an advisory lock:
+
+```sql
+SELECT pg_advisory_xact_lock(hashtext('create race table'));
+CREATE TABLE IF NOT EXISTS race (id int);
+```
+
+3. Catch the error (`unique_violation` or `duplicate_table`) in application code and treat it as success.
+
+## Migrations and Restores
+
+- **Migration history out of sync.** Flyway, Liquibase, Alembic, Django and Rails all record applied steps in a history table. If someone created the table by hand, or the history table was restored from a different environment, the tool tries to create it again. Fix the history (for example `flyway baseline`, `alembic stamp`, or `--fake` in Django) instead of editing the migration.
+- **`pg_restore` into a non-empty database** prints this error for every existing object. Restore into an empty database, or use `pg_restore --clean --if-exists` to drop objects before recreating them.
+- **Partitions.** `CREATE TABLE events_2026 PARTITION OF events ...` fails the same way if a partition with that name already exists, which is common in scripts that create next month's partition on a schedule. Use `IF NOT EXISTS`.
+
+If you are inspecting an unfamiliar database, a GUI client is the quickest way to see every table, index and sequence per schema. [Chat2DB](https://chat2db.ai/download) lists all of them in its object tree, and its AI assistant can write the rename statements for a table and its indexes and sequences in one go.
+
+## FAQ
+
+### Why does CREATE TABLE IF NOT EXISTS still fail?
+
+Either another session created the table at the same moment (see Cause 6), or the clash is not with the table name itself but with a constraint or index name inside the statement, such as `CONSTRAINT orders_pkey`. `IF NOT EXISTS` only covers the table's own name.
+
+### Does dropping a table free the index and sequence names?
+
+Yes. `DROP TABLE` removes its indexes, and sequences owned by the table's serial or identity columns. A sequence created separately and only used through `DEFAULT nextval(...)` is not owned and survives. Check with `\ds` after the drop.
+
+### How do I rename a table together with all its indexes?
+
+PostgreSQL has no single command for that. Rename the table, then each index with `ALTER INDEX ... RENAME TO`, and each owned sequence with `ALTER SEQUENCE ... RENAME TO`. Wrap them in one transaction. Find the objects with `pg_indexes WHERE tablename = '...'` and `pg_get_serial_sequence('table', 'column')`.

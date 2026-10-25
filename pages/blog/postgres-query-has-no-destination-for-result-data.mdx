@@ -1,0 +1,288 @@
+---
+title: "Fix Postgres: Query Has No Destination for Result"
+description: "Fix 'query has no destination for result data' in PL/pgSQL functions and DO blocks: SELECT INTO, PERFORM, RETURN QUERY and UPDATE ... RETURNING INTO."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: October 24, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# Fix Postgres: Query Has No Destination for Result
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="October 24, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+You move a query that works fine in psql into a PL/pgSQL function, call the function, and get:
+
+```
+ERROR:  query has no destination for result data
+HINT:  If you want to discard the results of a SELECT, use PERFORM instead.
+CONTEXT:  PL/pgSQL function user_count() line 3 at SQL statement
+```
+
+The SQLSTATE is `42601` (`syntax_error`), although nothing is wrong with the SQL itself. The problem is that PL/pgSQL does not send query results to the client. Inside a function, procedure or `DO` block, every `SELECT` must say where its result goes: into variables, into the function's return value, or nowhere. A bare `SELECT` does not say, so PL/pgSQL refuses to run it.
+
+This guide covers each way to give the result a destination, the variants that come from `RETURNING` clauses and CTEs, and the traps in `SELECT INTO`. All examples were run on PostgreSQL 18 and behave the same on every supported version.
+
+## Reproducing the Error
+
+The classic first attempt at a function that returns a count:
+
+```sql
+CREATE TABLE users (id int PRIMARY KEY, email text, active bool);
+INSERT INTO users VALUES (1, 'a@x.io', true), (2, 'b@x.io', false);
+
+CREATE OR REPLACE FUNCTION user_count() RETURNS int
+LANGUAGE plpgsql AS $$
+BEGIN
+  SELECT count(*) FROM users;
+END $$;
+
+SELECT user_count();
+-- ERROR:  query has no destination for result data
+-- HINT:  If you want to discard the results of a SELECT, use PERFORM instead.
+-- CONTEXT:  PL/pgSQL function user_count() line 3 at SQL statement
+```
+
+`CREATE FUNCTION` succeeds, because PL/pgSQL only checks this when the statement runs. The `CONTEXT` line gives you the function name and the line number inside the body (counting from the line after `$$`), which points straight at the statement to fix.
+
+The same error appears in a `DO` block, where the function name is `inline_code_block`, and in procedures:
+
+```sql
+DO $$ BEGIN SELECT now(); END $$;
+-- ERROR:  query has no destination for result data
+-- CONTEXT:  PL/pgSQL function inline_code_block line 1 at SQL statement
+```
+
+## Fix 1: SELECT INTO a Variable
+
+If you need the value, declare a variable and select into it:
+
+```sql
+CREATE OR REPLACE FUNCTION user_count() RETURNS int
+LANGUAGE plpgsql AS $$
+DECLARE
+  n int;
+BEGIN
+  SELECT count(*) INTO n FROM users;
+  RETURN n;
+END $$;
+
+SELECT user_count();
+-- 2
+```
+
+`INTO` can take several variables, matched by position (`SELECT id, email INTO v_id, v_email FROM ...`), or a single `record` or row-type variable (`SELECT * INTO v_user FROM users WHERE id = 1`, with `v_user users%ROWTYPE`).
+
+For a function that only returns one value, you can skip the variable and return a scalar subquery:
+
+```sql
+CREATE OR REPLACE FUNCTION user_count() RETURNS int
+LANGUAGE plpgsql AS $$
+BEGIN
+  RETURN (SELECT count(*) FROM users);
+END $$;
+```
+
+And if the whole body is one query, you do not need PL/pgSQL at all. A `LANGUAGE sql` function returns the result of its last statement:
+
+```sql
+CREATE OR REPLACE FUNCTION user_count_sql() RETURNS int
+LANGUAGE sql AS $$
+  SELECT count(*)::int FROM users
+$$;
+```
+
+### SELECT INTO Takes the First Row, Silently
+
+Plain `SELECT ... INTO` does not complain when the query returns several rows. It keeps the first one and discards the rest:
+
+```sql
+CREATE OR REPLACE FUNCTION first_email() RETURNS text
+LANGUAGE plpgsql AS $$
+DECLARE v text;
+BEGIN
+  SELECT email INTO v FROM users ORDER BY id;
+  RETURN v;
+END $$;
+
+SELECT first_email();
+-- a@x.io
+```
+
+Without `ORDER BY`, "first" is whatever row the plan happens to produce. If the query should return exactly one row, say so with `INTO STRICT`, which raises an error otherwise:
+
+```sql
+SELECT email INTO STRICT v FROM users ORDER BY id;
+-- ERROR:  query returned more than one row
+-- HINT:  Make sure the query returns a single row, or use LIMIT 1.
+```
+
+With zero rows, `STRICT` raises `query returned no rows` (`P0002`, `no_data_found`), and non-strict `INTO` sets the variables to NULL. After a non-strict `SELECT INTO`, the special variable `FOUND` tells you whether a row was found.
+
+## Fix 2: PERFORM to Discard the Result
+
+Sometimes you call a function only for its side effect: sending a notification, setting a configuration value, taking an advisory lock. You do not care about the return value, and that is what `PERFORM` is for:
+
+```sql
+DO $$ BEGIN PERFORM pg_notify('jobs', 'hello'); END $$;
+DO $$ BEGIN PERFORM set_config('app.user_id', '42', false); END $$;
+DO $$ BEGIN PERFORM pg_advisory_xact_lock(42); END $$;
+```
+
+`PERFORM` replaces the word `SELECT`. It runs the query, throws the rows away, and sets `FOUND` to true if at least one row was produced. That makes it a compact existence check:
+
+```sql
+CREATE OR REPLACE FUNCTION check_exists(p int) RETURNS bool
+LANGUAGE plpgsql AS $$
+BEGIN
+  PERFORM 1 FROM users WHERE id = p;
+  RETURN FOUND;
+END $$;
+
+SELECT check_exists(1), check_exists(9);
+-- t | f
+```
+
+`IF EXISTS (SELECT 1 FROM users WHERE id = p) THEN` is the other common idiom and is often clearer.
+
+### PERFORM With a CTE
+
+A query that starts with `WITH` is also a `SELECT` and fails the same way:
+
+```sql
+BEGIN
+  WITH x AS (SELECT 1) SELECT * FROM x;
+-- ERROR:  query has no destination for result data
+```
+
+You cannot write `PERFORM WITH ...`, because `PERFORM` must replace a leading `SELECT`. Wrap the query in a subquery instead:
+
+```sql
+PERFORM * FROM (WITH x AS (SELECT 1) SELECT * FROM x) AS s;
+```
+
+## Fix 3: RETURN QUERY for Set-Returning Functions
+
+For a function declared `RETURNS SETOF ...` or `RETURNS TABLE (...)`, a bare `SELECT` in the body is the same mistake:
+
+```sql
+CREATE OR REPLACE FUNCTION active_users() RETURNS SETOF users
+LANGUAGE plpgsql AS $$
+BEGIN
+  SELECT * FROM users WHERE active;
+END $$;
+
+SELECT * FROM active_users();
+-- ERROR:  query has no destination for result data
+```
+
+`RETURN QUERY` sends the rows to the function's result set:
+
+```sql
+CREATE OR REPLACE FUNCTION active_users() RETURNS SETOF users
+LANGUAGE plpgsql AS $$
+BEGIN
+  RETURN QUERY SELECT * FROM users WHERE active;
+END $$;
+
+SELECT * FROM active_users();
+```
+
+```
+ id | email  | active
+----+--------+--------
+  1 | a@x.io | t
+```
+
+`RETURN QUERY` does not end the function. You can call it several times to append more rows, and use `RETURN NEXT` inside a loop for row-by-row output. With `RETURNS TABLE (id int, email text)`, qualify the table's columns (`u.id`, `u.email`), because the output column names are also variables in the function and an unqualified `id` is ambiguous.
+
+## Fix 4: INSERT, UPDATE and DELETE With RETURNING
+
+DML is fine without a destination, until you add `RETURNING`:
+
+```sql
+CREATE OR REPLACE FUNCTION touch_user(p_id int) RETURNS void
+LANGUAGE plpgsql AS $$
+BEGIN
+  UPDATE users SET active = true WHERE id = p_id RETURNING email;
+END $$;
+
+SELECT touch_user(1);
+-- ERROR:  query has no destination for result data
+-- CONTEXT:  PL/pgSQL function touch_user(integer) line 3 at SQL statement
+```
+
+Note that this variant has no HINT, since `PERFORM` does not apply to `UPDATE`. Either drop the `RETURNING` clause if you do not need it, or add `INTO`:
+
+```sql
+DROP FUNCTION touch_user(int);  -- the return type changes from void to text
+
+CREATE FUNCTION touch_user(p_id int) RETURNS text
+LANGUAGE plpgsql AS $$
+DECLARE v_email text;
+BEGIN
+  UPDATE users SET active = true WHERE id = p_id RETURNING email INTO v_email;
+  RETURN v_email;
+END $$;
+
+SELECT touch_user(1), touch_user(99);
+-- a@x.io | (null)
+```
+
+The `DROP` is needed because `CREATE OR REPLACE` cannot change a function's return type (it fails with `cannot change return type of existing function`). `RETURNING ... INTO STRICT` turns "no row updated" into an error, which is useful when the caller passes an ID that must exist. For multi-row DML, use `RETURN QUERY` with a CTE, or loop with `FOR r IN UPDATE ... RETURNING ... LOOP`.
+
+## Fix 5: Procedures and Result Sets
+
+Procedures (`CREATE PROCEDURE`, PostgreSQL 11+) cannot return a result set the way SQL Server procedures can, so a `SELECT` inside one fails just like in a function:
+
+```sql
+CREATE PROCEDURE p1() LANGUAGE plpgsql AS $$ BEGIN SELECT 1; END $$;
+CALL p1();
+-- ERROR:  query has no destination for result data
+```
+
+This is the most common form of the error for people coming from SQL Server or MySQL, where a bare `SELECT` in a procedure streams rows to the client. In PostgreSQL, choose one of:
+
+- a function with `RETURNS TABLE (...)` and `RETURN QUERY`, called with `SELECT * FROM fn()`,
+- `INOUT` parameters on the procedure for single values,
+- a `refcursor` that the procedure opens and the caller fetches from inside the same transaction.
+
+For report-style "procedures" that just run a query, a function or a view is almost always the better fit.
+
+## What Does Not Trigger the Error
+
+A few statements run queries without needing a destination:
+
+- `FOR r IN SELECT ... LOOP` gives each row to the loop variable.
+- `EXECUTE 'SELECT ...'` without `INTO` runs dynamic SQL and silently discards the result. Add `INTO` when you need the value, for example `EXECUTE format('SELECT count(*) FROM %I', tbl) INTO n`.
+- `IF EXISTS (SELECT ...)`, `RETURN (SELECT ...)` and assignments like `n := (SELECT count(*) FROM users)` all consume the result as an expression.
+
+## Quick Reference
+
+| You wrote | You meant | Write |
+|---|---|---|
+| `SELECT count(*) FROM t;` | Use the value | `SELECT count(*) INTO n FROM t;` |
+| `SELECT pg_notify(...);` | Side effect only | `PERFORM pg_notify(...);` |
+| `SELECT * FROM t;` in `RETURNS SETOF` | Return the rows | `RETURN QUERY SELECT * FROM t;` |
+| `UPDATE ... RETURNING id;` | Get the new value | `UPDATE ... RETURNING id INTO v_id;` |
+| `WITH ... SELECT ...;` | Discard | `PERFORM * FROM (WITH ... SELECT ...) s;` |
+| `SELECT` in a procedure | Show rows to the caller | A `RETURNS TABLE` function |
+
+Debugging PL/pgSQL is easier when you can edit the function and rerun it side by side. [Chat2DB](https://chat2db.ai/download) opens function definitions in an editor next to a query console, and its AI assistant can explain a `CONTEXT` line and rewrite the failing statement with the right `INTO`, `PERFORM` or `RETURN QUERY`.
+
+## FAQ
+
+### Why does the same SELECT work in psql but not in a function?
+
+In psql, each statement's result goes to the client. In PL/pgSQL, statements run inside the server, and there is no client to receive the rows, so each query has to name a destination.
+
+### Can I print query results from a DO block?
+
+Not as a result set. Use `RAISE NOTICE` with values you select into variables, or loop over the rows: `FOR r IN SELECT * FROM users LOOP RAISE NOTICE '%', r.email; END LOOP;`. For real output, use a function and `SELECT * FROM fn()`.
+
+### Is PERFORM slower than SELECT INTO?
+
+No. Both run the same query. `PERFORM` just skips assigning the result. Neither stops after the first row unless the query does, so add `LIMIT 1` when you only need to know that a row exists.

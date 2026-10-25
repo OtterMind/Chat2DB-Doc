@@ -1,0 +1,283 @@
+---
+title: "Fix Postgres: Range Lower Bound Greater Than Upper"
+description: "Fix 'range lower bound must be less than or equal to range upper bound' in PostgreSQL, plus malformed range literal and 'range union would not be contiguous'."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: October 24, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# Fix Postgres: Range Lower Bound Greater Than Upper
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="October 24, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+Range types such as `tstzrange`, `daterange` and `int4range` are one of PostgreSQL's most useful features for bookings, price periods and versioned data. They are also strict about their input. The error you will meet first is:
+
+```
+ERROR:  range lower bound must be less than or equal to range upper bound
+```
+
+Its SQLSTATE is `22000` (`data_exception`). It usually appears when a query builds ranges from two columns, such as `tstzrange(start_at, end_at)`, and one row has its timestamps the wrong way round. Because the error does not say which row is at fault, a query over a million rows simply fails.
+
+This guide shows how to find the bad rows, how to build ranges safely, how to stop bad data at the door, and how to fix the two other range errors that tend to follow: `malformed range literal` and `result of range union would not be contiguous`. All output is from PostgreSQL 18 with `TimeZone` set to UTC.
+
+## Reproducing the Error
+
+A booking table that stores start and end as separate columns, as many schemas do:
+
+```sql
+CREATE TABLE bookings (
+  id       int PRIMARY KEY,
+  room     int,
+  start_at timestamptz,
+  end_at   timestamptz
+);
+
+INSERT INTO bookings VALUES
+  (1, 101, '2026-11-02 09:00', '2026-11-02 10:00'),
+  (2, 101, '2026-11-02 14:00', '2026-11-02 13:30'),  -- end before start
+  (3, 102, '2026-11-03 09:00', '2026-11-03 09:00'),  -- zero length
+  (4, 102, '2026-11-03 11:00', NULL);                -- open-ended
+
+SELECT id, tstzrange(start_at, end_at) FROM bookings;
+-- ERROR:  range lower bound must be less than or equal to range upper bound
+```
+
+Row 2 is the culprit. The same check applies to literals and to every range type:
+
+```sql
+SELECT '[5,1]'::int4range;
+SELECT int4range(10, 1);
+SELECT numrange(2.5, 1);
+SELECT daterange('2026-12-31', '2026-01-01');
+-- each: ERROR:  range lower bound must be less than or equal to range upper bound
+```
+
+Rows 3 and 4 do not raise errors, but they show two rules you need to know. Equal bounds are allowed. A NULL bound means "unbounded", not "unknown".
+
+## Step 1: Find the Rows With Reversed Bounds
+
+Before changing any query, find out how much bad data there is:
+
+```sql
+SELECT id, start_at, end_at
+FROM bookings
+WHERE start_at > end_at;
+```
+
+```
+ id |        start_at        |         end_at
+----+------------------------+------------------------
+  2 | 2026-11-02 14:00:00+00 | 2026-11-02 13:30:00+00
+```
+
+`start_at > end_at` is NULL when either side is NULL, so open-ended rows are correctly left out. For `numrange` built from prices or `int4range` built from version numbers, the test is the same: `lower_col > upper_col`.
+
+Then decide what the bad rows mean. A reversed booking is usually a data entry or time zone bug, and the right fix is to correct the source data, not to hide it in the query.
+
+### A Common Source: Overnight Times
+
+One pattern produces reversed bounds all the time: a schema that stores a date plus separate start and end times. A night shift from 22:00 to 06:00 combines to `2026-11-05 22:00` and `2026-11-05 06:00`, and the range constructor rejects it. The end belongs to the next day, so add a day when the end time is earlier than the start time:
+
+```sql
+SELECT tsrange(d + s, d + e + CASE WHEN e < s THEN interval '1 day' ELSE interval '0' END)
+FROM (VALUES (date '2026-11-05', time '22:00', time '06:00'),
+             (date '2026-11-06', time '09:00', time '17:00')) AS v(d, s, e);
+```
+
+```
+                    tsrange
+-----------------------------------------------
+ ["2026-11-05 22:00:00","2026-11-06 06:00:00")
+ ["2026-11-06 09:00:00","2026-11-06 17:00:00")
+```
+
+This only works if no shift is longer than 24 hours. If they can be, store full timestamps for both ends. Similar bugs come from converting only one of the two columns to UTC, and from imports that swap day and month in one column. In both cases a `WHERE start_at > end_at` query run straight after the import finds them before any range query does.
+
+## Step 2: Build Ranges Defensively
+
+If you have to query the data as it is, there are two common approaches, and one of them has a trap.
+
+**Filter the bad rows out:**
+
+```sql
+SELECT id, tstzrange(start_at, end_at) AS r
+FROM bookings
+WHERE start_at <= end_at OR end_at IS NULL
+ORDER BY id;
+```
+
+```
+ id |                          r
+----+-----------------------------------------------------
+  1 | ["2026-11-02 09:00:00+00","2026-11-02 10:00:00+00")
+  3 | empty
+  4 | ["2026-11-03 11:00:00+00",)
+```
+
+The `OR end_at IS NULL` keeps open-ended bookings. Without it they are dropped as well.
+
+**Swap the bounds, but not with LEAST and GREATEST.** The tempting fix is:
+
+```sql
+SELECT id, tstzrange(least(start_at, end_at), greatest(start_at, end_at))
+FROM bookings ORDER BY id;
+```
+
+```
+ id |                      tstzrange
+----+-----------------------------------------------------
+  1 | ["2026-11-02 09:00:00+00","2026-11-02 10:00:00+00")
+  2 | ["2026-11-02 13:30:00+00","2026-11-02 14:00:00+00")
+  3 | empty
+  4 | empty
+```
+
+Row 2 is repaired, but row 4 has become `empty`. `LEAST` and `GREATEST` ignore NULL arguments, so for the open-ended booking both return `start_at`, and `[start, start)` contains nothing. An open booking silently turns into an empty one. A NULL-aware swap avoids that:
+
+```sql
+SELECT id,
+       CASE WHEN end_at IS NULL OR start_at <= end_at
+            THEN tstzrange(start_at, end_at)
+            ELSE tstzrange(end_at, start_at)
+       END
+FROM bookings ORDER BY id;
+```
+
+Row 4 now keeps its unbounded upper end: `["2026-11-03 11:00:00+00",)`.
+
+### Equal Bounds and Empty Ranges
+
+Row 3 shows the other subtlety. `tstzrange(a, a)` uses the default bounds `[)`, which include the lower bound and exclude the upper, so a zero-length range contains no instants and becomes `empty`. With `'[]'` it contains exactly one point:
+
+```sql
+SELECT tstzrange(start_at, end_at, '[]') FROM bookings WHERE id = 3;
+-- ["2026-11-03 09:00:00+00","2026-11-03 09:00:00+00"]
+```
+
+Empty ranges overlap nothing and are contained in everything, so an exclusion constraint will never reject them. If zero-length bookings are invalid, say so explicitly with `CHECK (NOT isempty(during))` or `CHECK (start_at < end_at)`.
+
+Discrete types make this more visible, because PostgreSQL stores them in a canonical `[)` form:
+
+```sql
+SELECT '[1,5]'::int4range, '(1,5]'::int4range, '[1,1)'::int4range;
+```
+
+```
+ int4range | int4range | int4range
+-----------+-----------+-----------
+ [1,6)     | [2,6)     | empty
+```
+
+If you want to see how a literal will be stored and how two ranges compare, the free [Postgres Range Type Calculator](https://chat2db.ai/tools/postgres-range-type-calculator) shows the canonical form, the bounds and every range operator's result in the browser.
+
+## Step 3: Stop Bad Rows at Insert Time
+
+Once the data is clean, add a constraint so the problem cannot come back. It fails if any existing row still breaks it, which is a handy final check:
+
+```sql
+ALTER TABLE bookings ADD CONSTRAINT bookings_order_chk CHECK (start_at <= end_at);
+-- ERROR:  check constraint "bookings_order_chk" of relation "bookings" is violated by some row
+
+UPDATE bookings SET end_at = start_at + interval '30 minutes' WHERE id = 2;
+
+ALTER TABLE bookings ADD CONSTRAINT bookings_order_chk CHECK (start_at <= end_at);
+-- ALTER TABLE
+
+INSERT INTO bookings VALUES (5, 103, '2026-11-04 10:00', '2026-11-04 09:00');
+-- ERROR:  new row for relation "bookings" violates check constraint "bookings_order_chk"
+-- DETAIL:  Failing row contains (5, 103, 2026-11-04 10:00:00+00, 2026-11-04 09:00:00+00).
+```
+
+A `CHECK` failure names the constraint and shows the row, which is far easier to debug than the range error. NULL `end_at` still passes, because a check constraint only rejects rows where the expression is false.
+
+With the check in place, you can add a generated range column and index it:
+
+```sql
+ALTER TABLE bookings
+  ADD COLUMN during tstzrange
+  GENERATED ALWAYS AS (tstzrange(start_at, end_at)) STORED;
+```
+
+Without the check constraint, this `ALTER TABLE` would fail on the first reversed row, and every later insert of a reversed row would fail with the range error instead of a clear constraint message. Better still, store a single `tstzrange` column instead of two timestamps, and add an exclusion constraint (`EXCLUDE USING gist (room WITH =, during WITH &&)`, which needs the `btree_gist` extension) to prevent double bookings.
+
+## Related Error: malformed range literal
+
+Range literals have a fixed syntax: an opening `[` or `(`, the lower bound, a comma, the upper bound, and a closing `]` or `)`. Anything else fails with `22P02`, and the DETAIL line tells you which part is wrong:
+
+```sql
+SELECT '2026-11-02 09:00, 2026-11-02 10:00'::tstzrange;
+-- ERROR:  malformed range literal: "2026-11-02 09:00, 2026-11-02 10:00"
+-- DETAIL:  Missing left parenthesis or bracket.
+
+SELECT '[2026-11-02 09:00; 2026-11-02 10:00)'::tstzrange;
+-- ERROR:  malformed range literal: "[2026-11-02 09:00; 2026-11-02 10:00)"
+-- DETAIL:  Missing comma after lower bound.
+```
+
+The other DETAIL values are `Too many commas.`, `Junk after right parenthesis or bracket.`, `Unexpected end of input.` and `Junk after "empty" key word.`. A bound that contains a comma, bracket, parenthesis, quote or space can be wrapped in double quotes. PostgreSQL does that itself in its output: `["2026-11-02 09:00:00+00","2026-11-02 10:00:00+00")`.
+
+When you build ranges in application code, prefer the constructor function, `tstzrange($1, $2, '[)')`, with real parameters. It avoids quoting rules entirely.
+
+## Related Error: Range Union Would Not Be Contiguous
+
+The `+` operator returns a single range, so it refuses to join ranges with a gap between them:
+
+```sql
+SELECT '[1,5)'::int4range + '[7,9)'::int4range;
+-- ERROR:  result of range union would not be contiguous
+
+SELECT '[1,5)'::int4range + '[5,9)'::int4range;
+-- [1,9)
+```
+
+Ranges that overlap or touch are fine. For the others, choose what you mean:
+
+```sql
+-- the smallest single range that covers both, gap included
+SELECT range_merge('[1,5)'::int4range, '[7,9)'::int4range);
+-- [1,9)
+
+-- both pieces, gap excluded (PostgreSQL 14+ multiranges)
+SELECT int4multirange('[1,5)', '[7,9)');
+-- {[1,5),[7,9)}
+```
+
+Difference has the same limitation, with `result of range difference would not be contiguous` when you cut a hole in the middle of a range. Multiranges handle it:
+
+```sql
+SELECT '[1,10)'::int4range - '[4,6)'::int4range;
+-- ERROR:  result of range difference would not be contiguous
+
+SELECT '{[1,10)}'::int4multirange - '{[4,6)}'::int4multirange;
+-- {[1,4),[6,10)}
+```
+
+To combine many rows into non-overlapping pieces, use the `range_agg` aggregate:
+
+```sql
+SELECT range_agg(r)
+FROM (VALUES ('[1,5)'::int4range), ('[3,8)'), ('[10,12)')) AS v(r);
+-- {[1,8),[10,12)}
+```
+
+`unnest()` turns the multirange back into one row per range if your application expects plain ranges.
+
+Range queries are easier to debug when you can inspect intermediate results quickly. [Chat2DB](https://chat2db.ai/download) runs these queries against your PostgreSQL database, shows range columns in a readable grid, and its AI assistant can write the clean-up query and constraint for your own table.
+
+## FAQ
+
+### Does PostgreSQL ever swap reversed bounds automatically?
+
+No. Range constructors and literals never reorder bounds. They raise the error, so that reversed data is noticed instead of being silently reinterpreted.
+
+### Why is my range empty instead of an error?
+
+The bounds were equal and at least one was exclusive, for example `tstzrange(a, a)` with the default `[)`, or a discrete range like `(1,2)` that contains no integers. Only a lower bound strictly greater than the upper bound raises the error.
+
+### How do I find which row raised the error in a big INSERT ... SELECT?
+
+Run the source query with the condition `WHERE lower_col > upper_col` before the insert. In PL/pgSQL, wrap the range construction in a `BEGIN ... EXCEPTION WHEN data_exception` block to log the offending key, but a filter query is faster and needs no code.

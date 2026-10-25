@@ -1,0 +1,261 @@
+---
+title: "Fix Postgres: Set-Returning Functions Not Allowed"
+description: "Fix 'set-returning functions are not allowed in WHERE / CASE / COALESCE' in PostgreSQL: rewrite unnest, jsonb_array_elements and regexp_matches with LATERAL."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: October 24, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# Fix Postgres: Set-Returning Functions Not Allowed
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="October 24, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+You want to filter rows by an element of an array or a JSON array, reach for `unnest()` or `jsonb_array_elements()`, and PostgreSQL stops you:
+
+```
+ERROR:  set-returning functions are not allowed in WHERE
+LINE 1: select id from posts where unnest(tags) = 'postgres';
+                                   ^
+```
+
+Depending on where the function sits, the last word changes: `in CASE`, `in COALESCE`, `in JOIN conditions`, `in UPDATE`, `in FILTER`, `in DEFAULT expressions`, `in check constraints`. Inside an aggregate the wording is different again: `aggregate function calls cannot contain set-returning function calls`. All of them have SQLSTATE `0A000` (`feature_not_supported`), and all of them have the same root cause and the same family of fixes.
+
+This guide explains what a set-returning function is, why PostgreSQL only accepts it in a few places, and how to rewrite the queries that trigger the error. Every example was run on PostgreSQL 18.
+
+## What Is a Set-Returning Function?
+
+A set-returning function (SRF) returns zero, one or many rows instead of a single value. The common ones are:
+
+- `unnest(array)`: one row per array element
+- `generate_series(start, stop)`: one row per number or timestamp
+- `jsonb_array_elements(jsonb)` and `jsonb_each(jsonb)`: one row per JSON element or key
+- `regexp_matches(text, pattern)`: one row per match
+- `string_to_table(text, delimiter)` (PostgreSQL 14+): one row per piece
+- any user function declared `RETURNS SETOF ...` or `RETURNS TABLE (...)`
+
+A `WHERE` clause needs a single true or false per row. `unnest(tags) = 'postgres'` would produce several booleans for a row with several tags, and SQL has no defined way to combine them, so PostgreSQL rejects it. The same applies to `CASE`, `COALESCE` and the other expression contexts in the error: they evaluate one value at a time.
+
+SRFs are allowed in two places: in the `FROM` clause, where they behave like a table, and in the `SELECT` list, where they multiply the rows. The fix is almost always to move the function into `FROM`, usually with `LATERAL`, or to replace it with an operator that returns a single value.
+
+The sample data used below:
+
+```sql
+CREATE TABLE posts (id int PRIMARY KEY, title text, tags text[], meta jsonb);
+
+INSERT INTO posts VALUES
+  (1, 'Intro to PG', '{postgres,sql}', '{"authors":[{"name":"ann"},{"name":"bob"}]}'),
+  (2, 'MySQL tips',  '{mysql}',        '{"authors":[{"name":"cy"}]}'),
+  (3, 'Draft',       '{}',             '{"authors":[]}');
+```
+
+## Fix 1: Filter Arrays With ANY Instead of unnest
+
+To find rows whose array contains a value, you do not need to expand the array at all:
+
+```sql
+SELECT id, title FROM posts WHERE 'postgres' = ANY (tags);
+```
+
+```
+ id |    title
+----+-------------
+  1 | Intro to PG
+```
+
+`= ANY (array)` returns one boolean per row. Other single-value array tests:
+
+```sql
+WHERE tags @> ARRAY['postgres', 'sql']   -- contains all of these
+WHERE tags && ARRAY['postgres', 'mysql'] -- contains at least one of these
+WHERE cardinality(tags) = 0              -- empty array
+```
+
+`@>` and `&&` can use a GIN index on the array column (`CREATE INDEX ON posts USING gin (tags)`), which `unnest` in a subquery cannot.
+
+## Fix 2: JSON Arrays With `@>`, jsonb_path_exists or EXISTS
+
+The JSON version of the mistake is very common:
+
+```sql
+SELECT id FROM posts
+WHERE jsonb_array_elements(meta->'authors')->>'name' = 'bob';
+-- ERROR:  set-returning functions are not allowed in WHERE
+```
+
+There are three correct ways to write it. Containment is the shortest and can use a GIN index on `meta`:
+
+```sql
+SELECT id FROM posts WHERE meta->'authors' @> '[{"name":"bob"}]';
+```
+
+A JSON path expression handles conditions that containment cannot express, such as comparisons or pattern matches:
+
+```sql
+SELECT id FROM posts
+WHERE jsonb_path_exists(meta, '$.authors[*] ? (@.name == "bob")');
+```
+
+And `EXISTS` with the SRF in a subquery's `FROM` clause works for arbitrary SQL conditions:
+
+```sql
+SELECT id FROM posts p
+WHERE EXISTS (
+  SELECT 1
+  FROM jsonb_array_elements(p.meta->'authors') AS a
+  WHERE a->>'name' = 'bob'
+);
+```
+
+All three return post 1. Pick `@>` for equality checks, the path form for richer conditions, and `EXISTS` when you need to join or compare against other tables.
+
+## Fix 3: regexp_matches Versus regexp_match
+
+This one catches people who only wanted to test whether a pattern matches:
+
+```sql
+SELECT id FROM posts WHERE regexp_matches(title, 'PG|SQL') IS NOT NULL;
+-- ERROR:  set-returning functions are not allowed in WHERE
+```
+
+`regexp_matches` (plural) returns a set of matches. PostgreSQL 10 added `regexp_match` (singular), which returns the first match as a single `text[]` or NULL:
+
+```sql
+SELECT id FROM posts WHERE regexp_match(title, 'PG|SQL') IS NOT NULL;
+```
+
+```
+ id
+----
+  1
+  2
+```
+
+For a pure yes or no test, the `~` operator is simpler still: `WHERE title ~ 'PG|SQL'`. Use `~*` for a case-insensitive match. PostgreSQL 15 also added `regexp_like()`, `regexp_count()` and `regexp_substr()`, which all return single values.
+
+## Fix 4: CASE and COALESCE Need a LATERAL Join
+
+When you really want one output row per element, but a fallback for rows with no elements, the natural first attempt fails:
+
+```sql
+SELECT id, CASE WHEN cardinality(tags) > 0 THEN unnest(tags) ELSE 'untagged' END
+FROM posts;
+-- ERROR:  set-returning functions are not allowed in CASE
+-- HINT:  You might be able to move the set-returning function into a LATERAL FROM item.
+```
+
+The hint tells you exactly what to do. Expand the array in `FROM` with a `LEFT JOIN LATERAL`, which keeps rows whose array is empty, and apply the fallback to the joined column:
+
+```sql
+SELECT p.id, coalesce(t.tag, 'untagged') AS tag
+FROM posts p
+LEFT JOIN LATERAL unnest(p.tags) AS t(tag) ON true
+ORDER BY 1, 2;
+```
+
+```
+ id |   tag
+----+----------
+  1 | postgres
+  1 | sql
+  2 | mysql
+  3 | untagged
+```
+
+The same rewrite fixes `coalesce(unnest(tags), 'x')`, which fails with `not allowed in COALESCE`. `LATERAL` is what lets the function in `FROM` refer to `p.tags` from the row on the left. For functions in `FROM`, the keyword is optional, because PostgreSQL treats function calls there as lateral automatically, but writing it makes the intent clear.
+
+### Why Not Just Put unnest in the SELECT List?
+
+It is allowed, but it silently drops rows:
+
+```sql
+SELECT id, unnest(tags) AS tag FROM posts ORDER BY id, tag;
+```
+
+```
+ id |   tag
+----+----------
+  1 | postgres
+  1 | sql
+  2 | mysql
+```
+
+Post 3 has an empty array, so `unnest` returns zero rows and the post disappears from the result. The `LEFT JOIN LATERAL` form keeps it. Two SRFs of different lengths in one `SELECT` list are also surprising: since PostgreSQL 10 they run in lockstep and the shorter one is padded with NULLs:
+
+```sql
+SELECT id, unnest(tags), unnest(ARRAY[1,2,3]) FROM posts WHERE id = 1;
+```
+
+```
+ id |  unnest  | unnest
+----+----------+--------
+  1 | postgres |      1
+  1 | sql      |      2
+  1 |          |      3
+```
+
+If you want that pairing explicitly, `unnest(tags) WITH ORDINALITY` in `FROM` gives you an element number you can join on, and `unnest(a, b)` with several arrays (only allowed in `FROM`) zips them.
+
+## Fix 5: Aggregates Over a Generated Set
+
+```sql
+SELECT sum(generate_series(1, id)) FROM posts;
+-- ERROR:  aggregate function calls cannot contain set-returning function calls
+-- HINT:  You might be able to move the set-returning function into a LATERAL FROM item.
+```
+
+Generate the rows in `FROM` and aggregate the column:
+
+```sql
+SELECT sum(n) FROM posts, generate_series(1, id) AS n;
+```
+
+```
+ sum
+-----
+  10
+```
+
+The comma join with a function is an implicit `LATERAL`: for each post it generates `1..id`, giving 1 + 3 + 6 = 10.
+
+## Fix 6: JOIN Conditions, UPDATE and FILTER
+
+The other contexts follow the same pattern.
+
+**JOIN conditions.** `ON unnest(p.tags) = unnest(q.tags)` fails with `not allowed in JOIN conditions`. To find posts that share a tag, use array overlap: `JOIN posts q ON p.tags && q.tags AND p.id < q.id`.
+
+**UPDATE.** `UPDATE posts SET title = unnest(...)` fails with `not allowed in UPDATE`, because one row cannot take several values. Decide which value you want and use a scalar expression, for example `(array)[1]`, or `UPDATE ... FROM` a subquery that has one row per target row.
+
+**FILTER clauses** of aggregates and **DEFAULT** or **CHECK** expressions reject SRFs for the same reason. Move the logic into a subquery, or, for constraints, into a trigger.
+
+## Where Set-Returning Functions Are Allowed
+
+| Context | Allowed? | Notes |
+|---|---|---|
+| `FROM` / `JOIN ... LATERAL` | Yes | The preferred place |
+| `SELECT` list | Yes | Multiplies rows; empty sets drop the row |
+| `GROUP BY` / `ORDER BY` of a window | Yes | Rarely what you want |
+| `WHERE`, `HAVING`, `JOIN ... ON` | No | Use `ANY`, `@>`, `EXISTS` |
+| `CASE`, `COALESCE` | No | Move to a `LEFT JOIN LATERAL` |
+| Aggregate arguments, `FILTER` | No | Generate rows in `FROM`, then aggregate |
+| `UPDATE ... SET` | No | Use a scalar expression or `UPDATE ... FROM` |
+| `DEFAULT`, `CHECK`, index expressions | No | Use triggers or generated data |
+
+When the rewrite gets complicated, it helps to run each step separately and look at the intermediate rows. [Chat2DB](https://chat2db.ai/download) runs PostgreSQL queries in tabs with full result grids, and its AI assistant can rewrite a query that fails with this error into the `LATERAL` or `EXISTS` form for your tables.
+
+## FAQ
+
+### Did older PostgreSQL versions allow set-returning functions in CASE?
+
+Before PostgreSQL 10, SRFs inside `CASE` and `COALESCE` were accepted but behaved inconsistently, since the branches were not evaluated the way the syntax suggested. PostgreSQL 10 reworked SRF execution and turned these cases into errors, which is why queries copied from old blog posts can fail on modern servers.
+
+### Is unnest in a subquery in WHERE also an error?
+
+No. `WHERE 'x' IN (SELECT unnest(tags))` is valid, because the SRF is in the subquery's `SELECT` list and the subquery as a whole returns a set for `IN` to test. It is usually slower than `'x' = ANY (tags)`, though, and cannot use a GIN index.
+
+### How do I find which part of a long query raised the error?
+
+The `LINE` and caret in the error point at the function. In views and functions, where there is no caret, search the definition for the SRFs listed above, plus any user function with `RETURNS SETOF` or `RETURNS TABLE`. `SELECT proname FROM pg_proc WHERE proretset` lists every set-returning function in the database.

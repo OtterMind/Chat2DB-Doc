@@ -1,0 +1,233 @@
+---
+title: "Fix MySQL Error 1227: Access Denied, Need SUPER"
+description: "Fix MySQL ERROR 1227 'you need the SUPER privilege': DEFINER clauses in dumps, SET GLOBAL, SQL_LOG_BIN and GTID_PURGED, on MySQL 8, RDS and Cloud SQL."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: October 24, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# Fix MySQL Error 1227: Access Denied, Need SUPER
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="October 24, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+Error 1227 is MySQL's "you are not allowed to do that" for administrative operations. It usually appears in the middle of importing a dump into a new server or a managed database:
+
+```
+ERROR 1227 (42000) at line 92: Access denied; you need (at least one of) the SUPER or SET_ANY_DEFINER privilege(s) for this operation
+```
+
+The SQLSTATE is `42000`, and the message lists the privileges that would allow the statement. That list is the most useful part of the error: in MySQL 8 the old all-powerful `SUPER` privilege has been split into fine-grained dynamic privileges, and the message tells you which one this statement needs. You rarely need, or can get, `SUPER` itself.
+
+This guide goes through the statements that trigger 1227, with the exact messages from MySQL 8.4 for an account that has `ALL PRIVILEGES` on its own database but no global privileges, and the fix for each. It covers self-managed servers and managed services such as Amazon RDS, Aurora, Google Cloud SQL and Azure, where `SUPER` is never available.
+
+## The Test Account
+
+```sql
+CREATE USER 'app'@'%' IDENTIFIED BY '...';
+GRANT ALL PRIVILEGES ON app.* TO 'app'@'%';
+```
+
+```sql
+SHOW GRANTS;
+```
+
+```
+GRANT USAGE ON *.* TO `app`@`%`
+GRANT ALL PRIVILEGES ON `app`.* TO `app`@`%`
+```
+
+`ALL PRIVILEGES ON app.*` covers tables, views, routines and triggers inside `app`. It does not include anything global, and that is where 1227 comes from.
+
+## Cause 1: DEFINER Clauses Naming Another Account
+
+Views, stored procedures, functions, triggers and events all have a `DEFINER`. `mysqldump` writes it explicitly:
+
+```sql
+/*!50013 DEFINER=`root`@`localhost` SQL SECURITY DEFINER */
+CREATE DEFINER=`app`@`%` PROCEDURE `p1`() ...
+```
+
+Creating an object with yourself as definer is always allowed. Naming any other account requires `SET_ANY_DEFINER` (MySQL 8.2 and later; older 8.0 releases used `SET_USER_ID`) or `SUPER`:
+
+```sql
+CREATE DEFINER = 'root'@'localhost' VIEW v1 AS SELECT 1;
+-- ERROR 1227 (42000): Access denied; you need (at least one of) the SUPER or SET_ANY_DEFINER privilege(s) for this operation
+
+CREATE DEFINER = CURRENT_USER PROCEDURE p1() SELECT 1;
+-- Query OK
+```
+
+This is by far the most common cause during migrations: the dump was taken on a server where objects were created by `root` or a DBA account, and you import it as an application user on the new server.
+
+### Fix: Remove or Rewrite the DEFINER
+
+Strip the clause so each object is created with the importing account as definer:
+
+```bash
+mysqldump --routines --triggers --events app > app.sql
+sed -E 's/DEFINER=`[^`]+`@`[^`]+`//g' app.sql > app_clean.sql
+mysql -u app -p app < app_clean.sql
+```
+
+After the import, the view that used to belong to `root` is owned by the importing account:
+
+```sql
+SELECT table_name, definer FROM information_schema.views WHERE table_schema = 'app';
+```
+
+```
+TABLE_NAME	DEFINER
+v2	app@%
+v_root	app@%
+```
+
+If the objects should run as a specific service account, replace the definer instead of deleting it, and import as that account:
+
+```bash
+sed -E 's/DEFINER=`root`@`localhost`/DEFINER=`app`@`%`/g' app.sql > app_clean.sql
+```
+ MySQL Shell's dump utility can do this for you: `util.dumpSchemas(["app"], "/backup", {compatibility: ["strip_definers"]})`, and its load utility imports the result in parallel.
+
+The alternative on a self-managed server is to grant the privilege to the account that runs the import:
+
+```sql
+GRANT SET_ANY_DEFINER ON *.* TO 'deploy'@'%';
+```
+
+Keep it on a migration account, not the application account. An account that can set any definer can create a view or routine that runs with someone else's privileges.
+
+### A Related Message: SYSTEM_USER
+
+While importing as `app` into a database that already contained a view defined by `root`, the dump's `DROP VIEW IF EXISTS` failed with a different list:
+
+```
+ERROR 1227 (42000) at line 56: Access denied; you need (at least one of) the SYSTEM_USER privilege(s) for this operation
+```
+
+Since MySQL 8.0.16, accounts with `SYSTEM_USER` (such as `root`) are protected: an ordinary account cannot modify or drop objects whose definer is a system user, even inside its own database. Have an administrator drop those objects, or recreate them with a non-system definer.
+
+## Cause 2: SET GLOBAL and SET PERSIST
+
+Changing server-wide variables needs `SYSTEM_VARIABLES_ADMIN`:
+
+```sql
+SET GLOBAL max_connections = 500;
+SET PERSIST max_connections = 500;
+SET GLOBAL sql_mode = '';
+-- ERROR 1227 (42000): Access denied; you need (at least one of) the SUPER or SYSTEM_VARIABLES_ADMIN privilege(s) for this operation
+```
+
+On your own server, grant it to an administrative account (`GRANT SYSTEM_VARIABLES_ADMIN ON *.* TO 'dba'@'%'`) or run the statement as one. On managed services, server variables are changed through the parameter group (RDS and Aurora), database flags (Cloud SQL) or server parameters (Azure), never with `SET GLOBAL`.
+
+Many scripts do not need a global change at all. `SET SESSION sql_mode = ''` affects only your connection and needs no special privilege. The same is true for most session variables, such as `innodb_lock_wait_timeout`.
+
+### Restricted Session Variables
+
+A few session variables are protected because they affect replication or safety rules:
+
+```sql
+SET SESSION sql_log_bin = 0;
+SET SESSION sql_require_primary_key = 0;
+-- ERROR 1227 (42000): Access denied; you need (at least one of) the SUPER, SYSTEM_VARIABLES_ADMIN or SESSION_VARIABLES_ADMIN privilege(s) for this operation
+```
+
+`SESSION_VARIABLES_ADMIN` is the smallest privilege that allows these. `sql_log_bin = 0` deserves care even when you can set it: changes made in that session are not written to the binary log, so replicas never see them.
+
+## Cause 3: GTID Lines in a Dump
+
+When the source server uses GTIDs, `mysqldump` adds two lines near the top of the file:
+
+```sql
+SET @@SESSION.SQL_LOG_BIN= 0;
+SET @@GLOBAL.GTID_PURGED=/*!80000 '+'*/ '3E11FA47-71CA-11E1-9E33-C80AA9429562:1-5';
+```
+
+Both fail for an ordinary account, the first needing `SESSION_VARIABLES_ADMIN` and the second `SYSTEM_VARIABLES_ADMIN`:
+
+```
+ERROR 1227 (42000): Access denied; you need (at least one of) the SUPER or SYSTEM_VARIABLES_ADMIN privilege(s) for this operation
+```
+
+These lines matter only if you are building a replica that should continue from the source's GTID position. For a plain copy of the data, dump without them:
+
+```bash
+mysqldump --set-gtid-purged=OFF --routines --triggers app > app.sql
+```
+
+If you already have the file, delete the two lines with `sed -i '/SQL_LOG_BIN/d; /GTID_PURGED/d' app.sql`, or edit the top of the file by hand.
+
+## Cause 4: Replication and Binary Log Statements
+
+Monitoring scripts and backup tools often run these:
+
+```sql
+SHOW BINARY LOG STATUS;   -- SHOW MASTER STATUS before 8.2
+SHOW REPLICA STATUS;
+-- ERROR 1227 (42000): Access denied; you need (at least one of) the SUPER, REPLICATION CLIENT privilege(s) for this operation
+
+PURGE BINARY LOGS BEFORE NOW();
+-- ERROR 1227 (42000): Access denied; you need (at least one of) the SUPER or BINLOG_ADMIN privilege(s) for this operation
+
+FLUSH TABLES WITH READ LOCK;
+-- ERROR 1227 (42000): Access denied; you need (at least one of) the RELOAD or FLUSH_TABLES privilege(s) for this operation
+```
+
+Grant exactly what the tool needs: `REPLICATION CLIENT` for status queries, `BINLOG_ADMIN` for purging logs, `RELOAD` for `FLUSH` statements and for `mysqldump --single-transaction --source-data`. On RDS, binary log retention is set with the `mysql.rds_set_configuration` procedure instead of `PURGE`.
+
+Note that `SHOW PROCESSLIST` does not raise 1227 without `PROCESS`. It simply shows only your own sessions, which can make a monitoring script look like it is working when it sees almost nothing. Likewise, `KILL` on another user's thread fails with error 1095 ("You are not owner of thread") rather than 1227 unless you have `CONNECTION_ADMIN`.
+
+## Error 1227 on Managed MySQL
+
+On RDS, Aurora, Cloud SQL and Azure, the master user has a broad set of privileges, but not `SUPER`, `SYSTEM_VARIABLES_ADMIN` on the server level, or `SET_ANY_DEFINER` for arbitrary accounts. The practical rules:
+
+- Remove or rewrite `DEFINER` clauses before importing, or create the objects as the master user with the master user as definer.
+- Dump with `--set-gtid-purged=OFF`.
+- Change server variables in the parameter group or flags, not with `SET GLOBAL`. For functions and triggers, set `log_bin_trust_function_creators = 1` there as well, or the import continues to fail with errors 1418 or 1419.
+- Use the provider's stored procedures for administrative tasks, such as `mysql.rds_kill` on RDS.
+
+## Finding the Missing Privilege
+
+The error lists the privileges. To check what an account already has, including dynamic privileges:
+
+```sql
+SHOW GRANTS FOR 'app'@'%';
+
+SELECT grantee, privilege_type
+FROM information_schema.user_privileges
+WHERE grantee = "'app'@'%'";
+```
+
+When an import fails, the `at line N` part of the message points to the exact statement in the dump file. `sed -n 'Np' app.sql` prints it, which tells you which of the causes above you are dealing with.
+
+A database client that shows users and their grants makes this kind of audit quicker. [Chat2DB](https://chat2db.ai/download) lets you browse MySQL users and privileges, run `SHOW GRANTS` for any account, and ask its AI assistant which minimal privilege a failing statement needs.
+
+## Quick Reference
+
+| Statement | Privilege named in the error | Better fix |
+|---|---|---|
+| `CREATE DEFINER = other ...` | `SET_ANY_DEFINER` | Strip or rewrite `DEFINER` in the dump |
+| Dropping an object defined by root | `SYSTEM_USER` | Let an admin drop it |
+| `SET GLOBAL` / `SET PERSIST` | `SYSTEM_VARIABLES_ADMIN` | `SET SESSION`, or the parameter group on managed services |
+| `SET SESSION sql_log_bin`, `sql_require_primary_key` | `SESSION_VARIABLES_ADMIN` | Grant it to the migration account only |
+| `SET @@GLOBAL.GTID_PURGED` | `SYSTEM_VARIABLES_ADMIN` | `mysqldump --set-gtid-purged=OFF` |
+| `SHOW BINARY LOG STATUS`, `SHOW REPLICA STATUS` | `REPLICATION CLIENT` | Grant it to the monitoring account |
+| `PURGE BINARY LOGS` | `BINLOG_ADMIN` | Use the provider's retention setting |
+| `FLUSH TABLES WITH READ LOCK` | `RELOAD` or `FLUSH_TABLES` | Grant `RELOAD` to the backup account |
+
+## FAQ
+
+### Can I grant SUPER to fix error 1227?
+
+On a self-managed server you can, but `SUPER` is deprecated in MySQL 8 and grants far more than any single statement needs. Grant the specific dynamic privilege named in the error instead. On managed services, `SUPER` cannot be granted at all.
+
+### Why does the import work as root but fail as my application user?
+
+`root` has every privilege, including `SET_ANY_DEFINER` and `SYSTEM_VARIABLES_ADMIN`, so the `DEFINER` and `SET @@GLOBAL` lines in the dump succeed. Import as the application user only after removing those lines, or import as an administrative account.
+
+### Is error 1227 the same as error 1045 or 1142?
+
+No. Error 1045 means the login itself failed (wrong user, host or password). Error 1142 means a table-level privilege such as `SELECT` or `INSERT` is missing. Error 1227 is specific to administrative and global operations.

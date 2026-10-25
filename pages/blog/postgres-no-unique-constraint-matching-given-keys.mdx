@@ -1,0 +1,302 @@
+---
+title: "Fix Postgres: No Unique Constraint Matching Keys"
+description: "Fix 'there is no unique constraint matching given keys for referenced table' (42830) in PostgreSQL: missing keys, composite FKs, partial and expression indexes."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: October 24, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# Fix Postgres: No Unique Constraint Matching Keys
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="October 24, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+You add a foreign key, which looks like the simplest piece of DDL there is, and PostgreSQL refuses to create it:
+
+```
+ERROR:  there is no unique constraint matching given keys for referenced table "customers"
+```
+
+The SQLSTATE is `42830` (`invalid_foreign_key`). The message is accurate but terse. It means that the column list after `REFERENCES` does not match any primary key, unique constraint, or plain unique index on the referenced table. PostgreSQL needs that guarantee: a foreign key promises that every child row points at exactly one parent row, and only a uniqueness rule on the referenced columns can make that promise.
+
+This guide reproduces every common cause on PostgreSQL 18, shows how to find the missing key, and explains the fixes, including the cases where the obvious fix is rejected too. Everything here also applies to PostgreSQL 12 through 17.
+
+## The Rule Behind the Error
+
+When you write:
+
+```sql
+customer_id int REFERENCES customers (id)
+```
+
+PostgreSQL looks for an index on `customers` that:
+
+1. is unique (a primary key, a `UNIQUE` constraint, or a `CREATE UNIQUE INDEX`),
+2. covers exactly the referenced columns, no more and no fewer,
+3. is not partial (no `WHERE` clause) and has no expression columns,
+4. is not deferrable.
+
+If no index passes all four tests you get error 42830 (or, for the deferrable case, a different message we cover below). The order of the columns does not matter, but the set of columns must be identical.
+
+## Cause 1: The Referenced Column Has No Key at All
+
+The most frequent case is a table created without a primary key, often because it came from a CSV import, an ORM migration that was edited by hand, or a `CREATE TABLE AS SELECT`:
+
+```sql
+CREATE TABLE customers (id int, email text, name text);
+
+CREATE TABLE orders (
+  id          int PRIMARY KEY,
+  customer_id int REFERENCES customers (id)
+);
+-- ERROR:  there is no unique constraint matching given keys for referenced table "customers"
+```
+
+`id` looks like a key, but nothing tells PostgreSQL it is unique. Add the primary key and the same statement succeeds:
+
+```sql
+ALTER TABLE customers ADD PRIMARY KEY (id);
+
+CREATE TABLE orders (
+  id          int PRIMARY KEY,
+  customer_id int REFERENCES customers (id)
+);
+-- CREATE TABLE
+```
+
+If you write `REFERENCES customers` without a column list, PostgreSQL uses the primary key of `customers`. With no primary key, that form fails with a different message (`there is no primary key for referenced table "customers"`), but the fix is the same.
+
+### Check for Duplicates First
+
+Adding the key fails if the data already breaks it:
+
+```sql
+ALTER TABLE t2 ADD UNIQUE (code);
+-- ERROR:  could not create unique index "t2_code_key"
+-- DETAIL:  Key (code)=(a) is duplicated.
+```
+
+Find all the offenders before you try again:
+
+```sql
+SELECT code, count(*)
+FROM t2
+GROUP BY code
+HAVING count(*) > 1;
+```
+
+```
+ code | count
+------+-------
+      |     2
+ a    |     2
+```
+
+Only the `a` rows block the constraint. A normal `UNIQUE` constraint treats NULLs as distinct, so two NULL rows are allowed, although the `GROUP BY` lists them. Remove or merge the real duplicates, then add the constraint. If you need NULLs to collide as well, PostgreSQL 15+ supports `UNIQUE NULLS NOT DISTINCT`:
+
+```sql
+CREATE TABLE t3 (code text UNIQUE NULLS NOT DISTINCT);
+INSERT INTO t3 VALUES (NULL), (NULL);
+-- ERROR:  duplicate key value violates unique constraint "t3_code_key"
+-- DETAIL:  Key (code)=(null) already exists.
+```
+
+On large tables, build the index first with `CREATE UNIQUE INDEX CONCURRENTLY` and then attach it with `ALTER TABLE ... ADD CONSTRAINT ... UNIQUE USING INDEX ...`, so the table is not locked against writes for the whole build.
+
+## Cause 2: Referencing Part of a Composite Key
+
+Composite primary keys are common in multi-tenant and regional schemas:
+
+```sql
+CREATE TABLE products (
+  sku    text,
+  region text,
+  price  numeric,
+  PRIMARY KEY (sku, region)
+);
+
+CREATE TABLE order_items (
+  order_id int,
+  sku      text REFERENCES products (sku)
+);
+-- ERROR:  there is no unique constraint matching given keys for referenced table "products"
+```
+
+`(sku, region)` is unique, but `sku` alone is not: the same SKU can exist in several regions, so a child row with only a SKU could match more than one parent. You have two correct options.
+
+**Reference the whole key.** Carry the region in the child table and use a composite foreign key:
+
+```sql
+CREATE TABLE order_items (
+  order_id int,
+  sku      text,
+  region   text,
+  FOREIGN KEY (region, sku) REFERENCES products (region, sku)
+);
+-- CREATE TABLE
+```
+
+Note that the column order here is `(region, sku)` while the primary key is `(sku, region)`. PostgreSQL accepts it because it compares the set of columns, not their order. The pairs must line up, though: the first child column maps to the first referenced column.
+
+**Or make the single column unique**, if the business rule really is that a SKU is globally unique. Then `ALTER TABLE products ADD UNIQUE (sku)` and the original foreign key works. Do not add that constraint only to silence the error: if the same SKU legitimately appears in two regions, the `ALTER` fails, and that tells you the data model needs the composite key.
+
+## Cause 3: A Partial or Expression Unique Index
+
+This one surprises people because a unique index clearly exists:
+
+```sql
+CREATE UNIQUE INDEX customers_email_lower ON customers (lower(email));
+
+CREATE TABLE invites (id int, email text REFERENCES customers (email));
+-- ERROR:  there is no unique constraint matching given keys for referenced table "customers"
+```
+
+The index guarantees that `lower(email)` is unique, which is a different and stronger statement than "`email` is unique", but a foreign key can only compare plain column values. Expression indexes never qualify.
+
+Partial indexes fail the same way:
+
+```sql
+CREATE UNIQUE INDEX customers_email_active
+  ON customers (email) WHERE name IS NOT NULL;
+
+CREATE TABLE invites (id int, email text REFERENCES customers (email));
+-- ERROR:  there is no unique constraint matching given keys for referenced table "customers"
+```
+
+The index only enforces uniqueness for some rows, so it cannot back a foreign key. A plain unique index on the column works, even without a named constraint:
+
+```sql
+DROP INDEX customers_email_active;
+CREATE UNIQUE INDEX customers_email_uq ON customers (email);
+
+CREATE TABLE invites (id int, email text REFERENCES customers (email));
+-- CREATE TABLE
+
+SELECT conname, contype, conindid::regclass
+FROM pg_constraint
+WHERE conrelid = 'invites'::regclass;
+```
+
+```
+      conname       | contype |      conindid
+--------------------+---------+--------------------
+ invites_email_fkey | f       | customers_email_uq
+```
+
+`conindid` shows which unique index the foreign key depends on. You cannot drop that index while the foreign key exists.
+
+If you need case-insensitive email keys, store a normalised column (for example a generated column `email_norm text GENERATED ALWAYS AS (lower(email)) STORED`) with a unique constraint and reference that, or use the `citext` type, whose equality is case-insensitive.
+
+## Cause 4: A Deferrable Unique Constraint
+
+A deferrable unique constraint produces a related but different error:
+
+```sql
+CREATE TABLE accounts (id int, code text UNIQUE DEFERRABLE INITIALLY DEFERRED);
+CREATE TABLE refs (code text REFERENCES accounts (code));
+-- ERROR:  cannot use a deferrable unique constraint for referenced table "accounts"
+```
+
+A deferred constraint may hold duplicates until commit, so it cannot guarantee the single-parent rule at the moment the foreign key is checked. Keep the referenced constraint `NOT DEFERRABLE` (the default). If you made it deferrable to swap values inside a transaction, consider making the foreign key deferrable instead.
+
+## Cause 5: Partitioned Tables
+
+Since PostgreSQL 12, a foreign key can reference a partitioned table, but the referenced unique key must include every partition key column, because uniqueness is enforced per partition:
+
+```sql
+CREATE TABLE events (id bigint, created date, payload text)
+  PARTITION BY RANGE (created);
+CREATE TABLE events_2026 PARTITION OF events
+  FOR VALUES FROM ('2026-01-01') TO ('2027-01-01');
+
+ALTER TABLE events ADD PRIMARY KEY (id);
+-- ERROR:  unique constraint on partitioned table must include all partitioning columns
+-- DETAIL:  PRIMARY KEY constraint on table "events" lacks column "created" which is part of the partition key.
+
+ALTER TABLE events ADD PRIMARY KEY (id, created);
+
+CREATE TABLE event_tags (event_id bigint REFERENCES events (id));
+-- ERROR:  there is no unique constraint matching given keys for referenced table "events"
+```
+
+The only key is `(id, created)`, so the child must carry `created` too:
+
+```sql
+CREATE TABLE event_tags (
+  event_id bigint,
+  created  date,
+  FOREIGN KEY (event_id, created) REFERENCES events (id, created)
+);
+-- CREATE TABLE
+```
+
+This is a design decision as much as a fix. If child tables cannot know the parent's partition key, either partition on `id`, or drop the database-level foreign key and enforce the relationship in the application.
+
+## How to Find Which Keys Exist
+
+Before writing the foreign key, list the unique keys the referenced table really has:
+
+```sql
+SELECT conname, pg_get_constraintdef(oid)
+FROM pg_constraint
+WHERE conrelid = 'products'::regclass
+  AND contype IN ('p', 'u');
+```
+
+```
+    conname    |   pg_get_constraintdef
+---------------+--------------------------
+ products_pkey | PRIMARY KEY (sku, region)
+```
+
+Unique indexes created without a constraint do not appear there, so check `pg_indexes` too:
+
+```sql
+SELECT indexname, indexdef
+FROM pg_indexes
+WHERE tablename = 'customers'
+  AND indexdef LIKE 'CREATE UNIQUE%';
+```
+
+Look for an index whose definition has no `WHERE` clause and no function call around the columns. That is the one a foreign key can use. In psql, `\d customers` shows the same information under "Indexes".
+
+A database client makes this faster. In [Chat2DB](https://chat2db.ai/download) you can open the table's structure view to see primary keys, unique constraints and indexes side by side, and ask the AI assistant to write the `ALTER TABLE` that adds the missing key or the composite foreign key for your exact columns.
+
+## Fixes at a Glance
+
+| Situation | Fix |
+|---|---|
+| Referenced column has no key | `ALTER TABLE parent ADD PRIMARY KEY (col)` or `ADD UNIQUE (col)` |
+| Duplicates block the new key | Find them with `GROUP BY ... HAVING count(*) > 1`, clean up, retry |
+| Composite primary key | Reference all key columns, or add `UNIQUE` on the subset if it is truly unique |
+| Expression index such as `lower(email)` | Reference a stored normalised column with a unique constraint, or use `citext` |
+| Partial unique index | Create a full unique index or constraint on the column |
+| Deferrable unique constraint | Make it `NOT DEFERRABLE`; defer the foreign key instead |
+| Partitioned parent | Include the partition key in the foreign key |
+
+## ORM and Migration Tips
+
+- **Migrations that create tables in the wrong order.** If the child table and its foreign key are created before the parent's primary key is added (some tools add constraints in a later step), the foreign key fails. Make sure the parent key exists earlier in the migration.
+- **Natural keys.** Frameworks that let you set `to_field` or `references: :code` still need a unique constraint on that column in the database. Declare `unique: true` on the parent field.
+- **Restored dumps.** When you restore with `pg_restore --section=pre-data` and `--section=post-data` separately, the foreign keys are created in post-data after the indexes, so this error during a restore usually means the referenced unique index failed earlier. Scroll up for a "could not create unique index" message.
+
+## FAQ
+
+### Does the referenced column need a named UNIQUE constraint, or is a unique index enough?
+
+A plain, non-partial `CREATE UNIQUE INDEX` on exactly the referenced columns is enough. A constraint is still the cleaner choice because it documents intent and shows up in `pg_constraint` and in information_schema views.
+
+### Can a foreign key reference a column that allows NULL?
+
+Yes. The referenced columns only need a unique constraint, and a unique constraint allows NULLs. A child row whose foreign key value is NULL is not checked at all under the default `MATCH SIMPLE`.
+
+### Why does the composite foreign key work in a different column order?
+
+PostgreSQL matches the set of referenced columns against the set of columns in each unique index. `REFERENCES products (region, sku)` matches `PRIMARY KEY (sku, region)` because both cover the same two columns, and the child columns are paired with the referenced columns in the order you list them.
+
+### Is error 42830 the same in MySQL?
+
+MySQL reports it as error 1822 ("Failed to add the foreign key constraint. Missing index for constraint") or, in MySQL 8.4, error 6125 ("Missing unique key for constraint ... in the referenced table"). Older MySQL versions let InnoDB reference any index whose leading columns match, even a non-unique one. MySQL 8.4 turned on `restrict_fk_on_non_standard_key` by default, which, like PostgreSQL, requires a unique key over the referenced columns.

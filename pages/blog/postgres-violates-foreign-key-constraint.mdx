@@ -1,0 +1,253 @@
+---
+title: "Fix Postgres: Violates Foreign Key Constraint"
+description: "Fix PostgreSQL 23503 errors: 'insert or update on table violates foreign key constraint' and 'update or delete ... is still referenced', with orphan queries."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: October 24, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# Fix Postgres: Violates Foreign Key Constraint
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="October 24, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+Foreign keys are PostgreSQL's way of keeping references honest, and when a statement would break one you get SQLSTATE `23503` (`foreign_key_violation`) in one of two forms. When you write to the child table:
+
+```
+ERROR:  insert or update on table "orders" violates foreign key constraint "orders_customer_id_fkey"
+DETAIL:  Key (customer_id)=(3) is not present in table "customers".
+```
+
+And when you change the parent table:
+
+```
+ERROR:  update or delete on table "customers" violates foreign key constraint "orders_customer_id_fkey" on table "orders"
+DETAIL:  Key (id)=(1) is still referenced from table "orders".
+```
+
+The first says a child row points at a parent that does not exist. The second says you are removing or changing a parent that children still point at. This guide covers both directions with output from PostgreSQL 18: how to read the message, how to find the offending rows, how to load data in the right order, how to add a foreign key to a table that already has orphans, and when `ON DELETE CASCADE` is the right answer.
+
+The examples use two tables:
+
+```sql
+CREATE TABLE customers (id int PRIMARY KEY, name text);
+CREATE TABLE orders (
+  id          int PRIMARY KEY,
+  customer_id int NOT NULL REFERENCES customers (id),
+  total       numeric
+);
+
+INSERT INTO customers VALUES (1, 'Ann'), (2, 'Bob');
+INSERT INTO orders VALUES (10, 1, 50);
+```
+
+## Reading the Message
+
+Everything you need is in the two lines:
+
+- **The constraint name** (`orders_customer_id_fkey`). PostgreSQL generates it as `<table>_<column>_fkey` unless you named it. `\d orders` in psql or `pg_get_constraintdef` shows its definition.
+- **The table in the first line.** For "insert or update on table X", X is the child. For "update or delete on table X ... on table Y", X is the parent and Y is the child.
+- **The key in DETAIL.** That is the exact value that is missing, or still referenced. For composite keys it lists every column: `Key (region, sku)=(eu, A-1)`.
+
+If DETAIL is missing, your client may be hiding it. In psql, `\set VERBOSITY verbose` also shows the schema and the SQLSTATE.
+
+## Direction 1: The Parent Row Is Missing
+
+```sql
+INSERT INTO orders VALUES (11, 3, 20);
+-- ERROR:  insert or update on table "orders" violates foreign key constraint "orders_customer_id_fkey"
+-- DETAIL:  Key (customer_id)=(3) is not present in table "customers".
+
+UPDATE orders SET customer_id = 9 WHERE id = 10;
+-- ERROR:  insert or update on table "orders" violates foreign key constraint "orders_customer_id_fkey"
+-- DETAIL:  Key (customer_id)=(9) is not present in table "customers".
+```
+
+The usual causes, in rough order of frequency:
+
+1. **Load order.** A script inserts orders before customers. Insert parents first, or defer the check (see below).
+2. **A different environment.** IDs copied from production into a staging database where that customer does not exist.
+3. **Type or value mismatches.** The application sends `0` or an empty string converted to a default instead of NULL. A foreign key column that allows NULL accepts NULL without any check, so if "no customer" is valid, send NULL, not 0.
+4. **The parent row was deleted in another transaction** between your read and your insert. Insert the parent and the child in one transaction, or lock the parent with `SELECT ... FOR KEY SHARE` before inserting children.
+5. **Row-level security or a different schema.** The parent exists, but in another schema, or in a partition you do not expect. Check with a fully qualified `SELECT` as the same role.
+
+### Defer the Check for Circular or Out-of-Order Loads
+
+Some data cannot be inserted parent-first, because two tables reference each other. A deferrable constraint moves the check to `COMMIT`:
+
+```sql
+CREATE TABLE a  (id int PRIMARY KEY, b_id int);
+CREATE TABLE bb (id int PRIMARY KEY, a_id int REFERENCES a (id) DEFERRABLE INITIALLY IMMEDIATE);
+ALTER TABLE a ADD FOREIGN KEY (b_id) REFERENCES bb (id) DEFERRABLE INITIALLY IMMEDIATE;
+
+BEGIN;
+SET CONSTRAINTS ALL DEFERRED;
+INSERT INTO a  VALUES (2, 2);
+INSERT INTO bb VALUES (2, 2);
+COMMIT;   -- both rows exist at commit time, so it succeeds
+```
+
+Without `SET CONSTRAINTS ALL DEFERRED`, the first insert fails immediately. If a row is still missing at commit, the commit itself fails with the same 23503 error and the whole transaction is rolled back:
+
+```sql
+BEGIN;
+SET CONSTRAINTS ALL DEFERRED;
+INSERT INTO a VALUES (3, 3);
+COMMIT;
+-- ERROR:  insert or update on table "a" violates foreign key constraint "a_b_id_fkey"
+-- DETAIL:  Key (b_id)=(3) is not present in table "bb".
+```
+
+Only constraints declared `DEFERRABLE` can be deferred, and an existing constraint can be changed with `ALTER TABLE ... ALTER CONSTRAINT ... DEFERRABLE`.
+
+For bulk loads, `pg_restore` and `pg_dump` handle ordering for you: data is loaded first and foreign keys are added afterwards. If you load CSV files with `COPY`, load parent tables first, or drop and re-add the constraints around the load.
+
+## Direction 2: The Parent Row Is Still Referenced
+
+```sql
+DELETE FROM customers WHERE id = 1;
+-- ERROR:  update or delete on table "customers" violates foreign key constraint "orders_customer_id_fkey" on table "orders"
+-- DETAIL:  Key (id)=(1) is still referenced from table "orders".
+
+UPDATE customers SET id = 100 WHERE id = 1;
+-- same error: changing a referenced key is treated like deleting it
+```
+
+The default action is `NO ACTION`, which refuses the change. Decide what should happen to the children, and either handle them first or encode the rule in the constraint.
+
+**Handle the children explicitly**, which is the safest choice for business data:
+
+```sql
+BEGIN;
+DELETE FROM orders WHERE customer_id = 1;   -- or move them: UPDATE orders SET customer_id = 2 ...
+DELETE FROM customers WHERE id = 1;
+COMMIT;
+```
+
+**Or change the referential action.** The options are `ON DELETE CASCADE` (delete the children), `ON DELETE SET NULL` or `SET DEFAULT` (detach them), and `ON UPDATE CASCADE` (follow a key change). Replace the constraint in one statement:
+
+```sql
+ALTER TABLE orders
+  DROP CONSTRAINT orders_customer_id_fkey,
+  ADD CONSTRAINT orders_customer_id_fkey
+      FOREIGN KEY (customer_id) REFERENCES customers (id) ON DELETE CASCADE;
+```
+
+`SET NULL` only works if the column allows NULL. Our `customer_id` is `NOT NULL`, so it would fail with a not-null violation at delete time.
+
+### Cascades Stop at the Next Foreign Key
+
+Cascading delete is not a guarantee that the delete succeeds. If a grandchild table references the child without its own cascade, the chain is blocked there:
+
+```sql
+-- payments.order_id REFERENCES orders (id), with the default NO ACTION
+DELETE FROM customers WHERE id = 1;
+-- ERROR:  update or delete on table "orders" violates foreign key constraint "payments_order_fk" on table "payments"
+-- DETAIL:  Key (id)=(10) is still referenced from table "payments".
+```
+
+The error now names `orders`, not `customers`, because the cascaded delete of order 10 was the statement that failed. Nothing was deleted. To see every table that references a parent before you change it:
+
+```sql
+SELECT conrelid::regclass AS child, conname, pg_get_constraintdef(oid)
+FROM pg_constraint
+WHERE confrelid = 'customers'::regclass;
+```
+
+```
+ child  |         conname         |                         pg_get_constraintdef
+--------+-------------------------+----------------------------------------------------------------------
+ orders | orders_customer_id_fkey | FOREIGN KEY (customer_id) REFERENCES customers(id) ON DELETE CASCADE
+```
+
+Run it again for each child to walk the whole tree. Also make sure every foreign key column on the child side is indexed. PostgreSQL does not create that index automatically, and without it every parent delete scans the child table to check for references.
+
+### TRUNCATE Has Its Own Error
+
+`TRUNCATE` does not check rows one by one, so it refuses outright when the table is referenced:
+
+```sql
+TRUNCATE customers;
+-- ERROR:  cannot truncate a table referenced in a foreign key constraint
+-- DETAIL:  Table "orders" references "customers".
+-- HINT:  Truncate table "orders" at the same time, or use TRUNCATE ... CASCADE.
+```
+
+`TRUNCATE customers, orders` empties both together. `TRUNCATE customers CASCADE` truncates every referencing table, recursively, so check the list above before using it outside a test database.
+
+## Adding a Foreign Key to a Table With Orphans
+
+When you add a constraint to existing data, PostgreSQL validates every row, and a single orphan fails the whole `ALTER`:
+
+```sql
+CREATE TABLE payments (id int PRIMARY KEY, order_id int, amount numeric);
+INSERT INTO payments VALUES (1, 10, 50), (2, 99, 5), (3, NULL, 1);
+
+ALTER TABLE payments ADD CONSTRAINT payments_order_fk
+  FOREIGN KEY (order_id) REFERENCES orders (id);
+-- ERROR:  insert or update on table "payments" violates foreign key constraint "payments_order_fk"
+-- DETAIL:  Key (order_id)=(99) is not present in table "orders".
+```
+
+DETAIL shows only the first orphan found. To list them all, use an anti-join:
+
+```sql
+SELECT p.*
+FROM payments p
+LEFT JOIN orders o ON o.id = p.order_id
+WHERE p.order_id IS NOT NULL
+  AND o.id IS NULL;
+```
+
+```
+ id | order_id | amount
+----+----------+--------
+  2 |       99 |      5
+```
+
+Row 3 is not an orphan: a NULL foreign key is not checked. Fix or delete the orphans, then add the constraint.
+
+On a large, busy table, a plain `ADD CONSTRAINT` holds a lock while it scans every row. Split it in two:
+
+```sql
+ALTER TABLE payments ADD CONSTRAINT payments_order_fk
+  FOREIGN KEY (order_id) REFERENCES orders (id) NOT VALID;
+
+-- new and updated rows are checked from now on
+INSERT INTO payments VALUES (4, 98, 1);
+-- ERROR:  ... Key (order_id)=(98) is not present in table "orders".
+
+DELETE FROM payments WHERE id = 2;      -- clean up the old orphans
+ALTER TABLE payments VALIDATE CONSTRAINT payments_order_fk;
+```
+
+`NOT VALID` adds the constraint instantly and enforces it for new writes. `VALIDATE CONSTRAINT` then checks the existing rows with a weaker lock that allows normal reads and writes. If orphans remain, `VALIDATE` fails with the usual error and you can clean up and retry. `pg_constraint.convalidated` shows whether validation has completed.
+
+A visual client helps when you are untangling relationships across many tables. [Chat2DB](https://chat2db.ai/download) shows foreign keys in its table designer and ER diagram, and its AI assistant can write the orphan query or the `NOT VALID` migration for your own schema.
+
+## Quick Reference
+
+| Message starts with | Problem | Fix |
+|---|---|---|
+| `insert or update on table "child"` | Parent key missing | Insert parent first, send NULL for "none", or defer the constraint |
+| `update or delete on table "parent"` | Children still reference it | Delete or move children first, or use `ON DELETE CASCADE` / `SET NULL` |
+| Same, naming a table you did not touch | Cascade blocked further down | Find the grandchild with `pg_constraint`, handle it first |
+| `cannot truncate a table referenced` | `TRUNCATE` on a parent | Truncate the tables together, or `CASCADE` |
+| Error while adding the constraint | Existing orphans | Anti-join to list them, clean up, or add `NOT VALID` then `VALIDATE` |
+
+## FAQ
+
+### Does a foreign key check NULL values?
+
+No. With the default `MATCH SIMPLE`, a row is only checked when all foreign key columns are non-NULL. For a composite key, a single NULL column skips the check entirely. Use `MATCH FULL` if you want "all NULL or all present".
+
+### Why does my insert fail even though the parent row exists?
+
+Usually the parent was inserted in another transaction that has not committed yet, or it exists in a different schema or database than the one your connection uses. Check `current_schema()` and `current_database()`, and make sure the parent insert is committed before the child is written by another connection.
+
+### Can I temporarily disable foreign key checks like MySQL's FOREIGN_KEY_CHECKS=0?
+
+There is no session switch for that. Setting `session_replication_role = replica` skips the triggers that enforce foreign keys, but it needs superuser rights, and any orphans you create are not detected later. Deferrable constraints or `NOT VALID` plus `VALIDATE` are the safe alternatives.

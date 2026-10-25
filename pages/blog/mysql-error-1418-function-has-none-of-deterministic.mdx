@@ -1,0 +1,214 @@
+---
+title: "Fix MySQL Error 1418: Function Not DETERMINISTIC"
+description: "Fix MySQL ERROR 1418 and 1419 when creating functions or triggers with binary logging on: DETERMINISTIC, READS SQL DATA and log_bin_trust_function_creators."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: October 24, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# Fix MySQL Error 1418: Function Not DETERMINISTIC
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="October 24, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+You create a stored function that works on your laptop, run the same script on a production server or a fresh MySQL 8 install, and get:
+
+```
+ERROR 1418 (HY000): This function has none of DETERMINISTIC, NO SQL, or READS SQL DATA in its declaration and binary logging is enabled (you *might* want to use the less safe log_bin_trust_function_creators variable)
+```
+
+A close relative appears when an account without the `SUPER` privilege creates a function or trigger:
+
+```
+ERROR 1419 (HY000): You do not have the SUPER privilege and binary logging is enabled (you *might* want to use the less safe log_bin_trust_function_creators variable)
+```
+
+Both come from the same safety rule. When the binary log is on, MySQL wants to be sure that stored functions can be replicated and replayed safely, and by default it only trusts functions that declare what they do, created by accounts it trusts. Since MySQL 8.0 the binary log is enabled by default, so a script that used to run on a 5.7 server without binary logging now fails.
+
+This guide explains the rule, shows the real errors from MySQL 8.4, and covers the three fixes: declare the function's characteristics correctly, grant the right privilege, or relax the check with `log_bin_trust_function_creators`, and when each is appropriate.
+
+## Why MySQL Checks Function Declarations
+
+Replicas, and point-in-time recovery from the binary log, re-execute changes. With statement-based logging, a statement such as `UPDATE orders SET total = gross(total, tax_rate)` is written to the log as text and run again on the replica. If `gross()` returned a different result there, because it used `NOW()`, `RAND()` or a different table's contents, the replica would silently diverge.
+
+MySQL cannot analyse a function body to prove it is safe, so it relies on what you declare:
+
+- `DETERMINISTIC`: the same inputs always give the same result.
+- `NO SQL`: the function contains no SQL statements.
+- `READS SQL DATA`: it reads data but does not change it.
+- `MODIFIES SQL DATA`: it changes data. This alone is not enough to pass the check.
+- `CONTAINS SQL`: the default when nothing is declared, meaning "has SQL but neither reads nor writes data".
+
+With `log_bin = ON` and `log_bin_trust_function_creators = OFF` (both defaults in 8.0 and 8.4), `CREATE FUNCTION` succeeds only if the function declares at least one of `DETERMINISTIC`, `NO SQL` or `READS SQL DATA`, and the creator has `SUPER` (or, for the privilege part, the conditions described in Fix 2). Check your server with:
+
+```sql
+SELECT @@log_bin, @@binlog_format, @@log_bin_trust_function_creators;
+```
+
+```
+1	ROW	0
+```
+
+## Reproducing Error 1418
+
+A simple calculation function without any characteristic:
+
+```sql
+CREATE TABLE orders (id int PRIMARY KEY, total decimal(10,2), tax_rate decimal(4,3));
+INSERT INTO orders VALUES (1, 100.00, 0.080), (2, 50.00, 0.100);
+
+CREATE FUNCTION gross(t decimal(10,2), r decimal(4,3)) RETURNS decimal(10,2)
+RETURN t * (1 + r);
+-- ERROR 1418 (HY000): This function has none of DETERMINISTIC, NO SQL, or READS SQL DATA in its declaration and binary logging is enabled ...
+```
+
+A function that queries a table fails the same way when it declares nothing:
+
+```sql
+CREATE FUNCTION order_count() RETURNS int
+RETURN (SELECT count(*) FROM orders);
+-- ERROR 1418 (HY000): ...
+```
+
+And so does a function that writes data, even when it says so honestly:
+
+```sql
+DELIMITER //
+CREATE FUNCTION next_order_id() RETURNS int MODIFIES SQL DATA
+BEGIN
+  INSERT INTO orders VALUES ((SELECT coalesce(max(id), 0) + 1 FROM (SELECT id FROM orders) x), 0, 0);
+  RETURN last_insert_id();
+END//
+DELIMITER ;
+-- ERROR 1418 (HY000): ...
+```
+
+## Fix 1: Declare the Characteristics Truthfully
+
+This is the right fix for almost every function. Add the characteristic that describes what the function really does:
+
+```sql
+CREATE FUNCTION gross(t decimal(10,2), r decimal(4,3)) RETURNS decimal(10,2)
+DETERMINISTIC
+RETURN t * (1 + r);
+
+SELECT id, gross(total, tax_rate) FROM orders;
+```
+
+```
+id	gross(total, tax_rate)
+1	108.00
+2	55.00
+```
+
+`gross()` depends only on its arguments, so `DETERMINISTIC` is true. For `order_count()`, the result changes when the table changes, so it is not deterministic, but it only reads, so `READS SQL DATA` is the honest declaration:
+
+```sql
+CREATE FUNCTION order_count() RETURNS int
+READS SQL DATA
+RETURN (SELECT count(*) FROM orders);
+```
+
+You can combine characteristics, for example `DETERMINISTIC READS SQL DATA` for a lookup in a table that never changes. To see what existing routines declare:
+
+```sql
+SELECT routine_name, is_deterministic, sql_data_access
+FROM information_schema.routines
+WHERE routine_schema = 'f8';
+```
+
+```
+ROUTINE_NAME	IS_DETERMINISTIC	SQL_DATA_ACCESS
+gross	YES	CONTAINS SQL
+order_count	NO	READS SQL DATA
+today_label	YES	CONTAINS SQL
+```
+
+### Do Not Lie About DETERMINISTIC
+
+MySQL does not verify the declaration. This is accepted:
+
+```sql
+CREATE FUNCTION today_label() RETURNS varchar(20)
+DETERMINISTIC
+RETURN date_format(now(), '%Y-%m-%d');
+```
+
+But it is false: the result depends on the current date. The optimiser may also use the declaration, for example to evaluate the function fewer times than you expect. With `binlog_format = ROW`, the default since MySQL 5.7.7, replicas receive the changed rows rather than the statement, so a wrong declaration is far less dangerous for replication than it used to be. It is still a bug waiting for someone to switch to statement or mixed logging, so declare `NOT DETERMINISTIC` (the default) with `READS SQL DATA` or `NO SQL` when the function is not deterministic.
+
+Functions that modify data have no honest way to pass the check. Usually that is a sign the logic belongs in a stored procedure, which is not subject to this rule, or in application code. If it must be a function, use Fix 3.
+
+## Fix 2: Error 1419 and the SUPER Privilege
+
+Even with correct declarations, an ordinary account is refused:
+
+```sql
+-- as user 'dev' with ALL PRIVILEGES on f8.*
+CREATE FUNCTION g2(t int) RETURNS int DETERMINISTIC RETURN t * 2;
+-- ERROR 1419 (HY000): You do not have the SUPER privilege and binary logging is enabled ...
+```
+
+Triggers are covered too:
+
+```sql
+CREATE TRIGGER trg2 BEFORE UPDATE ON orders FOR EACH ROW SET NEW.total = NEW.total;
+-- ERROR 1419 (HY000): You do not have the SUPER privilege and binary logging is enabled ...
+```
+
+The reason is that a function or trigger runs with its definer's privileges inside replicated statements, and MySQL treats creating one as a trusted operation when the binary log is on. Note the order of the checks: the same user creating a function without any characteristic gets 1418 first, and only after fixing the declaration sees 1419.
+
+`SUPER` is deprecated in MySQL 8 and should not be handed out just for this. Your options are:
+
+- **Create routines from a trusted account**, such as the migration or DBA account, with an explicit `DEFINER` for the application user where appropriate.
+- **Set `log_bin_trust_function_creators = 1`**, which removes the `SUPER` requirement for creators that have `CREATE ROUTINE` and `TRIGGER` as usual. This is what most managed services expect you to do (see below).
+
+## Fix 3: log_bin_trust_function_creators
+
+The variable named in the message turns both checks off:
+
+```sql
+SET GLOBAL log_bin_trust_function_creators = 1;
+```
+
+After that, the function that modifies data and the undeclared function both create successfully. Changing it requires `SUPER` or `SYSTEM_VARIABLES_ADMIN`. An ordinary account gets error 1227:
+
+```
+ERROR 1227 (42000): Access denied; you need (at least one of) the SUPER or SYSTEM_VARIABLES_ADMIN privilege(s) for this operation
+```
+
+`SET GLOBAL` is lost on restart. Use `SET PERSIST log_bin_trust_function_creators = 1` or put it in `my.cnf` under `[mysqld]` to keep it.
+
+Is it safe? The variable says "trust the people who create functions to declare them correctly". With row-based logging, which is the default, the replication risk is small, and many teams run with it on. It is a reasonable choice when you control who can create routines. It is a poor choice if many low-privilege accounts can create functions on a server that uses statement-based logging.
+
+### Managed MySQL (RDS, Aurora, Cloud SQL, Azure)
+
+You do not get `SUPER` on managed services, so `SET GLOBAL` fails. Set `log_bin_trust_function_creators` to `1` in the instance's parameter group (Amazon RDS and Aurora) or database flags (Google Cloud SQL, Azure Database for MySQL). It is a dynamic parameter on RDS, so no reboot is needed. This is the standard way to import dumps that contain functions and triggers on those platforms.
+
+## Importing Dumps That Fail With 1418
+
+`mysqldump` writes routines exactly as they were defined. If the source server did not have binary logging, or had the trust variable on, its functions may have no characteristics, and the import into a new MySQL 8 server stops at the first one. You can:
+
+1. Enable `log_bin_trust_function_creators` on the target for the import, then decide whether to keep it.
+2. Fix the source definitions by adding the correct characteristic, then dump again.
+3. For a one-off import into a scratch server where you do not need the binary log, start that server with `--skip-log-bin`.
+
+Imports also often fail on `DEFINER` clauses for accounts that do not exist on the target, with error 1227 or 1449. Those are separate problems with their own fixes.
+
+Reviewing dozens of routine definitions by hand is slow. [Chat2DB](https://chat2db.ai/download) lists functions, procedures and triggers per database with their full source, and its AI assistant can read a function body and tell you whether `DETERMINISTIC`, `READS SQL DATA` or `NO SQL` is the honest declaration.
+
+## FAQ
+
+### Do stored procedures trigger error 1418?
+
+No. The check applies to stored functions and triggers. Procedures are logged differently: the statements inside them are written to the binary log individually, so their characteristics are not needed for safety.
+
+### Should I just turn off binary logging?
+
+Only on a server that is never a replication source and never needs point-in-time recovery, such as a local development instance. On anything else, the binary log is how you recover from mistakes. Fix the declarations or use the trust variable instead.
+
+### Why did this work on MySQL 5.7?
+
+Binary logging was off by default in 5.7, and the check only applies when it is on. MySQL 8.0 enabled it by default (`log_bin = ON`, `binlog_format = ROW`), which is why scripts that ran cleanly for years start failing after an upgrade.
