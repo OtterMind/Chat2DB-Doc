@@ -1,0 +1,227 @@
+---
+title: "Fix Postgres: Index Row Size Exceeds Btree Maximum"
+description: "Fix 'index row size exceeds btree version 4 maximum 2704' in PostgreSQL: why long text breaks B-tree indexes, plus hash, md5, sha256 and prefix index fixes."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: October 25, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# Fix Postgres: Index Row Size Exceeds Btree Maximum
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="October 25, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+An insert that worked for months suddenly fails on one particular row:
+
+```
+ERROR:  index row size 3216 exceeds btree version 4 maximum 2704 for index "pages_body_idx"
+DETAIL:  Index row references tuple (0,2) in relation "pages".
+HINT:  Values larger than 1/3 of a buffer page cannot be indexed.
+Consider a function index of an MD5 hash of the value, or use full text indexing.
+```
+
+The SQLSTATE is `54000` (`program_limit_exceeded`). The same error stops `CREATE INDEX` or `ADD CONSTRAINT ... UNIQUE` when one existing row is too large, and it often appears only in production, because test data is short.
+
+This guide explains the limit, why some long values pass and others fail, and the fixes that work, from hash indexes to hashed unique constraints. All output is from PostgreSQL 18.
+
+## Why B-tree Entries Have a Size Limit
+
+A B-tree page must hold at least three index entries so that the tree can split pages and keep working. With the default 8 kB block size, that caps a single entry at roughly a third of a page. For the current B-tree format (version 4, used since PostgreSQL 12) the exact limit is 2704 bytes. Version 3 indexes allowed 2712.
+
+The limit applies to the whole index tuple: all key columns, any `INCLUDE` columns, and a small header. It is checked against the value as it will be stored in the index, and that detail explains most of the confusing behaviour.
+
+## Why Some Long Values Work and Others Fail
+
+PostgreSQL compresses large text and bytea values with pglz or lz4 before storing them, and the index stores the compressed form. A 3000-byte value that compresses well is far below the limit:
+
+```sql
+CREATE TABLE pages (id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY, url text, body text);
+CREATE INDEX pages_body_idx ON pages (body);
+
+INSERT INTO pages (url, body) VALUES ('/a', repeat('x', 3000));
+-- INSERT 0 1
+
+INSERT INTO pages (url, body)
+SELECT '/b', string_agg(md5(i::text), '') FROM generate_series(1, 100) i;
+-- ERROR:  index row size 3216 exceeds btree version 4 maximum 2704 for index "pages_body_idx"
+```
+
+The first value is 3000 bytes but stores in 44. The second is 3200 bytes of random hex that hardly compresses, so the index row is 3216 bytes. You can see the stored size with `pg_column_size`:
+
+```sql
+SELECT url, octet_length(body) AS raw_bytes, pg_column_size(body) AS stored_bytes FROM pages;
+```
+
+```
+ url | raw_bytes | stored_bytes
+-----+-----------+--------------
+ /a  |      3000 |           44
+```
+
+That is why the error looks random: it depends on how well each value compresses, not just on its length. Values that rarely compress include URLs with tokens, base64 or hex data, JSON with many unique keys, encrypted text and long hashes concatenated together.
+
+## Find the Rows That Will Fail
+
+Before building an index on existing data, check the largest stored values:
+
+```sql
+SELECT id, pg_column_size(body) AS stored_bytes
+FROM pages
+WHERE pg_column_size(body) > 2600
+ORDER BY stored_bytes DESC
+LIMIT 20;
+```
+
+For a composite index, add the sizes of all key and `INCLUDE` columns. Use a margin of about 100 bytes below 2704 for headers and alignment.
+
+`CREATE INDEX` reports the first offending row through the `DETAIL` line (`tuple (0,4)` is block 0, item 4). Look it up with `SELECT * FROM pages WHERE ctid = '(0,4)'`.
+
+## Fix 1: Ask What the Index Is For
+
+A B-tree index on a long text column serves one of three purposes. Each has a better tool:
+
+| Purpose | Better choice |
+|---------|---------------|
+| Equality lookups (`WHERE body = $1`) | Hash index, or B-tree on a hash of the value |
+| Uniqueness | Unique index on `sha256()` of the value, or an exclusion constraint using hash |
+| Search inside the text (`LIKE`, words) | `pg_trgm` GIN index or full-text search |
+| Sorting / range scans | B-tree on a prefix (`left(col, n)`) |
+
+## Fix 2: Use a Hash Index for Equality
+
+Hash indexes store a 4-byte hash of the value, so the size of the value does not matter. Since PostgreSQL 10 they are WAL-logged and crash-safe.
+
+```sql
+DROP INDEX IF EXISTS pages_body_idx;
+CREATE INDEX pages_body_hash ON pages USING hash (body);
+
+EXPLAIN (COSTS OFF) SELECT id FROM pages WHERE body = 'abc';
+```
+
+```
+                QUERY PLAN
+-------------------------------------------
+ Index Scan using pages_body_hash on pages
+   Index Cond: (body = 'abc'::text)
+```
+
+Your queries stay unchanged. The limits: hash indexes support only `=`, cannot be `UNIQUE`, and cannot cover multiple columns.
+
+## Fix 3: Index a Hash of the Value
+
+The hint in the error message suggests an expression index on `md5(value)`. It works for both lookups and uniqueness:
+
+```sql
+CREATE UNIQUE INDEX pages_body_md5_uq ON pages (md5(body));
+```
+
+Queries must use the same expression to use the index. Keep the original comparison as well, so a hash collision can never return the wrong row:
+
+```sql
+EXPLAIN (COSTS OFF)
+SELECT id FROM pages WHERE md5(body) = md5('abc') AND body = 'abc';
+```
+
+```
+                              QUERY PLAN
+----------------------------------------------------------------------
+ Index Scan using pages_body_md5_uq on pages
+   Index Cond: (md5(body) = '900150983cd24fb0d6963f7d28e17f72'::text)
+   Filter: (body = 'abc'::text)
+```
+
+For uniqueness on values that users control, prefer SHA-256. MD5 collisions can be constructed on purpose, which would let someone insert a different value that the unique index rejects or accepts incorrectly. `sha256()` takes `bytea`, and the `url::bytea` cast is immutable, so it can be used in an index:
+
+```sql
+CREATE TABLE links2 (id int, url text);
+CREATE UNIQUE INDEX links2_url_sha ON links2 (sha256(url::bytea));
+
+INSERT INTO links2 SELECT 2, 'https://example.com/?q=' || string_agg(md5(i::text), '')
+FROM generate_series(1, 200) i;
+-- second time:
+-- ERROR:  duplicate key value violates unique constraint "links2_url_sha"
+-- DETAIL:  Key (sha256(url::bytea))=(\x8ee59420cf...) already exists.
+```
+
+Upserts work with the expression too: `INSERT ... ON CONFLICT ((sha256(url::bytea))) DO NOTHING`.
+
+Note that `convert_to(url, 'UTF8')` does not work here. It is only `STABLE`, and you get `functions in index expression must be marked IMMUTABLE`.
+
+A plain `UNIQUE (url)` constraint on the same table fails exactly like the original error, because it creates a B-tree index on the full value:
+
+```
+ERROR:  index row size 6440 exceeds btree version 4 maximum 2704 for index "links2_url_key"
+```
+
+## Fix 4: Uniqueness Without Changing Queries (Exclusion Constraint)
+
+If you want the database to enforce uniqueness of a long column without hash expressions in your queries, use an exclusion constraint backed by a hash index:
+
+```sql
+CREATE TABLE links (
+  id  int GENERATED ALWAYS AS IDENTITY,
+  url text,
+  CONSTRAINT links_url_uniq EXCLUDE USING hash (url WITH =)
+);
+```
+
+A duplicate insert now fails with `conflicting key value violates exclusion constraint "links_url_uniq"`, whatever the length of the URL. The hash index also serves `WHERE url = $1` lookups. The trade-offs: an exclusion constraint cannot be the target of a foreign key, and `ON CONFLICT DO UPDATE` does not support exclusion constraints, only `DO NOTHING`.
+
+## Fix 5: Prefix Index for Sorting and Range Scans
+
+If you need ordering or `>`/`<` comparisons on the first part of the text, index a prefix:
+
+```sql
+CREATE INDEX pages_body_prefix ON pages (left(body, 200));
+
+SELECT id FROM pages
+WHERE left(body, 200) = left($1, 200) AND body = $1;
+```
+
+`left()` counts characters, so 200 characters of 4-byte UTF-8 is at most 800 bytes, safely under the limit.
+
+## Fix 6: Searching Inside Text
+
+If the index exists to speed up `LIKE '%term%'` or word search, a B-tree never helped those queries anyway. Use a trigram index (`CREATE EXTENSION pg_trgm; CREATE INDEX ... USING gin (body gin_trgm_ops)`) or full-text search with a `tsvector` column and a GIN index. GIN indexes store individual trigrams or lexemes, so long documents are fine.
+
+## JSONB, Arrays and Composite Indexes
+
+The same error appears for `jsonb` and array columns with a B-tree index. Here a jsonb object with 120 keys stored in 5180 bytes:
+
+```
+ERROR:  index row size 5192 exceeds btree version 4 maximum 2704 for index "ev_payload_idx"
+```
+
+A B-tree on a whole jsonb document is rarely what you want. Use a GIN index (`jsonb_path_ops` for containment queries) or index the specific keys you filter on, for example `((payload->>'customer_id'))`.
+
+For composite indexes and `INCLUDE` columns, every column counts toward the 2704 bytes:
+
+```sql
+CREATE INDEX ON inc (id) INCLUDE (body);
+-- ERROR:  index row size 3216 exceeds btree version 4 maximum 2704 for index "inc_id_body_idx"
+```
+
+Do not put large text in `INCLUDE`. The heap lookup is cheap compared with a bloated index.
+
+## Changing the Block Size Is Not the Answer
+
+The limit scales with the block size, which is fixed when PostgreSQL is compiled (`--with-blocksize`). Managed services do not let you change it, and a larger block size affects every table and index. Fix the index design instead.
+
+When you are reviewing which indexes exist on a table and which columns they cover, a GUI helps. [Chat2DB](https://chat2db.ai/download) lists every index with its definition and size, and its AI assistant can rewrite a failing B-tree index into a hash or expression index for you.
+
+## FAQ
+
+### What does "btree version 4 maximum 2704" mean?
+
+Version 4 is the on-disk format of B-tree indexes created by PostgreSQL 12 and later. With 8 kB pages, one index entry may be at most 2704 bytes so that a page can always hold at least three entries. Indexes upgraded from older releases with `pg_upgrade` may still be version 3, whose limit is 2712 bytes.
+
+### Why did the error only appear for some rows?
+
+PostgreSQL compresses large values, and the limit applies to the compressed size. Repetitive text compresses to a fraction of its length, while random-looking data such as tokens, hex or base64 does not. Check `pg_column_size(column)` for the failing row.
+
+### Is an md5 expression index safe for a UNIQUE constraint?
+
+For data you generate yourself, collisions are not a practical concern. For values that untrusted users submit, use `sha256(col::bytea)`, because MD5 collisions can be created deliberately. In both cases keep `AND col = $1` in lookup queries.

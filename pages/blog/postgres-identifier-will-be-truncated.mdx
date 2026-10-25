@@ -1,0 +1,230 @@
+---
+title: "Postgres: Identifier Will Be Truncated (63 Bytes)"
+description: "Why PostgreSQL prints NOTICE identifier will be truncated, how the 63-byte NAMEDATALEN limit causes name collisions and broken migrations, and how to fix it."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: October 25, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# Postgres: Identifier Will Be Truncated (63 Bytes)
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="October 25, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+You create a table with a descriptive name and PostgreSQL answers with a notice instead of an error:
+
+```
+NOTICE:  identifier "customer_subscription_billing_history_with_tax_adjustments_by_region" will be truncated to "customer_subscription_billing_history_with_tax_adjustments_by_r"
+CREATE TABLE
+```
+
+The statement succeeds, so the notice is easy to ignore. It should not be. PostgreSQL has just stored a different name from the one you typed. Later that difference shows up as a `relation already exists` error for a table you never created, a migration tool that keeps trying to create the same table, or two columns that turn out to be the same column.
+
+This article explains where the limit comes from, shows each way it bites with output from PostgreSQL 18, and covers how to find and fix truncated names in an existing database.
+
+## Where the 63-Byte Limit Comes From
+
+Every identifier in PostgreSQL (table, column, index, constraint, sequence, schema, role, function name) is stored in the system catalogs using the `name` type. `name` is a fixed-size type of `NAMEDATALEN` bytes, and `NAMEDATALEN` is 64 by default. One byte is reserved for the terminating zero, which leaves 63 bytes for the name itself. You can read the limit from any server:
+
+```sql
+SHOW max_identifier_length;
+```
+
+```
+ max_identifier_length
+-----------------------
+ 63
+```
+
+When the parser reads an identifier that is 64 bytes or longer, it cuts it to 63 bytes and emits the notice. This happens in the lexer, before PostgreSQL knows whether the identifier is a table, a column or an alias, so the same rule applies everywhere.
+
+Two details matter:
+
+1. **The limit is in bytes, not characters.** In a UTF-8 database, `ü` takes 2 bytes and a CJK character takes 3, so non-English names are cut much earlier than 63 characters.
+2. **PostgreSQL never splits a multibyte character.** It cuts at the last complete character that fits, so the stored name can be shorter than 63 bytes.
+
+```sql
+CREATE TABLE "Überprüfung_der_Kundenbestellungen_für_das_Geschäftsjahr_2026_Q4" (id int);
+-- NOTICE:  identifier "Überprüfung_der_Kundenbestellungen_für_das_Geschäftsjahr_2026_Q4"
+--          will be truncated to "Überprüfung_der_Kundenbestellungen_für_das_Geschäftsjahr_20"
+
+SELECT relname, length(relname::text) AS chars, octet_length(relname::text) AS bytes
+FROM pg_class WHERE relname LIKE 'Über%';
+```
+
+```
+                           relname                           | chars | bytes
+-------------------------------------------------------------+-------+-------
+ Überprüfung_der_Kundenbestellungen_für_das_Geschäftsjahr_20 |    59 |    63
+```
+
+Fifty-nine characters, 63 bytes. A name in Chinese or Japanese is limited to about 21 characters.
+
+## Why Queries With the Long Name Still Work
+
+Truncation is applied to every identifier the parser reads, not only in `CREATE` statements. A query that uses the full long name is cut the same way and finds the table:
+
+```sql
+SELECT count(*) FROM customer_subscription_billing_history_with_tax_adjustments_by_region;
+-- NOTICE:  identifier "..._by_region" will be truncated to "..._by_r"
+--  count
+-- -------
+--      0
+```
+
+The same happens when a string literal is cast to `name`. That includes comparisons against `information_schema` columns, which use a domain over `name`:
+
+```sql
+SELECT count(*) FROM information_schema.tables
+WHERE table_name = 'customer_subscription_billing_history_with_tax_adjustments_by_region';
+-- 1
+
+SELECT count(*) FROM information_schema.tables
+WHERE table_name::text = 'customer_subscription_billing_history_with_tax_adjustments_by_region';
+-- 0
+```
+
+This is why truncation can go unnoticed for months: SQL that names the object directly keeps working. The trouble starts when two names share the same first 63 bytes, or when code compares names as plain strings.
+
+## Problem 1: Two Names Collapse Into One
+
+Names that differ only after byte 63 become the same name:
+
+```sql
+CREATE TABLE customer_subscription_billing_history_with_tax_adjustments_by_country (id bigint PRIMARY KEY);
+-- NOTICE:  ... will be truncated to "customer_subscription_billing_history_with_tax_adjustments_by_c"
+
+CREATE TABLE customer_subscription_billing_history_with_tax_adjustments_by_city (id bigint);
+-- NOTICE:  ... will be truncated to "customer_subscription_billing_history_with_tax_adjustments_by_c"
+-- ERROR:  relation "customer_subscription_billing_history_with_tax_adjustments_by_c" already exists
+```
+
+With `CREATE TABLE IF NOT EXISTS` it is worse. There is no error, only a notice that the relation exists and was skipped, and your code then writes city rows into the country table.
+
+Columns behave the same way:
+
+```sql
+ALTER TABLE t ADD COLUMN the_total_amount_of_money_received_from_customers_during_the_year_a int;
+ALTER TABLE t ADD COLUMN the_total_amount_of_money_received_from_customers_during_the_year_b int;
+-- ERROR:  column "the_total_amount_of_money_received_from_customers_during_the_ye" of relation "t" already exists
+```
+
+So do column aliases in a view:
+
+```sql
+CREATE VIEW v AS
+SELECT 1 AS revenue_by_region_and_product_category_for_the_fiscal_year_2026_q1,
+       2 AS revenue_by_region_and_product_category_for_the_fiscal_year_2026_q2;
+-- ERROR:  column "revenue_by_region_and_product_category_for_the_fiscal_year_2026" specified more than once
+```
+
+A plain `SELECT` with those aliases does not fail. It returns two columns with the same name, and a driver that maps rows to a dictionary silently keeps only one of them.
+
+## Problem 2: Generated Index and Constraint Names
+
+When you do not name an index or constraint, PostgreSQL builds a name from the table name, the column names and a suffix such as `pkey`, `key`, `idx`, `fkey` or `check`. Those names hit the limit long before your own names do. PostgreSQL does not emit a notice for them. It shortens the longer part (table or columns) so the suffix still fits, and if the result is taken it appends a number:
+
+```sql
+CREATE TABLE order_line_items (
+  id bigint PRIMARY KEY,
+  warehouse_location_identifier_code bigint,
+  fulfillment_partner_account_reference bigint
+);
+CREATE INDEX ON order_line_items (warehouse_location_identifier_code, fulfillment_partner_account_reference);
+CREATE INDEX ON order_line_items (warehouse_location_identifier_code, fulfillment_partner_account_reference, id);
+
+SELECT indexname FROM pg_indexes WHERE tablename = 'order_line_items' ORDER BY 1;
+```
+
+```
+                            indexname
+-----------------------------------------------------------------
+ order_line_items_pkey
+ order_line_items_warehouse_location_identifier_code_fulfil_idx1
+ order_line_items_warehouse_location_identifier_code_fulfill_idx
+```
+
+The second index got `_idx1`, and both names hide the trailing columns. A migration that later says `DROP INDEX order_line_items_warehouse_location_identifier_code_fulfillment_partner_account_reference_idx` drops nothing useful, because that name never existed. The same applies to primary keys of long-named tables. Above, the second table's key became `customer_subscription_billing_history_with_tax_adjustment_pkey1`.
+
+To predict these names before you deploy, paste the table and column names into the [Postgres Identifier Checker](https://chat2db.ai/tools/postgres-identifier-checker). It applies the same shortening rules and shows the stored name for every constraint type.
+
+## Problem 3: Migration Tools and ORMs
+
+ORMs and migration frameworks often keep the model's name in application code and compare it with names read back from the catalog. If the model says `..._by_region` and the database returns `..._by_r`, the tool decides the table does not exist and generates a `CREATE TABLE` on every run, or an autogenerate step proposes dropping and re-creating the table. Common symptoms:
+
+- Alembic or Django `makemigrations` keeps producing the same migration.
+- Hibernate `ddl-auto=validate` reports a missing table or column.
+- A schema-diff tool shows a rename that never happened.
+
+Some frameworks know about the limit. Django shortens long generated index names with a hash, for example. Names you choose yourself are still your responsibility.
+
+## How to Find Truncated Names
+
+Any name that is exactly 63 bytes long is suspicious. It is either a name someone typed at exactly the limit or, far more often, a truncated one:
+
+```sql
+-- tables, indexes, sequences, views
+SELECT n.nspname, c.relname, c.relkind
+FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+WHERE octet_length(c.relname::text) = 63
+  AND n.nspname NOT IN ('pg_catalog', 'information_schema');
+
+-- columns
+SELECT attrelid::regclass AS table_name, attname
+FROM pg_attribute
+WHERE octet_length(attname::text) = 63 AND attnum > 0 AND NOT attisdropped
+  AND attrelid >= 16384;
+
+-- constraints
+SELECT conrelid::regclass, conname FROM pg_constraint
+WHERE octet_length(conname::text) >= 60;
+```
+
+Run these after each deployment, or turn them into a CI check against a test database.
+
+## How to Fix It
+
+**Rename to a shorter, deliberate name.** This is the real fix. Renaming is a catalog-only change and does not rewrite data:
+
+```sql
+BEGIN;
+ALTER TABLE customer_subscription_billing_history_with_tax_adjustments_by_r
+  RENAME TO billing_history_tax_by_region;
+ALTER INDEX customer_subscription_billing_history_with_tax_adjustments_pkey
+  RENAME TO billing_history_tax_by_region_pkey;
+COMMIT;
+```
+
+Update the ORM model or migration in the same release, and remember that views and functions that reference the table by name in their source text (SQL-language function bodies, dynamic SQL) are not updated automatically. Views store a reference to the table's OID, so they follow the rename.
+
+**Name indexes and constraints yourself** when the generated name would be long:
+
+```sql
+CREATE INDEX oli_warehouse_partner_idx
+  ON order_line_items (warehouse_location_identifier_code, fulfillment_partner_account_reference);
+```
+
+**Adopt a naming convention with a budget.** Keep table names under about 40 bytes so generated names like `<table>_<column>_fkey` have room. Prefer common abbreviations (`acct`, `qty`, `addr`) over sentence-length names, and use plain ASCII snake_case for anything that will be typed often.
+
+**Treat the notice as an error in CI.** Run migrations with `client_min_messages = notice`, capture server messages, and fail the build when one contains `will be truncated`. Some teams also grep their migration files for identifiers longer than 63 bytes.
+
+**Recompiling with a larger `NAMEDATALEN`** is possible (set it in `pg_config_manual.h` and rebuild), but every client, extension and replica must use the same build, managed services do not allow it, and `pg_upgrade` between builds with different values is not supported. It is almost never worth it.
+
+When you are cleaning up a large schema, it helps to see the stored names next to the definitions. [Chat2DB](https://chat2db.ai/download) shows the real catalog names in its object tree and table editor, and its AI assistant can generate the `ALTER ... RENAME` statements for a table, its indexes and constraints in one batch.
+
+## FAQ
+
+### Is "identifier will be truncated" an error?
+
+No. It is a `NOTICE`, and the statement completes with the shortened name. Many clients and drivers do not display notices at all, which is why truncated names often go unnoticed until two of them collide.
+
+### Does the 63-byte limit apply to quoted identifiers?
+
+Yes. Double quotes preserve case and allow spaces or keywords, but the stored value is still a `name` and is cut to 63 bytes in exactly the same way.
+
+### Why does my index name end in 1 or 2?
+
+PostgreSQL generated the name, found it already in use (often because truncation made two generated names identical), and appended a number to the suffix. Give the index an explicit name to avoid surprises in later migrations.

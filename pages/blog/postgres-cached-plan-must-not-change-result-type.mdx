@@ -1,0 +1,189 @@
+---
+title: "Postgres: Cached Plan Must Not Change Result Type"
+description: "Fix 'cached plan must not change result type' in PostgreSQL: why prepared statements break after ALTER TABLE, with fixes for JDBC, PgBouncer and ORMs."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: October 25, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# Postgres: Cached Plan Must Not Change Result Type
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="October 25, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+You deploy a migration that adds a column, and a few seconds later the application logs fill up with:
+
+```
+ERROR:  cached plan must not change result type
+```
+
+The SQLSTATE is `0A000` (`feature_not_supported`). The error comes from prepared statements that existed before the migration. It usually disappears after the application restarts, which is why many teams treat it as a deployment glitch. It can be avoided entirely once you understand what PostgreSQL is protecting.
+
+This article reproduces the error on PostgreSQL 18, explains exactly which schema changes trigger it, and covers the fixes for psql, JDBC, connection poolers and ORMs.
+
+## Reproducing the Error
+
+```sql
+CREATE TABLE users (id int PRIMARY KEY, name text);
+INSERT INTO users VALUES (1, 'ada');
+
+PREPARE get_user(int) AS SELECT * FROM users WHERE id = $1;
+EXECUTE get_user(1);
+```
+
+```
+ id | name
+----+------
+  1 | ada
+```
+
+Now change the table and execute the same prepared statement again:
+
+```sql
+ALTER TABLE users ADD COLUMN email text;
+EXECUTE get_user(1);
+```
+
+```
+ERROR:  cached plan must not change result type
+```
+
+## What PostgreSQL Is Protecting
+
+When a statement is prepared, PostgreSQL parses it, expands `SELECT *` into the concrete column list, and tells the client the shape of the result: column names, types and type modifiers. Drivers rely on that description. Many of them cache it and decode later result rows using it, without asking again.
+
+After a schema change, PostgreSQL invalidates the plan and re-plans the statement on the next `EXECUTE`. That part is automatic and normally invisible. But if the new plan would return a different row shape (an extra column, a removed column, a different type), sending those rows would break the contract with the client. PostgreSQL refuses and raises this error instead.
+
+So the rule is: **re-planning is fine, changing the result shape is not.** The prepared statement stays broken until it is deallocated and prepared again. `DISCARD PLANS` does not help, because the result description belongs to the prepared statement itself:
+
+```sql
+DISCARD PLANS;
+EXECUTE get_user(1);
+-- ERROR:  cached plan must not change result type
+
+DEALLOCATE get_user;
+PREPARE get_user(int) AS SELECT * FROM users WHERE id = $1;
+EXECUTE get_user(1);   -- works, now returns id, name, email
+```
+
+## Which Changes Trigger It
+
+These changes alter the result of a prepared statement and trigger the error:
+
+| Change | `SELECT *` | Explicit column list |
+|--------|-----------|----------------------|
+| `ADD COLUMN` | Error | Works |
+| `DROP COLUMN` | Error | Works, unless a listed column is dropped: then `column "b" does not exist` |
+| `ALTER COLUMN ... TYPE` on a selected column | Error | Error |
+| Changing `varchar(n)` length or `numeric(p,s)` on a selected column | Error | Error |
+| `RENAME COLUMN` | Error (column names are part of the result) | Works for other columns; a renamed listed column gives `column "a" does not exist` |
+| New table or view earlier in `search_path` | Error if the shape differs | Error if types differ |
+
+The statement text is parsed again on re-planning, so a listed column that was renamed or dropped fails with an ordinary "does not exist" error instead.
+
+The column-list case is easy to verify:
+
+```sql
+PREPARE get_user2(int) AS SELECT id, name FROM users WHERE id = $1;
+ALTER TABLE users ADD COLUMN created_at timestamptz;
+EXECUTE get_user2(1);                       -- still works
+
+ALTER TABLE users ALTER COLUMN name TYPE varchar(100);
+EXECUTE get_user2(1);
+-- ERROR:  cached plan must not change result type
+```
+
+Changing `search_path` triggers it too, because the same text can now resolve to a different table:
+
+```sql
+CREATE SCHEMA app_v2;
+CREATE TABLE app_v2.users (id int PRIMARY KEY, name text, tier text);
+
+PREPARE s(int) AS SELECT * FROM users WHERE id = $1;   -- resolves to public.users
+SET search_path = app_v2, public;
+EXECUTE s(1);
+-- ERROR:  cached plan must not change result type
+```
+
+If the error happens inside a transaction, the transaction is aborted like after any other error, and every later statement fails with `current transaction is aborted, commands ignored until end of transaction block` until you roll back.
+
+## Where the Prepared Statements Come From
+
+Most applications never write `PREPARE` themselves. The statements are created by:
+
+- **JDBC (pgjdbc).** After a `PreparedStatement` has been executed `prepareThreshold` times (5 by default), the driver switches to a named server-side prepared statement and keeps it for the life of the connection.
+- **Connection pools** such as HikariCP keep those connections open for hours, so statements prepared before a migration survive it.
+- **PgBouncer 1.21+** in transaction mode with `max_prepared_statements` set tracks protocol-level prepared statements and prepares them on server connections.
+- **Other drivers and ORMs.** asyncpg caches prepared statements per connection, Npgsql has automatic preparation, and Rails, Go's pgx and others prepare frequently used statements.
+
+That is why the error appears right after a deployment: the migration runs, while long-lived connections still hold statements prepared against the old schema.
+
+## Fix 1: Stop Using SELECT * in Application Queries
+
+Explicit column lists make `ADD COLUMN`, the most common migration, harmless for existing statements. It also keeps the application from loading columns it does not use. Most ORMs already generate explicit column lists, so check your raw SQL and views.
+
+```sql
+-- fragile across migrations
+SELECT * FROM users WHERE id = $1;
+
+-- survives ADD COLUMN, and RENAME or DROP of other columns
+SELECT id, name, email FROM users WHERE id = $1;
+```
+
+Type changes on selected columns still break existing statements, so plan those as described below.
+
+## Fix 2: Let the Driver Retry (pgjdbc autosave)
+
+pgjdbc can recover automatically. With `autosave=conservative` the driver sets a savepoint before each statement. If the statement fails with this error, it rolls back to the savepoint, drops its cached statement, prepares it again and retries:
+
+```
+jdbc:postgresql://db:5432/app?autosave=conservative
+```
+
+The savepoints add a small cost to each statement inside a transaction. That is usually acceptable, and it removes the deployment errors without code changes. Alternatives are `prepareThreshold=0`, which disables server-side prepared statements entirely and costs some parsing time, or recycling the pool after migrations (below).
+
+asyncpg re-prepares statements on its own when it can, but inside a transaction it raises `InvalidCachedStatementError`. Retry the whole transaction in that case. In other drivers, check for an option to disable or reset the statement cache.
+
+## Fix 3: Recycle Connections After a Migration
+
+Since the broken statements live in existing sessions, new sessions are not affected. Common approaches:
+
+- Restart or roll the application instances after the migration, which is the usual deployment order anyway.
+- Ask the pool to evict connections. HikariCP has `softEvictConnections()` via its MXBean. Other pools have similar calls.
+- Set a modest `maxLifetime` so connections are replaced regularly.
+- With PgBouncer, run `RECONNECT` on the admin console after the migration so server connections are closed once they are idle.
+
+Run the migration with `DISCARD ALL` or `DEALLOCATE ALL` only if you control the session. These commands affect only the session that runs them, not other connections.
+
+## Fix 4: Make Schema Changes Compatible
+
+For zero-downtime deployments, structure changes so that old statements keep working:
+
+1. **Add columns first, use them later.** With explicit column lists, adding a column breaks nothing. Deploy the code that reads the column afterwards.
+2. **Change types with a new column.** Instead of `ALTER COLUMN ... TYPE`, add `name_v2`, backfill it, switch the code, then drop the old column in a later release.
+3. **Avoid renames under load.** Add the new column, write both, switch reads, and drop the old one later.
+
+These patterns also avoid the long locks that `ALTER COLUMN TYPE` takes when it rewrites a table.
+
+## What About PL/pgSQL Functions?
+
+PL/pgSQL caches plans for the queries inside functions, but it handles row-type changes itself. A function that loops over `SELECT * FROM users` or uses `RETURNS SETOF users` keeps working after `ADD COLUMN`. In our test, `SELECT * FROM f()` simply returned the new column. The error is specific to prepared statements whose result description was already sent to a client.
+
+When you change a table that many services query, it helps to see who depends on it first. [Chat2DB](https://chat2db.ai/download) shows table definitions, dependent views and active sessions side by side, and its AI assistant can turn an `ALTER COLUMN TYPE` into the add, backfill and swap steps described above.
+
+## FAQ
+
+### Why does restarting the application fix the error?
+
+The cached prepared statements live in database sessions. Restarting the application closes those connections, so new sessions prepare statements against the new schema. Restarting PostgreSQL itself is never needed.
+
+### Does `plan_cache_mode = force_custom_plan` prevent it?
+
+No. That setting only chooses between generic and custom plans. The statement is still re-planned against the new schema, and the result shape check still applies.
+
+### Can I see which prepared statements a session holds?
+
+Inside the session, query `pg_prepared_statements`. It shows the name, the SQL text and when each statement was prepared. Other sessions' prepared statements are not visible, so for pooled applications check the driver's own statistics.

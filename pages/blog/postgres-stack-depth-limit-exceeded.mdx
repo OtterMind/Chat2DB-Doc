@@ -1,0 +1,245 @@
+---
+title: "Fix Postgres Error: Stack Depth Limit Exceeded"
+description: "Fix 'stack depth limit exceeded' (54001) in PostgreSQL: recursive functions, triggers that fire themselves, huge generated expressions, and max_stack_depth."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: October 25, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# Fix Postgres Error: Stack Depth Limit Exceeded
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="October 25, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+A query, an update or a function call fails with:
+
+```
+ERROR:  stack depth limit exceeded
+HINT:  Increase the configuration parameter "max_stack_depth" (currently 2048kB), after ensuring the platform's stack depth limit is adequate.
+CONTEXT:  PL/pgSQL expression "n * fact(n - 1)"
+PL/pgSQL function fact(integer) line 1 at RETURN
+PL/pgSQL expression "n * fact(n - 1)"
+PL/pgSQL function fact(integer) line 1 at RETURN
+...
+```
+
+The SQLSTATE is `54001` (`statement_too_complex`). The hint suggests raising `max_stack_depth`, and sometimes that is the right fix. But in most real cases the error is a symptom of unbounded recursion, such as a trigger that fires itself or a function that walks a cycle in your data. A bigger stack only makes those fail later and use more memory first.
+
+This guide shows the four common causes with output from PostgreSQL 18, how to tell them apart from the `CONTEXT` lines, and the right fix for each.
+
+## What the Limit Protects
+
+Each PostgreSQL backend is a process with a C stack. Recursive work, such as evaluating nested expressions, calling functions from functions or firing triggers from triggers, uses stack frames. If the process ran out of real stack it would crash, and a backend crash makes the postmaster restart all sessions. To avoid that, PostgreSQL checks how much stack it has used and raises this error once it passes `max_stack_depth`, which defaults to 2MB.
+
+```sql
+SHOW max_stack_depth;
+--  2MB
+```
+
+The error is safe. Only the current statement fails, and the session continues after rollback.
+
+## Cause 1: Recursive Functions
+
+A recursive PL/pgSQL function uses several stack frames per call: the function call, the expression evaluation and the SPI query that runs it. With the default 2MB, a simple recursive factorial got only 800 levels deep in our test:
+
+```sql
+CREATE FUNCTION fact(n int) RETURNS numeric LANGUAGE plpgsql AS $$
+BEGIN
+  IF n <= 1 THEN RETURN 1; END IF;
+  RETURN n * fact(n - 1);
+END $$;
+
+SELECT fact(10);       -- 3628800
+SELECT fact(100000);   -- ERROR:  stack depth limit exceeded
+```
+
+Raising `max_stack_depth` to 7MB only moved the limit to 2811 levels. Recursion in procedural code does not scale, so rewrite it as a loop:
+
+```sql
+CREATE FUNCTION fact_iter(n int) RETURNS numeric LANGUAGE plpgsql AS $$
+DECLARE r numeric := 1;
+BEGIN
+  FOR i IN 2..n LOOP r := r * i; END LOOP;
+  RETURN r;
+END $$;
+
+SELECT length(fact_iter(20000)::text);   -- 77338 digits, no stack used
+```
+
+For tree-shaped data (categories, org charts, bills of materials), use a recursive CTE instead of a recursive function. A recursive CTE is executed iteratively, one level at a time, so its depth is not limited by the stack:
+
+```sql
+WITH RECURSIVE t(n) AS (
+  SELECT 1 UNION ALL SELECT n + 1 FROM t WHERE n < 1000000
+)
+SELECT max(n) FROM t;     -- 1000000
+```
+
+## Cause 2: Cycles in Your Data
+
+A recursive function that follows parent pointers works fine until someone creates a cycle:
+
+```sql
+CREATE TABLE emp (id int, manager_id int);
+INSERT INTO emp VALUES (1, 2), (2, 1);   -- 1 reports to 2, 2 reports to 1
+
+CREATE FUNCTION chain(i int) RETURNS int LANGUAGE sql AS $$
+  SELECT CASE WHEN i IS NULL THEN 0
+              ELSE 1 + chain((SELECT manager_id FROM emp WHERE id = i)) END
+$$;
+
+SELECT chain(1);
+-- ERROR:  stack depth limit exceeded
+-- CONTEXT:  SQL function "chain" statement 1
+```
+
+No stack size fixes this. The recursion never ends. Use a recursive CTE with cycle detection. Since PostgreSQL 14 the `CYCLE` clause does it for you:
+
+```sql
+WITH RECURSIVE chain AS (
+  SELECT id, manager_id FROM emp WHERE id = 1
+  UNION ALL
+  SELECT e.id, e.manager_id FROM emp e JOIN chain c ON e.id = c.manager_id
+) CYCLE id SET is_cycle USING path
+SELECT * FROM chain;
+```
+
+```
+ id | manager_id | is_cycle |     path
+----+------------+----------+---------------
+  1 |          2 | f        | {(1)}
+  2 |          1 | f        | {(1),(2)}
+  1 |          2 | t        | {(1),(2),(1)}
+```
+
+On older versions, carry an array of visited ids and stop with `WHERE NOT e.id = ANY (c.path)`. Then fix the data, and consider a trigger or constraint that prevents cycles in the first place.
+
+## Cause 3: A Trigger That Fires Itself
+
+This is the most common cause in production. An `AFTER UPDATE` trigger updates the same table, which fires the trigger again, and so on:
+
+```sql
+CREATE TABLE accounts (id int PRIMARY KEY, balance numeric, updated_at timestamptz);
+INSERT INTO accounts VALUES (1, 100, now());
+
+CREATE FUNCTION touch() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+  UPDATE accounts SET updated_at = now() WHERE id = NEW.id;
+  RETURN NEW;
+END $$;
+
+CREATE TRIGGER accounts_touch AFTER UPDATE ON accounts
+  FOR EACH ROW EXECUTE FUNCTION touch();
+
+UPDATE accounts SET balance = 200 WHERE id = 1;
+```
+
+```
+ERROR:  stack depth limit exceeded
+HINT:  Increase the configuration parameter "max_stack_depth" (currently 2048kB), ...
+CONTEXT:  SQL statement "UPDATE accounts SET updated_at = now() WHERE id = NEW.id"
+PL/pgSQL function touch() line 1 at SQL statement
+SQL statement "UPDATE accounts SET updated_at = now() WHERE id = NEW.id"
+PL/pgSQL function touch() line 1 at SQL statement
+...
+```
+
+The `CONTEXT` repeats the same trigger function hundreds of times (664 times here). That repetition is the signature of trigger recursion.
+
+**The right fix: modify `NEW` in a `BEFORE` trigger.** If the goal is to change columns of the row being updated, do not issue a second `UPDATE`. Assign to `NEW` in a `BEFORE` trigger. It is also faster, because the row is written once:
+
+```sql
+DROP TRIGGER accounts_touch ON accounts;
+
+CREATE FUNCTION touch2() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+  NEW.updated_at := now();
+  RETURN NEW;
+END $$;
+
+CREATE TRIGGER accounts_touch2 BEFORE UPDATE ON accounts
+  FOR EACH ROW EXECUTE FUNCTION touch2();
+
+UPDATE accounts SET balance = 400 WHERE id = 1;   -- UPDATE 1
+```
+
+**If you really must update the table from its own trigger**, for example to maintain a summary row in the same table, stop the recursion explicitly. `pg_trigger_depth()` returns how deeply nested the current trigger is:
+
+```sql
+CREATE TRIGGER accounts_touch AFTER UPDATE ON accounts
+  FOR EACH ROW WHEN (pg_trigger_depth() < 1) EXECUTE FUNCTION touch();
+```
+
+Be careful: the `WHEN` condition also skips the trigger when the update comes from any other trigger, which may not be what you want. A condition on the data, such as `WHEN (OLD.balance IS DISTINCT FROM NEW.balance)`, is often the more precise guard, because the inner update does not change `balance`.
+
+Indirect loops cause the same error: table A's trigger updates B, and B's trigger updates A. Look for two alternating functions in the `CONTEXT` output.
+
+## Cause 4: Huge Generated Expressions
+
+Query builders and ORMs sometimes generate SQL with a deeply nested expression. Evaluating it is recursive, and a long enough expression exceeds the stack:
+
+```sql
+DO $$ BEGIN
+  EXECUTE 'SELECT ' || repeat('1+', 100000) || '1';
+END $$;
+-- ERROR:  stack depth limit exceeded
+```
+
+`a + b + c + ...` is parsed as a left-deep tree, so 100,000 terms means 100,000 nested levels. In contrast, PostgreSQL flattens long `OR` and `AND` chains into one list, and an `IN` list with 200,000 values worked without problems in the same test. Very deep parentheses fail earlier, in the parser, with `memory exhausted at or near "("`.
+
+If application code generates such expressions, change the shape of the query instead:
+
+- Replace long `OR` or `IN` lists with `= ANY($1)` and pass an array parameter.
+- Join against a `VALUES` list or a temporary table instead of building a huge `CASE`.
+- Sum many values with `SELECT sum(x) FROM unnest($1::numeric[]) x` instead of `a + b + c + ...`.
+
+## Raising max_stack_depth Safely
+
+Increase the setting only when the work is legitimately deep and bounded, such as a recursive function on a tree you know is at most a few thousand levels deep. Two rules apply.
+
+**It must stay below the operating system's stack limit.** PostgreSQL refuses values too close to the process limit (`ulimit -s`):
+
+```sql
+SET max_stack_depth = '16MB';
+-- ERROR:  invalid value for parameter "max_stack_depth": 16384
+-- DETAIL:  "max_stack_depth" must not exceed 7680kB.
+-- HINT:  Increase the platform's stack depth limit via "ulimit -s" or local equivalent.
+```
+
+Here the container's `ulimit -s` was 8192 kB, and PostgreSQL keeps a safety margin. To go higher, raise the stack limit for the postgres service (for systemd, `LimitSTACK=` in the unit file), restart the server, then set `max_stack_depth` in `postgresql.conf`.
+
+**It needs superuser rights.** Ordinary users cannot change it per session, and managed services may restrict it. You can scope it to a single function with `ALTER FUNCTION fact(int) SET max_stack_depth = '6MB'` as a superuser.
+
+Setting `max_stack_depth` higher than the real stack limit removes the protection. A runaway query then crashes the backend with a segmentation fault and the whole server goes into recovery. That is much worse than the error.
+
+## Reading the CONTEXT Lines
+
+The `CONTEXT` block tells you which cause you have:
+
+| Pattern in CONTEXT | Likely cause |
+|--------------------|--------------|
+| One function repeated, with a `RETURN` or expression line | Recursive function (Cause 1 or 2) |
+| `SQL statement "UPDATE ..."` + trigger function, repeated | Trigger firing itself (Cause 3) |
+| Two trigger functions alternating | Triggers on two tables updating each other |
+| No repetition, one huge statement | Generated expression (Cause 4) |
+
+Most clients truncate long error messages. In psql, `\set VERBOSITY verbose` and `\errverbose` show the full text of the last error.
+
+When you need to inspect the triggers on a table and the functions behind them, [Chat2DB](https://chat2db.ai/download) lists triggers, their timing and their function source together, and its AI assistant can explain a trigger chain or rewrite an `AFTER` trigger that updates its own table into a `BEFORE` trigger.
+
+## FAQ
+
+### Is it safe to set max_stack_depth to a very large value?
+
+Only up to what PostgreSQL accepts, which is a bit below the operating system's stack limit. PostgreSQL rejects larger values for that reason. If you raise the OS limit to allow more, make sure every backend gets that limit, otherwise a deep query can crash the server instead of raising an error.
+
+### Why does my recursive CTE not hit this error?
+
+`WITH RECURSIVE` is executed as a loop: each iteration takes the rows produced by the previous one and runs the recursive term again. Depth costs memory and time, not stack. Recursive functions really nest calls, which is why they fail at a few hundred to a few thousand levels.
+
+### How do I find which trigger is recursing?
+
+Read the `CONTEXT` lines of the error: they name the trigger function and the statement it ran. Then list the triggers on the table with `SELECT tgname, tgfoid::regproc FROM pg_trigger WHERE tgrelid = 'accounts'::regclass AND NOT tgisinternal`.

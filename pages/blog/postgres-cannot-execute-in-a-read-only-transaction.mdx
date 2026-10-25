@@ -1,0 +1,251 @@
+---
+title: "Postgres Cannot Execute in a Read-Only Transaction"
+description: "Fix 'cannot execute INSERT in a read-only transaction' (25006) in PostgreSQL: standby replicas, default_transaction_read_only on roles and databases, failover."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: October 25, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# Postgres Cannot Execute in a Read-Only Transaction
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="October 25, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+A write that has always worked starts failing:
+
+```
+ERROR:  cannot execute INSERT in a read-only transaction
+```
+
+The verb changes with the statement (`UPDATE`, `DELETE`, `CREATE TABLE`, `nextval()`, `SELECT FOR UPDATE`), and the SQLSTATE is always `25006` (`read_only_sql_transaction`). PostgreSQL is telling you that the transaction is in read-only mode. The real question is why. There are two very different answers:
+
+1. You are connected to a **standby** (a read replica), which can never accept writes.
+2. You are on a writable server, but a **setting** put the transaction in read-only mode: `BEGIN READ ONLY`, or `default_transaction_read_only` set for the session, the role or the database.
+
+This guide shows how to tell which one you have in ten seconds, then how to fix each, with output from PostgreSQL 18.
+
+## Step 1: Primary or Standby?
+
+Run this on the connection that fails:
+
+```sql
+SELECT pg_is_in_recovery();
+SHOW transaction_read_only;
+SHOW default_transaction_read_only;
+```
+
+| `pg_is_in_recovery()` | `default_transaction_read_only` | Meaning |
+|-----------------------|---------------------------------|---------|
+| `t` | (any) | You are on a standby. Writes are impossible. Connect to the primary. |
+| `f` | `on` | A setting makes transactions read-only. Find where it comes from. |
+| `f` | `off` | The transaction itself was started read-only (`BEGIN READ ONLY`, or a driver or framework flag). |
+
+On a standby the output looks like this:
+
+```
+ pg_is_in_recovery
+-------------------
+ t
+
+ transaction_read_only
+-----------------------
+ on
+
+ default_transaction_read_only
+-------------------------------
+ off
+```
+
+`transaction_read_only` is `on` even though the default is `off`. During recovery every transaction is read-only, and you cannot change that:
+
+```sql
+SET default_transaction_read_only = off;   -- accepted, but has no effect
+BEGIN READ WRITE;
+-- ERROR:  cannot set transaction read-write mode during recovery
+```
+
+## Case 1: Connected to a Standby
+
+A hot standby replays WAL from the primary and serves only read queries. It rejects anything that would write, including some statements that do not look like writes:
+
+```
+INSERT ...              ERROR:  cannot execute INSERT in a read-only transaction
+CREATE TEMP TABLE ...   ERROR:  cannot execute CREATE TABLE in a read-only transaction
+SELECT nextval(...)     ERROR:  cannot execute nextval() in a read-only transaction
+SELECT ... FOR UPDATE   ERROR:  cannot execute SELECT FOR UPDATE in a read-only transaction
+ANALYZE orders          ERROR:  cannot execute ANALYZE during recovery
+VACUUM orders           ERROR:  cannot execute VACUUM during recovery
+```
+
+Advisory locks, on the other hand, work on a standby, because they live only in memory.
+
+Typical ways an application ends up on a standby:
+
+**Wrong endpoint or host.** Managed services expose separate writer and reader endpoints (for example the cluster and reader endpoints of Aurora, or replica hostnames in Cloud SQL, Azure and others). A copied connection string, or an environment variable pointing at the reader, sends writes to a replica.
+
+**A load balancer or DNS name that includes replicas.** If one hostname round-robins across the primary and replicas, some connections land on a replica and fail randomly.
+
+**Failover.** After a failover the old primary may come back as a standby. Pooled connections opened before the switch stay connected to it, and their writes fail until they reconnect. This often looks like a sudden burst of 25006 errors right after a maintenance event.
+
+**Fix: tell the client to require a writable server.** libpq (psql, Python's psycopg, Ruby's pg, PHP and many others) can list several hosts and pick the one that accepts writes:
+
+```
+postgresql://db1:5432,db2:5432/app?target_session_attrs=read-write
+```
+
+The JDBC driver has the equivalent option:
+
+```
+jdbc:postgresql://db1:5432,db2:5432/app?targetServerType=primary
+```
+
+With these options a connection attempt that reaches a standby is rejected and the client tries the next host. After a failover, new connections go to the new primary. Also set a reasonable connection lifetime in your pool (HikariCP `maxLifetime`, for example) so old connections are replaced.
+
+**Fix: split reads and writes on purpose.** If you use replicas to scale reads, route only read-only work to them and keep everything that writes, including `nextval()`, temporary tables and `SELECT FOR UPDATE`, on the primary. Most frameworks support a read replica configuration for exactly this.
+
+## Case 2: Read-Only Mode by Setting
+
+On a primary, transactions are read-only when you ask for it explicitly:
+
+```sql
+BEGIN READ ONLY;
+INSERT INTO orders (total) VALUES (10);
+-- ERROR:  cannot execute INSERT in a read-only transaction
+ROLLBACK;
+```
+
+They are also read-only by default when `default_transaction_read_only` is on. That setting can come from four places, and the last one wins:
+
+```sql
+-- 1. postgresql.conf or ALTER SYSTEM (whole server)
+-- 2. per database
+ALTER DATABASE app SET default_transaction_read_only = on;
+-- 3. per role (or role + database)
+ALTER ROLE reporter SET default_transaction_read_only = on;
+-- 4. per session
+SET default_transaction_read_only = on;
+```
+
+Role and database settings are often used on purpose, to make a reporting user read-only, and then forgotten. A user who later needs to write gets the error even with the right `GRANT`s:
+
+```sql
+CREATE ROLE reporter LOGIN;
+GRANT SELECT, INSERT ON orders TO reporter;
+ALTER ROLE reporter SET default_transaction_read_only = on;
+
+-- connected as reporter:
+INSERT INTO orders (total) VALUES (10);
+-- ERROR:  cannot execute INSERT in a read-only transaction
+```
+
+Find which level set it with `pg_db_role_setting` and `pg_settings`:
+
+```sql
+SELECT coalesce(r.rolname, '(all roles)') AS role,
+       coalesce(d.datname, '(all databases)') AS database,
+       s.setconfig
+FROM pg_db_role_setting s
+LEFT JOIN pg_roles r ON r.oid = s.setrole
+LEFT JOIN pg_database d ON d.oid = s.setdatabase;
+```
+
+```
+   role   |    database     |             setconfig
+----------+-----------------+------------------------------------
+ reporter | (all databases) | {default_transaction_read_only=on}
+```
+
+```sql
+SELECT setting, source, sourcefile FROM pg_settings
+WHERE name = 'default_transaction_read_only';
+```
+
+`source` tells you whether the value came from the configuration file, the database, the user or the session.
+
+**Fix: reset it at the right level.**
+
+```sql
+ALTER ROLE reporter RESET default_transaction_read_only;
+-- or
+ALTER DATABASE app RESET default_transaction_read_only;
+```
+
+The change applies to new sessions. Existing connections keep the old value until they reconnect.
+
+### The Trap: A Database You Cannot Reset
+
+If you set `default_transaction_read_only = on` on the database you are connected to, the `ALTER DATABASE ... RESET` that would undo it is itself a write, and fails:
+
+```sql
+ALTER DATABASE b5 RESET default_transaction_read_only;
+-- ERROR:  cannot execute ALTER DATABASE in a read-only transaction
+```
+
+Override the default in your session first, or start an explicit read-write transaction, then reset:
+
+```sql
+SET default_transaction_read_only = off;
+ALTER DATABASE b5 RESET default_transaction_read_only;   -- ALTER DATABASE
+```
+
+This works because the session setting is applied after the database setting. On a standby, by contrast, no setting can make a transaction writable.
+
+### Drivers and Frameworks That Start Read-Only Transactions
+
+Some libraries put transactions into read-only mode for you:
+
+- **Spring** `@Transactional(readOnly = true)` makes the JDBC driver run `SET SESSION CHARACTERISTICS AS TRANSACTION READ ONLY` (or `BEGIN READ ONLY`, depending on the driver's `readOnlyMode` setting). A write inside such a method, or a nested method that joins the same transaction, fails with 25006.
+- **JDBC** `connection.setReadOnly(true)` has the same effect, and the flag can leak to the next user of a pooled connection if the pool does not reset it.
+- **psycopg** `conn.read_only = True` and **SQLAlchemy** execution options can set it too.
+
+Finally, the mode must be chosen before the first query of a transaction:
+
+```sql
+BEGIN READ ONLY;
+SELECT 1;
+SET TRANSACTION READ WRITE;
+-- ERROR:  transaction read-write mode must be set before any query
+```
+
+## Temporary Tables in Read-Only Transactions
+
+On a primary, a read-only transaction may write to temporary tables that already exist, which is handy for reports:
+
+```sql
+CREATE TEMP TABLE scratch (x int);   -- outside the read-only transaction
+BEGIN READ ONLY;
+INSERT INTO scratch VALUES (1);      -- INSERT 0 1
+COMMIT;
+```
+
+Creating the temporary table inside the read-only transaction is not allowed (`cannot execute CREATE TABLE in a read-only transaction`). On a standby, temporary tables cannot be created at all.
+
+## Logical Replication Subscribers Are Writable
+
+Do not confuse a physical standby with a logical replication subscriber. A subscriber created with `CREATE SUBSCRIPTION` is an ordinary primary: `pg_is_in_recovery()` returns `f` and it accepts writes, including writes to the replicated tables. That is a different risk, because local changes can conflict with incoming changes and stop replication. If you want a subscriber to be read-only for applications, revoke `INSERT`, `UPDATE` and `DELETE` from application roles on the replicated tables. Privileges apply only to the roles you revoke them from, so the subscription's own apply process keeps working.
+
+## Quick Checklist
+
+1. `SELECT pg_is_in_recovery();`. If `t`, fix the host, endpoint or `target_session_attrs`.
+2. `SHOW default_transaction_read_only;`. If `on`, check `pg_db_role_setting` and `pg_settings.source`, then reset at that level.
+3. If both are off, look for `BEGIN READ ONLY`, `readOnly = true` or `setReadOnly(true)` in the application.
+4. After a failover, recycle pooled connections.
+
+If you switch between primaries and replicas often, it helps to see which server each connection points to. [Chat2DB](https://chat2db.ai/download) lets you save separate writer and reader connections, shows server status per connection, and its AI assistant can explain errors like this one from the actual session settings.
+
+## FAQ
+
+### Why does nextval() fail in a read-only transaction?
+
+`nextval()` changes the sequence and writes WAL, so PostgreSQL treats it as a write. Inserts that rely on a `serial` or identity default therefore fail on standbys and in read-only transactions, even before the row is inserted.
+
+### Can I make a standby accept writes?
+
+No. A standby is in recovery and only replays changes from the primary. To make it writable you must promote it (`pg_promote()` or `pg_ctl promote`), which ends replication and turns it into an independent primary.
+
+### Does default_transaction_read_only protect against malicious users?
+
+No. Any user can run `SET default_transaction_read_only = off` or `BEGIN READ WRITE` in their own session. It is a safety net against mistakes. For real protection, grant only `SELECT` privileges, or point the user at a standby.
