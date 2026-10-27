@@ -1,0 +1,266 @@
+---
+title: "Postgres: No Space Left on Device (Disk Full)"
+description: "Fix PostgreSQL 'could not extend file: No space left on device' (53100) and WAL PANIC: free space safely, find replication slots and temp files that fill disks."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: October 27, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# Postgres: No Space Left on Device (Disk Full)
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="October 27, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+When the disk under PostgreSQL fills up, the error depends on which file PostgreSQL was trying to grow. For a table or index:
+
+```
+ERROR:  could not extend file "pg_tblspc/16384/PG_18_202506291/5/16386": No space left on device
+HINT:  Check free disk space.
+```
+
+For a temporary file used by a sort or hash:
+
+```
+ERROR:  could not write to file "pg_tblspc/16393/PG_18_202506291/pgsql_tmp/pgsql_tmp89.2": No space left on device
+```
+
+And for the write-ahead log, which is the serious one:
+
+```
+PANIC:  could not write to file "pg_wal/xlogtemp.95": No space left on device
+```
+
+The first two are ordinary errors (SQLSTATE `53100`, `disk_full`). The statement fails, its transaction rolls back, and the server keeps running. A full WAL volume causes a `PANIC`: the server crashes, and it may not start again until you free space. We reproduced all three on PostgreSQL 18 with deliberately tiny file systems. This guide shows what happens in each case, how to free space without making things worse, and how to find what filled the disk.
+
+## Rule Zero: Never Delete Files Inside the Data Directory
+
+When the disk is full and the database is down, it is tempting to delete "old" files in `pg_wal`, `base` or `pg_xact`. Do not. Those files are not logs in the usual sense. WAL segments are needed for crash recovery and replication, and the files under `base` are your tables. Deleting them turns a full disk into a corrupted cluster. Free space outside the data directory, or give the volume more space, and let PostgreSQL clean up after itself.
+
+## Case 1: A Table or Index Cannot Grow
+
+We created a tablespace on an 8 MB file system and filled it:
+
+```sql
+CREATE TABLESPACE tiny LOCATION '/small/ts';
+CREATE TABLE logs (id bigserial, msg text) TABLESPACE tiny;
+
+INSERT INTO logs (msg)
+SELECT repeat(md5(g::text), 4) FROM generate_series(1, 200000) g;
+```
+
+```
+ERROR:  could not extend file "pg_tblspc/16384/PG_18_202506291/5/16386": No space left on device
+HINT:  Check free disk space.
+```
+
+With `\set VERBOSITY verbose`, psql also shows the SQLSTATE `53100`. The path tells you where the problem is: `pg_tblspc/16384/...` is the tablespace with OID 16384, and `base/...` is the default tablespace inside the data directory. The last number is the relation's file node. Map it back to a table with the tablespace OID (use `0` for files under `base`):
+
+```sql
+SELECT pg_filenode_relation(16384, 16386);
+```
+
+The insert failed and rolled back, so the table has no rows. But the space is still used:
+
+```sql
+SELECT count(*) FROM logs;                              -- 0
+SELECT pg_size_pretty(pg_relation_size('logs'));        -- 8160 kB
+```
+
+Pages written before the error stay allocated until `VACUUM` reclaims them. Here is the trap: when the disk is completely full, the usual cleanup commands need space too.
+
+```sql
+VACUUM (VERBOSE) logs;
+```
+
+```
+INFO:  vacuuming "postgres.public.logs"
+ERROR:  could not extend file "pg_tblspc/16384/PG_18_202506291/5/16386_vm": No space left on device
+HINT:  Check free disk space.
+CONTEXT:  while scanning block 0 of relation "public.logs"
+```
+
+`VACUUM` wanted to create the visibility map fork (`_vm`). `TRUNCATE` failed too, because it creates a new, empty file before it removes the old one:
+
+```
+ERROR:  could not extend file "pg_tblspc/16384/PG_18_202506291/5/16400": No space left on device
+```
+
+`DROP TABLE` only removes files, and it worked immediately:
+
+```sql
+DROP TABLE logs;
+```
+
+```
+Filesystem      Size  Used Avail Use% Mounted on
+tmpfs           8.0M     0  8.0M   0% /small
+```
+
+The lesson is not "drop tables", but that you need a little free space before maintenance can run. Get that first room from outside the database: remove old server logs, old backups or core dumps on the same volume, or grow the volume. If something in the database can be dropped completely (an old staging table, an abandoned index), `DROP` frees space without needing any. After that, `VACUUM` can reclaim space inside the remaining tables.
+
+## Case 2: Temporary Files Fill the Disk
+
+Sorts, hashes and some joins spill to temporary files when they need more than `work_mem`. A single bad query can write many gigabytes. With `temp_tablespaces` pointing at a 4 MB file system:
+
+```sql
+SET temp_tablespaces = 'tmp_tiny';
+SET work_mem = '64kB';
+
+SELECT count(*) FROM (
+  SELECT md5(g::text) AS h FROM generate_series(1, 300000) g ORDER BY 1
+) s;
+```
+
+```
+ERROR:  could not write to file "pg_tblspc/16393/PG_18_202506291/pgsql_tmp/pgsql_tmp89.2": No space left on device
+```
+
+Temporary files are deleted as soon as the query ends, so this kind of "disk full" fixes itself. The danger is that while the query runs, it takes space that table writes and WAL need. Protect the server with `temp_file_limit`, which cancels a query that writes too much temporary data before the disk is full:
+
+```sql
+SET temp_file_limit = '1MB';
+SELECT count(*) FROM (
+  SELECT md5(g::text) AS h FROM generate_series(1, 300000) g ORDER BY 1
+) s;
+```
+
+```
+ERROR:  temporary file size exceeds "temp_file_limit" (1024kB)
+```
+
+Set it in `postgresql.conf` to a value well below the free space you normally have, for example `temp_file_limit = '20GB'` on a server with 200 GB free. Track temporary file usage per database with:
+
+```sql
+SELECT datname, temp_files, pg_size_pretty(temp_bytes) AS temp_size
+FROM pg_stat_database ORDER BY temp_bytes DESC;
+```
+
+Setting `log_temp_files = '100MB'` logs every query that writes more than that, so you can find and fix the queries that need an index or more `work_mem`.
+
+## Case 3: The WAL Volume Is Full (PANIC)
+
+WAL is written before data, and PostgreSQL cannot continue if it cannot write it. We ran PostgreSQL 18 with `pg_wal` on a 72 MB file system and wrote a large insert:
+
+```
+PANIC:  could not write to file "pg_wal/xlogtemp.95": No space left on device
+server closed the connection unexpectedly
+```
+
+The server log shows the crash and the automatic restart, and the restart failing for the same reason:
+
+```
+LOG:  client backend (PID 95) was terminated by signal 6: Aborted
+LOG:  terminating any other active server processes
+LOG:  all server processes terminated; reinitializing
+LOG:  database system was not properly shut down; automatic recovery in progress
+LOG:  redo starts at 0/1761998
+LOG:  redo done at 0/4FFFE10 system usage: CPU: user: 0.03 s, system: 0.01 s, elapsed: 0.04 s
+FATAL:  could not write to file "pg_wal/xlogtemp.99": No space left on device
+LOG:  startup process (PID 99) exited with exit code 1
+LOG:  shutting down due to startup process failure
+LOG:  database system is shut down
+```
+
+Crash recovery itself needs to write WAL (it ends with a checkpoint), so the server stays down until there is room. The fix is the same as before, but now there is no SQL access to help:
+
+1. Free space on the volume that holds `pg_wal`, outside the data directory, or grow the volume. Many outages here are caused by server logs or backups on the same disk.
+2. If the volume cannot grow quickly, move the whole cluster (or just `pg_wal`, replaced by a symlink) to a larger disk while the server is stopped, using a copy that preserves permissions.
+3. Start PostgreSQL and let recovery finish.
+4. Find out why WAL grew, using the next section, before it happens again.
+
+Do not use `pg_resetwal` to "clear" WAL. It discards data that has not reached the table files and is a last resort for a cluster that cannot start for other reasons.
+
+## What Fills pg_wal
+
+Under normal operation, PostgreSQL removes or recycles old WAL segments after each checkpoint, keeping roughly `max_wal_size` (1 GB by default). If `pg_wal` is much bigger than that, something is holding WAL back. There are three usual suspects.
+
+### An Inactive Replication Slot
+
+A replication slot guarantees that WAL is kept until its consumer has received it. If the replica or logical decoding client is gone, the slot keeps WAL forever. We created a slot nobody used and wrote some data:
+
+```sql
+SELECT pg_create_physical_replication_slot('old_replica', true);
+CREATE TABLE junk AS SELECT g, md5(g::text) FROM generate_series(1, 500000) g;
+CHECKPOINT;
+
+SELECT slot_name, active, wal_status,
+       pg_size_pretty(pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn)) AS retained_wal
+FROM pg_replication_slots;
+```
+
+```
+  slot_name  | active | wal_status | retained_wal
+-------------+--------+------------+--------------
+ old_replica | f      | reserved   | 56 MB
+```
+
+On a busy production server this number grows by gigabytes per hour. If the slot belongs to a replica or CDC tool you no longer use, drop it with `SELECT pg_drop_replication_slot('old_replica');`. To cap the damage in the future, set `max_slot_wal_keep_size` (default `-1`, unlimited). A slot that falls further behind is then marked `lost` instead of filling the disk, and the consumer must be re-synced.
+
+### A Failing archive_command
+
+With `archive_mode = on`, a segment can only be removed after `archive_command` (or `archive_library`) has archived it successfully. If archiving fails, for example because the backup bucket's credentials expired, WAL piles up:
+
+```sql
+SELECT archived_count, failed_count, last_failed_wal, last_failed_time
+FROM pg_stat_archiver;
+```
+
+A rising `failed_count` together with growing `pg_wal` is the signature. Fix the archive target, and the backlog is archived and removed automatically.
+
+### wal_keep_size and Large max_wal_size
+
+`wal_keep_size` keeps extra WAL for replicas without slots, and a large `max_wal_size` lets WAL grow between checkpoints. Both are fine when they fit the disk. Check them with:
+
+```sql
+SELECT name, setting, unit FROM pg_settings
+WHERE name IN ('max_wal_size', 'min_wal_size', 'wal_keep_size', 'max_slot_wal_keep_size');
+```
+
+Note that `pg_wal` does not shrink below `min_wal_size` (80 MB by default), because PostgreSQL keeps recycled segments ready for reuse.
+
+## Find What Uses the Space
+
+Before you delete anything, measure. Inside the database:
+
+```sql
+-- Largest tables including indexes and TOAST
+SELECT relname, pg_size_pretty(pg_total_relation_size(oid)) AS total
+FROM pg_class WHERE relkind = 'r'
+ORDER BY pg_total_relation_size(oid) DESC LIMIT 10;
+
+-- Size of each tablespace and of pg_wal
+SELECT spcname, pg_size_pretty(pg_tablespace_size(oid)) FROM pg_tablespace;
+SELECT pg_size_pretty(sum(size)) AS pg_wal_size, count(*) AS segments FROM pg_ls_waldir();
+```
+
+On the server, `du -sh` on `base`, `pg_wal` and `log` inside the data directory shows which part grew. Server log files in `log/` are a classic culprit when `log_min_duration_statement` or `log_statement = 'all'` was turned on for debugging and never turned off.
+
+## Prevention
+
+| Measure | Why |
+|---------|-----|
+| Disk usage alerts at 80% and 90% | Gives you time to act before writes fail |
+| `pg_wal` on its own volume, or plenty of headroom | A full WAL disk takes the server down |
+| `max_slot_wal_keep_size` | Stops abandoned slots from filling the disk |
+| Monitor `pg_stat_archiver.failed_count` | Archive failures silently grow WAL |
+| `temp_file_limit` and `log_temp_files` | Stops and reveals runaway sorts |
+| Logs and backups on another volume | They cannot eat the database's space |
+
+Regular checks are easier when the queries are at hand. In [Chat2DB](https://chat2db.ai/download) you can keep the replication slot, archiver and table size queries above as saved snippets, run them on every server you manage, and ask the AI assistant to explain what a growing number means.
+
+## FAQ
+
+### Does a "No space left on device" error corrupt my data?
+
+Not by itself. For table, index and temporary files, the failing statement rolls back and committed data is safe. A full WAL volume crashes the server, but crash recovery restores a consistent state once there is space. Corruption comes from what people do next, mainly deleting files inside the data directory.
+
+### Why did the disk not get space back after I deleted rows?
+
+`DELETE` only marks rows as dead. `VACUUM` makes the space reusable inside the table but rarely returns it to the operating system. `VACUUM FULL` or `pg_repack` rewrites the table and returns space, but needs room for the new copy while it runs.
+
+### Can I move pg_wal to another disk?
+
+Yes, with the server stopped: move the directory to the new disk and replace it with a symlink, keeping ownership and permissions. For new clusters, `initdb --waldir` sets the location from the start.

@@ -1,0 +1,290 @@
+---
+title: "Postgres: Invalid Regular Expression Errors"
+description: "Fix PostgreSQL 'invalid regular expression' errors (2201B): quantifier operand invalid, parentheses or brackets not balanced, invalid escape, and user input."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: October 27, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# Postgres: Invalid Regular Expression Errors
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="October 27, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+PostgreSQL compiles a regular expression every time you use `~`, `~*`, `SIMILAR TO`, `regexp_replace()`, `regexp_matches()`, `substring(... from ...)` or any other regex function. If the pattern is not valid, the query fails before it reads a single row:
+
+```
+ERROR:  invalid regular expression: quantifier operand invalid
+```
+
+All of these errors have SQLSTATE `2201B` (`invalid_regular_expression`), and the text after the colon tells you exactly what the regex engine did not like. This guide goes through each message with a minimal example and the fix, then covers the case that causes most of them in production: building a pattern from user input. Every example was run on PostgreSQL 18.
+
+## A Quick Note on PostgreSQL's Regex Flavor
+
+PostgreSQL uses Henry Spencer's "advanced regular expressions" (ARE), the same engine as Tcl. It supports most of what you know from Perl, JavaScript or Python, including `\d`, `\w`, `\s`, non-greedy quantifiers, lookahead and lookbehind:
+
+```sql
+SELECT 'x' ~ '(?<=a)x';            -- f, lookbehind is supported
+SELECT substring('order-123' from 'order-(\d+)');   -- 123
+```
+
+A few things are different, and they explain several of the errors below:
+
+- Named capture groups such as `(?<name>...)` are not supported.
+- Word boundaries are written `\m` (start of word), `\M` (end of word) and `\y` (either), not `\b`. In PostgreSQL, `\b` means backspace.
+- Bounds in `{m,n}` cannot exceed 255.
+
+## quantifier operand invalid
+
+A quantifier (`*`, `+`, `?` or `{m,n}`) needs something before it to repeat. This error means a quantifier appears at the start of the pattern, right after `(` or `|`, or after another quantifier:
+
+```sql
+SELECT 'price: $25' ~ '*25';
+-- ERROR:  invalid regular expression: quantifier operand invalid
+
+SELECT 'a+b' ~ '+b';
+-- ERROR:  invalid regular expression: quantifier operand invalid
+
+SELECT 'x' ~ 'a**';
+-- ERROR:  invalid regular expression: quantifier operand invalid
+```
+
+Usually the author meant a literal character. Escape it with a backslash or put it in a bracket expression:
+
+```sql
+SELECT 'a+b' ~ 'a\+b';   -- t
+SELECT 'a+b' ~ 'a[+]b';  -- t
+```
+
+The same message appears for named groups, because the engine reads `(?<` as a lookbehind and then fails on the name:
+
+```sql
+SELECT 'x' ~ '(?<name>x)';
+-- ERROR:  invalid regular expression: quantifier operand invalid
+```
+
+Use a plain capturing group `(x)` and refer to it by number. If you are porting a pattern from another language, `*`, `+` and `?` written as wildcards (shell style) are another common source. A filename filter such as `*.csv` is a glob, not a regex. The regex is `\.csv$`, or use `LIKE '%.csv'`.
+
+## parentheses () not balanced
+
+Every `(` needs a matching `)`:
+
+```sql
+SELECT 'f(x)' ~ 'f(x';
+-- ERROR:  invalid regular expression: parentheses () not balanced
+```
+
+If you want to match a literal parenthesis, escape it:
+
+```sql
+SELECT 'f(x)' ~ 'f\(x';    -- t
+SELECT 'f(x)' ~ 'f[(]x';   -- t
+```
+
+`SIMILAR TO` patterns are converted to regular expressions internally, so they report the same message:
+
+```sql
+SELECT 'abc' SIMILAR TO 'a(b|c';
+-- ERROR:  invalid regular expression: parentheses () not balanced
+```
+
+## brackets [] not balanced
+
+An opening `[` starts a bracket expression that must be closed:
+
+```sql
+SELECT '[tag]' ~ '[tag';
+-- ERROR:  invalid regular expression: brackets [] not balanced
+```
+
+To match a literal `[`, escape it (`\[`). To include `]` inside a bracket expression, put it first: `[]abc]` matches `]`, `a`, `b` or `c`. Character classes use the POSIX form inside brackets, so the outer brackets are required: `[[:alpha:]]`, `[[:digit:]]`, and in PostgreSQL also `[[:word:]]`.
+
+## `braces {} not balanced` and `invalid repetition count(s)`
+
+Braces are bounds, so `{` must be followed by a number and `}`:
+
+```sql
+SELECT 'a{2}' ~ 'a{2';
+-- ERROR:  invalid regular expression: braces {} not balanced
+```
+
+The numbers must be in order and at most 255 (`DUPMAX`):
+
+```sql
+SELECT 'abc' ~ 'a{3,2}';
+-- ERROR:  invalid regular expression: invalid repetition count(s)
+
+SELECT 'aaa' ~ 'a{256}';
+-- ERROR:  invalid regular expression: invalid repetition count(s)
+
+SELECT 'x' ~ 'a{1,300}';
+-- ERROR:  invalid regular expression: invalid repetition count(s)
+```
+
+The 255 limit surprises people who check lengths with a regex, such as `^.{1,1000}$`. Use `length()` or `char_length()` for length checks. They are clearer and faster:
+
+```sql
+SELECT char_length(note) BETWEEN 1 AND 1000 FROM tickets;
+```
+
+To match a literal brace, escape it: `\{`.
+
+## invalid escape \ sequence
+
+PostgreSQL accepts a fixed set of escapes. An unknown letter after a backslash, or a backslash at the very end of the pattern, is an error:
+
+```sql
+SELECT 'x' ~ '\q';
+-- ERROR:  invalid regular expression: invalid escape \ sequence
+
+SELECT 'x' ~ '\d+\';
+-- ERROR:  invalid regular expression: invalid escape \ sequence
+```
+
+Two situations cause most of these. The first is a pattern copied from another engine that uses an escape PostgreSQL does not have. The second is double escaping. With `standard_conforming_strings = on` (the default), a backslash in a normal string literal is just a backslash, so a pattern needs only one:
+
+```sql
+SHOW standard_conforming_strings;   -- on
+
+SELECT 'C:\temp' ~ 'C:\\temp';       -- t: regex \\ matches one backslash
+SELECT 'C:\temp' ~ E'C:\\\\temp';    -- t: E'' string, every backslash doubled again
+```
+
+In an `E''` string, the string parser removes one level of backslashes before the regex engine sees the pattern. Mixing the two styles, or adding extra escaping in application code on top of bind parameters, produces patterns with stray backslashes. If you pass the pattern as a bind parameter, write it exactly as the regex engine should see it.
+
+## invalid backreference number
+
+A backreference `\1` to `\9` must refer to a capturing group that exists before it:
+
+```sql
+SELECT 'abc' ~ '(a)\2';
+-- ERROR:  invalid regular expression: invalid backreference number
+```
+
+Count only capturing groups. Non-capturing groups `(?:...)` and lookarounds do not get numbers.
+
+## invalid character range
+
+A range inside brackets must go from a lower to a higher character:
+
+```sql
+SELECT 'z' ~ '[z-a]';
+-- ERROR:  invalid regular expression: invalid character range
+```
+
+A frequent accidental range is a hyphen in the middle of a character list, such as `[a-z_-.]`, where `_-.` is read as a range from `_` to `.`. Put a literal hyphen first or last in the brackets: `[-a-z_.]` or `[a-z_.-]`.
+
+## invalid regular expression option
+
+The flags argument of `regexp_replace()`, `regexp_matches()` and similar functions only accepts specific letters, such as `g` (global), `i` (case-insensitive), `c` (case-sensitive), `n` (newline-sensitive) and `x` (expanded syntax):
+
+```sql
+SELECT regexp_replace('AbC', 'b', 'x', 'gi');   -- AxC
+SELECT regexp_replace('AbC', 'b', 'x', 'z');
+-- ERROR:  invalid regular expression option: "z"
+```
+
+Since PostgreSQL 15, `regexp_replace()` also accepts a start position and an occurrence number as separate arguments. `regexp_replace('a1b2c3', '\d', 'X', 1, 2)` replaces only the second digit and returns `a1bXc3`.
+
+## Patterns Built from User Input
+
+The most common way to get these errors in production is a search feature that uses the user's text as a pattern:
+
+```sql
+SELECT * FROM products WHERE name ~* ('(' || 'user input');
+-- ERROR:  invalid regular expression: parentheses () not balanced
+```
+
+Any user who types `(`, `[`, `*` or `\` breaks the query. Worse, a carefully crafted pattern can be slow to evaluate. There are three good fixes.
+
+### Don't Use a Regex for a Plain Substring Search
+
+If you only want "contains this text", use `strpos()` or `ILIKE` with the wildcard characters escaped. Neither treats the input as a regex:
+
+```sql
+SELECT * FROM products WHERE strpos(lower(name), lower($1)) > 0;
+```
+
+For `ILIKE`, escape `%`, `_` and `\` in the input before adding your own wildcards.
+
+### Escape the Input
+
+If you really need a regex around the user's text, for example to anchor it, escape every regex metacharacter first:
+
+```sql
+SELECT regexp_replace('1+1=2 (ok)', '([.^$*+?()\[\]{}|\\-])', '\\\1', 'g') AS escaped;
+```
+
+```
+    escaped
+---------------
+ 1\+1=2 \(ok\)
+```
+
+The escaped value can then be placed inside a larger pattern safely:
+
+```sql
+SELECT 'a.b' ~ ('^' || regexp_replace('a.b', '([.^$*+?()\[\]{}|\\-])', '\\\1', 'g') || '$');
+-- t
+```
+
+Wrap this in a small SQL function so every query escapes the same way.
+
+### Validate Patterns from Power Users
+
+Some applications let users enter real regular expressions, for example for log filters. Validate the pattern once when it is saved, in a PL/pgSQL block that catches the error, and show the message to the user:
+
+```sql
+CREATE OR REPLACE FUNCTION regex_error(p text) RETURNS text
+LANGUAGE plpgsql AS $$
+BEGIN
+  PERFORM '' ~ p;
+  RETURN NULL;
+EXCEPTION WHEN invalid_regular_expression THEN
+  RETURN SQLERRM;
+END $$;
+
+SELECT regex_error('f(x');
+-- invalid regular expression: parentheses () not balanced
+```
+
+Combine this with `statement_timeout` on the role that runs user-supplied patterns, so a pathological pattern cannot hold a connection for long.
+
+The same function finds bad patterns that are already stored. Suppose a `routing_rules` table keeps one pattern per row and a nightly job fails as soon as it reaches an invalid one. Check every row in one pass instead of fixing them one error at a time:
+
+```sql
+SELECT id, pattern, regex_error(pattern) AS problem
+FROM routing_rules
+WHERE regex_error(pattern) IS NOT NULL;
+```
+
+Each result row shows the pattern and the exact message PostgreSQL would raise, so you can fix them all before the job runs again. Add a `CHECK (regex_error(pattern) IS NULL)` constraint afterwards to keep invalid patterns out for good.
+
+## Common Escapes at a Glance
+
+| Want to match | Write in the pattern |
+|---------------|----------------------|
+| A literal `.` `*` `+` `?` `(` `)` `[` `{` `^` `$` or a pipe | Prefix with `\`, or put it in `[...]` |
+| A literal backslash | `\\` in a normal string, `E'\\\\'` in an `E''` string |
+| Word boundary | `\y`, or `\m` / `\M` for start / end of a word |
+| Digit, word char, space | `\d`, `\w`, `\s` |
+| A hyphen inside brackets | First or last: `[-a-z]` |
+
+When a pattern gets complicated, testing it against sample rows saves time. In [Chat2DB](https://chat2db.ai/download) you can run the pattern against a `VALUES` list of test strings, see which ones match, and ask the AI assistant to explain or rewrite a pattern that throws one of the errors above.
+
+## FAQ
+
+### Why does a regex that works in JavaScript fail in PostgreSQL?
+
+PostgreSQL's engine is not PCRE. Named groups `(?<name>...)` are not supported, `\b` means backspace rather than a word boundary, bounds are limited to 255, and some escapes differ. Rewrite named groups as numbered groups and use `\y` for word boundaries.
+
+### Does the error happen even if the table is empty?
+
+Yes. The pattern is compiled when the query runs, before rows are read. A constant invalid pattern fails even on an empty table. A pattern taken from a column fails on the first row with a bad value.
+
+### What SQLSTATE should my application catch?
+
+`2201B` (`invalid_regular_expression`) covers all the "invalid regular expression: ..." messages. An unknown flag letter is reported as `invalid regular expression option` with SQLSTATE `22023` (`invalid_parameter_value`), so catch that too if users can supply flags.

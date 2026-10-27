@@ -1,0 +1,237 @@
+---
+title: "MySQL Error 1236: Source Purged Binary Logs"
+description: "Fix MySQL replication error 1236 'Cannot replicate because the source purged required binary logs': find missing GTIDs, rebuild with CLONE, and prevent it."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: October 27, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# MySQL Error 1236: Source Purged Binary Logs
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="October 27, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+A replica that was fine yesterday has stopped, and `SHOW REPLICA STATUS` shows:
+
+```
+Replica_IO_Running: No
+     Last_IO_Errno: 13114
+     Last_IO_Error: Got fatal error 1236 from source when reading data from binary log: 'Cannot replicate because the source purged required binary logs. Replicate the missing transactions from elsewhere, or provision a new replica from backup. Consider increasing the source's binary log expiration period. The GTID set sent by the replica is '749bd8c2-d25d-11f1-8d8b-12ba0e351b09:1-10', and the missing transactions are '749bd8c2-d25d-11f1-8d8b-12ba0e351b09:11-12''
+```
+
+Error 1236 is the source telling the replica's I/O thread that it cannot send what was asked for. The text in quotes explains why. This guide reproduces the most common variant, purged binary logs with GTID replication, on a MySQL 8.4 source and replica, then shows how to read the GTID sets, how to fix the replica properly, and how to stop it from happening again. It also covers the two file-position variants of the same error.
+
+## Why It Happens
+
+The source writes every transaction to its binary log. A replica connects, says which transactions it already has, and the source streams the rest from its binary log files. Those files do not live forever. They are removed by `binlog_expire_logs_seconds` (30 days by default in MySQL 8), by `PURGE BINARY LOGS`, or by `RESET BINARY LOGS AND GTIDS` (`RESET MASTER` before 8.4).
+
+If the replica needs a transaction from a file that is already gone, the source cannot serve it and replies with error 1236. Typical situations:
+
+- The replica was stopped or broken for longer than the binlog retention period.
+- Someone purged binary logs manually to free disk space.
+- A replica was restored from a backup that is older than the source's oldest binary log.
+- After a failover, the new source has a different, shorter binlog history.
+
+## Reproducing It
+
+Our lab has a source and a replica on MySQL 8.4 with `gtid_mode=ON` and `SOURCE_AUTO_POSITION=1`. Replication works, then we stop the replica and keep writing on the source:
+
+```sql
+-- on the replica
+STOP REPLICA;
+
+-- on the source
+INSERT INTO shop.orders (amount) VALUES (40), (50);
+FLUSH BINARY LOGS;
+INSERT INTO shop.orders (amount) VALUES (60);
+FLUSH BINARY LOGS;
+PURGE BINARY LOGS TO 'binlog.000004';
+
+SELECT @@GLOBAL.gtid_executed AS executed, @@GLOBAL.gtid_purged AS purged\G
+```
+
+```
+executed: 749bd8c2-d25d-11f1-8d8b-12ba0e351b09:1-12
+  purged: 749bd8c2-d25d-11f1-8d8b-12ba0e351b09:1-12
+```
+
+Every transaction the source has executed is now purged from its binary logs. When the replica starts again, it asks for everything after `1-10`, and the source has to refuse:
+
+```sql
+START REPLICA;
+SHOW REPLICA STATUS\G
+```
+
+The result is the error at the top of this article. The replica's error log has the same text, with the server error code:
+
+```
+[ERROR] [MY-013114] [Repl] Replica I/O for channel '': Got fatal error 1236 from source when reading data from binary log: 'Cannot replicate because the source purged required binary logs. ...', Error_code: MY-013114
+```
+
+## Read the GTID Sets
+
+MySQL 8 includes the two numbers you need directly in the message:
+
+- **The GTID set sent by the replica**: what the replica has (`...:1-10`).
+- **The missing transactions**: what the replica needs that the source no longer has in its binary logs (`...:11-12`).
+
+You can compute the same thing yourself, which is useful with older versions or when several channels and UUIDs are involved. On the source, read `gtid_purged`. On the replica, read `gtid_executed`. Then subtract:
+
+```sql
+-- run anywhere; the values come from the two servers
+SELECT GTID_SUBTRACT('749bd8c2-d25d-11f1-8d8b-12ba0e351b09:1-12',  -- source gtid_purged
+                     '749bd8c2-d25d-11f1-8d8b-12ba0e351b09:1-10')  -- replica gtid_executed
+       AS purged_but_missing;
+```
+
+```
+749bd8c2-d25d-11f1-8d8b-12ba0e351b09:11-12
+```
+
+If the result is empty, purged logs are not the problem. If it is not empty, the replica cannot catch up from this source. Real GTID sets with several UUIDs and dozens of ranges are hard to compare by eye. The free [MySQL GTID Set Calculator](https://chat2db.ai/tools/mysql-gtid-set-calculator) takes the source's `gtid_executed` and `gtid_purged` and the replica's `gtid_executed`, and shows the missing, purged and errant transactions with the SQL to inspect or fix them.
+
+## The Right Fix: Re-provision the Replica
+
+The missing transactions exist only in the source's data now, not in any binary log. The replica has to get a fresh copy of the data with a matching GTID position. There are three common ways.
+
+### Option 1: CLONE (MySQL 8.0.17+)
+
+The clone plugin copies a running source's data directory to the replica over the network, including the GTID state. On the source:
+
+```sql
+INSTALL PLUGIN clone SONAME 'mysql_clone.so';
+CREATE USER 'donor'@'%' IDENTIFIED BY 'donorpw';
+GRANT BACKUP_ADMIN ON *.* TO 'donor'@'%';
+```
+
+On the replica:
+
+```sql
+INSTALL PLUGIN clone SONAME 'mysql_clone.so';
+SET GLOBAL clone_valid_donor_list = 'src84:3306';
+CLONE INSTANCE FROM 'donor'@'src84':3306 IDENTIFIED BY 'donorpw';
+```
+
+The clone replaces the replica's data and then restarts `mysqld`. In our Docker lab the statement returned:
+
+```
+ERROR 3707 (HY000): Restart server failed (mysqld is not managed by supervisor process).
+```
+
+This is expected when nothing supervises the process. The clone itself completed, as `performance_schema.clone_status` shows, and our container restart policy brought the server back. Under systemd the restart is automatic. After the restart the replica had the source's GTID state:
+
+```sql
+SELECT STATE FROM performance_schema.clone_status;     -- Completed
+SELECT @@GLOBAL.gtid_executed;                         -- ...:1-14
+```
+
+In our test the replication configuration was not kept, and `START REPLICA` failed with `ERROR 1200: The server is not configured as replica`. So configure it again:
+
+```sql
+CHANGE REPLICATION SOURCE TO
+  SOURCE_HOST = 'src84', SOURCE_USER = 'repl', SOURCE_PASSWORD = 'replpw',
+  SOURCE_AUTO_POSITION = 1, GET_SOURCE_PUBLIC_KEY = 1;
+START REPLICA;
+```
+
+```
+Replica_IO_Running: Yes
+Replica_SQL_Running: Yes
+```
+
+### Option 2: A Logical or Physical Backup
+
+MySQL Shell's `util.dumpInstance()` and `util.loadDump()`, `mysqldump --single-transaction --set-gtid-purged=ON`, or a physical backup tool all work. The important part is that the backup records the source's `gtid_executed` at the moment of the copy and that the restore sets the replica's `gtid_purged` to it. Then `SOURCE_AUTO_POSITION=1` makes the replica request exactly the transactions after the backup.
+
+### Option 3: Copy from Another Replica
+
+If another replica is healthy and has the missing transactions, it can be the clone donor or the backup source. The error message suggests this too: "Replicate the missing transactions from elsewhere".
+
+## The Shortcut and Why It Is Dangerous
+
+You will find advice to simply tell the replica that it already has the missing transactions:
+
+```sql
+STOP REPLICA;
+SET GLOBAL gtid_purged = '+749bd8c2-d25d-11f1-8d8b-12ba0e351b09:11-12';
+START REPLICA;
+```
+
+The `+` adds the set to `gtid_purged` (MySQL 8.0+), and replication resumes. But the replica never applied those transactions, so its data is now silently different from the source. Every query that touches those rows can return a different result on the replica, and the difference only gets worse over time. Use this only when you know that the data is already there, for example because you loaded it by another method. `gtid_purged` can only grow, so a mistake is hard to undo:
+
+```
+ERROR 3546 (HY000): @@GLOBAL.GTID_PURGED cannot be changed: the new value must be a superset of the old value
+```
+
+If you have used the shortcut, verify the data with a checksum tool such as `pt-table-checksum` before trusting the replica.
+
+## File-Position Replication Variants
+
+Without GTIDs, or with `SOURCE_AUTO_POSITION=0`, the replica asks for a file name and position. We reproduced the two typical messages on the same lab:
+
+```
+Got fatal error 1236 from source when reading data from binary log: 'Could not find first log file name in binary log index file'
+```
+
+The file in `Source_Log_File` was purged or never existed on this source. The fix is the same as above: re-provision the replica.
+
+```
+Got fatal error 1236 from source when reading data from binary log: 'Client requested source to start replication from position > file size'
+```
+
+The position is past the end of the file, which happens when the source crashed and its binary log was shorter after recovery than what the replica had already read, or when a position was typed by hand. Check the real end of the file with `SHOW BINARY LOGS` on the source. If the replica only missed events that the source lost in its crash, the next file usually starts where you need to continue. Verify the data before you skip anything.
+
+## Errant Transactions: The Failover Version of 1236
+
+A related problem appears after a failover. If someone wrote directly to a replica, that replica has GTIDs that the source never had. In our lab:
+
+```sql
+-- on the replica, by mistake
+CREATE DATABASE scratch;
+SELECT @@GLOBAL.gtid_executed;
+```
+
+```
+749bd8c2-d25d-11f1-8d8b-12ba0e351b09:1-16,
+74afe2bb-d25d-11f1-8cf0-4a2fd1f5151f:1
+```
+
+The second UUID is the replica's own. If this replica is promoted later and its binary log containing that transaction has been purged, the other replicas fail with error 1236 because they ask for a transaction nobody can send. Find errant transactions with `GTID_SUBTRACT(replica_executed, source_executed)`, and neutralize them on the source by committing an empty transaction with the same GTID:
+
+```sql
+-- on the source
+SET GTID_NEXT = '74afe2bb-d25d-11f1-8cf0-4a2fd1f5151f:1';
+BEGIN; COMMIT;
+SET GTID_NEXT = 'AUTOMATIC';
+```
+
+Afterwards both servers have the same `gtid_executed`. Prevent new errant transactions with `super_read_only = ON` on every replica.
+
+## Prevention
+
+| Measure | Why |
+|---------|-----|
+| Keep `binlog_expire_logs_seconds` longer than your longest expected replica outage | Logs a stopped replica needs are still there when it returns |
+| Alert on `Replica_IO_Running = No` and on replication lag | You fix the replica before the logs expire |
+| Do not purge binary logs by hand to free disk | Check what every replica has read first (`SHOW REPLICA STATUS` on each) |
+| Take backups with GTID information | A replica can be rebuilt quickly when it does happen |
+| `super_read_only = ON` on replicas | Prevents errant transactions |
+
+Checking replicas regularly is easier with the queries at hand. In [Chat2DB](https://chat2db.ai/download) you can connect to the source and every replica, keep `SHOW REPLICA STATUS` and the `GTID_SUBTRACT` checks as saved queries, and compare the results across servers.
+
+## FAQ
+
+### Can I skip the missing transactions and continue?
+
+Not safely. With GTIDs, "skipping" means declaring them applied with `gtid_purged`, which leaves the replica with different data than the source. The correct fix is to re-provision the replica from the source or another healthy replica.
+
+### How long does MySQL keep binary logs?
+
+`binlog_expire_logs_seconds` defaults to 2592000 seconds (30 days) in MySQL 8.0 and later. Managed services often use much shorter retention, sometimes hours, and have their own setting for it. Check `SHOW VARIABLES LIKE 'binlog_expire_logs_seconds';` on the source.
+
+### Does error 1236 mean the source is broken?
+
+No. The source is working normally. It just no longer has the binary log files that this particular replica asked for. Other replicas that are up to date keep replicating without problems.

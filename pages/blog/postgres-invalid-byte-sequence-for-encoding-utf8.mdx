@@ -1,0 +1,294 @@
+---
+title: "Postgres: Invalid Byte Sequence for Encoding UTF8"
+description: "Fix 'invalid byte sequence for encoding UTF8' (22021) in PostgreSQL: Latin-1 CSV files, 0x00 NUL bytes, client_encoding mistakes and NUL escapes in JSON."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: October 27, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# Postgres: Invalid Byte Sequence for Encoding UTF8
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="October 27, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+An import that worked on your laptop fails on the server with:
+
+```
+ERROR:  invalid byte sequence for encoding "UTF8": 0xe9 0x0a 0x32
+CONTEXT:  COPY customers, line 2
+```
+
+or, from an application:
+
+```
+ERROR:  invalid byte sequence for encoding "UTF8": 0x00
+```
+
+The SQLSTATE is `22021` (`character_not_in_repertoire`). PostgreSQL checks every string that arrives from a client and rejects any byte sequence that is not valid in the encoding the client said it was sending. The hex bytes in the message are the key: they tell you which kind of bad data you have.
+
+This guide explains how to read those bytes, then fixes the four common causes: files saved in Latin-1 or Windows-1252, NUL (`0x00`) bytes, a wrong `client_encoding`, and `\u0000` inside JSON. Every example was run on PostgreSQL 18 with a UTF8 database.
+
+## Read the Bytes in the Error Message
+
+UTF-8 encodes ASCII characters as single bytes below `0x80`. Every other character is two to four bytes, and the first byte decides how many continuation bytes (`0x80` to `0xBF`) must follow. When PostgreSQL finds a byte that breaks this rule, it prints the bad byte and the next few bytes.
+
+| Bytes in the error | What it usually is |
+|--------------------|--------------------|
+| `0xe9`, `0xe8`, `0xe0`, `0xf1`, `0xfc` followed by ASCII | Latin-1 / Windows-1252 accented letters (`é`, `è`, `à`, `ñ`, `ü`) |
+| `0x92`, `0x93`, `0x94`, `0x96` | Windows-1252 "smart quotes" and dashes from Word or Excel |
+| `0x00` | A NUL byte, which PostgreSQL text can never store |
+| `0xc3` followed by a byte below `0x80` | A UTF-8 character cut in half, often by a byte-based substring in the source system |
+
+In the first example, `0xe9` is `é` in Latin-1, and the bytes after it are a newline (`0x0a`) and the digit `2` (`0x32`), the start of the next line. So the file contains the word "Café" saved as Latin-1, not UTF-8.
+
+You can confirm which encodings are in play with:
+
+```sql
+SHOW server_encoding;   -- UTF8: what the database stores
+SHOW client_encoding;   -- UTF8: what the server expects you to send
+```
+
+The error is raised when the bytes sent do not match `client_encoding`. The server encoding only matters later, when PostgreSQL converts from the client encoding to it.
+
+## Cause 1: A CSV File Saved in Latin-1 or Windows-1252
+
+This is by far the most common case. Excel on Windows, older ERP exports and many mainframe extracts write files in a legacy single-byte encoding. Here is a three-line file saved as Latin-1:
+
+```sql
+CREATE TABLE customers (id int, name text);
+
+\copy customers FROM 'latin1.csv' WITH (FORMAT csv, HEADER true)
+```
+
+```
+ERROR:  invalid byte sequence for encoding "UTF8": 0xe9 0x0a 0x32
+CONTEXT:  COPY customers, line 2
+```
+
+Nothing is loaded, because `COPY` is all-or-nothing. The fix is to tell PostgreSQL what encoding the file really uses. `COPY` has an `ENCODING` option for exactly this:
+
+```sql
+\copy customers FROM 'latin1.csv' WITH (FORMAT csv, HEADER true, ENCODING 'LATIN1')
+-- COPY 3
+
+SELECT id, name, octet_length(name) FROM customers;
+```
+
+```
+ id | name  | octet_length
+----+-------+--------------
+  1 | Café  |            5
+  2 | Naïve |            6
+  3 | Plain |            5
+```
+
+PostgreSQL converted the file to UTF-8 while loading. `Café` is now 5 bytes, because `é` takes two bytes in UTF-8.
+
+Use `WIN1252` instead of `LATIN1` if the file came from Windows software. The two encodings are identical for letters, but Windows-1252 also maps `0x80` to `0x9F` to characters such as `€`, `’` and `–`. Converting those bytes as Latin-1 gives invisible control characters instead of an error, so `WIN1252` is the safer guess for anything produced by Excel.
+
+### Convert the File Before Loading
+
+If the import goes through a tool that has no encoding option, convert the file first:
+
+```bash
+# Find out whether the file is valid UTF-8 (prints the first bad offset)
+iconv -f UTF-8 -t UTF-8 latin1.csv > /dev/null
+# iconv: illegal input sequence at position 13
+
+# Show the lines that are not valid UTF-8 (GNU grep)
+LC_ALL=C.UTF-8 grep -naxv '.*' latin1.csv
+
+# Convert to UTF-8
+iconv -f WINDOWS-1252 -t UTF-8 latin1.csv > customers_utf8.csv
+```
+
+`grep -naxv '.*'` prints only the lines that do not match "any characters", which in a UTF-8 locale means lines with invalid byte sequences. It is the quickest way to find the three bad rows in a million-line file.
+
+## Cause 2: NUL Bytes (0x00)
+
+PostgreSQL `text`, `varchar` and `char` values cannot contain the NUL character at all, in any encoding. Every way of sending one fails:
+
+```sql
+SELECT E'abc\x00def';
+-- ERROR:  invalid byte sequence for encoding "UTF8": 0x00
+
+SELECT chr(0);
+-- ERROR:  null character not permitted
+```
+
+Server-side `COPY` rejects a file with a raw NUL byte:
+
+```
+ERROR:  invalid byte sequence for encoding "UTF8": 0x00
+CONTEXT:  COPY t0, line 2
+```
+
+Watch out for psql's `\copy`, though. In our test it did not report an error. It stopped reading the value at the NUL byte, so the field `bad\0x` was stored as `bad` and the rest of the value was silently lost. That is worse than an error, so clean NUL bytes before you load.
+
+NUL bytes usually come from fixed-width exports padded with `\0`, from binary data stored in a text column of another database (MySQL and SQL Server both allow NUL in strings), or from C programs that write whole buffers. Remove them at the source or in the pipeline:
+
+```bash
+tr -d '\000' < export.csv > export_clean.csv
+```
+
+If the data really is binary (hashes, encrypted values, file contents), store it in a `bytea` column instead of `text`. `bytea` can hold any byte, including `0x00`.
+
+## Cause 3: The Wrong client_encoding
+
+The server trusts the client to say which encoding it sends. If the client says the wrong thing, one of two things happens, and the second is worse.
+
+If a client declares UTF8 but sends Latin-1, you get the error from this article. If a client declares `LATIN1` but actually sends UTF-8, every byte is valid Latin-1, so there is no error at all. PostgreSQL converts each byte as a separate Latin-1 character, and you get mojibake:
+
+```sql
+SET client_encoding = 'LATIN1';
+\copy customers FROM 'utf8.csv' WITH (FORMAT csv, HEADER true)
+-- COPY 1
+RESET client_encoding;
+
+SELECT id, name, octet_length(name) FROM customers;
+```
+
+```
+ id | name  | octet_length
+----+-------+--------------
+  1 | CafÃ© |            7
+```
+
+`Ã©` is the classic sign of UTF-8 text that was decoded as Latin-1. If you see it in your tables, look for a `client_encoding` setting in the connection string, the `PGCLIENTENCODING` environment variable, or a `SET client_encoding` line in a script header.
+
+The PostgreSQL JDBC driver always uses UTF8 and most other drivers default to it, so this mismatch mostly affects psql scripts and older ETL tools. The rule is simple: the declared `client_encoding` must describe the bytes you actually send.
+
+## Cause 4: `\u0000` in JSON Data
+
+The `json` type stores the input text as is, so it accepts the escape `\u0000`. The `jsonb` type converts strings to PostgreSQL text, and that is impossible for NUL:
+
+```sql
+SELECT '{"a":"x\u0000y"}'::json;    -- works
+SELECT '{"a":"x\u0000y"}'::jsonb;
+```
+
+```
+ERROR:  unsupported Unicode escape sequence
+DETAIL:  \u0000 cannot be converted to text.
+CONTEXT:  JSON data, line 1: {"a":"x\u0000...
+```
+
+This one has SQLSTATE `22P05` rather than `22021`, but it shows up in the same situations: an event pipeline that worked with a `json` column starts failing after a migration to `jsonb`, or `->>` on a `json` value tries to return a NUL as text. Find and clean the affected rows before converting:
+
+```sql
+CREATE TABLE events_json (id int, payload json);
+INSERT INTO events_json VALUES
+  (1, '{"user":"ann\u0000","n":1}'),
+  (2, '{"user":"bob","n":2}');
+
+-- Which rows contain the escape?
+SELECT id FROM events_json WHERE payload::text LIKE '%\u0000%';
+
+-- Strip it while converting
+SELECT id, replace(payload::text, '\u0000', '')::jsonb FROM events_json;
+```
+
+```
+ id |         replace
+----+-------------------------
+  1 | {"n": 1, "user": "ann"}
+  2 | {"n": 2, "user": "bob"}
+```
+
+With `standard_conforming_strings` on (the default), `'\u0000'` in the `LIKE` pattern and in `replace()` is the literal six-character text of the escape, which is exactly what is stored in the `json` value.
+
+## Find Bad Rows Already Stored as bytea
+
+Sometimes you cannot fix the source and need to salvage what you can. A practical pattern is to load the raw values into a `bytea` staging column, which accepts anything, and then decode each row with the right encoding. This small function tests whether a value is valid UTF-8:
+
+```sql
+CREATE OR REPLACE FUNCTION is_valid_utf8(b bytea) RETURNS boolean
+LANGUAGE plpgsql IMMUTABLE AS $$
+BEGIN
+  PERFORM convert_from(b, 'UTF8');
+  RETURN true;
+EXCEPTION WHEN character_not_in_repertoire THEN
+  RETURN false;
+END $$;
+
+CREATE TABLE raw_import (id int, name_raw bytea);
+INSERT INTO raw_import VALUES
+  (1, '\x436166c3a9'),  -- "Café" in UTF-8
+  (2, '\x436166e9'),    -- "Café" in Latin-1
+  (3, '\x6f6b'),        -- "ok"
+  (4, '\x6100');        -- "a" followed by NUL
+
+SELECT id, name_raw, is_valid_utf8(name_raw) FROM raw_import;
+```
+
+```
+ id |   name_raw   | is_valid_utf8
+----+--------------+---------------
+  1 | \x436166c3a9 | t
+  2 | \x436166e9   | f
+  3 | \x6f6b       | t
+  4 | \x6100       | f
+```
+
+Now decode valid rows as UTF-8 and the rest as Latin-1, and leave the rows with NUL bytes for manual review:
+
+```sql
+SELECT id,
+       convert_from(name_raw,
+                    CASE WHEN is_valid_utf8(name_raw) THEN 'UTF8' ELSE 'LATIN1' END) AS name
+FROM raw_import
+WHERE position('\x00'::bytea IN name_raw) = 0;
+```
+
+```
+ id | name
+----+------
+  1 | Café
+  2 | Café
+  3 | ok
+```
+
+This mixed approach is common when a legacy system has been written to by several applications over the years, so the same column holds both encodings. The exception handler costs a subtransaction per call, so use it for a cleanup job, not in a hot query.
+
+## The Opposite Error: No Equivalent in Encoding
+
+The reverse problem appears when the server has to convert UTF-8 text into a smaller encoding, for example when a client uses `client_encoding = 'LATIN1'` or you call `convert_to()`:
+
+```sql
+SELECT convert_to('€ price', 'LATIN1');
+```
+
+```
+ERROR:  character with byte sequence 0xe2 0x82 0xac in encoding "UTF8" has no equivalent in encoding "LATIN1"
+```
+
+The euro sign exists in Windows-1252 but not in Latin-1, so the conversion fails (SQLSTATE `22P05`). The fix is to use an encoding that can represent the character (`WIN1252` here, or simply UTF8) on the client side.
+
+## Prevention Checklist
+
+| Where | What to do |
+|-------|-----------|
+| Database creation | Create databases with `ENCODING 'UTF8'`. `SQL_ASCII` disables all checks and stores whatever arrives, which only moves the problem to the next system. |
+| File imports | Agree on UTF-8 with whoever produces the file, or always pass `ENCODING` to `COPY`. |
+| Pipelines | Strip `\x00` and validate with `iconv` before the database. |
+| JSON | Remove `\u0000` before casting to `jsonb`. |
+| Clients | Leave `client_encoding` at UTF8 unless you really send another encoding. |
+
+When you work through a messy import, it helps to see the raw bytes next to the decoded text. In [Chat2DB](https://chat2db.ai/download) you can run the `is_valid_utf8()` query above, inspect the failing rows in the result grid, and ask the AI assistant to write the cleanup `UPDATE` for you.
+
+## FAQ
+
+### What does "invalid byte sequence for encoding UTF8: 0x00" mean?
+
+Your data contains a NUL byte. PostgreSQL text types cannot store NUL in any encoding, so the value is rejected. Remove the byte (for example with `tr -d '\000'`), or store the data as `bytea` if it is really binary.
+
+### Can I make PostgreSQL ignore invalid UTF-8?
+
+Not for a UTF8 database. The check is always on, and there is no setting to skip it. The only way around it is a `SQL_ASCII` database, which stores bytes without any validation and is a bad idea for new systems. Clean or convert the data instead, or load it as `bytea` and decode it in SQL as shown above.
+
+### Why does the same file load fine on another server?
+
+The other server probably has a different `client_encoding` default, or a `SQL_ASCII` database. Check `SHOW server_encoding;` and `SHOW client_encoding;` on both. If the other server shows Latin-1 text as `CafÃ©` or similar, the data loaded without an error but is already corrupted.

@@ -1,0 +1,351 @@
+---
+title: "Postgres COPY: Missing Data for Column (Fix)"
+description: "Fix PostgreSQL COPY errors: missing data for column, extra data after last expected column, unterminated CSV quoted field, empty strings and ON_ERROR ignore."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: October 27, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# Postgres COPY: Missing Data for Column (Fix)
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="October 27, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+`COPY` is the fastest way to load a file into PostgreSQL, and it is also strict. One bad line stops the whole load:
+
+```
+ERROR:  missing data for column "amount"
+CONTEXT:  COPY payments, line 3: "2,b@x.com"
+```
+
+The same family of errors includes `extra data after last expected column`, `unterminated CSV quoted field`, `invalid input syntax for type integer`, and `literal newline found in data`. Most of them come down to a mismatch between what the file contains and what you told `COPY` to expect: the number of columns, the delimiter, the quoting, or the line endings.
+
+This guide reproduces each error with a small file, explains what PostgreSQL is complaining about, and shows the fix. It also covers the `ON_ERROR ignore` and `REJECT_LIMIT` options in PostgreSQL 17 and 18, which let a load skip bad rows. All output is from PostgreSQL 18.
+
+## The Table Used in the Examples
+
+```sql
+CREATE TABLE payments (
+  id     int PRIMARY KEY,
+  email  text NOT NULL,
+  amount numeric(10,2)
+);
+```
+
+The good version of the file looks like this:
+
+```
+id,email,amount
+1,a@x.com,10.50
+2,b@x.com,3.00
+```
+
+## How COPY Reads a Line
+
+Knowing the parsing order makes every error message easier to read. For each line, `COPY`:
+
+1. Splits the line into fields using the delimiter (comma for CSV, tab for the default text format), respecting quotes in CSV mode.
+2. Checks that the number of fields equals the number of target columns.
+3. Converts each field to the column type, which is where `invalid input syntax` errors come from.
+4. Inserts the row and checks constraints.
+
+Errors in steps 1 and 2 are format errors. Errors in step 3 are data type errors. The difference matters for `ON_ERROR`, as you will see below.
+
+## missing data for column
+
+The file has fewer fields on a line than the table (or the column list) has columns:
+
+```
+id,email,amount
+1,a@x.com,10.50
+2,b@x.com
+3,c@x.com,7.25
+```
+
+```sql
+COPY payments FROM '/tmp/c_missing.csv' WITH (FORMAT csv, HEADER true);
+```
+
+```
+ERROR:  missing data for column "amount"
+CONTEXT:  COPY payments, line 3: "2,b@x.com"
+```
+
+The `CONTEXT` line gives you the line number in the file (counting the header) and the raw text of that line. Common causes:
+
+- A row really is incomplete. Exports from spreadsheets often drop trailing empty cells.
+- The file has fewer columns than the table, for example when the table has a `created_at` column with a default that the file does not include. Fix this with a column list: `COPY payments (id, email) FROM ...`. Columns not in the list get their default value.
+- The delimiter is wrong, so a whole line is read as one field.
+
+The last case gives a different-looking error when the first column is numeric, because the entire line ends up in that first field:
+
+```
+ERROR:  invalid input syntax for type integer: "1;a@x.com;10.50"
+CONTEXT:  COPY payments, line 2, column id: "1;a@x.com;10.50"
+```
+
+A whole line inside one column value means the delimiter is wrong. Semicolons are common in files from European locales, and tabs in files exported as "text". Set the delimiter explicitly:
+
+```sql
+COPY payments FROM '/tmp/c_semi.csv' WITH (FORMAT csv, HEADER true, DELIMITER ';');
+```
+
+For a tab-separated file, either use `FORMAT text` (whose default delimiter is a tab) or `FORMAT csv, DELIMITER E'\t'`.
+
+## extra data after last expected column
+
+This is the opposite problem: a line has more fields than expected.
+
+```
+id,email,amount
+1,a@x.com,10.50
+2,b@x.com,3.00,EUR
+```
+
+```
+ERROR:  extra data after last expected column
+CONTEXT:  COPY payments, line 3: "2,b@x.com,3.00,EUR"
+```
+
+Typical causes are an extra column added to the export, a trailing delimiter on every line (`1,a@x.com,10.50,`), or an unquoted value that contains the delimiter, such as `Smith, John` in a CSV name field. The last one is a bug in whatever produced the file: values containing commas must be quoted. If the extra column is legitimate, add it to the table or load into a staging table first (see "Load Ragged Files Through a Staging Table" below).
+
+## unterminated CSV quoted field
+
+In CSV mode a double quote starts a quoted field that can contain commas and even newlines. If the closing quote is missing, `COPY` keeps reading until the end of the file:
+
+```
+id,email,amount
+1,"a@x.com,10.50
+2,b@x.com,3.00
+```
+
+```
+ERROR:  unterminated CSV quoted field
+CONTEXT:  COPY payments, line 4: "1,"a@x.com,10.50
+2,b@x.com,3.00
+"
+```
+
+The line number in the context points at the end of the file, not at the line where the quote was opened. Look at the text in the context instead: it starts at the opening quote. The usual causes are a stray `"` inside a value (for example `12" pipe`) that the exporter did not escape as `""`, or a file that is not really CSV.
+
+If the file uses double quotes as ordinary characters and never quotes fields, choose a quote character that never appears in the data:
+
+```sql
+COPY payments FROM '/tmp/data.csv' WITH (FORMAT csv, HEADER true, QUOTE E'\x01');
+```
+
+Properly quoted multi-line values are fine, by the way. This file loads without problems in CSV mode:
+
+```
+id,note
+1,"line one
+line two"
+2,plain
+```
+
+```
+ id |   note
+----+----------
+  1 | line one+
+    | line two
+  2 | plain
+```
+
+## Empty Strings: invalid input syntax for type numeric: ""
+
+In CSV format, an empty unquoted field is NULL, so `1,a@x.com,` loads with a NULL amount. A quoted empty field is an empty string, and an empty string is not a valid number:
+
+```
+id,email,amount
+1,a@x.com,""
+```
+
+```
+ERROR:  invalid input syntax for type numeric: ""
+CONTEXT:  COPY payments, line 2, column amount: ""
+```
+
+`FORCE_NULL` tells `COPY` to treat quoted empty values as NULL for specific columns:
+
+```sql
+COPY payments FROM '/tmp/c_quoted_empty.csv'
+  WITH (FORMAT csv, HEADER true, FORCE_NULL (amount));
+-- COPY 1
+```
+
+If the file uses another marker for missing values, such as `NULL` or `\N`, set it with the `NULL` option: `WITH (FORMAT csv, NULL 'NULL')`.
+
+## Column Order: Use HEADER MATCH
+
+`HEADER true` only skips the first line. It does not check that the columns are in the order you expect. A file with `email,id,amount` fails on the first data row with a confusing type error:
+
+```
+ERROR:  invalid input syntax for type integer: "a@x.com"
+CONTEXT:  COPY payments, line 2, column id: "a@x.com"
+```
+
+Since PostgreSQL 15, `HEADER match` compares the header line with the column names and reports the real problem:
+
+```sql
+COPY payments FROM '/tmp/c_hdr.csv' WITH (FORMAT csv, HEADER match);
+```
+
+```
+ERROR:  column name mismatch in header line field 1: got "email", expected "id"
+CONTEXT:  COPY payments, line 1: "email,id,amount"
+```
+
+Then either reorder the file, or give `COPY` a column list in the file's order:
+
+```sql
+COPY payments (email, id, amount) FROM '/tmp/c_hdr.csv' WITH (FORMAT csv, HEADER match);
+-- COPY 1
+```
+
+## Line Endings: literal newline found in data
+
+Windows line endings (`\r\n`) are handled automatically in CSV mode. In the default text format, `COPY` decides on the line ending from the first line, and a file that mixes `\r\n` and `\n` fails:
+
+```
+ERROR:  literal newline found in data
+HINT:  Use "\n" to represent newline.
+CONTEXT:  COPY payments, line 2
+```
+
+The related message `literal carriage return found in data` appears in the opposite situation. Normalize the file with `dos2unix` or `sed 's/\r$//'` before loading, or load it in CSV format.
+
+## Skip Bad Rows with ON_ERROR ignore (PostgreSQL 17+)
+
+PostgreSQL 17 added `ON_ERROR ignore`, which skips rows that fail type conversion instead of aborting the whole `COPY`:
+
+```
+id,email,amount
+1,a@x.com,10.50
+2,b@x.com,abc
+3,c@x.com,
+4,d@x.com,4.00
+```
+
+```sql
+COPY payments FROM '/tmp/c_bad.csv'
+  WITH (FORMAT csv, HEADER true, ON_ERROR ignore, LOG_VERBOSITY verbose);
+```
+
+```
+NOTICE:  skipping row due to data type incompatibility at line 3 for column "amount": "abc"
+NOTICE:  1 row was skipped due to data type incompatibility
+COPY 3
+```
+
+`LOG_VERBOSITY verbose` (PostgreSQL 17+) prints one notice per skipped row, so you know exactly which lines to fix. PostgreSQL 18 adds `REJECT_LIMIT`, which aborts the load if too many rows are bad. That protects you from silently loading a file that is mostly garbage:
+
+```sql
+COPY payments FROM '/tmp/c_bad2.csv'
+  WITH (FORMAT csv, HEADER true, ON_ERROR ignore, REJECT_LIMIT 1);
+```
+
+```
+ERROR:  skipped more than REJECT_LIMIT (1) rows due to data type incompatibility
+CONTEXT:  COPY payments, line 4, column amount: "x"
+```
+
+Two limits are important. First, `ON_ERROR ignore` only covers data type conversion errors. Format errors such as missing or extra columns still abort the load:
+
+```sql
+COPY payments FROM '/tmp/c_missing.csv' WITH (FORMAT csv, HEADER true, ON_ERROR ignore);
+```
+
+```
+ERROR:  missing data for column "amount"
+CONTEXT:  COPY payments, line 3: "2,b@x.com"
+```
+
+Second, constraint violations (duplicate keys, `NOT NULL`, foreign keys) are not skipped either. For those, load into a staging table without constraints and move the clean rows with `INSERT ... SELECT ... ON CONFLICT DO NOTHING`.
+
+## Load Ragged Files Through a Staging Table
+
+When lines have different numbers of fields, load each whole line as a single text value, then split and filter in SQL. The trick is to use CSV mode with a delimiter and a quote character that never occur in the file:
+
+```sql
+CREATE TABLE raw_lines (
+  line_no bigint GENERATED ALWAYS AS IDENTITY,
+  line    text
+);
+
+COPY raw_lines (line) FROM '/tmp/c_ragged.csv'
+  WITH (FORMAT csv, DELIMITER E'\x01', QUOTE E'\x02');
+
+SELECT line_no, line, array_length(string_to_array(line, ','), 1) AS fields
+FROM raw_lines ORDER BY line_no;
+```
+
+```
+ line_no |        line        | fields
+---------+--------------------+--------
+       1 | id,email,amount    |      3
+       2 | 1,a@x.com,10.50    |      3
+       3 | 2,b@x.com          |      2
+       4 | 3,c@x.com,7.25,EUR |      4
+```
+
+Now you can see every bad line at once instead of one error at a time, and insert only the rows with the right shape:
+
+```sql
+INSERT INTO payments (id, email, amount)
+SELECT f[1]::int, f[2], f[3]::numeric
+FROM (SELECT line_no, string_to_array(line, ',') AS f
+      FROM raw_lines WHERE line_no > 1) s
+WHERE array_length(f, 1) = 3;
+```
+
+This simple split does not handle quoted commas. For real CSV with quotes, load into a staging table whose columns are all `text` and fix the file only for the lines the error points at.
+
+## COPY vs \copy: File Location Errors
+
+Two more errors are not about the data at all. Server-side `COPY ... FROM 'file'` reads the file on the database server, as the server process:
+
+```
+ERROR:  could not open file "/home/alice/payments.csv" for reading: No such file or directory
+HINT:  COPY FROM instructs the PostgreSQL server process to read a file. You may want a client-side facility such as psql's \copy.
+```
+
+And it requires superuser or the `pg_read_server_files` role:
+
+```
+ERROR:  permission denied to COPY from a file
+DETAIL:  Only roles with privileges of the "pg_read_server_files" role may COPY from a file.
+HINT:  Anyone can COPY to stdout or from stdin. psql's \copy command also works for anyone.
+```
+
+psql's `\copy` reads the file on your machine and streams it to the server, so it works for any user with `INSERT` privilege. Most drivers offer the same thing through `COPY ... FROM STDIN`.
+
+## Quick Reference
+
+| Error | Cause | Fix |
+|-------|-------|-----|
+| `missing data for column` | Fewer fields than columns | Column list, fix delimiter, fix the row |
+| `extra data after last expected column` | More fields than columns | Quote values with commas, add a column, staging table |
+| `invalid input syntax ... "whole line"` | Wrong delimiter | `DELIMITER ';'` or `E'\t'` |
+| `unterminated CSV quoted field` | Unbalanced `"` | Escape quotes as `""`, or `QUOTE E'\x01'` |
+| `invalid input syntax ... ""` | Quoted empty string | `FORCE_NULL (col)` |
+| `column name mismatch in header line` | Columns in another order | Column list in file order |
+| `literal newline found in data` | Mixed line endings | Normalize, or use CSV format |
+
+If you load files regularly, a GUI import can save the trial and error. [Chat2DB](https://chat2db.ai/download) previews a CSV, maps file columns to table columns, and shows the rows that failed, and you can also run the `COPY` statements above directly in its SQL editor.
+
+## FAQ
+
+### Can COPY skip rows with missing columns?
+
+No. `ON_ERROR ignore` only skips rows whose values fail type conversion. Lines with too few or too many fields always abort the load. Use the staging-table technique to load whole lines as text, then filter out the bad ones in SQL.
+
+### How do I find the bad line in a huge file?
+
+Use the line number in the `CONTEXT` line, for example with `sed -n '3p' file.csv`. For unterminated quotes the line number points at the end of the file, so search for the text shown after `CONTEXT` instead.
+
+### Is COPY transactional?
+
+Yes. If any row fails without `ON_ERROR ignore`, nothing from that `COPY` is kept, and the table is unchanged. The space used by the rows written before the error is reclaimed later by `VACUUM`.

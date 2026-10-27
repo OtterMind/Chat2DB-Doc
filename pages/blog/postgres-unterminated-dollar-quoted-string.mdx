@@ -1,0 +1,267 @@
+---
+title: "Postgres: Unterminated Dollar-Quoted String Fix"
+description: "Fix 'unterminated dollar-quoted string' in PostgreSQL: tools that split scripts on semicolons, Spring and Liquibase settings, mismatched tags and quotes."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: October 27, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# Postgres: Unterminated Dollar-Quoted String Fix
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="October 27, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+A function that works perfectly in psql fails when your migration tool or application runs it:
+
+```
+ERROR:  unterminated dollar-quoted string at or near "$$
+BEGIN
+  NEW.updated_at := now()"
+LINE 1: ...ON touch_updated_at() RETURNS trigger LANGUAGE plpgsql AS $$
+                                                                     ^
+```
+
+PostgreSQL received a statement that opens a dollar-quoted string with `$$` and never closes it. Since the same SQL works in psql, the SQL itself is usually fine. Something between your file and the server cut the statement into pieces, almost always at a semicolon. This guide shows how to confirm that, how to fix it in the common tools, and how to deal with the related errors `unterminated quoted string`, `unterminated quoted identifier` and `unterminated /* comment`. All error output is from PostgreSQL 18.
+
+## What Dollar Quoting Is
+
+A function body is a string literal. Writing it with ordinary single quotes means doubling every quote inside it, which gets unreadable fast. Dollar quoting solves this: everything between `$$` and the next `$$` is taken literally, quotes and semicolons included.
+
+```sql
+CREATE OR REPLACE FUNCTION touch_updated_at() RETURNS trigger
+LANGUAGE plpgsql AS $$
+BEGIN
+  NEW.updated_at := now();
+  RETURN NEW;
+END;
+$$;
+```
+
+You can also put a tag between the dollar signs, `$body$ ... $body$`, so one dollar-quoted string can contain another:
+
+```sql
+SELECT $tag$it's fine, even with ; and 'quotes'$tag$ AS v;
+```
+
+```
+                  v
+-------------------------------------
+ it's fine, even with ; and 'quotes'
+```
+
+The server's parser understands all of this. The problem is that many client tools have their own, simpler parser.
+
+## The Usual Cause: The Script Is Split on Semicolons
+
+Many tools run a script by splitting it into statements at each `;` and sending the pieces one by one. A naive splitter does not know that the semicolons inside `$$ ... $$` belong to the function body. The function above has three semicolons in its body, so the tool sends this as the first statement:
+
+```sql
+CREATE OR REPLACE FUNCTION touch_updated_at() RETURNS trigger
+LANGUAGE plpgsql AS $$
+BEGIN
+  NEW.updated_at := now()
+```
+
+That statement opens `$$` and never closes it. This is exactly what the server reports. We reproduced it by sending only that fragment:
+
+```
+ERROR:  unterminated dollar-quoted string at or near "$$
+BEGIN
+  NEW.updated_at := now()"
+```
+
+The next fragment then fails with a second, confusing error:
+
+```
+ERROR:  syntax error at or near "RETURN"
+LINE 1: RETURN NEW;
+        ^
+```
+
+So if you see `unterminated dollar-quoted string` followed by syntax errors at `RETURN`, `END` or `$$`, the script is being split. Look at the text in the error message: it always ends right before a semicolon inside the function body.
+
+## Fixes by Tool
+
+### psql
+
+psql has a full lexer that understands dollar quotes, so `psql -f script.sql` never splits inside a function body. If a script works with `psql -f` but not in another tool, the other tool's splitter is the problem.
+
+### Spring Boot (schema.sql / data.sql)
+
+Spring's script runner splits on `;` by default. Change the separator in `application.properties` so that the script is split only where you mark it:
+
+```properties
+spring.sql.init.separator=^^^ END OF SCRIPT ^^^
+```
+
+With this value the whole file is sent as one statement, which works with the PostgreSQL JDBC driver because it accepts multiple statements in one simple query. Alternatively pick a separator such as `/` on its own line and put it after each statement.
+
+### Liquibase
+
+In a formatted SQL changelog, turn off splitting for the changeset that creates the function:
+
+```sql
+--liquibase formatted sql
+--changeset app:create-touch-function splitStatements:false
+CREATE OR REPLACE FUNCTION touch_updated_at() RETURNS trigger
+LANGUAGE plpgsql AS $$
+BEGIN
+  NEW.updated_at := now();
+  RETURN NEW;
+END;
+$$;
+```
+
+In XML or YAML changelogs, the `sql` change type has the same `splitStatements` attribute, and `endDelimiter` lets you choose a different statement terminator.
+
+### Flyway
+
+Flyway's PostgreSQL parser understands dollar quoting, so a correct function in a migration file normally runs as is. If you still see the error, check for an unbalanced tag (see below) or for a migration that is generated or concatenated by your own code before Flyway sees it.
+
+### Your Own Code
+
+If your application reads a `.sql` file and calls `split(";")`, it will break every function, `DO` block and SQL-standard function body. Either send the whole file in one call (simple query protocol allows multiple statements), or use a real splitter that tracks single quotes, double quotes, dollar-quote tags and comments.
+
+### GUI Clients
+
+Most SQL editors run the statement under the cursor or the selected text. If you select only part of a function body and execute it, you get this error too. Select the whole `CREATE FUNCTION` statement, from `CREATE` to the closing `$$;`, and run the selection. In [Chat2DB](https://chat2db.ai/download) you can select a complete function or `DO` block in the SQL editor and execute just that selection, and the AI assistant can explain the error if a tag does not match.
+
+## Mismatched Tags
+
+The second common cause is a tag that opens one way and closes another:
+
+```sql
+DO $body$
+BEGIN
+  RAISE NOTICE 'done';
+END $$;
+```
+
+```
+ERROR:  unterminated dollar-quoted string at or near "$body$
+BEGIN
+  RAISE NOTICE 'done';
+END $$;"
+LINE 1: DO $body$
+           ^
+```
+
+`$body$` can only be closed by `$body$`. The `$$` inside is just text. The caret points at the opening tag, which is the one to fix. This often happens when code is copied from a template that uses `$function$`, the tag that `pg_get_functiondef()` produces, and only one end is edited.
+
+Tags are case-sensitive and follow identifier rules. A tag cannot start with a digit, because `$1` is a parameter reference:
+
+```sql
+SELECT $1abc$ x $1abc$;
+```
+
+```
+ERROR:  trailing junk after parameter at or near "$1abc$"
+```
+
+## Unterminated Quoted String
+
+The single-quote version of the error has the same two causes, a splitter or a real mistake:
+
+```sql
+SELECT 'never closed
+```
+
+```
+ERROR:  unterminated quoted string at or near "'never closed"
+LINE 1: SELECT 'never closed
+               ^
+```
+
+A real mistake is usually an apostrophe inside the text. Note that `'it's broken'` does not produce the unterminated error. The literal `'it'` ends at the apostrophe, and the parser then trips over the next word:
+
+```
+ERROR:  syntax error at or near "broken"
+LINE 1: SELECT 'it's broken';
+                     ^
+```
+
+Double the quote, use an escape string, or switch to dollar quoting:
+
+```sql
+SELECT 'it''s doubled' AS a, E'it\'s escaped' AS b, $$it's dollar-quoted$$ AS c;
+```
+
+A trailing backslash is the other classic. In an `E''` string, `\'` is an escaped quote, so this literal never ends:
+
+```sql
+SELECT E'C:\temp\';
+-- ERROR:  unterminated quoted string at or near "E'C:\temp\'"
+```
+
+In a normal string (`standard_conforming_strings = on`, the default since PostgreSQL 9.1) a backslash is an ordinary character, so `'C:\temp\'` is fine. Mixing the two styles is a common source of this error in generated SQL. When you build SQL in application code, use bind parameters instead of string concatenation and the problem disappears.
+
+## Unterminated Quoted Identifier and Comment
+
+Double quotes delimit identifiers, so a lone `"` swallows the rest of the statement:
+
+```sql
+SELECT "order_id FROM orders;
+```
+
+```
+ERROR:  unterminated quoted identifier at or near ""order_id FROM orders;"
+```
+
+And a block comment without its closing `*/`:
+
+```sql
+SELECT 1 /* forgot to close
+```
+
+```
+ERROR:  unterminated /* comment at or near "/* forgot to close"
+```
+
+PostgreSQL block comments nest, unlike in most other databases. `/* outer /* inner */ still a comment */` is one comment, so a stray `/*` inside a commented-out block also leaves the comment open.
+
+## Avoid the Problem: SQL-Standard Function Bodies
+
+Since PostgreSQL 14, functions written in `LANGUAGE sql` can use a SQL-standard body instead of a string. There is no dollar quoting at all:
+
+```sql
+CREATE FUNCTION add_one(i int) RETURNS int
+LANGUAGE sql
+RETURN i + 1;
+
+CREATE FUNCTION f_body(i int) RETURNS int
+LANGUAGE sql
+BEGIN ATOMIC
+  SELECT i + 1;
+  SELECT i + 2;
+END;
+```
+
+The single-expression `RETURN` form contains no semicolon inside the body, so even naive splitters handle it. The `BEGIN ATOMIC` form still has inner semicolons and needs a splitter that understands it. Both forms are parsed when the function is created, so a typo or a missing table is reported immediately instead of at the first call. PL/pgSQL functions still need a string body.
+
+## Checklist
+
+| Symptom | Likely cause | Fix |
+|---------|--------------|-----|
+| Text in error stops before a `;` inside a body | Tool splits on semicolons | Disable splitting or change the separator |
+| Caret on an opening `$tag$` | Closing tag differs | Make both tags identical |
+| `trailing junk after parameter` | Tag starts with a digit | Start tags with a letter or underscore |
+| `unterminated quoted string` | Missing quote or `E'...\'` | Double quotes, or use dollar quoting |
+| `unterminated quoted identifier` | Stray `"` | Remove it or close it |
+| `unterminated /* comment` | Missing or nested `*/` | Close every `/*` |
+
+## FAQ
+
+### Why does my function work in psql but not in my application?
+
+psql parses dollar quotes and sends the whole `CREATE FUNCTION` as one statement. Your application or framework probably splits the script on semicolons. Run the file as one statement, or configure the tool's separator as shown above.
+
+### Can I use single quotes instead of dollar quotes for a function body?
+
+Yes, but you must double every single quote inside the body (`''`), which gets hard to read. Dollar quoting exists to avoid that, and the real fix is to stop the tool from splitting the statement.
+
+### Does the error mean my function was partly created?
+
+No. The statement that failed did nothing. But if your tool continued with the following fragments, some of them may have run on their own, so check for side effects before you run the script again.

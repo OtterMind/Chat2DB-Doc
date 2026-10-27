@@ -1,0 +1,264 @@
+---
+title: "Postgres: Time Zone Not Recognized (Fix)"
+description: "Fix 'time zone not recognized' and 'invalid value for parameter TimeZone' in PostgreSQL: legacy names like US/Eastern, Debian tzdata-legacy, POSIX offsets."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: October 27, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# Postgres: Time Zone Not Recognized (Fix)
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="October 27, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+PostgreSQL reports a bad time zone name in two different ways. In an expression:
+
+```
+ERROR:  time zone "Mars/Olympus" not recognized
+```
+
+and when you set the session time zone, or when a driver sets it at connection time:
+
+```
+ERROR:  invalid value for parameter "TimeZone": "US/Eastern"
+FATAL:  invalid value for parameter "TimeZone": "Asia/Calcutta"
+```
+
+The second form is the one that surprises people, because names such as `US/Eastern`, `Asia/Calcutta` and `EST` worked for years and suddenly stop working after an upgrade or a move to a new container image. This guide explains where PostgreSQL gets its time zone names, why legacy names disappear, and how to fix each case. It also covers a quieter problem: offsets such as `GMT+8` and `UTC+08:00` that are accepted but mean the opposite of what you expect. All examples were run on PostgreSQL 18.
+
+## Where PostgreSQL Gets Time Zone Names
+
+PostgreSQL does not hard-code time zones. It reads the IANA time zone database (tzdata) from disk. Builds from source ship their own copy under `share/timezone`, but most Linux packages are compiled with `--with-system-tzdata` and read the operating system's `/usr/share/zoneinfo` instead. You can check a server's build:
+
+```bash
+pg_config --configure | tr ' ' '\n' | grep tzdata
+# '--with-system-tzdata=/usr/share/zoneinfo'
+```
+
+The names available to SQL are listed in `pg_timezone_names`, and the abbreviations (which are a separate list) in `pg_timezone_abbrevs`:
+
+```sql
+SELECT name FROM pg_timezone_names WHERE name ILIKE '%new%york%';
+--        name
+-- ------------------
+--  America/New_York
+
+SELECT count(*) FROM pg_timezone_names;
+```
+
+If a name is not in `pg_timezone_names`, `SET timezone` rejects it.
+
+## Cause 1: Legacy Names Removed from the OS Time Zone Database
+
+IANA keeps old names such as `US/Eastern`, `Asia/Calcutta` (now `Asia/Kolkata`) and `EST` as "backward" links. Debian 13 (trixie) moved these links into a separate package, `tzdata-legacy`, which is not installed by default. The official `postgres:17` and `postgres:18` Docker images are based on Debian 13 at the time of writing, and they read the system time zone files. So on these images:
+
+```sql
+SET timezone = 'US/Eastern';
+-- ERROR:  invalid value for parameter "TimeZone": "US/Eastern"
+
+SET timezone = 'Asia/Calcutta';
+-- ERROR:  invalid value for parameter "TimeZone": "Asia/Calcutta"
+
+SET timezone = 'EST';
+-- ERROR:  invalid value for parameter "TimeZone": "EST"
+```
+
+while the canonical names work:
+
+```sql
+SELECT name, abbrev, utc_offset FROM pg_timezone_names
+WHERE name ILIKE '%kolkata%' OR name ILIKE '%calcutta%';
+```
+
+```
+     name     | abbrev | utc_offset
+--------------+--------+------------
+ Asia/Kolkata | IST    | 05:30:00
+```
+
+Only `Asia/Kolkata` is listed. The old alias is gone. On our test server `pg_timezone_names` had 487 entries without the legacy package.
+
+This breaks applications in a nasty way, because the name often comes from the client, not from your SQL. The PostgreSQL JDBC driver sends the JVM's default time zone in the startup packet. A JVM that reports `Asia/Calcutta`, or a container with `TZ=US/Eastern`, then cannot connect at all:
+
+```
+FATAL:  invalid value for parameter "TimeZone": "Asia/Calcutta"
+```
+
+We reproduced the connection failure with psql's `PGTZ` environment variable, which works the same way.
+
+### Fix A: Install the Legacy Links on the Server
+
+On Debian and Ubuntu based servers or images, install the package:
+
+```bash
+apt-get update && apt-get install -y tzdata-legacy
+```
+
+PostgreSQL reads time zone files on demand, so new sessions see the names without a restart:
+
+```sql
+SET timezone = 'Asia/Calcutta';
+SELECT '2026-10-27 12:00:00+00'::timestamptz;
+```
+
+```
+        timestamptz
+---------------------------
+ 2026-10-27 17:30:00+05:30
+```
+
+After installing the package our server listed 600 names. For a Docker image, add the line to your Dockerfile so that it survives rebuilds:
+
+```dockerfile
+FROM postgres:18
+RUN apt-get update && apt-get install -y --no-install-recommends tzdata-legacy \
+ && rm -rf /var/lib/apt/lists/*
+```
+
+### Fix B: Use Canonical Names Everywhere
+
+The long-term fix is to stop using aliases. Use `America/New_York` instead of `US/Eastern`, `Asia/Kolkata` instead of `Asia/Calcutta`, `America/Panama` (or a real location) instead of `EST`, and `UTC` for UTC. For Java clients, set the JVM time zone explicitly, for example `-Duser.timezone=UTC` or `-Duser.timezone=Asia/Kolkata`, so the driver sends a name every server knows.
+
+Check what is stored in the configuration too. A bad name in `ALTER DATABASE ... SET timezone` or `ALTER ROLE ... SET timezone` is rejected when you run the command:
+
+```sql
+ALTER DATABASE enc SET timezone = 'Asia/Calcuta';
+-- ERROR:  invalid value for parameter "TimeZone": "Asia/Calcuta"
+```
+
+But a setting that was valid on the old server keeps living in `pg_db_role_setting` and is restored by `pg_dump`. Before an upgrade, list the per-database and per-role settings:
+
+```sql
+SELECT coalesce(d.datname, '*') AS database, coalesce(r.rolname, '*') AS role, s.setconfig
+FROM pg_db_role_setting s
+LEFT JOIN pg_database d ON d.oid = s.setdatabase
+LEFT JOIN pg_roles r ON r.oid = s.setrole;
+```
+
+## Cause 2: Typos and Spaces
+
+Names are matched case-insensitively, so `utc` and `america/new_york` work, but every other character must be exact:
+
+```sql
+SET timezone = 'America/New York';
+-- ERROR:  invalid value for parameter "TimeZone": "America/New York"
+
+SELECT '2026-10-27 12:00:00 Europe/Pariss'::timestamptz;
+-- ERROR:  time zone "europe/pariss" not recognized
+```
+
+IANA names use underscores instead of spaces, and the city in the name is a representative city, not a country. When in doubt, search the catalog:
+
+```sql
+SELECT name FROM pg_timezone_names WHERE name ILIKE '%paris%';
+```
+
+## Cause 3: Abbreviations Are Not Time Zones
+
+`PST`, `EST`, `IST` and `CST` are abbreviations, and PostgreSQL treats them differently from full names. In date/time input and in `AT TIME ZONE`, abbreviations are looked up in the `timezone_abbreviations` list and mean a fixed offset:
+
+```sql
+SELECT '2026-10-27 12:00:00+00'::timestamptz AT TIME ZONE 'PST' AS pst,
+       '2026-10-27 12:00:00+00'::timestamptz AT TIME ZONE 'IST' AS ist;
+```
+
+```
+         pst         |         ist
+---------------------+---------------------
+ 2026-10-27 04:00:00 | 2026-10-27 14:00:00
+```
+
+`IST` gave 14:00, two hours ahead, not India's five and a half. In the default abbreviation set, `IST` is Israel Standard Time:
+
+```sql
+SELECT abbrev, utc_offset, is_dst FROM pg_timezone_abbrevs
+WHERE abbrev IN ('IST', 'PST', 'EST', 'CST', 'BST') ORDER BY abbrev;
+```
+
+```
+ abbrev | utc_offset | is_dst
+--------+------------+--------
+ BST    | 01:00:00   | t
+ CST    | -06:00:00  | f
+ EST    | -05:00:00  | f
+ IST    | 02:00:00   | f
+ PST    | -08:00:00  | f
+```
+
+The `TimeZone` setting does not accept these abbreviations at all, which is why `SET timezone = 'PST'` fails. Even where an abbreviation works, it is a fixed offset with no daylight saving time. `PST` in July is still UTC-8, while Los Angeles is on UTC-7. Use full names for anything that crosses a DST change.
+
+## Cause 4: POSIX Offsets Mean the Opposite
+
+This case raises no error, which makes it dangerous. PostgreSQL accepts POSIX-style zone specifications such as `GMT+8` and `UTC+08:00`. In POSIX notation the sign is inverted: positive means west of Greenwich.
+
+```sql
+SELECT '2026-10-27 12:00:00+00'::timestamptz AT TIME ZONE 'GMT+8'          AS posix_gmt_plus_8,
+       '2026-10-27 12:00:00+00'::timestamptz AT TIME ZONE 'Etc/GMT-8'      AS etc_gmt_minus_8,
+       '2026-10-27 12:00:00+00'::timestamptz AT TIME ZONE 'Asia/Shanghai'  AS shanghai,
+       '2026-10-27 12:00:00+00'::timestamptz AT TIME ZONE INTERVAL '+08:00' AS interval_form;
+```
+
+```
+  posix_gmt_plus_8   |   etc_gmt_minus_8   |      shanghai       |    interval_form
+---------------------+---------------------+---------------------+---------------------
+ 2026-10-27 04:00:00 | 2026-10-27 20:00:00 | 2026-10-27 20:00:00 | 2026-10-27 20:00:00
+```
+
+`GMT+8` produced 04:00, which is UTC minus 8 hours. The same happens with the string `'+08:00'` and with `'UTC+08:00'`. Setting the session zone to a bare offset string is just as misleading:
+
+```sql
+SET timezone = '+05:30';
+SELECT '2026-10-27 12:00:00+00'::timestamptz AS shown;
+```
+
+```
+           shown
+---------------------------
+ 2026-10-27 06:30:00-05:30
+```
+
+The output even prints `-05:30`, which tells you what happened. If you need a fixed offset with the ISO sign convention, use an `INTERVAL` (as in the last column above) or a named zone. For UTC+8 with no DST, `Asia/Shanghai` or `Asia/Singapore` express the intent clearly.
+
+## Where Time Zones Come From in a Session
+
+When a session's time zone is wrong or invalid, check these sources, from highest to lowest priority:
+
+| Source | How to see it |
+|--------|---------------|
+| `SET timezone` in the session | `SHOW timezone;` |
+| Driver startup options (JDBC sends the JVM zone, `PGTZ` for libpq) | Connection string, JVM `user.timezone`, environment |
+| `ALTER ROLE ... SET timezone` | `pg_db_role_setting` query above |
+| `ALTER DATABASE ... SET timezone` | Same query |
+| `timezone` in `postgresql.conf` | `SELECT setting, source FROM pg_settings WHERE name = 'TimeZone';` |
+
+The server default is chosen by `initdb` from the machine's time zone when the cluster is created. Official Docker images default to `Etc/UTC`.
+
+## Store timestamptz, Convert at the Edges
+
+Most time zone trouble goes away with one design rule: store points in time as `timestamptz` and convert only when you display them. `timestamptz` stores UTC internally. The session `TimeZone` only affects how values are parsed and printed, so a wrong session zone shows wrong local times but never corrupts the stored instants. Plain `timestamp` columns, on the other hand, depend on whoever wrote them using the right zone.
+
+To display a stored value in a user's zone, pass the zone name per query instead of changing the session:
+
+```sql
+SELECT order_id, created_at AT TIME ZONE 'America/New_York' AS created_local
+FROM orders;
+```
+
+When you check time zone settings across several environments, it helps to run the same diagnostic queries everywhere. In [Chat2DB](https://chat2db.ai/download) you can save the `pg_db_role_setting` and `pg_timezone_names` queries as snippets and run them against each connection.
+
+## FAQ
+
+### What is the difference between "time zone not recognized" and "invalid value for parameter TimeZone"?
+
+They report the same problem in different places. `time zone "..." not recognized` comes from date/time input and `AT TIME ZONE`. `invalid value for parameter "TimeZone"` comes from setting the `TimeZone` parameter with `SET`, `ALTER ROLE`, `ALTER DATABASE`, `postgresql.conf` or a connection option. When it happens during connection startup it is reported as `FATAL` and the connection fails.
+
+### Why did US/Eastern stop working after I upgraded my Docker image?
+
+The newer image is based on Debian 13, where legacy names are in the optional `tzdata-legacy` package, and PostgreSQL reads the system time zone files. Install `tzdata-legacy` in the image, or switch to the canonical name `America/New_York`.
+
+### Is UTC+8 east or west of Greenwich in PostgreSQL?
+
+As a time zone string, `UTC+8` and `GMT+8` follow POSIX rules and mean eight hours west of Greenwich (UTC-8). Use `INTERVAL '+08:00'` or a named zone such as `Asia/Shanghai` for UTC+8.

@@ -1,0 +1,286 @@
+---
+title: "MySQL sql_mode Explained: Strict Mode & Defaults"
+description: "What MySQL sql_mode does, the MySQL 8 defaults, strict vs non-strict behavior with real examples, and how to change it safely with SET PERSIST or my.cnf."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: October 27, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# MySQL sql_mode Explained: Strict Mode & Defaults
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="October 27, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+The same `INSERT` can store a truncated value on one MySQL server and fail with an error on another. The same `GROUP BY` query can work on your laptop and fail in production. The difference is almost always `sql_mode`, a system variable that controls how strictly MySQL validates data and which SQL syntax it accepts.
+
+This guide explains what `sql_mode` is, what the MySQL 8 default contains, how strict and non-strict mode differ (with real output), and how to change the setting without the usual mistakes. All examples were run on MySQL 8.4. MySQL 8.0 behaves the same for everything shown here.
+
+## What sql_mode Is
+
+`sql_mode` is a comma-separated list of mode names. Each mode switches on one behavior. You can read it at both levels:
+
+```sql
+SELECT @@GLOBAL.sql_mode, @@SESSION.sql_mode;
+```
+
+The global value is copied into each new connection when it starts. After that, each session has its own copy, and changing the global value does not affect connections that are already open.
+
+The default in MySQL 8.0 and 8.4 is:
+
+```
+ONLY_FULL_GROUP_BY,STRICT_TRANS_TABLES,NO_ZERO_IN_DATE,NO_ZERO_DATE,ERROR_FOR_DIVISION_BY_ZERO,NO_ENGINE_SUBSTITUTION
+```
+
+Many managed services, Docker images and older `my.cnf` files override this, so never assume. Check the actual value on each server.
+
+## The Modes That Matter Most
+
+| Mode | What it does |
+|------|--------------|
+| `STRICT_TRANS_TABLES` | Invalid, out-of-range or missing values are errors for transactional tables (InnoDB) instead of warnings with adjusted data |
+| `STRICT_ALL_TABLES` | The same for all tables, including MyISAM |
+| `ONLY_FULL_GROUP_BY` | Rejects queries that select non-aggregated columns not determined by the `GROUP BY` (error 1055) |
+| `NO_ZERO_DATE` | `'0000-00-00'` is an error in strict mode |
+| `NO_ZERO_IN_DATE` | Dates like `'2026-00-15'` are errors in strict mode |
+| `ERROR_FOR_DIVISION_BY_ZERO` | Division by zero in `INSERT`/`UPDATE` is an error in strict mode |
+| `NO_ENGINE_SUBSTITUTION` | `CREATE TABLE ... ENGINE=X` fails if engine X is not available, instead of silently using InnoDB |
+| `ANSI_QUOTES` | Double quotes delimit identifiers, like in standard SQL |
+| `PIPES_AS_CONCAT` | The double-pipe operator concatenates strings instead of meaning `OR` |
+| `NO_BACKSLASH_ESCAPES` | Backslash is an ordinary character in string literals |
+
+"Strict mode" means that `STRICT_TRANS_TABLES` or `STRICT_ALL_TABLES` is on. Most of the data-quality behavior depends on it.
+
+## Non-Strict Mode: Bad Data Gets In Quietly
+
+Here is a small table and an insert with four problems: a code that is too long, a quantity out of range for `TINYINT UNSIGNED`, an impossible date, and a missing `NOT NULL` column without a default.
+
+```sql
+CREATE TABLE orders (
+  id     INT PRIMARY KEY,
+  code   VARCHAR(5) NOT NULL,
+  qty    TINYINT UNSIGNED,
+  placed DATE,
+  note   VARCHAR(20) NOT NULL
+);
+
+SET SESSION sql_mode = '';
+INSERT INTO orders (id, code, qty, placed) VALUES (1, 'ABCDEFG', 300, '2026-02-31');
+SHOW WARNINGS;
+```
+
+```
++---------+------+-------------------------------------------------+
+| Level   | Code | Message                                         |
++---------+------+-------------------------------------------------+
+| Warning | 1265 | Data truncated for column 'code' at row 1       |
+| Warning | 1264 | Out of range value for column 'qty' at row 1    |
+| Warning | 1264 | Out of range value for column 'placed' at row 1 |
+| Warning | 1364 | Field 'note' doesn't have a default value       |
++---------+------+-------------------------------------------------+
+```
+
+The insert succeeded. This is what was stored:
+
+```
++----+-------+------+------------+------+
+| id | code  | qty  | placed     | note |
++----+-------+------+------------+------+
+|  1 | ABCDE |  255 | 0000-00-00 |      |
++----+-------+------+------------+------+
+```
+
+Every value is wrong, and most applications never read the warnings. A string such as `'ten'` in an integer column becomes `0` with warning 1366, and `SELECT 10 / 0` returns `NULL` without any warning at all.
+
+## Strict Mode: The Same Mistakes Become Errors
+
+With the default `sql_mode`, each problem stops the statement:
+
+```sql
+SET SESSION sql_mode = DEFAULT;
+
+INSERT INTO orders (id, code, qty, placed) VALUES (3, 'ABCDEFG', 1, '2026-01-01');
+-- ERROR 1406 (22001): Data too long for column 'code' at row 1
+
+INSERT INTO orders (id, code, qty, placed, note) VALUES (3, 'AB', 300, '2026-01-01', 'n');
+-- ERROR 1264 (22003): Out of range value for column 'qty' at row 1
+
+INSERT INTO orders (id, code, qty, placed, note) VALUES (3, 'AB', 1, '2026-02-31', 'n');
+-- ERROR 1292 (22007): Incorrect date value: '2026-02-31' for column 'placed' at row 1
+
+INSERT INTO orders (id, code, qty, placed) VALUES (3, 'AB', 1, '2026-01-01');
+-- ERROR 1364 (HY000): Field 'note' doesn't have a default value
+
+INSERT INTO orders (id, code, qty, placed, note) VALUES (3, 'AB', 1, '0000-00-00', 'n');
+-- ERROR 1292 (22007): Incorrect date value: '0000-00-00' for column 'placed' at row 1
+
+INSERT INTO orders (id, code, qty, placed, note) VALUES (3, 'AB', 10/0, '2026-01-01', 'n');
+-- ERROR 1365 (22012): Division by 0
+```
+
+These are the errors behind many "it worked on the old server" tickets after an upgrade from MySQL 5.6, or after moving from a server that had `sql_mode = ''` in its configuration. They are not bugs in MySQL. They are bugs in the data that the old server hid.
+
+### INSERT IGNORE Brings Back the Old Behavior for One Statement
+
+`INSERT IGNORE` and `UPDATE IGNORE` downgrade these errors to warnings and store the adjusted values, even in strict mode:
+
+```sql
+INSERT IGNORE INTO orders (id, code, qty, placed, note)
+VALUES (3, 'ABCDEFG', 300, '2026-02-31', 'n');
+SHOW WARNINGS;
+```
+
+```
+| Warning | 1265 | Data truncated for column 'code' at row 1       |
+| Warning | 1264 | Out of range value for column 'qty' at row 1    |
+| Warning | 1264 | Out of range value for column 'placed' at row 1 |
+```
+
+Use it deliberately, for example in a one-off import where you accept truncation, and not as a general way to make errors go away.
+
+## ONLY_FULL_GROUP_BY
+
+This mode rejects queries in which the result is not well defined:
+
+```sql
+SELECT id, code, MAX(qty) FROM orders GROUP BY code;
+```
+
+```
+ERROR 1055 (42000): Expression #1 of SELECT list is not in GROUP BY clause and contains nonaggregated column 'modes.orders.id' which is not functionally dependent on columns in GROUP BY clause; this is incompatible with sql_mode=only_full_group_by
+```
+
+Several orders can share a `code`, so which `id` should MySQL return? Without the mode, it returns one from an arbitrary row. Grouping by the primary key is allowed, because every other column depends on it:
+
+```sql
+SELECT id, code, qty FROM orders GROUP BY id;   -- OK
+```
+
+When any value from the group is acceptable, say so explicitly with `ANY_VALUE()`:
+
+```sql
+SELECT ANY_VALUE(id), code, MAX(qty) FROM orders GROUP BY code;
+```
+
+That is better than removing `ONLY_FULL_GROUP_BY` for the whole server, which would hide real bugs in other queries.
+
+## Syntax Modes: ANSI_QUOTES and Friends
+
+Some modes change how SQL is parsed. With `ANSI_QUOTES`, a double-quoted word is a column name:
+
+```sql
+SET SESSION sql_mode = 'ANSI_QUOTES';
+SELECT "code" FROM orders WHERE id = 1;    -- returns ABCDE, the column value
+
+SET SESSION sql_mode = DEFAULT;
+SELECT "code" FROM orders WHERE id = 1;    -- returns the string 'code'
+```
+
+Turning such a mode on for a whole server breaks every query that uses double quotes for strings, so these modes are best used per session by applications that need them.
+
+## How to Change sql_mode
+
+### For One Connection
+
+```sql
+SET SESSION sql_mode = 'STRICT_TRANS_TABLES,NO_ENGINE_SUBSTITUTION';
+```
+
+Many drivers can do this at connect time. With MySQL Connector/J, for example, add `sessionVariables=sql_mode='...'` to the JDBC URL. This is the right tool when one legacy application needs a looser mode and the rest of the server should stay strict.
+
+### For the Whole Server
+
+`SET GLOBAL` changes the value for new connections until the next restart. `SET PERSIST` (MySQL 8.0+) also writes it to `mysqld-auto.cnf` in the data directory, so it survives restarts:
+
+```sql
+SET PERSIST sql_mode = 'STRICT_TRANS_TABLES,NO_ZERO_IN_DATE,NO_ZERO_DATE,ERROR_FOR_DIVISION_BY_ZERO,NO_ENGINE_SUBSTITUTION';
+```
+
+To undo a persisted value, use `RESET PERSIST sql_mode;` and then set the global value back.
+
+Or put it in the option file, in the `[mysqld]` section:
+
+```ini
+[mysqld]
+sql_mode = "STRICT_TRANS_TABLES,NO_ZERO_IN_DATE,NO_ZERO_DATE,ERROR_FOR_DIVISION_BY_ZERO,NO_ENGINE_SUBSTITUTION"
+```
+
+Two mistakes stop the server from starting here. A space after a comma, and a mode that no longer exists, both make `mysqld` abort at startup. We tested both on MySQL 8.4:
+
+```
+[ERROR] [MY-000077] [Server] /usr/sbin/mysqld: Error while setting value 'STRICT_TRANS_TABLES, NO_ENGINE_SUBSTITUTION' to 'sql_mode'.
+[ERROR] [MY-010119] [Server] Aborting
+```
+
+The removed-mode case (`NO_AUTO_CREATE_USER` in a `my.cnf` copied from MySQL 5.7) is covered in detail in our guide to [MySQL error 1231](/blog/mysql-error-1231-variable-cant-be-set). Before you restart a production server with a new value, paste it into the free [MySQL sql_mode Checker](https://chat2db.ai/tools/mysql-sql-mode-checker). It applies the same parsing rules as the server and shows the stored value, warnings and errors.
+
+### Warning 3135
+
+If you set strict mode without the three date and division modes, or one of those three without strict mode, MySQL accepts the value but adds a warning:
+
+```
+Warning (Code 3135): 'NO_ZERO_DATE', 'NO_ZERO_IN_DATE' and 'ERROR_FOR_DIVISION_BY_ZERO' sql modes should be used with strict mode. They will be merged with strict mode in a future release.
+```
+
+Setting all four together, as the default does, avoids it.
+
+## Gotcha: Stored Routines Keep Their Own sql_mode
+
+A stored procedure, function, trigger or event runs with the `sql_mode` that was active when it was created, not the caller's. This procedure was created in a non-strict session:
+
+```sql
+SET SESSION sql_mode = '';
+CREATE PROCEDURE add_order(p_id INT, p_code VARCHAR(50))
+  INSERT INTO orders (id, code, qty, placed, note)
+  VALUES (p_id, p_code, 1, '2026-01-01', 'n');
+
+SET SESSION sql_mode = DEFAULT;      -- strict again
+CALL add_order(10, 'TOOLONGCODE');
+SHOW WARNINGS;
+```
+
+```
+| Warning | 1265 | Data truncated for column 'code' at row 1 |
+```
+
+Even though the calling session is strict, the value was truncated with only a warning. You can see the stored mode of every routine:
+
+```sql
+SELECT routine_name, sql_mode FROM information_schema.routines
+WHERE routine_schema = 'modes';
+```
+
+After you tighten `sql_mode` on a server, re-create routines that were created under the old mode, or they keep the old behavior forever. Triggers have the same column in `information_schema.triggers`.
+
+## Combination Modes
+
+`ANSI` and `TRADITIONAL` are shortcuts that expand into several modes:
+
+```sql
+SET SESSION sql_mode = 'TRADITIONAL';
+SELECT @@SESSION.sql_mode;
+```
+
+```
+STRICT_TRANS_TABLES,STRICT_ALL_TABLES,NO_ZERO_IN_DATE,NO_ZERO_DATE,ERROR_FOR_DIVISION_BY_ZERO,TRADITIONAL,NO_ENGINE_SUBSTITUTION
+```
+
+The stored value keeps the combination name next to its parts, which is why you may see `TRADITIONAL` or `ANSI` in the middle of a list.
+
+Comparing settings across servers is a common cause of confusion. In [Chat2DB](https://chat2db.ai/download) you can open the same `SELECT @@GLOBAL.sql_mode, @@SESSION.sql_mode` query on each connection side by side, and the AI assistant explains which mode causes an error such as 1055 or 1292.
+
+## FAQ
+
+### Should I turn off strict mode to fix errors after an upgrade?
+
+Only as a short-term measure, and preferably per session for the affected application, not globally. Strict mode errors point at real data problems: truncated strings, invalid dates and missing values. Fix the application or the schema, for example by adding a default for the column in error 1364, and keep the server strict.
+
+### Why does SET GLOBAL sql_mode not change my application's behavior?
+
+`SET GLOBAL` only affects connections opened afterwards. Connection pools keep their connections for a long time, so restart the application or recycle the pool. Also check that the application or its driver does not set its own session `sql_mode` when it connects.
+
+### What is the difference between STRICT_TRANS_TABLES and STRICT_ALL_TABLES?
+
+They differ only for non-transactional tables such as MyISAM. With `STRICT_TRANS_TABLES`, an invalid value in the first row is an error, but later rows of a multi-row insert get adjusted values and warnings, because earlier rows cannot be rolled back. With `STRICT_ALL_TABLES` every invalid value is an error, which can leave a MyISAM table partly updated. For InnoDB tables both behave the same.
