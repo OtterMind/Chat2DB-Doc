@@ -1,0 +1,256 @@
+---
+title: "MySQL Error 1406: Data Too Long for Column (Fix)"
+description: "Fix MySQL ERROR 1406 'Data too long for column': VARCHAR vs byte limits, emoji, UUIDs in BINARY(16), BIT and TEXT columns, strict mode and finding bad rows."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: October 28, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# MySQL Error 1406: Data Too Long for Column (Fix)
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="October 28, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+MySQL raises this error when a value does not fit into the column it is written to:
+
+```
+ERROR 1406 (22001): Data too long for column 'name' at row 1
+```
+
+SQLSTATE `22001` means "string data, right truncation". In strict mode, which is the default since MySQL 5.7, MySQL refuses to cut the value short and rejects the whole statement. In non-strict mode the same insert succeeds with a warning and silently stores a truncated value.
+
+The column name in the message tells you where to look. The confusing part is usually how the length is counted. This guide reproduces the error on MySQL 8.4.11 for the common column types and shows how to find and fix the rows that do not fit.
+
+## Reproducing It
+
+```sql
+CREATE TABLE customers (
+  id     int PRIMARY KEY AUTO_INCREMENT,
+  name   varchar(10),
+  code   char(3),
+  bio    text,
+  uid    binary(16),
+  note   tinytext
+) CHARSET utf8mb4;
+
+INSERT INTO customers (name) VALUES ('Christopher');
+```
+
+```
+ERROR 1406 (22001): Data too long for column 'name' at row 1
+```
+
+`'Christopher'` has 11 characters and the column allows 10. The other columns behave the same way when their limit is exceeded:
+
+```sql
+INSERT INTO customers (code) VALUES ('USA1');                -- char(3)
+INSERT INTO customers (note) VALUES (repeat('x', 256));      -- tinytext, 255 bytes
+INSERT INTO customers (bio)  VALUES (repeat('x', 65536));    -- text, 65535 bytes
+```
+
+```
+ERROR 1406 (22001): Data too long for column 'code' at row 1
+ERROR 1406 (22001): Data too long for column 'note' at row 1
+ERROR 1406 (22001): Data too long for column 'bio' at row 1
+```
+
+In a multi-row insert, "at row N" is the position of the offending row in the statement, counting from 1:
+
+```sql
+INSERT INTO t2 VALUES ('abc'), ('abcdefgh'), ('xyz');   -- v varchar(5)
+```
+
+```
+ERROR 1406 (22001): Data too long for column 'v' at row 2
+```
+
+The whole statement is rolled back, so none of the three rows is inserted.
+
+## How MySQL Counts Length
+
+Most surprises come from the difference between characters and bytes.
+
+**`CHAR(n)` and `VARCHAR(n)` count characters.** A `varchar(10)` column in `utf8mb4` accepts ten characters even if each is a 4-byte emoji. In our test, `'Chris 😀😀😀😀'` (10 characters, 22 bytes) was accepted, while `'Chris 😀😀😀😀😀'` (11 characters, 26 bytes) failed:
+
+```sql
+SELECT char_length('Chris 😀😀😀😀😀'), length('Chris 😀😀😀😀😀');
+```
+
+```
++-----------------------+------------------+
+| char_length(...)      | length(...)      |
++-----------------------+------------------+
+|                    11 |               26 |
++-----------------------+------------------+
+```
+
+`'Gökhan Öz'` (9 characters) fits as well. When you check lengths in application code, count characters (code points) the way MySQL does, not bytes and not UTF-16 units. In JavaScript, `'😀'.length` is 2.
+
+**`TINYTEXT`, `TEXT`, `MEDIUMTEXT` and `LONGTEXT` count bytes:** 255, 65,535, 16,777,215 and 4,294,967,295 bytes. In `utf8mb4`, a `TEXT` column holds 65,535 ASCII characters but only about 32,767 two-byte characters such as `é`. `repeat('é', 40000)` is 80,000 bytes and fails in a `TEXT` column, even though it is only 40,000 characters.
+
+**`BINARY(n)`, `VARBINARY(n)` and `BLOB` types count bytes.**
+
+You can see both limits in the data dictionary:
+
+```sql
+SELECT column_name, data_type, character_maximum_length, character_octet_length
+FROM information_schema.columns
+WHERE table_schema = 'dt' AND table_name = 'customers';
+```
+
+```
+| name  | varchar  |    10 |    40 |
+| code  | char     |     3 |    12 |
+| bio   | text     | 65535 | 65535 |
+| uid   | binary   |    16 |    16 |
+| note  | tinytext |   255 |   255 |
+```
+
+`character_maximum_length` is the limit MySQL enforces for `CHAR` and `VARCHAR`. For the `TEXT` types the byte limit is the one that counts.
+
+## Common Real-World Causes
+
+### A UUID string inserted into BINARY(16)
+
+A very common case in schemas that store UUIDs compactly:
+
+```sql
+INSERT INTO customers (uid) VALUES ('6ccd780c-baba-1026-9564-5b8c656024db');
+```
+
+```
+ERROR 1406 (22001): Data too long for column 'uid' at row 1
+```
+
+The 36-character text does not fit into 16 bytes. Convert it on the way in and out:
+
+```sql
+INSERT INTO customers (uid) VALUES (UUID_TO_BIN('6ccd780c-baba-1026-9564-5b8c656024db'));
+SELECT BIN_TO_UUID(uid) FROM customers;
+```
+
+Use the same `swap_flag` everywhere: `UUID_TO_BIN(u, 1)` must be read with `BIN_TO_UUID(b, 1)`. The free [MySQL UUID to BINARY(16) Converter](https://chat2db.ai/tools/mysql-uuid-binary-converter) converts values in both directions and shows which swap flag a stored value was written with.
+
+### An UPDATE that grows a value
+
+`UPDATE` checks the new value, not the old one:
+
+```sql
+UPDATE customers SET name = concat(name, ' - archived') WHERE id = 100;   -- name was 'Ada'
+```
+
+```
+ERROR 1406 (22001): Data too long for column 'name' at row 1
+```
+
+Soft-delete patterns that append a suffix to a unique column, such as `email`, hit this as soon as a long value is archived.
+
+### BIT columns
+
+`BIT(n)` counts bits. Writing 8 (binary `1000`) into a `bit(3)` column fails with the same message:
+
+```sql
+INSERT INTO t4 (b) VALUES (8);
+-- ERROR 1406 (22001): Data too long for column 'b' at row 1
+```
+
+### Errors that look similar but are not 1406
+
+- Numbers that are too large give `ERROR 1264 (22003): Out of range value for column` (for example `1234.5` into `decimal(5,2)`).
+- An `ENUM` value that is not in the list gives `ERROR 1265 (01000): Data truncated for column`.
+- Characters the column's character set cannot store give `ERROR 1366 (HY000): Incorrect string value`. `'Ωmega'` into a `latin1` column or an emoji into a `utf8mb3` column fails this way, not with 1406. See our [error 1366 guide](/blog/mysql-error-1366-incorrect-string-value).
+
+## Trailing Spaces Are Not an Error
+
+For `CHAR` and `VARCHAR`, MySQL treats excess trailing spaces specially. `'Christophe '` (10 letters and a space) into `varchar(10)` succeeds even in strict mode, with a note instead of an error:
+
+```
+Query OK, 1 row affected, 1 warning
+| Note | 1265 | Data truncated for column 'name' at row 1 |
+```
+
+Only spaces are dropped this way. `'Christophe x'` fails with 1406. If data from a fixed-width file "sometimes" fails, check for trailing spaces versus real characters.
+
+## Strict Mode and Why Turning It Off Is the Wrong Fix
+
+With `STRICT_TRANS_TABLES` removed, the insert succeeds and data is lost silently:
+
+```sql
+SET SESSION sql_mode = '';
+INSERT INTO customers (name) VALUES ('Christopher');
+SHOW WARNINGS;
+```
+
+```
+| Warning | 1265 | Data truncated for column 'name' at row 1 |
+```
+
+The table now contains `'Christophe'`. `INSERT IGNORE` does the same thing in strict mode. Both "fix" the error by corrupting the data, and a truncated email address or URL is worse than a failed insert. Keep strict mode on. Our [sql_mode guide](/blog/mysql-sql-mode-explained) explains the modes in detail, and the [error 1265 guide](/blog/mysql-error-1265-data-truncated) covers the warning side.
+
+## Fix 1: Make the Column Fit the Data
+
+If the data is legitimate, widen the column:
+
+```sql
+ALTER TABLE customers MODIFY name varchar(50);
+```
+
+Repeat every attribute of the column in `MODIFY` (`NOT NULL`, `DEFAULT`, `COMMENT`, character set), because any attribute you leave out is dropped. In our 8.4 test, the change from `varchar(10)` to `varchar(50)` finished immediately with `0 rows affected`. Growing a `VARCHAR` within the same length-byte range is an in-place, metadata-only change (`ALGORITHM=INPLACE`, not `INSTANT`). Crossing the 255-byte boundary needs a table copy: changing `varchar(60)` to `varchar(100)` in `utf8mb4` with `ALGORITHM=INPLACE` was rejected with `ERROR 1846 ... Cannot change column type INPLACE. Try ALGORITHM=COPY`, which matters on large tables. Keep the index limits in mind as well: an index on `varchar(1000)` in `utf8mb4` exceeds the 3072-byte key limit.
+
+## Fix 2: Validate or Truncate Deliberately
+
+If the limit is a business rule, enforce it before the database does and tell the user. If truncation is acceptable, do it explicitly so it is visible in the code:
+
+```sql
+INSERT INTO customers (name) SELECT left('Christopher', 10);
+```
+
+`LEFT()` and `SUBSTRING()` count characters, so they never cut a multibyte character in half.
+
+## Fix 3: Find the Rows That Do Not Fit Before a Migration
+
+Before you shorten a column, or load data from another system, check what would fail:
+
+```sql
+-- rows that would fail in a varchar(10)
+SELECT id, name, char_length(name) FROM customers WHERE char_length(name) > 10;
+
+-- rows close to a TEXT byte limit
+SELECT id, length(bio) FROM customers WHERE length(bio) > 60000;
+```
+
+For CSV loads with `LOAD DATA`, load into a staging table with wide columns first, run these checks, and then `INSERT ... SELECT` into the real table.
+
+For a table with many text columns, let the data dictionary write the checks for you. This query generates one counting query per `CHAR` and `VARCHAR` column, using each column's real limit:
+
+```sql
+SELECT concat('SELECT ''', column_name, ''' AS col, count(*) AS too_long FROM ', table_name,
+              ' WHERE char_length(', column_name, ') > ', character_maximum_length, ' UNION ALL') AS q
+FROM information_schema.columns
+WHERE table_schema = 'dt' AND table_name = 'customers' AND data_type IN ('varchar', 'char');
+```
+
+```
+SELECT 'name' AS col, count(*) AS too_long FROM customers WHERE char_length(name) > 10 UNION ALL
+SELECT 'code' AS col, count(*) AS too_long FROM customers WHERE char_length(code) > 3 UNION ALL
+```
+
+Remove the last `UNION ALL` and run the result against the staging table, replacing the table name. Change `character_maximum_length` to the new, smaller size when you plan to shorten a column, and you get a list of exactly the rows the `ALTER TABLE` would reject. For `TEXT` and `BLOB` columns, compare `length()` with `character_octet_length` instead, because their limits are in bytes.
+
+## Why Applications Hit It After Working for Months
+
+1406 often appears long after a schema was designed, because real data slowly gets longer than the test data. Typical examples are customer names with several family names, addresses after a move to a country with longer street names, URLs with tracking parameters, error messages and stack traces written to a log table, and user agents. When you pick a size, look at the longest real values with `SELECT max(char_length(col))` and leave room for growth instead of matching today's maximum exactly. For free-form text where no natural limit exists, a `TEXT` column is often the more honest choice than a large `VARCHAR`.
+
+Finding the offending row in a big batch insert is the tedious part. [Chat2DB](https://chat2db.ai/download) shows column definitions next to the data, so you can compare a value with its column limit in the grid, and its AI assistant can write the `char_length` checks for every column of a table at once.
+
+## Summary
+
+- `ERROR 1406 (22001)` means a value is longer than its column in strict mode; the whole statement fails.
+- `CHAR`/`VARCHAR` limits are in characters, `TEXT` and `BINARY`/`BLOB` limits are in bytes, `BIT` limits are in bits.
+- UUID strings need `UUID_TO_BIN()` for `BINARY(16)` columns.
+- Excess trailing spaces only produce note 1265; other characters raise 1406.
+- Numbers, enums and unsupported characters fail with 1264, 1265 and 1366 instead.
+- Do not disable strict mode or use `INSERT IGNORE`; widen the column, validate input or truncate explicitly.

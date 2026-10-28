@@ -1,0 +1,205 @@
+---
+title: "Postgres: Cannot Insert Multiple Commands (Fix)"
+description: "Fix PostgreSQL 'cannot insert multiple commands into a prepared statement' (42601) from Node, Python and ORMs: split statements, use transactions or one CTE."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: October 28, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# Postgres: Cannot Insert Multiple Commands (Fix)
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="October 28, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+You send two SQL statements separated by a semicolon, along with some parameters, and PostgreSQL refuses to run them:
+
+```
+ERROR:  cannot insert multiple commands into a prepared statement
+```
+
+The SQLSTATE is `42601` (`syntax_error`), although nothing is wrong with the syntax of either statement. The same string works in psql, works in your GUI client, and even works from your application as long as you do not pass parameters. Add one `$1` and it fails.
+
+The reason is the protocol your driver uses, not the SQL. This guide reproduces the error with node-postgres and psql on PostgreSQL 18.6, explains why parameters change the behavior, and shows the right fix for the common cases: a transfer between two accounts, a batch of inserts, and migration scripts.
+
+## Why Parameters Make the Difference
+
+PostgreSQL has two ways to run SQL from a client.
+
+The **simple query protocol** sends one string. The server splits it at semicolons and runs each statement in turn. It cannot carry parameter values, so any values must already be inside the SQL text. psql uses it for normal input, and so do most drivers when you call them without parameters.
+
+The **extended query protocol** sends the SQL in a Parse message, the values in a separate Bind message, and then runs it. The server turns the SQL into one prepared statement, and a prepared statement holds exactly one command. If Parse receives more than one, it fails with "cannot insert multiple commands into a prepared statement", raised in the server function `exec_parse_message`.
+
+Drivers switch to the extended protocol whenever you pass parameters, because that is the only way to send values separately from the SQL. So the rule is:
+
+- Multiple statements **without** parameters: the simple protocol is used and the string works.
+- Multiple statements **with** parameters: the extended protocol is used and the string fails.
+
+## Reproducing the Error
+
+With node-postgres and a small `accounts` table:
+
+```sql
+CREATE TABLE accounts (id int PRIMARY KEY, balance numeric);
+CREATE TABLE audit_log (id serial, account_id int, delta numeric);
+INSERT INTO accounts VALUES (1, 100), (2, 50);
+```
+
+```javascript
+await client.query(
+  'UPDATE accounts SET balance = balance - $1 WHERE id = $2; ' +
+  'UPDATE accounts SET balance = balance + $1 WHERE id = $3',
+  [10, 1, 2]
+);
+// error: cannot insert multiple commands into a prepared statement  (code 42601)
+```
+
+The same two statements with the values typed into the SQL run fine, and node-postgres returns one result per statement:
+
+```javascript
+await client.query(
+  'UPDATE accounts SET balance = balance - 10 WHERE id = 1; ' +
+  'UPDATE accounts SET balance = balance + 10 WHERE id = 2; ' +
+  'SELECT * FROM accounts ORDER BY id'
+);
+// UPDATE | UPDATE | SELECT [{ id: 1, balance: '90' }, { id: 2, balance: '60' }]
+```
+
+psql 16 and later can use the extended protocol with `\bind`, and `\;` keeps two statements in one request, so you can see the same failure without writing code:
+
+```sql
+INSERT INTO app_users(name, email) VALUES ($1, $2) \; SELECT count(*) FROM app_users \bind Mia mia@example.com \g
+```
+
+```
+ERROR:  42601: cannot insert multiple commands into a prepared statement
+LOCATION:  exec_parse_message, postgres.c:1473
+```
+
+Forcing the extended protocol without any parameters gives the same error. node-postgres has a `queryMode: 'extended'` option for this:
+
+```javascript
+await client.query({ text: 'SELECT 1; SELECT 2', queryMode: 'extended' });
+// error: cannot insert multiple commands into a prepared statement
+```
+
+A trailing semicolon is fine. `SELECT $1::int AS x;` and even `SELECT $1::int AS x;;` work, because empty statements are ignored. A semicolon inside a string literal is also fine (`SELECT $1::text || ';'`). Only a second real command triggers the error.
+
+## Do Not "Fix" It by Inlining Values
+
+Since the error disappears when the parameters disappear, it is tempting to build the SQL with string concatenation. Do not do that with user input. Parameters exist so that values can never become SQL, and inlining them opens the door to SQL injection. Use one of the fixes below instead.
+
+## Fix 1: Separate Queries in One Transaction
+
+The most direct fix: send each statement on its own, and wrap them in a transaction if they must succeed or fail together. With node-postgres the transaction must run on one client, not on the pool, because every `pool.query()` call may use a different connection:
+
+```javascript
+const client = await pool.connect();
+try {
+  await client.query('BEGIN');
+  await client.query('UPDATE accounts SET balance = balance - $1 WHERE id = $2', [1, 1]);
+  await client.query('UPDATE accounts SET balance = balance + $1 WHERE id = $2', [1, 2]);
+  await client.query('COMMIT');
+} catch (e) {
+  await client.query('ROLLBACK');
+  throw e;
+} finally {
+  client.release();
+}
+```
+
+This costs one round trip per statement. For a handful of statements that is negligible. In return, each statement gets its own result and its own error.
+
+## Fix 2: Combine the Writes Into One Statement With a CTE
+
+PostgreSQL allows `INSERT`, `UPDATE` and `DELETE` inside `WITH` clauses, so related writes can often become one statement that uses the parameters once:
+
+```sql
+WITH debit AS (
+  UPDATE accounts SET balance = balance - $1 WHERE id = $2 RETURNING id
+), credit AS (
+  UPDATE accounts SET balance = balance + $1 WHERE id = $3 RETURNING id
+)
+INSERT INTO audit_log (account_id, delta)
+SELECT id, -$1::numeric FROM debit
+UNION ALL
+SELECT id, $1 FROM credit
+RETURNING account_id, delta;
+```
+
+With `[5, 1, 2]` this moved 5 from account 1 to account 2 and wrote two audit rows in one round trip:
+
+```
+[{ account_id: 1, delta: '-5' }, { account_id: 2, delta: '5' }]
+```
+
+A single statement is also atomic on its own, so no explicit transaction is needed. There are limits. All sub-statements see the same snapshot, so one CTE cannot see rows that another CTE in the same statement changed. The same row should not be modified twice in one statement. And a CTE cannot contain DDL.
+
+## Fix 3: One Statement for Many Rows
+
+When the multiple statements are really one insert per row, send all rows as arrays and expand them on the server with `unnest`:
+
+```sql
+INSERT INTO audit_log (account_id, delta)
+SELECT * FROM unnest($1::int[], $2::numeric[])
+RETURNING id, account_id, delta;
+```
+
+```javascript
+await client.query(sql, [[1, 2, 1], [1.5, -2, 3]]);
+// three rows inserted with one statement and two parameters
+```
+
+This is faster than a loop of single inserts and keeps the parameter count fixed however many rows you send. For large loads, use `COPY` instead.
+
+## Fix 4: Move the Logic Into a Function or Procedure
+
+If the sequence of statements is part of your business logic, put it in a function and call it with parameters:
+
+```sql
+CREATE FUNCTION transfer(amount numeric, from_id int, to_id int) RETURNS void
+LANGUAGE plpgsql AS $$
+BEGIN
+  UPDATE accounts SET balance = balance - amount WHERE id = from_id;
+  UPDATE accounts SET balance = balance + amount WHERE id = to_id;
+END $$;
+```
+
+```javascript
+await client.query('SELECT transfer($1, $2, $3)', [10, 1, 2]);
+```
+
+The call is a single statement, so the extended protocol is happy, and the function body runs inside the caller's transaction.
+
+## Fix 5: Scripts Without Parameters Can Use the Simple Protocol
+
+Schema migrations and seed files usually contain many statements and no parameters. Run them through the simple protocol: call the driver without a values argument, or use psql (`psql -f migration.sql`). Keep in mind that a multi-statement string sent in one simple query runs as one implicit transaction. In our test, an `UPDATE` followed by a failing statement was rolled back:
+
+```javascript
+await client.query('UPDATE accounts SET balance = 0 WHERE id = 1; SELECT 1/0');
+// error: division by zero  -- and the UPDATE was rolled back too
+```
+
+That is usually what you want for a migration. Note that commands like `CREATE INDEX CONCURRENTLY` or `VACUUM` cannot run inside a transaction block, so they fail inside a multi-statement string. Put them in their own call.
+
+## What Different Drivers Do
+
+The error is the same everywhere, but drivers differ in when they use the extended protocol:
+
+- **node-postgres** uses it whenever you pass a values array, or when `queryMode: 'extended'` is set.
+- **psycopg 3** sends queries with parameters through the extended protocol, so multiple statements with parameters fail. psycopg2 merged the values into the SQL text on the client side, which is why code that worked with psycopg2 can break after an upgrade.
+- **ORMs and query builders** hit the same error whenever they pass values as bound parameters, for example Prisma's raw queries, Knex `raw` with bindings or Sequelize's `bind` option. Sequelize `replacements` are escaped into the SQL on the client instead. Split the SQL into separate calls inside the ORM's transaction API.
+- **pgJDBC** splits a multi-statement string on its own and sends the parts together, so this error is rare from Java.
+
+If you are not sure what your library sends, enable `log_statement = 'all'` on a development server and read the log, or look at `pg_stat_activity.query` while the call runs.
+
+Multi-statement scripts are much easier to debug in a client that runs them statement by statement and shows each result. In [Chat2DB](https://chat2db.ai/download) you can run the script, see which statement failed, and ask the AI assistant to rewrite a group of statements as one CTE before you move it into application code. For the related count mismatch error, see [bind message supplies N parameters](/blog/postgres-bind-message-supplies-parameters).
+
+## Summary
+
+- "cannot insert multiple commands into a prepared statement" (`42601`) means a string with more than one statement was sent through the extended protocol, which drivers use whenever you pass parameters.
+- The same string works without parameters because the simple protocol splits statements on the server.
+- Do not inline values to avoid it. Send separate statements in one transaction, merge writes into one CTE, use `unnest` for many rows, or call a function.
+- Multi-statement simple queries run as one implicit transaction; `CREATE INDEX CONCURRENTLY` and `VACUUM` need their own calls.

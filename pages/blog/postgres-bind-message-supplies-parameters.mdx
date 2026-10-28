@@ -1,0 +1,245 @@
+---
+title: "Postgres: Bind Message Supplies N Parameters Fix"
+description: "Fix 'bind message supplies 1 parameters, but prepared statement requires 2' (08P01): placeholders inside quotes and comments, wrong value counts and IN lists."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: October 28, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# Postgres: Bind Message Supplies N Parameters Fix
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="October 28, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+When an application sends a parameterized query to PostgreSQL, the server compares the number of values with the number of placeholders. If they differ, it rejects the query:
+
+```
+ERROR:  bind message supplies 1 parameters, but prepared statement "" requires 2
+```
+
+The SQLSTATE is `08P01` (`protocol_violation`). The name sounds alarming, but it does not mean your network or driver is broken. It means the values your code passed and the `$n` placeholders PostgreSQL found in the SQL text do not match. The empty name `""` refers to the unnamed prepared statement that most drivers use for one-off queries.
+
+The confusing case is "requires 0": you can see `$1` in your SQL, but PostgreSQL says the statement has no parameters. This guide reproduces every variant with node-postgres and psql against PostgreSQL 18.6 and shows the fix for each.
+
+## How Parameters Reach PostgreSQL
+
+Drivers that use server-side parameters speak the extended query protocol. Each query is sent as several messages:
+
+1. **Parse**: the SQL text with `$1`, `$2`, ... placeholders. The server parses it and counts the parameters.
+2. **Bind**: the parameter values. The server checks that their number matches the count from Parse.
+3. **Execute**: run it and return rows.
+
+The error comes from the Bind step (`exec_bind_message` in the server source). PostgreSQL counts placeholders with the real SQL lexer. A `$1` inside a string literal, a comment or a dollar-quoted function body is just text, not a parameter. That rule explains most of the surprising cases below.
+
+You can reproduce the protocol behavior from psql 16 or later with `\bind`:
+
+```sql
+SELECT $1::int + $2::int AS s \bind 1 \g
+```
+
+```
+ERROR:  bind message supplies 1 parameters, but prepared statement "" requires 2
+```
+
+```sql
+SELECT $1::int + $2::int AS s \bind 1 2 \g
+```
+
+```
+ s
+---
+ 3
+(1 row)
+```
+
+## Case 1: Too Few or Too Many Values
+
+The simple case is a plain count mismatch. In node-postgres:
+
+```javascript
+await client.query('SELECT $1::int + $2::int AS s', [1]);
+// error: bind message supplies 1 parameters, but prepared statement "" requires 2
+
+await client.query('SELECT $1::int AS s', [1, 2]);
+// error: bind message supplies 2 parameters, but prepared statement "" requires 1
+```
+
+PostgreSQL is strict in both directions. Extra values are an error too, which surprises developers who are used to drivers that ignore unused named parameters. Typical causes:
+
+- A query builder adds a condition to the values array but the SQL fragment for it was skipped, or the other way round.
+- A refactor removed a `WHERE` clause and left its value in the array.
+- The array was built with a spread of an object (`Object.values(filters)`) that contains an extra key.
+
+Build the SQL text and the values array in the same place, one condition at a time, so they cannot drift apart:
+
+```javascript
+const where = [];
+const values = [];
+if (filters.name) { values.push(filters.name); where.push(`name = $${values.length}`); }
+if (filters.email) { values.push(filters.email); where.push(`email = $${values.length}`); }
+const sql = `SELECT * FROM app_users${where.length ? ' WHERE ' + where.join(' AND ') : ''}`;
+await client.query(sql, values);
+```
+
+## Case 2: Placeholder Inside a String Literal ("requires 0")
+
+This is the most common "requires 0" case:
+
+```javascript
+await client.query("SELECT * FROM app_users WHERE name LIKE '%$1%'", ['Ada']);
+```
+
+```
+error: bind message supplies 1 parameters, but prepared statement "" requires 0
+```
+
+`'%$1%'` is a string literal that happens to contain a dollar sign and a digit. PostgreSQL does not look for placeholders inside it, so the statement has zero parameters and the one value is rejected. Concatenate the wildcard around the parameter instead:
+
+```javascript
+await client.query("SELECT * FROM app_users WHERE name LIKE '%' || $1 || '%'", ['Ad']);
+// [{ id: 1, name: 'Ada', email: 'ada@example.com' }]
+```
+
+Or build the pattern in application code and pass it as the value (`LIKE $1` with `'%Ad%'`). If user input can contain `%` or `_`, escape them first, or those characters will act as wildcards.
+
+## Case 3: Placeholder Inside a Comment or a DO Block
+
+Comments are removed by the lexer, so a `$1` there does not count:
+
+```javascript
+await client.query('SELECT * FROM app_users -- filter by $1\n', ['x']);
+// error: bind message supplies 1 parameters, but prepared statement "" requires 0
+```
+
+This usually happens when someone comments out the condition that used the parameter during debugging and forgets the value.
+
+Anonymous code blocks are a harder case. The body of a `DO` block is a dollar-quoted string, so placeholders inside it are invisible to the server:
+
+```javascript
+await client.query('DO $$ BEGIN PERFORM $1; END $$', [1]);
+// error: bind message supplies 1 parameters, but prepared statement "" requires 0
+```
+
+`DO` cannot take parameters at all. Create a function and call it with parameters, or set a custom setting first and read it inside the block:
+
+```sql
+SELECT set_config('app.user_id', $1, false);   -- parameterized
+DO $$ BEGIN RAISE NOTICE 'user %', current_setting('app.user_id'); END $$;
+```
+
+## Case 4: Utility Commands Do Not Accept Parameters
+
+Only `SELECT`, `INSERT`, `UPDATE`, `DELETE`, `MERGE` and `VALUES` statements accept `$n` placeholders. Commands like `SET`, `CREATE USER ... PASSWORD`, `LISTEN` or `ALTER ROLE` do not. Here the error is a syntax error rather than a bind error:
+
+```javascript
+await client.query('SET statement_timeout = $1', ['5s']);
+// error: syntax error at or near "$1"
+```
+
+Use the function form where one exists:
+
+```javascript
+await client.query("SELECT set_config('statement_timeout', $1, false)", ['5s']);
+```
+
+For DDL such as `CREATE ROLE`, quote identifiers and literals safely in your application (node-postgres has `client.escapeIdentifier` and `client.escapeLiteral`), or call a server-side function that uses `format('%I', ...)` and `format('%L', ...)` with `EXECUTE`.
+
+## Case 5: The Wrong Placeholder Style
+
+PostgreSQL only understands `$1`, `$2`, ... Placeholders from other drivers or databases reach the server as plain text and fail as syntax errors:
+
+```javascript
+await client.query('SELECT * FROM app_users WHERE name = ?', ['Ada']);
+// error: syntax error at end of input
+
+await client.query('SELECT * FROM app_users WHERE name = :name', ['Ada']);
+// error: syntax error at or near ":"
+```
+
+Some libraries translate `?` or `:name` into `$n` before sending. pgJDBC does this for `?`, and ORMs do it for their own syntax. If you mix a translating layer with hand-written `$1` SQL, or send raw SQL past the translator, the counts no longer match. Check what actually reaches the server: with `log_min_error_statement = error` (the default), PostgreSQL logs the failing statement next to the error:
+
+```
+ERROR:  bind message supplies 1 parameters, but prepared statement "" requires 2
+STATEMENT:  select $1::int + $2::int as s
+```
+
+## Case 6: Gaps in the Numbering
+
+PostgreSQL derives the number of parameters from the highest `$n` it sees. If you skip a number, the count still matches, but the server cannot infer a type for the unused parameter:
+
+```javascript
+await client.query('SELECT $2::int AS s', [1, 2]);
+// error: could not determine data type of parameter $1   (SQLSTATE 42P18)
+
+await client.query('SELECT $1::text, $3::text', ['a', 'b', 'c']);
+// error: could not determine data type of parameter $2
+```
+
+So "requires 3" with three values can still fail. Renumber the placeholders, or add an explicit cast for each one. Our guide to [could not determine data type of parameter](/blog/postgres-could-not-determine-data-type-of-parameter) covers that error in detail.
+
+## Case 7: Passing a List to IN
+
+A single placeholder is always a single value. Joining an array into a string does not create several parameters:
+
+```javascript
+await client.query('SELECT * FROM app_users WHERE id IN ($1)', ['1,2']);
+// error: invalid input syntax for type integer: "1,2"
+```
+
+Pass a real array and compare with `= ANY`:
+
+```javascript
+await client.query('SELECT * FROM app_users WHERE id = ANY($1)', [[1, 2]]);
+// returns users 1 and 2
+```
+
+This keeps the statement at one parameter however long the list is. Code that generates `IN ($1, $2, ..., $n)` dynamically is a frequent source of off-by-one count mismatches. It also creates a new statement text for every list length, which defeats prepared statement caching.
+
+## Case 8: Named Prepared Statements
+
+When the message shows a name instead of `""`, the statement was prepared once under that name and executed later. Drivers do this for statements they cache, and the name is chosen by the driver. psql 17 and later can do the same with `\parse` and `\bind_named`, which is a convenient way to test:
+
+```sql
+SELECT * FROM app_users WHERE id = $1 AND name = $2 \parse get_user
+\bind_named get_user 1 \g
+```
+
+```
+ERROR:  bind message supplies 1 parameters, but prepared statement "get_user" requires 2
+```
+
+The server remembers what it parsed, and `pg_prepared_statements` shows the parameter types it inferred:
+
+```sql
+SELECT name, parameter_types FROM pg_prepared_statements;
+```
+
+```
+   name   | parameter_types
+----------+-----------------
+ get_user | {integer,text}
+```
+
+The statement is prepared once, but each execution supplies its own values, so a mismatch can appear on some calls and not others. The usual cause is application code that reuses a cached statement name for a different SQL text, or connection poolers in transaction mode that move a session's named statements between server connections. If the reported name belongs to your driver's cache, check whether the same name could be used with two different queries.
+
+## Debugging Checklist
+
+1. Read the two numbers in the message. "Supplies" is what your code sent, "requires" is what PostgreSQL found in the SQL.
+2. If it says "requires 0", look for `$n` inside quotes, comments, `DO` blocks or function bodies.
+3. Print the final SQL and values right before the call, or read the `STATEMENT:` line in the server log.
+4. Make sure every `$n` from 1 to the highest number appears in the SQL.
+5. For lists, use `= ANY($1)` with an array.
+
+To experiment with the placeholders outside your application, paste the query and its values into the free [SQL Parameter Binder](https://chat2db.ai/tools/sql-parameter-binder), which fills each value into its placeholder and gives you runnable SQL to inspect. If you want to run and edit the inlined query against a real database, [Chat2DB](https://chat2db.ai/download) can execute it directly and its AI assistant can explain why a statement has fewer parameters than you expected.
+
+## Summary
+
+- `bind message supplies X parameters, but prepared statement "" requires Y` (`08P01`) means the value count does not match the `$n` placeholders PostgreSQL parsed.
+- Placeholders inside string literals, comments and dollar-quoted bodies (`DO $$ ... $$`) are not parameters, which gives "requires 0".
+- Extra values are an error, not ignored.
+- Utility commands like `SET` take no parameters; use `set_config()` or safe quoting.
+- Gaps in numbering cause `could not determine data type of parameter` (`42P18`).
+- Pass lists as one array parameter with `= ANY($1)`.

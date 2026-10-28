@@ -1,0 +1,200 @@
+---
+title: "MySQL Error 1206: Locks Exceed Lock Table Size"
+description: "Fix MySQL ERROR 1206 'The total number of locks exceeds the lock table size': size the InnoDB buffer pool, batch big DELETE and UPDATE jobs."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: October 28, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# MySQL Error 1206: Locks Exceed Lock Table Size
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="October 28, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+A large `DELETE`, `UPDATE` or locking `SELECT` stops with:
+
+```
+ERROR 1206 (HY000): The total number of locks exceeds the lock table size
+```
+
+The wording suggests a fixed "lock table" with a size setting, but InnoDB has no such setting. Row locks are stored in memory taken from the InnoDB buffer pool. When one transaction locks so many rows that its lock structures would crowd out the data pages, InnoDB refuses to create more locks and returns 1206. The two real causes are almost always a buffer pool that is too small, and a single statement that touches far too many rows.
+
+This guide reproduces the error on MySQL 8.4.11 with a deliberately tiny buffer pool, measures how much memory locks take, and compares the fixes. One of our attempts did not return 1206 at all. It crashed the server on purpose, which is worth knowing before you try this on a production machine.
+
+## Where Lock Memory Comes From
+
+InnoDB does not keep one lock object per row. It creates one lock structure per page (per transaction and lock mode), with a bitmap that marks which records on that page are locked. Locking every row of a table therefore costs memory proportional to the number of pages, not the number of rows.
+
+Those structures are allocated from the buffer pool, the same memory that caches table and index pages (`innodb_buffer_pool_size`). InnoDB checks how much of the pool is taken by lock memory and similar non-data objects:
+
+- When such memory takes up most of the pool, new lock requests fail with error 1206. This happens at about three quarters of the pool.
+- If it keeps growing past 95 percent anyway, InnoDB deliberately crashes the server with a stack trace, because it can no longer read data pages.
+
+With a reasonably sized buffer pool you will rarely see either. The error shows up on servers that still run with a small default or a container memory limit, and in jobs that modify millions of rows in a single statement.
+
+## Reproducing the Error
+
+We started a throwaway MySQL 8.4 server with the minimum buffer pool size of 5 MB and 4 KB pages, so that a small table spans many pages:
+
+```bash
+docker run -d --name my1206 -e MYSQL_ROOT_PASSWORD=pw mysql:8.4 \
+  --innodb-buffer-pool-size=5M --innodb-page-size=4k
+```
+
+```sql
+SELECT @@innodb_buffer_pool_size, @@innodb_page_size;
+-- 5242880 | 4096
+
+CREATE TABLE big (id int PRIMARY KEY, pad varchar(1500));
+SET SESSION cte_max_recursion_depth = 1000000;
+INSERT INTO big
+SELECT n, repeat('x', 1500)
+FROM (WITH RECURSIVE s(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM s WHERE n < 150000)
+      SELECT n FROM s) t;
+```
+
+A locking read over all 150,000 rows:
+
+```sql
+BEGIN;
+SELECT id FROM big FOR SHARE;
+```
+
+```
+ERROR 1206 (HY000): The total number of locks exceeds the lock table size
+```
+
+That is the normal, recoverable form of the error. The transaction gets the error and the server keeps running.
+
+## Our Attempt That Crashed the Server
+
+Before that, we tried a plain `UPDATE big SET pad = 'y'` in a transaction. The update also writes undo records and dirties pages, so memory pressure grew faster than the lock check caught it. The server did not return 1206. It wrote this to the error log and restarted:
+
+```
+[ERROR] [MY-013962] [InnoDB] buf_LRU_check_size_of_non_data_objects(): Over 95 percent of the buffer pool
+(curr_size=5 MB) is occupied by lock heaps or the adaptive hash index or BUF_BLOCK_MEMORY pages.
+Check that your transactions do not set too many row locks. Maybe you should make the buffer pool bigger?.
+We intentionally generate a seg fault to print a stack trace on Linux!
+[ERROR] [MY-013183] [InnoDB] Assertion failure: buf0lru.cc:1265:!buf_pool_full
+```
+
+After crash recovery the table was intact and the update was gone, since it was never committed. But every other connection was dropped. A server with a badly undersized buffer pool can go down from one big statement, not just fail that statement.
+
+## Measuring Lock Memory
+
+`information_schema.innodb_trx` shows how many locks a transaction holds and how much memory they use. Locking 20,000 of the rows:
+
+```sql
+BEGIN;
+SELECT count(*) FROM (SELECT id FROM big WHERE id <= 20000 FOR SHARE) t;
+
+SELECT trx_rows_locked, trx_lock_structs, trx_lock_memory_bytes
+FROM information_schema.innodb_trx
+WHERE trx_mysql_thread_id = connection_id();
+```
+
+```
++-----------------+------------------+-----------------------+
+| trx_rows_locked | trx_lock_structs | trx_lock_memory_bytes |
++-----------------+------------------+-----------------------+
+|           32340 |            12342 |               1332328 |
++-----------------+------------------+-----------------------+
+```
+
+About 1.3 MB of lock memory for 20,000 rows on 4 KB pages. After increasing the buffer pool, locking all 150,000 rows succeeded and used:
+
+```
+|          233215 |            83216 |               8971368 |
+```
+
+Almost 9 MB of lock memory, well over the original 5 MB buffer pool. `trx_rows_locked` is higher than the number of rows because, under `REPEATABLE READ`, InnoDB also locks the supremum pseudo-record at the end of each page. In the first measurement, 32,340 − 20,000 = 12,340, almost exactly the number of lock structures, which means one per page.
+
+Run this query from a second session against a long-running job to see whether it is heading for trouble. You can also look at the `TRANSACTIONS` section of `SHOW ENGINE INNODB STATUS`, which prints the lock structs and heap size for each transaction.
+
+## Fix 1: Give the Buffer Pool Realistic Memory
+
+On a dedicated database server, the buffer pool usually gets 50 to 75 percent of RAM. Check what you have:
+
+```sql
+SELECT @@innodb_buffer_pool_size / 1024 / 1024 AS mb;
+```
+
+You can resize the pool online since MySQL 5.7:
+
+```sql
+SET GLOBAL innodb_buffer_pool_size = 64 * 1024 * 1024;
+SHOW STATUS LIKE 'Innodb_buffer_pool_resize_status%';
+SELECT @@innodb_buffer_pool_size;
+```
+
+```
+| Innodb_buffer_pool_resize_status          | Completed resizing buffer pool at 261028 23:22:19. |
+| Innodb_buffer_pool_resize_status_code     | 0                                                  |
+
+68157440
+```
+
+The pool is resized in multiples of `innodb_buffer_pool_chunk_size × innodb_buffer_pool_instances`, so the value you get can be a bit larger than the value you asked for. Here it was 65 MB instead of 64 MB, because the chunk size had been reduced to 5 MB to fit the original pool. Persist the value in `my.cnf` or with `SET PERSIST` so a restart does not undo it. On MySQL 8.0 and later, `innodb_dedicated_server = ON` sizes the pool automatically from the machine's memory, which is a reasonable choice for a database host. In containers, make sure the container memory limit is larger than the pool plus per-connection memory.
+
+The free [MySQL Config Calculator](https://chat2db.ai/tools/mysql-config-calculator) suggests a buffer pool size and related settings from your server's RAM and workload.
+
+## Fix 2: Split Huge Statements Into Batches
+
+A bigger buffer pool only moves the limit. A statement that modifies tens of millions of rows in one transaction also creates a huge undo log, holds locks that block other sessions, makes replication lag, and takes a long time to roll back if it fails. Batch it instead. With the buffer pool back at 5 MB, deleting in chunks of 5,000 rows worked where a single statement could not:
+
+```sql
+DELETE FROM big WHERE id <= 5000;
+DELETE FROM big WHERE id <= 10000;
+DELETE FROM big ORDER BY id LIMIT 5000;
+SELECT count(*) FROM big;   -- 135000
+```
+
+In practice you loop over primary key ranges until no rows are affected:
+
+```sql
+-- repeat until ROW_COUNT() = 0, with autocommit on
+DELETE FROM events WHERE created_at < '2025-01-01' ORDER BY id LIMIT 10000;
+```
+
+Walking the primary key in ranges (`WHERE id BETWEEN @lo AND @hi`) is faster than `ORDER BY ... LIMIT` on very large tables, because each batch starts where the last one ended. Tools such as `pt-archiver` from Percona Toolkit implement this pattern with throttling.
+
+For "delete almost everything" jobs, it is often better to copy the rows you keep into a new table and swap them with `RENAME TABLE`, or to drop old partitions if the table is partitioned by date. Neither takes row locks on the deleted rows.
+
+## Fix 3: Lock Fewer Rows Per Statement
+
+Locks are taken on the rows a statement scans, not only on the rows it changes. Under the default `REPEATABLE READ`, an `UPDATE` or `DELETE` whose `WHERE` clause cannot use an index scans and locks the whole table. Add an index on the filter columns so the statement touches only matching rows:
+
+```sql
+EXPLAIN DELETE FROM events WHERE created_at < '2025-01-01';
+-- type: ALL means a full scan, and every scanned row is locked
+CREATE INDEX idx_events_created_at ON events (created_at);
+```
+
+`READ COMMITTED` releases locks on rows that do not match the `WHERE` condition, which helps scan-heavy updates. It does not help when the statement really needs every row. In our test, `SELECT ... FOR SHARE` over the whole table still failed with 1206 under `READ COMMITTED`, because every row matched.
+
+Also check whether the lock is needed at all. A report that reads millions of rows with `FOR SHARE` or `FOR UPDATE` usually wants a consistent snapshot, not locks. A plain `SELECT` inside a `REPEATABLE READ` transaction gives you that without locking anything.
+
+## Is 1206 Related to Deadlocks or Lock Wait Timeouts?
+
+No. Error 1213 (deadlock) and 1205 (lock wait timeout) are about two transactions waiting for each other's locks. Error 1206 is about one transaction holding too many locks for the available memory. A batching fix often reduces all three, though, because smaller transactions hold fewer locks for less time. See our guides to [deadlocks](/blog/mysql-error-1213-deadlock-found) and [lock wait timeouts](/blog/mysql-lock-wait-timeout-exceeded).
+
+## Checklist
+
+1. Check `@@innodb_buffer_pool_size`. Anything in the low megabytes on a production server is the likely cause.
+2. Find the statement and check how many rows it scans with `EXPLAIN`.
+3. Watch `trx_lock_memory_bytes` in `information_schema.innodb_trx` while it runs.
+4. Batch big `DELETE` and `UPDATE` jobs by primary key range.
+5. Add indexes so statements lock only the rows they change.
+
+Long-running maintenance statements are easier to control when you can watch them from another session. In [Chat2DB](https://chat2db.ai/download) you can run the batched delete in one tab and keep a query on `information_schema.innodb_trx` refreshing in another, and the AI assistant can turn a single large `DELETE` into a batched loop for you.
+
+## Summary
+
+- `ERROR 1206` means one transaction's row locks need more memory than the InnoDB buffer pool can spare; there is no separate lock table setting.
+- Lock memory grows with the number of pages locked; locking 150,000 rows on 4 KB pages used about 9 MB.
+- With a badly undersized pool, InnoDB can crash on purpose (MY-013962) instead of returning 1206.
+- Fix the buffer pool size first (it can be resized online), then batch large DML by primary key range.
+- Indexes on filter columns reduce the rows scanned and locked; `READ COMMITTED` helps only when many scanned rows do not match.

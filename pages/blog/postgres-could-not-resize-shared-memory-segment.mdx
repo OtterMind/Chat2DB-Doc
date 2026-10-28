@@ -1,0 +1,222 @@
+---
+title: "Postgres: Could Not Resize Shared Memory Segment"
+description: "Fix PostgreSQL 'could not resize shared memory segment ... No space left on device' in Docker and Kubernetes: /dev/shm size, parallel query and DSM settings."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: October 28, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# Postgres: Could Not Resize Shared Memory Segment
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="October 28, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+This error appears almost exclusively when PostgreSQL runs in a container:
+
+```
+ERROR:  could not resize shared memory segment "/PostgreSQL.1630011360" to 33624064 bytes: No space left on device
+```
+
+The SQLSTATE is `53100` (`disk_full`), but your data disk is not full. The "device" is `/dev/shm`, a small in-memory filesystem that Docker gives every container. Its default size is 64 MB. PostgreSQL puts dynamic shared memory there, and a parallel query can ask for more than 64 MB, especially a parallel hash join. When the request does not fit, the query fails.
+
+This guide reproduces the error on PostgreSQL 18.6 in Docker, explains which queries trigger it, and compares the fixes: a bigger `/dev/shm`, a different `dynamic_shared_memory_type`, `min_dynamic_shared_memory`, and limiting parallel query.
+
+## What Dynamic Shared Memory Is
+
+PostgreSQL has two kinds of shared memory. The main segment holds `shared_buffers`, the lock table and other fixed structures. It is allocated once at startup with an anonymous `mmap`, so it does not use `/dev/shm`.
+
+Dynamic shared memory (DSM) is allocated while the server runs. Parallel query uses it to share data between the leader and its workers: tuple queues, the shared hash table of a parallel hash join, parallel bitmap heap scans and parallel index builds. How DSM is allocated depends on `dynamic_shared_memory_type`, which is `posix` by default on Linux. With `posix`, each segment is a file under `/dev/shm` named `PostgreSQL.<number>`, which is the name in the error message.
+
+PostgreSQL creates the file and then grows it to the size it needs with `posix_fallocate()`. On a tmpfs with too little room left, that call fails with `ENOSPC`, and you get "could not resize shared memory segment ... No space left on device". PostgreSQL checks the allocation up front so that the query fails cleanly. Without the check, the server would crash later with `SIGBUS` when it touched the missing pages.
+
+## Reproducing the Error
+
+Start PostgreSQL with a small `/dev/shm`. Docker's default is 64 MB. We use 16 MB here so that the error appears with a few million rows:
+
+```bash
+docker run -d --name pgshm --shm-size=16m -e POSTGRES_PASSWORD=pw postgres:18
+docker exec pgshm df -h /dev/shm
+```
+
+```
+Filesystem      Size  Used Avail Use% Mounted on
+shm              16M  1.1M   15M   7% /dev/shm
+```
+
+Create two tables and join them:
+
+```sql
+CREATE TABLE a AS SELECT g AS id, md5(g::text) AS v FROM generate_series(1, 3000000) g;
+CREATE TABLE b AS SELECT g AS id, md5(g::text) AS w FROM generate_series(1, 3000000) g;
+ANALYZE a; ANALYZE b;
+
+EXPLAIN (COSTS OFF) SELECT count(*) FROM a JOIN b USING (id);
+```
+
+```
+ Finalize Aggregate
+   ->  Gather
+         Workers Planned: 2
+         ->  Partial Aggregate
+               ->  Parallel Hash Join
+                     Hash Cond: (a.id = b.id)
+                     ->  Parallel Seq Scan on a
+                     ->  Parallel Hash
+                           ->  Parallel Seq Scan on b
+```
+
+```sql
+SELECT count(*) FROM a JOIN b USING (id);
+```
+
+```
+ERROR:  53100: could not resize shared memory segment "/PostgreSQL.2184071060" to 8388608 bytes: No space left on device
+LOCATION:  dsm_impl_posix, dsm_impl.c:307
+```
+
+That is with the default `work_mem` of 4 MB. With `SET work_mem = '64MB'`, the shared hash table grows faster and the failing request becomes `33624064 bytes`. Lowering `work_mem` does not make the error go away. The parallel hash join keeps adding segments as the hash table grows, and the total is what has to fit into `/dev/shm`.
+
+If `/dev/shm` is tiny, PostgreSQL cannot even be initialized. With `--shm-size=1m`, `initdb` in the official image fails during bootstrap:
+
+```
+FATAL:  could not resize shared memory segment "/PostgreSQL.3762297230" to 1048576 bytes: No space left on device
+PANIC:  cannot abort transaction 1, it was already committed
+```
+
+## Fix 1: Give the Container a Bigger /dev/shm
+
+This is the most direct fix, and it costs nothing until the memory is used. `/dev/shm` is a tmpfs, so its size is a limit, not a reservation.
+
+Docker:
+
+```bash
+docker run -d --name pg --shm-size=1g -e POSTGRES_PASSWORD=pw postgres:18
+```
+
+Docker Compose:
+
+```yaml
+services:
+  db:
+    image: postgres:18
+    shm_size: 1g
+    environment:
+      POSTGRES_PASSWORD: pw
+```
+
+The shm size cannot be changed on a running container, so recreate it (the data volume stays). After the restart, check with `df -h /dev/shm` inside the container.
+
+Kubernetes does not have a `shm_size` field. The usual approach is a memory-backed `emptyDir` mounted over `/dev/shm`:
+
+```yaml
+spec:
+  containers:
+    - name: postgres
+      image: postgres:18
+      volumeMounts:
+        - name: dshm
+          mountPath: /dev/shm
+  volumes:
+    - name: dshm
+      emptyDir:
+        medium: Memory
+        sizeLimit: 1Gi
+```
+
+Pages written to a memory-backed `emptyDir` count against the container's memory limit, so leave room for it next to `shared_buffers` and per-connection memory. PostgreSQL operators such as CloudNativePG mount a memory-backed `/dev/shm` for you. If you run PostgreSQL from a plain StatefulSet, you have to add it yourself.
+
+How big should it be? A reasonable starting point is a few hundred megabytes up to about the size of `shared_buffers`. The real requirement is roughly the peak of concurrent parallel queries times their hash table sizes, which grows with `work_mem`, `hash_mem_multiplier` and `max_parallel_workers_per_gather`.
+
+## Fix 2: Use mmap or sysv for Dynamic Shared Memory
+
+If you cannot change the container settings, for example on a platform that hides them, move DSM out of `/dev/shm`. Both alternatives worked in our test container that was still limited to 16 MB:
+
+```sql
+ALTER SYSTEM SET dynamic_shared_memory_type = 'mmap';
+-- restart the server
+SET work_mem = '64MB';
+SELECT count(*) FROM a JOIN b USING (id);
+```
+
+```
+  count
+---------
+ 3000000
+```
+
+With `mmap`, segments are files in `$PGDATA/pg_dynshmem` (we saw files named `mmap.1917203004` there during the query). They live on the data disk, so the kernel may write them back to storage. That adds I/O, which is why `posix` is the default. `sysv` uses System V shared memory, which is not limited by the size of `/dev/shm`, and it also worked:
+
+```sql
+ALTER SYSTEM SET dynamic_shared_memory_type = 'sysv';
+-- restart the server
+```
+
+Both settings need a server restart. Treat them as a workaround. A properly sized `/dev/shm` with `posix` is the configuration most PostgreSQL deployments use.
+
+## Fix 3: Preallocate With min_dynamic_shared_memory
+
+Since PostgreSQL 14, `min_dynamic_shared_memory` reserves memory for parallel query inside the main shared memory segment at startup. That segment does not live in `/dev/shm`, so DSM requests are served from it first and only spill to `/dev/shm` when it is used up.
+
+In our test, `64MB` was not enough for the 64 MB `work_mem` join. The query failed again, this time trying to create a 16 MB segment in `/dev/shm`. With `256MB` both the default and the 64 MB `work_mem` versions of the query succeeded:
+
+```sql
+ALTER SYSTEM SET min_dynamic_shared_memory = '256MB';
+-- restart the server
+```
+
+This memory is allocated at startup and counts toward the main segment, like `shared_buffers`. It is a good option when you control `postgresql.conf` but not the container runtime. Size it for your peak parallel workload, not for one query.
+
+## Fix 4: Limit Parallel Query for the Affected Workload
+
+Turning off parallelism for the session or role makes the query run without DSM-backed hash tables:
+
+```sql
+SET max_parallel_workers_per_gather = 0;
+SELECT count(*) FROM a JOIN b USING (id);   -- works
+```
+
+A more targeted option keeps parallel scans but uses a private hash table in each worker:
+
+```sql
+SET enable_parallel_hash = off;
+EXPLAIN (COSTS OFF) SELECT count(*) FROM a JOIN b USING (id);
+```
+
+```
+ Finalize Aggregate
+   ->  Gather
+         Workers Planned: 2
+         ->  Partial Aggregate
+               ->  Hash Join
+                     Hash Cond: (a.id = b.id)
+                     ->  Parallel Seq Scan on a
+                     ->  Hash
+                           ->  Seq Scan on b
+```
+
+That query also succeeded at 16 MB. Every worker now builds its own full copy of the hash table in private memory, so memory use goes up and the join can be slower. Use these settings per role (`ALTER ROLE reporting SET max_parallel_workers_per_gather = 0`) or per query, not as a global fix for a container that simply has too little shm.
+
+## Is This the Same as "Out of Shared Memory"?
+
+No. `ERROR: out of shared memory` with the hint `You might need to increase max_locks_per_transaction` comes from the lock table in the main shared memory segment, usually when a transaction touches thousands of tables or partitions. It has nothing to do with `/dev/shm`. The fix is a larger `max_locks_per_transaction`, as explained in [our out of shared memory guide](/blog/postgres-out-of-shared-memory-fix). The resize error is about dynamic shared memory and parallel query.
+
+## Checklist
+
+1. Run `df -h /dev/shm` inside the container. A size of `64M` means Docker's default.
+2. Look at the failing query with `EXPLAIN`. A `Parallel Hash` or `Gather` node confirms the cause.
+3. Raise the shm size (`--shm-size`, `shm_size`, or a memory-backed `emptyDir`) and recreate the container.
+4. If you cannot, set `min_dynamic_shared_memory`, or switch `dynamic_shared_memory_type` to `mmap` or `sysv`, and restart.
+5. For one heavy report, use `SET enable_parallel_hash = off` or `max_parallel_workers_per_gather = 0` as a temporary measure.
+
+When you tune these settings it is easy to lose track of which session has which value. In [Chat2DB](https://chat2db.ai/download) you can keep a tab connected to the container with `SHOW dynamic_shared_memory_type`, `SHOW min_dynamic_shared_memory` and the `EXPLAIN` of the problem query, and compare plans before and after each change. For more on running PostgreSQL in containers, see our [production Docker Compose setup](/blog/postgres-docker-compose-production-setup).
+
+## Summary
+
+- The error means a dynamic shared memory segment in `/dev/shm` could not grow. It is not about your data disk.
+- Docker gives containers a 64 MB `/dev/shm`; parallel hash joins easily need more.
+- Best fix: a larger `/dev/shm` (`--shm-size`, `shm_size`, or `emptyDir` with `medium: Memory`).
+- Alternatives that avoid `/dev/shm`: `min_dynamic_shared_memory` (big enough for peak use), or `dynamic_shared_memory_type = mmap` / `sysv`. All need a restart.
+- Lowering `work_mem` alone did not prevent the error; limiting parallel hash or parallel workers did.

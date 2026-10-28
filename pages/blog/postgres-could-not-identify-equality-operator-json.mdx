@@ -1,0 +1,261 @@
+---
+title: "Postgres: No Equality Operator for Type json"
+description: "Fix 'could not identify an equality operator for type json' in DISTINCT, GROUP BY, UNION and joins: switch to jsonb, cast to text, or use UNION ALL."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: October 28, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# Postgres: No Equality Operator for Type json
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="October 28, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+You add `DISTINCT` to a query, or a `GROUP BY`, or turn `UNION ALL` into `UNION`, and a query that worked a minute ago fails:
+
+```
+ERROR:  could not identify an equality operator for type json
+```
+
+The SQLSTATE is `42883` (`undefined_function`). The cause is a design decision in PostgreSQL. The `json` type stores the input text exactly as it was written and has no `=` operator, so PostgreSQL cannot tell whether two `json` values are equal. Any operation that needs to compare or deduplicate values fails as soon as a `json` column is involved.
+
+This guide reproduces the error on PostgreSQL 18.6, lists all the places where it appears (including some that are not obvious), and compares the fixes. In most cases the right long-term fix is to use `jsonb`.
+
+## Reproducing the Error
+
+```sql
+CREATE TABLE events (id int, payload json, tags json, loc point);
+
+INSERT INTO events VALUES
+  (1, '{"a":1,"b":2}',  '["x"]', '(1,2)'),
+  (2, '{"b":2,"a":1}',  '["x"]', '(1,2)'),
+  (3, '{"a":1, "b":2}', '["y"]', '(3,4)'),
+  (4, '{"a":1,"b":2}',  '["x"]', '(1,2)');
+
+SELECT DISTINCT payload FROM events;
+```
+
+```
+ERROR:  42883: could not identify an equality operator for type json
+LINE 1: select distinct payload from events;
+                        ^
+LOCATION:  get_sort_group_operators, parse_oper.c:219
+```
+
+The four payloads describe the same object, written three different ways. As text they are different. As JSON they are equal. PostgreSQL refuses to guess which of those you mean.
+
+## Why json Has No Equality Operator
+
+PostgreSQL has two JSON types with different goals. `json` validates the input and then stores the text unchanged: whitespace, key order and even duplicate keys are kept exactly as received. Every function that reads a `json` value parses it again. `jsonb` parses the input once and stores a binary tree. It removes whitespace, sorts keys, keeps only the last value for a duplicate key and stores numbers as `numeric`.
+
+Equality needs a definition, and for `json` there is no good one. Text equality would treat `{"a":1,"b":2}` and `{"b":2,"a":1}` as different, which surprises anyone who thinks of them as the same object. Semantic equality would require parsing both values on every comparison, which defeats the purpose of a type that exists to store text cheaply. So PostgreSQL defines no `=`, no ordering and no hash function for `json`. Operations that need one of them fail, and the error message names the operator class lookup that failed (`get_sort_group_operators`).
+
+`jsonb` has a definition: two values are equal when they contain the same keys and values after normalization. That is why it has a full set of comparison operators and a B-tree and hash operator class.
+
+## Every Place the Error Shows Up
+
+The same check runs for every operation that groups, sorts or deduplicates. All of these failed on the table above:
+
+```sql
+SELECT payload, count(*) FROM events GROUP BY payload;
+SELECT payload FROM events UNION SELECT payload FROM events;
+SELECT array_agg(DISTINCT payload) FROM events;
+SELECT json_agg(DISTINCT payload) FROM events;
+SELECT count(DISTINCT payload) FROM events;
+SELECT DISTINCT ON (payload) id FROM events;
+```
+
+```
+ERROR:  could not identify an equality operator for type json
+```
+
+Sorting gives a close relative of the error, with a hint:
+
+```sql
+SELECT * FROM events ORDER BY payload;
+```
+
+```
+ERROR:  42883: could not identify an ordering operator for type json
+HINT:  Use an explicit ordering operator or modify the query.
+```
+
+Direct comparisons and joins fail with the general "operator does not exist" message instead:
+
+```sql
+SELECT * FROM events WHERE payload = '{"a":1,"b":2}';
+-- ERROR:  operator does not exist: json = unknown
+
+SELECT * FROM events e1 JOIN events e2 USING (payload);
+-- ERROR:  operator does not exist: json = json
+```
+
+`EXCEPT` and `INTERSECT` fail as well. When the `json` value is wrapped in a row, the message changes again:
+
+```sql
+SELECT row(payload) FROM events EXCEPT SELECT row(payload) FROM events;
+-- ERROR:  could not identify a comparison function for type json
+```
+
+`json` is not the only type with this property. The geometric type `point` has no default equality operator either:
+
+```sql
+SELECT DISTINCT loc FROM events;
+-- ERROR:  could not identify an equality operator for type point
+```
+
+Often the `json` column is not even mentioned in the query. `SELECT DISTINCT *`, `SELECT DISTINCT t.*` or `UNION` over two `SELECT *` queries compares every column, including the `json` one. ORMs produce the same pattern. A "distinct" option on a query that selects whole entities, or a view built from a `UNION` of tables that later gain a `json` column, can start failing when the schema changes.
+
+## Fix 1: Use jsonb
+
+`jsonb` stores a parsed, binary form of the document. It has equality, ordering and hashing, so all of the operations above just work:
+
+```sql
+SELECT DISTINCT payload::jsonb FROM events;
+```
+
+```
+     payload
+------------------
+ {"a": 1, "b": 2}
+(1 row)
+```
+
+All four rows collapse into one, because `jsonb` compares meaning, not text. Grouping works too:
+
+```sql
+SELECT payload::jsonb, count(*) FROM events GROUP BY payload::jsonb;
+```
+
+```
+     payload      | count
+------------------+-------
+ {"a": 1, "b": 2} |     4
+```
+
+To fix the problem permanently, convert the column:
+
+```sql
+ALTER TABLE events ALTER COLUMN payload TYPE jsonb USING payload::jsonb;
+```
+
+After that, `SELECT DISTINCT payload` and `ORDER BY payload` run without casts. The conversion rewrites the table and holds an `ACCESS EXCLUSIVE` lock while it runs, so schedule it for large tables. `jsonb` is also what you need for GIN indexes and the containment operators (`@>`, `?`), so most applications should use it anyway. Our [json vs jsonb comparison](/blog/postgres-json-vs-jsonb) covers the trade-offs.
+
+Know what `jsonb` normalizes before you rely on its equality:
+
+```sql
+SELECT '{"a":1,"a":2}'::json, '{"a":1,"a":2}'::jsonb;
+-- {"a":1,"a":2}   |  {"a": 2}           duplicate keys: last one wins
+
+SELECT '{"a":1.0}'::jsonb = '{"a":1}'::jsonb;
+-- t                                      numbers compare by value
+
+SELECT '[1,2]'::jsonb = '[2,1]'::jsonb;
+-- f                                      array order still matters
+```
+
+Key order and whitespace never matter in `jsonb`. Duplicate keys are dropped, keeping the last value. Numbers compare as numbers, so `1.0` equals `1`, although `jsonb` still prints `1.0`. Array order matters. If you need to keep the exact original text (for example a signed webhook body you must verify byte for byte), keep a `json` or `text` copy of it and use `jsonb` for querying.
+
+## Fix 2: Cast to text When You Want Text Equality
+
+Sometimes byte-for-byte equality is what you want, for example when you deduplicate raw API responses. Cast to `text`:
+
+```sql
+SELECT DISTINCT payload::text FROM events;
+```
+
+```
+    payload
+----------------
+ {"a":1, "b":2}
+ {"a":1,"b":2}
+ {"b":2,"a":1}
+(3 rows)
+```
+
+Three rows remain, because the texts differ. That is correct for text equality and wrong for JSON equality, so choose deliberately. When the documents are large, grouping by a hash keeps the sort keys small:
+
+```sql
+SELECT md5(payload::text) AS h, count(*) FROM events GROUP BY 1;
+```
+
+## Fix 3: Use UNION ALL When You Do Not Need Deduplication
+
+`UNION` removes duplicate rows, and that needs equality. `UNION ALL` keeps every row and never compares them:
+
+```sql
+SELECT payload FROM events UNION ALL SELECT payload FROM events;   -- 8 rows, no error
+```
+
+Many queries use `UNION` out of habit when the two halves cannot overlap anyway. Switching to `UNION ALL` fixes the error and makes the query faster, because PostgreSQL skips the sort or hash step.
+
+## Fix 4: Deduplicate on a Key, Not on the Document
+
+If the rows have an identifier, deduplicate on it and carry the `json` column along:
+
+```sql
+SELECT DISTINCT ON (payload::jsonb) id, payload
+FROM events
+ORDER BY payload::jsonb, id;
+```
+
+Or group by the fields you actually care about:
+
+```sql
+SELECT payload->>'a' AS a, count(*) FROM events GROUP BY payload->>'a';
+```
+
+The `->>` operator returns `text`, which has equality, so grouping on extracted fields never hits this error. It is usually the better query too, because the report is about one attribute, not the whole document.
+
+## Fix 5: For Views and ORM Queries
+
+If the error comes from a view or from generated SQL:
+
+- In views, replace `SELECT DISTINCT *` and `UNION` with explicit column lists. Leave the `json` column out of the deduplication, or cast it with `::jsonb`.
+- In ORMs, a "distinct" option on an entity that maps a `json` column generates `SELECT DISTINCT` over every column. Map the column as `jsonb` in the database (most ORMs support it as a JSON type), or deduplicate by primary key in a subquery and then load the entities.
+- If you cannot change the column type yet, a cast in an index expression helps queries that filter or group by the `jsonb` value: `CREATE INDEX ON events ((payload::jsonb))`.
+
+## Find Every json Column Before You Convert
+
+Before a migration to `jsonb`, list the `json` columns in your database. The data dictionary has them:
+
+```sql
+SELECT table_schema, table_name, column_name, data_type
+FROM information_schema.columns
+WHERE data_type = 'json'
+  AND table_schema NOT IN ('pg_catalog', 'information_schema')
+ORDER BY 1, 2, 3;
+```
+
+```
+ table_schema |  table_name   | column_name | data_type
+--------------+---------------+-------------+-----------
+ public       | events        | tags        | json
+ public       | webhook_inbox | body        | json
+ public       | webhook_inbox | headers     | json
+```
+
+For each column, decide whether you need the original text. Webhook bodies that must be verified against a signature are a good reason to keep `json`, or to add a separate `jsonb` column for queries. Everything else can usually be converted. Views that select the column must be dropped and recreated around the `ALTER TABLE`, because PostgreSQL does not change the type of a column a view depends on.
+
+## Quick Decision Table
+
+| You want | Use |
+|---|---|
+| Same JSON meaning counts as equal | `jsonb` column, or `::jsonb` in the query |
+| Same text counts as equal | `::text`, or `md5(col::text)` for large values |
+| Keep all rows from both sides | `UNION ALL` |
+| Unique rows per entity | `DISTINCT ON (id)` or `GROUP BY id` |
+| Group by a field inside the document | `GROUP BY col->>'field'` |
+
+When you are not sure whether a column is `json` or `jsonb`, check the table definition before rewriting queries. In [Chat2DB](https://chat2db.ai/download) the column types are visible in the table view, and the AI assistant can generate the `ALTER TABLE ... TYPE jsonb USING` statement and point out views that depend on the column. For the related `operator does not exist` errors, see [our guide to error 42883](/blog/postgres-operator-does-not-exist-fix).
+
+## Summary
+
+- `json` keeps the original text and has no equality or ordering operator, so `DISTINCT`, `GROUP BY`, `UNION`, `count(DISTINCT)`, `DISTINCT ON`, `ORDER BY` and joins on it fail with `42883`.
+- `SELECT DISTINCT *` and `UNION` of whole rows trigger it even when the `json` column is not named.
+- Prefer `jsonb`: it compares by meaning, supports sorting, hashing and GIN indexes.
+- `jsonb` drops duplicate keys, ignores key order and whitespace, compares numbers by value and keeps array order.
+- Use `::text` only when you really want text equality, and `UNION ALL` when you do not need deduplication.

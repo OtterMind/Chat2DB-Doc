@@ -1,0 +1,193 @@
+---
+title: "MySQL Error 1130: Host Is Not Allowed to Connect"
+description: "Fix MySQL ERROR 1130 'Host is not allowed to connect to this MySQL server': create the right user@host account, use subnets safely, and tell it apart from 1045."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: October 28, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# MySQL Error 1130: Host Is Not Allowed to Connect
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="October 28, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+You can reach the MySQL port, but the server turns you away before it even looks at your password:
+
+```
+ERROR 1130 (HY000): Host '172.17.0.8' is not allowed to connect to this MySQL server
+```
+
+The network is fine. If it were not, you would see `ERROR 2003 (HY000): Can't connect to MySQL server`. Error 1130 comes from the account system. In MySQL an account is a user name plus a host, written `'user'@'host'`. When a connection arrives, MySQL checks whether any account matches the client's host at all. If none does, it rejects the connection with 1130, whatever user name you sent.
+
+This guide reproduces the error on MySQL 8.4.11 in Docker, explains how it differs from 1045, and shows how to create accounts for remote hosts without opening the server to the whole internet.
+
+## Reproducing Error 1130
+
+The official MySQL image can limit the root account to local connections with `MYSQL_ROOT_HOST=localhost`:
+
+```bash
+docker run -d --name my1130 -e MYSQL_ROOT_PASSWORD=pw -e MYSQL_ROOT_HOST=localhost mysql:8.4
+```
+
+Inside the server, only local accounts exist:
+
+```sql
+SELECT user, host FROM mysql.user;
+```
+
+```
++------------------+-----------+
+| user             | host      |
++------------------+-----------+
+| mysql.infoschema | localhost |
+| mysql.session    | localhost |
+| mysql.sys        | localhost |
+| root             | localhost |
++------------------+-----------+
+```
+
+Connecting from another container on the same Docker network:
+
+```
+$ mysql -h 172.17.0.7 -uroot -ppw
+ERROR 1130 (HY000): Host '172.17.0.8' is not allowed to connect to this MySQL server
+
+$ mysql -h 172.17.0.7 -unobody -pxx
+ERROR 1130 (HY000): Host '172.17.0.8' is not allowed to connect to this MySQL server
+```
+
+Both a real user and a user that does not exist get the same error. MySQL never got as far as checking the user name.
+
+## 1130 vs 1045
+
+The two errors come from different steps of the same check:
+
+- **1130**: no row in `mysql.user` has a host value that matches the client's address. The connection is refused immediately.
+- **1045** (`Access denied for user 'x'@'host'`): at least one account matches the host, but the user name and password combination is wrong.
+
+We saw this switch in the same test. After an account for the Docker subnet (`'app'@'172.17.%'`) was created, the same root login from the same container changed from 1130 to:
+
+```
+ERROR 1045 (28000): Access denied for user 'root'@'172.17.0.8' (using password: YES)
+```
+
+`root` still only exists for `localhost`, but the host now matches *some* account, so MySQL continues to the password check and fails there. The opposite happens on a default Docker MySQL, where `root@'%'` exists. There every host matches, so a wrong user name or password always produces 1045 and you never see 1130. If you get 1130, the server has no account for your host at all.
+
+## The Surprise: 127.0.0.1 Is Not localhost
+
+Inside the same container, connecting to `127.0.0.1` over TCP also failed:
+
+```
+$ mysql -h127.0.0.1 -uroot -ppw
+ERROR 1130 (HY000): Host '127.0.0.1' is not allowed to connect to this MySQL server
+
+$ mysql -hlocalhost -uroot -ppw -e 'SELECT current_user()'
+root@localhost
+```
+
+With `-hlocalhost`, the client connects through the Unix socket, and the account `root@localhost` matches. With `-h127.0.0.1` it connects over TCP from the address `127.0.0.1`. This server runs with `skip_name_resolve = ON` (the official Docker image enables it), so MySQL does not resolve that address to the name `localhost`, and no account matches the literal IP. Tools that always use TCP, such as many GUI clients, JDBC URLs and ORMs, hit this when an account exists only for `localhost`. Either connect through the socket or create the account for `127.0.0.1` as well.
+
+## Fix 1: Create an Account for the Client's Host
+
+Look at the host in the error message. That is the address MySQL sees, after any NAT or Docker port mapping. Then create an account that matches it, with only the privileges the application needs:
+
+```sql
+CREATE USER 'app'@'172.17.%' IDENTIFIED BY 'AppPass#1';
+GRANT SELECT, INSERT, UPDATE, DELETE ON appdb.* TO 'app'@'172.17.%';
+```
+
+```
+$ mysql -h 172.17.0.7 -uapp -p'AppPass#1' -e 'SELECT current_user(), user()'
+app@172.17.%    app@172.17.0.8
+```
+
+`current_user()` shows the account that matched, and `user()` shows what the client sent. Comparing the two is the quickest way to debug which account a connection uses.
+
+MySQL accepts several forms for the host part, and all three worked in our test:
+
+```sql
+CREATE USER 'app'@'172.17.%'               IDENTIFIED BY '...';  -- wildcard
+CREATE USER 'app2'@'172.17.0.0/255.255.0.0' IDENTIFIED BY '...';  -- address/netmask
+CREATE USER 'app3'@'172.17.0.0/16'          IDENTIFIED BY '...';  -- CIDR (8.0.23+)
+```
+
+Prefer the narrowest match that covers your clients. A single application server gets its exact IP. A private subnet gets the subnet. To generate these statements with minimal privileges, use the free [MySQL GRANT Statement Generator](https://chat2db.ai/tools/mysql-grant-generator).
+
+## Fix 2: Do Not Try to Fix It With GRANT Alone
+
+Older tutorials say `GRANT ALL ON *.* TO 'root'@'%'`. In MySQL 8.0 and later, `GRANT` no longer creates accounts:
+
+```sql
+GRANT ALL ON *.* TO 'root'@'%';
+```
+
+```
+ERROR 1410 (42000): You are not allowed to create a user with GRANT
+```
+
+Run `CREATE USER` first, then `GRANT`. And think twice before creating `root@'%'`. A superuser that accepts connections from any address is the most attacked account on any internet-facing MySQL server. Create a separate application account instead, and connect as root only through the socket or an SSH tunnel.
+
+## Fix 3: Hostnames and skip_name_resolve
+
+Accounts can use hostnames (`'app'@'web1.internal'`), but only when MySQL resolves client addresses to names. With `skip_name_resolve = ON`, every client is identified by IP only, so host values that are names never match and those clients get 1130. Our test account `'app4'@'client.example.com'` was created without any complaint, and nothing would ever match it.
+
+Check the setting:
+
+```sql
+SELECT @@skip_name_resolve;
+```
+
+If it is `1`, use IPs, subnets or CIDR in the host part. Turning name resolution on makes every connection depend on DNS, which adds latency and can lock clients out when DNS fails, so most deployments keep it off.
+
+## Fix 4: Know Which Address the Server Sees
+
+The host in the error is the source address from the server's point of view, which is often not the address you expect:
+
+- From the Docker host to a container through a published port, the server usually sees the Docker bridge gateway (for example `172.17.0.1`) or, on Docker Desktop, an address of its virtual network. It does not see your machine's LAN IP.
+- Behind a load balancer or proxy (HAProxy, ProxySQL, a cloud proxy), it sees the proxy's address, unless the PROXY protocol is configured.
+- Applications in Kubernetes appear with their pod IP, which changes when pods are rescheduled. Use the pod network CIDR, not individual IPs.
+
+Always copy the host from the actual error message before creating the account.
+
+To check whether any existing account would accept that address, compare it with the host column. `LIKE` uses the same `%` and `_` wildcards as account host names:
+
+```sql
+SELECT user, host FROM mysql.user WHERE '172.17.0.8' LIKE host ORDER BY user;
+```
+
+```
++------+----------+
+| user | host     |
++------+----------+
+| app  | 172.17.% |
++------+----------+
+```
+
+An empty result for the address in the error message confirms 1130. This shortcut only covers wildcard and exact hosts. Accounts written as netmask or CIDR (`172.17.0.0/16`) need to be checked by eye.
+
+## Related Errors
+
+- **1129 `Host 'x' is blocked because of many connection errors`**: the host made too many failed connection attempts (`max_connect_errors`). Fix the client, then clear the host cache with `TRUNCATE TABLE performance_schema.host_cache`. `FLUSH HOSTS` is deprecated in 8.0 and later.
+- **2003 `Can't connect to MySQL server`**: nothing is listening at that address and port, or a firewall blocks it. Check `bind_address` (the Docker image listens on `*`) and the port mapping.
+- **1045 `Access denied`**: the host matched an account, but the user or password is wrong. See our [error 1045 guide](/blog/mysql-error-1045).
+
+## Checklist
+
+1. Copy the host from the error message.
+2. Run `SELECT user, host FROM mysql.user` as an admin on the server, over the socket.
+3. Create a dedicated account for that host or subnet with `CREATE USER`, then `GRANT` only what is needed.
+4. If you used `127.0.0.1`, remember it is a different host from `localhost`.
+5. If accounts use hostnames, check `skip_name_resolve`.
+
+Managing accounts across several servers is easier when you can see them side by side. In [Chat2DB](https://chat2db.ai/download) you can connect to each server, list `mysql.user` with the hosts and plugins, and let the AI assistant draft the `CREATE USER` and `GRANT` statements for a new application subnet. Our guide to [creating MySQL users and granting privileges](/blog/mysql-create-user-grant-privileges) covers roles and privilege design in more depth.
+
+## Summary
+
+- `ERROR 1130` means no account in `mysql.user` matches the client's host, so MySQL refuses the connection before checking the user or password.
+- Once any account matches the host, a wrong login becomes 1045 instead.
+- `127.0.0.1` over TCP is not `localhost` over the socket, especially with `skip_name_resolve = ON`.
+- Fix it with `CREATE USER 'app'@'<ip, subnet or CIDR>'` plus a minimal `GRANT`; `GRANT` alone fails with 1410 in MySQL 8.
+- Avoid `root@'%'`; use the exact host from the error message and the narrowest subnet that works.

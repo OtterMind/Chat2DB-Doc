@@ -1,0 +1,193 @@
+---
+title: "MySQL Error 1153: max_allowed_packet Exceeded"
+description: "Fix MySQL ERROR 1153 'Got a packet bigger than max_allowed_packet bytes' on imports, BLOB inserts and dumps: raise the server and client limits correctly."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: October 28, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# MySQL Error 1153: max_allowed_packet Exceeded
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="October 28, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+MySQL rejects any single message from a client that is larger than `max_allowed_packet`:
+
+```
+ERROR 1153 (08S01): Got a packet bigger than 'max_allowed_packet' bytes
+```
+
+The SQLSTATE `08S01` is a communication error, and that is a hint about what happens next. The server does not just reject the statement, it closes the connection. The next statement in your script fails with `ERROR 2013 (HY000): Lost connection to MySQL server during query`, and many people chase that second error instead of the first.
+
+This guide reproduces 1153 and its client-side twin, error 2020, on MySQL 8.4.11, explains which limit applies where, and shows how to raise the limits for imports, large `BLOB` and `TEXT` values, and dumps.
+
+## What a "Packet" Is
+
+The MySQL client/server protocol sends data in packets. A whole SQL statement, including every literal value inside it, travels from the client as one logical packet, and so does every result row coming back. `max_allowed_packet` is the upper limit for one such packet. It is not a limit on the size of a table, a transaction or a result set, only on a single statement or a single row.
+
+Several limits exist, and each side enforces its own:
+
+| Where | Setting | Default in 8.4 | Error when exceeded |
+|---|---|---|---|
+| Server, for statements it receives | `max_allowed_packet` (global) | 64 MB (67108864) | `ERROR 1153 (08S01)` |
+| mysql command-line client, for rows it receives | `--max-allowed-packet` | 16 MB | `ERROR 2020 (HY000)` |
+| mysqldump | `--max-allowed-packet` | 24 MB | `ERROR 2020` on large rows |
+| String functions on the server | `max_allowed_packet` | same as server | `NULL` plus warning 1301 |
+
+Values were checked on MySQL 8.4.11 with `SELECT @@max_allowed_packet` and `mysql --help` / `mysqldump --help`. Application drivers have their own limits, usually configurable in the connection settings.
+
+## Reproducing Error 1153
+
+Lower the server limit to 1 MB and send a 1.5 MB `INSERT`:
+
+```sql
+CREATE TABLE pk.docs (id int PRIMARY KEY AUTO_INCREMENT, body longblob);
+SET GLOBAL max_allowed_packet = 1048576;
+```
+
+A new connection is needed, because the session value is copied from the global value when the session starts. Then run a file containing one `INSERT` with a 1,500,000-character literal, followed by another statement:
+
+```
+$ mysql -uroot -p --force < bigins.sql
+ERROR 1153 (08S01) at line 1: Got a packet bigger than 'max_allowed_packet' bytes
+ERROR 2013 (HY000) at line 2: Lost connection to MySQL server during query
+```
+
+The second statement, a trivial `SELECT 'after'`, failed only because the connection was already gone. After restoring the limit to 64 MB, the same file ran without errors.
+
+Notice also that the session variable cannot be changed directly:
+
+```sql
+SET SESSION max_allowed_packet = 1048576;
+```
+
+```
+ERROR 1621 (HY000): SESSION variable 'max_allowed_packet' is read-only. Use SET GLOBAL to assign the value
+```
+
+## The Client-Side Twin: Error 2020
+
+The client enforces its own limit on what it receives. Here the server limit is 64 MB, but the mysql client was started with a 1 MB limit, and a query returns a 2 MB value:
+
+```
+$ mysql --max-allowed-packet=1M -e "SELECT repeat('a', 2000000)"
+ERROR 2020 (HY000): Got packet bigger than 'max_allowed_packet' bytes
+```
+
+The wording is almost the same as 1153 (without "a"), but the number tells you which side failed. 1153 comes from the server and means your statement was too large. 2020 comes from the client library and means a result row was too large for the client's setting.
+
+## The Silent Variant: NULL From String Functions
+
+Functions that build strings on the server also respect `max_allowed_packet`, but they do not raise an error. They return `NULL` with a warning:
+
+```sql
+SELECT length(repeat('a', 2000000));   -- with max_allowed_packet = 1 MB
+SHOW WARNINGS;
+```
+
+```
+NULL
+Warning | 1301 | Result of repeat() was larger than max_allowed_packet (1048576) - truncated
+```
+
+This affects `REPEAT`, `CONCAT`, `GROUP_CONCAT` results that are also limited by `group_concat_max_len`, `LOAD_FILE` and similar functions. If an `UPDATE ... SET body = CONCAT(body, ...)` suddenly stores `NULL`, check the warnings for 1301.
+
+## Fix 1: Raise the Server Limit
+
+Set the global value at runtime and persist it so it survives a restart:
+
+```sql
+SET PERSIST max_allowed_packet = 268435456;   -- 256 MB
+SELECT @@GLOBAL.max_allowed_packet;
+```
+
+Or in the configuration file:
+
+```ini
+[mysqld]
+max_allowed_packet = 256M
+```
+
+The maximum is 1 GB. Existing connections keep their old session value, so reconnect your client, restart the application's connection pool or rerun the import in a new session. Connection pools are the usual reason why "I raised it and nothing changed". You can see the difference directly:
+
+```sql
+SET GLOBAL max_allowed_packet = 134217728;
+SELECT @@GLOBAL.max_allowed_packet, @@SESSION.max_allowed_packet;
+```
+
+```
++-----------------------------+------------------------------+
+| @@GLOBAL.max_allowed_packet | @@SESSION.max_allowed_packet |
++-----------------------------+------------------------------+
+|                   134217728 |                     67108864 |
++-----------------------------+------------------------------+
+```
+
+After reconnecting, both columns show 134217728. Run the same check from the application's own connection, not only from your terminal, to be sure it picked up the new value.
+
+The server allocates buffers up to this size only when a large packet actually arrives, so a higher limit does not cost memory by itself. It does mean one connection can make the server allocate that much, so do not raise it far beyond your largest real row.
+
+On managed services you change the same parameter through the provider's parameter group or flags instead of `SET PERSIST`.
+
+## Fix 2: Raise the Client Limit Too
+
+For the mysql client:
+
+```bash
+mysql --max-allowed-packet=256M -u app -p appdb < dump.sql
+```
+
+Or permanently:
+
+```ini
+[mysql]
+max_allowed_packet = 256M
+
+[mysqldump]
+max_allowed_packet = 256M
+```
+
+Application drivers need their own setting. With MySQL Connector/J the client limit follows the server value by default, and other drivers document an option to change it. If you get 2020 or a driver-specific "packet too large" error while the server is fine, this is the setting to look at.
+
+## Fix 3: Make Dumps Import Cleanly
+
+mysqldump writes multi-row `INSERT` statements and keeps each one below `--net-buffer-length` (about 1 MB by default in 8.4), so normal dumps rarely produce large statements. 1153 during an import usually means one of these:
+
+1. **A single row is larger than the target server's limit**, typically a big `LONGBLOB` or `LONGTEXT`. A row cannot be split across statements, so the target needs a `max_allowed_packet` larger than the largest row. Find it before the import:
+
+```sql
+SELECT id, length(body) FROM docs ORDER BY length(body) DESC LIMIT 5;
+```
+
+2. **The dump was made with `--net-buffer-length` set very high**, or by another tool that writes huge multi-row inserts. Recreate the dump with the default, or raise the target limit.
+
+3. **The target is a different server with a lower limit** than the source, for example a managed instance with a default you never changed.
+
+If you control both sides, an option is `mysqldump --hex-blob` for binary columns, which makes the dump safe to edit and transfer. It doubles the size of those values, though, so the packet limit has to be correspondingly larger.
+
+## Fix 4: Avoid Huge Statements in Application Code
+
+When the application builds one enormous `INSERT ... VALUES (...), (...), ...` for a bulk load, split it into batches of a few thousand rows or a few megabytes each. Smaller batches also keep transactions, undo logs and replication events smaller.
+
+For large files, consider not storing them in the database at all. Put them in object storage and keep the path and checksum in the table. If they must live in MySQL, send them as prepared statement parameters instead of literals in the SQL text. An escaped or hex literal can be up to twice the size of the raw bytes, so a value that fits as a parameter may not fit as a literal. The limit still applies to the value itself: the MySQL manual notes that parameters sent with `mysql_stmt_send_long_data()` are bounded by `max_allowed_packet` too.
+
+## Checklist
+
+1. Read the error number: 1153 is the server, 2020 is the client.
+2. Check `SELECT @@GLOBAL.max_allowed_packet` and compare it to your largest statement or row.
+3. Raise it with `SET PERSIST` (or `my.cnf`) and reconnect, including your connection pool.
+4. Raise `--max-allowed-packet` for mysql and mysqldump when the rows are large.
+5. If a statement stores `NULL` unexpectedly, look for warning 1301.
+
+When an import fails, you need to find the oversized statement or row. [Chat2DB](https://chat2db.ai/download) can open the dump file, run it statement by statement and show which one failed, and its AI assistant can help you rewrite a giant multi-row insert into batches. If the follow-up symptom is a dropped connection, our guide to [MySQL error 2013](/blog/mysql-error-2013-lost-connection) covers the other causes of lost connections.
+
+## Summary
+
+- `ERROR 1153 (08S01)` means one statement was larger than the server's `max_allowed_packet`; the server then closes the connection, so the next statement reports 2013.
+- `ERROR 2020` is the client-side limit (16 MB by default for the mysql client, 24 MB for mysqldump).
+- Server string functions return `NULL` with warning 1301 instead of failing.
+- Raise the limit with `SET PERSIST max_allowed_packet` (up to 1 GB) and reconnect; the session value is read-only.
+- For imports, the target must allow the largest single row; keep bulk inserts batched.

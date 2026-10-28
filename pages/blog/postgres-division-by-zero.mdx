@@ -1,0 +1,274 @@
+---
+title: "Postgres ERROR: Division by Zero (22012) Fix"
+description: "Fix PostgreSQL ERROR: division by zero (SQLSTATE 22012) with NULLIF, CASE and safe ratios, and avoid the CASE, aggregate and WHERE traps that still raise it."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: October 28, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# Postgres ERROR: Division by Zero (22012) Fix
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="October 28, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+PostgreSQL stops a query as soon as one row divides by zero:
+
+```
+ERROR:  division by zero
+```
+
+The SQLSTATE is `22012` (`division_by_zero`). The message is short and the cause looks obvious, but this error has a few traps. The usual fixes work for simple columns and then fail inside `CASE` expressions, aggregates and window functions. Unlike some other databases, PostgreSQL raises the error for every numeric type, including `float8`, and it never quietly returns `NULL`.
+
+This guide shows where the error comes from, the standard `NULLIF` fix, and the cases where a "guarded" query still fails. Every example was run on PostgreSQL 18.6.
+
+## Which Operations Raise Division by Zero
+
+Integer, `numeric` and floating-point division all raise the same error. With `\set VERBOSITY verbose` in psql you can see the internal function that rejected the value:
+
+```sql
+SELECT 10 / 0;          -- integer
+SELECT 10.5 / 0;        -- numeric
+SELECT 10::float8 / 0;  -- double precision
+SELECT 0::float8 / 0;   -- not NaN, still an error
+SELECT 1 / 0.0::real;   -- real
+```
+
+```
+ERROR:  22012: division by zero
+LOCATION:  int4div, int.c:870
+ERROR:  22012: division by zero
+LOCATION:  div_var, numeric.c:9436
+ERROR:  22012: division by zero
+LOCATION:  float_zero_divide_error, float.c:104
+```
+
+Developers coming from JavaScript or from IEEE 754 arithmetic often expect `1.0 / 0` to return `Infinity` and `0.0 / 0` to return `NaN`. PostgreSQL does not do that for literal zero divisors. You only get `NaN` when an operand is already special, for example `'Infinity'::float8 / 'Infinity'` or `'NaN'::numeric / 0`.
+
+The modulo operator and the integer division functions use the same check:
+
+```sql
+SELECT 10 % 0;     -- ERROR:  division by zero  (int4mod)
+SELECT mod(5, 0);  -- ERROR:  division by zero
+SELECT div(5, 0);  -- ERROR:  division by zero
+```
+
+A few related functions fail with their own messages, which you may confuse with this one. `log(0)` raises `cannot take logarithm of zero` (SQLSTATE `2201E`). `width_bucket(5, 0, 0, 10)` raises `lower bound cannot equal upper bound` (`2201G`).
+
+`NULL` is the one value that never triggers the error. Division is a strict operator, so `NULL / 0` returns `NULL` without evaluating anything. That is why the classic fix below works.
+
+## A Realistic Example
+
+Most real cases look like this: a ratio over rows where some denominators are zero.
+
+```sql
+CREATE TABLE sales (region text, revenue numeric, orders int);
+
+INSERT INTO sales VALUES
+  ('north', 1200, 10),
+  ('south',    0,  0),
+  ('east',   300,  0),
+  ('west',  NULL,  5);
+
+SELECT region, revenue / orders AS avg_order FROM sales;
+```
+
+```
+ERROR:  division by zero
+```
+
+The query fails as a whole, so the single `north` row with a valid value is lost too. One bad row stops the whole report.
+
+## Fix 1: NULLIF the Denominator
+
+`NULLIF(a, b)` returns `NULL` when `a = b`, and `a` otherwise. Wrapping the divisor turns a zero into `NULL`, and `NULL` divided into anything is `NULL`:
+
+```sql
+SELECT region, revenue / NULLIF(orders, 0) AS avg_order FROM sales;
+```
+
+```
+ region |      avg_order
+--------+----------------------
+ north  | 120.0000000000000000
+ south  |
+ east   |
+ west   |
+(4 rows)
+```
+
+This is the fix to reach for first. It is short, it works in every clause (select list, `WHERE`, `ORDER BY`, index expressions), and it makes the result honest. An average order value for a region with no orders is unknown, not zero.
+
+If a report really needs a number, add `COALESCE` around the whole expression, not around the divisor:
+
+```sql
+SELECT region, COALESCE(revenue / NULLIF(orders, 0), 0) AS avg_order FROM sales;
+```
+
+Be careful with that choice. A `0` average and a "no data" average mean different things to whoever reads the report, and charts that average these values again will be skewed by the fake zeros.
+
+## Fix 2: CASE With a Column Condition
+
+A `CASE` expression evaluates the branch only for rows where its condition is true:
+
+```sql
+SELECT region,
+       CASE WHEN orders > 0 THEN revenue / orders ELSE 0 END AS avg_order
+FROM sales;
+```
+
+```
+      avg_order
+----------------------
+ 120.0000000000000000
+                    0
+                    0
+
+(4 rows)
+```
+
+The `west` row still returns `NULL` because its revenue is `NULL`. Use `CASE` when the fallback depends on more than one column, or when you want to label rows (`ELSE 'n/a'` after casting to text). Use `NULLIF` for everything else.
+
+## Trap 1: Constant Expressions Inside CASE
+
+The PostgreSQL documentation warns that `CASE` cannot always protect a subexpression, and this is easy to reproduce. The planner simplifies constant expressions before the query runs. If a branch contains a constant division by zero, it is evaluated at planning time, even if no row would ever reach it:
+
+```sql
+-- No row has more than 100 orders, but this still fails
+SELECT CASE WHEN orders > 100 THEN 1 / 0 END FROM sales;
+```
+
+```
+ERROR:  division by zero
+```
+
+The same query with a non-constant divisor runs fine and returns four `NULL` values:
+
+```sql
+SELECT CASE WHEN orders > 100 THEN 1 / (orders - orders) END FROM sales;
+```
+
+When the whole condition is constant, the planner folds the `CASE` first, so `SELECT CASE WHEN 1 > 0 THEN 1 ELSE 1/0 END` returns `1`. In practice this trap appears in generated SQL. An ORM or a reporting tool turns a parameter into a literal, and a branch that "never runs" ends up as `x / 0`. If you build SQL strings, keep zero divisors out of the text and use `NULLIF` instead.
+
+## Trap 2: Aggregates Are Computed Before CASE
+
+Aggregate functions in a query are computed before the `CASE` around them is evaluated. A guard on the outside does not prevent the error inside an aggregate:
+
+```sql
+SELECT region,
+       CASE WHEN count(*) > 0 THEN 1 ELSE max(1 / orders) END
+FROM sales
+GROUP BY region;
+```
+
+```
+ERROR:  division by zero
+```
+
+`max(1 / orders)` runs over every row of every group while the groups are built, long before PostgreSQL looks at `count(*) > 0`. Put the guard inside the aggregate argument:
+
+```sql
+SELECT region, max(1.0 / NULLIF(orders, 0)) FROM sales GROUP BY region;
+```
+
+## Trap 3: Percent of Total With Window Functions
+
+"Percent of total" queries divide by a window sum. If a filter leaves only rows whose total is zero, the denominator is zero:
+
+```sql
+SELECT region, round(100.0 * revenue / sum(revenue) OVER (), 2) AS pct
+FROM sales
+WHERE region = 'south';
+```
+
+```
+ERROR:  division by zero
+```
+
+Apply the same fix to the window expression:
+
+```sql
+SELECT region,
+       round(100.0 * revenue / NULLIF(sum(revenue) OVER (), 0), 2) AS pct
+FROM sales;
+```
+
+Empty groups behave differently. `sum(revenue) / count(*)` over zero rows returns `NULL`, not an error, because `sum` of no rows is `NULL` and the division short-circuits. So a query can pass every test on an empty table and fail on the first real zero.
+
+## Trap 4: WHERE Conditions Are Not Evaluated Left to Right
+
+A common guard is to filter out zeros in the same `WHERE` clause:
+
+```sql
+SELECT region FROM sales WHERE orders <> 0 AND revenue / orders > 50;
+```
+
+This works on the small table above, and the plan shows the conditions in the order written:
+
+```
+ Seq Scan on sales
+   Filter: ((orders <> 0) AND ((revenue / (orders)::numeric) > '50'::numeric))
+```
+
+But SQL does not promise short-circuit evaluation of `AND`. The planner may reorder conditions by cost, push one condition into an index scan and evaluate the other later, or inline a view so that your guard ends up after the division. The documentation recommends a `CASE` for this, and `NULLIF` works too:
+
+```sql
+SELECT region FROM sales WHERE revenue / NULLIF(orders, 0) > 50;
+```
+
+`NULL > 50` is not true, so rows with zero orders are filtered out without any reliance on evaluation order.
+
+## Handling the Error in PL/pgSQL
+
+Inside a function or `DO` block you can catch the condition by name:
+
+```sql
+DO $$
+BEGIN
+  PERFORM 1 / 0;
+EXCEPTION WHEN division_by_zero THEN
+  RAISE NOTICE 'caught: %', SQLERRM;
+END $$;
+```
+
+```
+NOTICE:  caught: division by zero
+```
+
+Use this for logging or for a clearer message, not as the normal way to compute ratios. Each `EXCEPTION` block starts a subtransaction, which costs time and can cause problems at high volume. It also hides the row that caused the problem. Fix the expression instead.
+
+## Should Zero Return NULL, Zero or Infinity?
+
+The fix is mostly a choice about meaning:
+
+| Situation | Recommended result | Expression |
+|---|---|---|
+| Average per item when there are no items | `NULL` (unknown) | `a / NULLIF(b, 0)` |
+| Conversion rate shown as a percentage on a dashboard | `0` or a label | `COALESCE(a / NULLIF(b, 0), 0)` |
+| Growth rate from a zero baseline | `NULL` plus a flag | `CASE WHEN b = 0 THEN NULL ELSE (a - b) / b END` |
+| Scientific `float8` math that must follow IEEE rules | `Infinity` / `NaN` | `CASE WHEN b = 0 THEN 'Infinity'::float8 * sign(a) ELSE a / b END` |
+
+Pick one rule per metric and use it consistently in views, so different reports do not disagree about the same number.
+
+## Finding the Rows That Cause It
+
+When a large report fails, find the zero denominators before you change the query:
+
+```sql
+SELECT region, orders FROM sales WHERE orders = 0;
+```
+
+If the divisor is an expression, test the expression itself (`WHERE coalesce(total - refunds, 0) = 0`). Check the PostgreSQL log as well: with the default `log_min_error_statement = error`, the server logs the failing statement after the `ERROR: division by zero` line, which helps when the SQL comes from an application.
+
+When a query like this breaks in production, it helps to run the fixed and the original version side by side against the same data. [Chat2DB](https://chat2db.ai/download) lets you keep both in one editor tab, compare the result grids, and ask its AI assistant to rewrite every ratio in a long report with `NULLIF`. The free [PostgreSQL Error Code Lookup](https://chat2db.ai/tools/postgres-error-code-lookup) explains `22012` and related arithmetic SQLSTATEs.
+
+## Summary
+
+- `ERROR: division by zero` (`22012`) is raised for integer, `numeric`, `real` and `float8` division, and for `%`, `mod()` and `div()`.
+- `NULL` divided by zero is `NULL`, which is why `x / NULLIF(y, 0)` is the standard fix.
+- A `CASE` guard fails when its branch holds a constant like `1 / 0`, which the planner folds at planning time.
+- Aggregates and window sums are computed before the surrounding `CASE`, so put the guard inside them.
+- `WHERE y <> 0 AND x / y > 1` relies on evaluation order that SQL does not guarantee; filter with `x / NULLIF(y, 0) > 1`.
+- Decide per metric whether "no denominator" means `NULL`, `0` or a label, and document it.
