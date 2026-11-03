@@ -1,0 +1,261 @@
+---
+title: "MySQL Error 3143: Invalid JSON Path Expression"
+description: "Fix MySQL ERROR 3143 Invalid JSON path expression: quote keys with hyphens, spaces or digits, use [last] and $**, and repair broken generated columns."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: November 2, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# MySQL Error 3143: Invalid JSON Path Expression
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="November 2, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+MySQL raises this error when the path you pass to `JSON_EXTRACT`, `->`, `->>`, `JSON_SET` or any other JSON function does not follow its path grammar:
+
+```
+ERROR 3143 (42000): Invalid JSON path expression. The error is around character position 10.
+```
+
+The document is fine. The problem is the path string, and the position tells you roughly where MySQL gave up. Most cases come from writing paths the way JavaScript or JSONPath libraries allow, which MySQL's stricter syntax does not. This guide goes through every common cause with the exact position MySQL 8.4 reports, and ends with a trap that can make a whole table unreadable.
+
+All examples use this table on MySQL 8.4.11:
+
+```sql
+CREATE TABLE orders (id INT PRIMARY KEY, doc JSON);
+
+INSERT INTO orders VALUES (1, '{
+  "order-id": "A-1001",
+  "shipping address": {"city": "Lisbon"},
+  "items": [{"sku": "A-1", "qty": 2}, {"sku": "B-7", "qty": 1}],
+  "2024": {"total": 30}
+}');
+```
+
+## MySQL JSON Path Syntax in Brief
+
+A path starts with `$` (the whole document) and continues with steps:
+
+| Step | Meaning |
+|---|---|
+| `.key` | Object member; the key must be a valid identifier |
+| `."any key"` | Object member with any name, in double quotes |
+| `.*` | Every member of an object |
+| `[2]` | Array element (0-based) |
+| `[last]`, `[last-1]` | Last element, second to last |
+| `[1 to 3]`, `[last-2 to last]` | Range of elements |
+| `[*]` | Every element of an array |
+| `**` | Any depth, as in `$**.sku`; must be followed by another step |
+
+That is the complete grammar. There are no filters, no negative indexes, no `..` operator and no single-quoted keys.
+
+## Cause 1: Keys With Hyphens, Spaces or Leading Digits
+
+An unquoted key must look like a JavaScript identifier: letters, digits, `_` and `$`, not starting with a digit. Anything else needs double quotes.
+
+```sql
+SELECT doc->'$.order-id' FROM orders;
+-- ERROR 3143 (42000): ... around character position 10.
+
+SELECT doc->>'$.shipping address.city' FROM orders;
+-- ERROR 3143 (42000): ... around character position 11.
+
+SELECT doc->'$.2024.total' FROM orders;
+-- ERROR 3143 (42000): ... around character position 6.
+```
+
+The fixes:
+
+```sql
+SELECT doc->'$."order-id"' FROM orders;                -- "A-1001"
+SELECT doc->>'$."shipping address".city' FROM orders;  -- Lisbon
+SELECT doc->'$."2024".total' FROM orders;              -- 30
+```
+
+The positions make sense once you know how MySQL reads a key. An unquoted key runs until a space, `.`, `[` or `*`. For `$.order-id` it reads the whole `order-id` (ending at position 10), and then rejects it as an identifier. For `$.shipping address.city` it accepts `shipping`, skips the space, and fails at position 11, where it expects a new step and finds `a`.
+
+Non-ASCII keys are a gray area. MySQL 8.4 accepted `$.é` unquoted but rejected some other letters, for example `$.日本` failed at position 8 (positions count bytes, and each of those characters is 3 bytes). Quote non-ASCII keys and you never have to think about it.
+
+## Cause 2: Syntax From JSONPath or JavaScript
+
+MySQL paths look like JSONPath, but several JSONPath features do not exist:
+
+```sql
+SELECT doc->'$.items[-1]' FROM orders;          -- position 8: no negative indexes
+SELECT doc->'$..sku' FROM orders;               -- position 2: no .. operator
+SELECT doc->'$.items[?(@.qty > 1)]' FROM orders; -- position 8: no filters
+SELECT JSON_EXTRACT(doc, "$.'order-id'") FROM orders; -- position 12: no single quotes
+```
+
+The MySQL equivalents:
+
+```sql
+SELECT doc->'$.items[last]' FROM orders;   -- {"qty": 1, "sku": "B-7"}
+SELECT doc->'$**.sku' FROM orders;         -- ["A-1", "B-7"]
+```
+
+For filters, use `JSON_TABLE` to turn the array into rows and filter with SQL:
+
+```sql
+SELECT jt.sku, jt.qty
+FROM orders,
+     JSON_TABLE(doc, '$.items[*]'
+       COLUMNS (sku VARCHAR(10) PATH '$.sku',
+                qty INT         PATH '$.qty')) AS jt
+WHERE jt.qty > 1;
+```
+
+## Cause 3: Small Structural Mistakes
+
+```sql
+SELECT doc->'items[0]' FROM orders;          -- position 1: path must start with $
+SELECT doc->'$.items[0].' FROM orders;       -- position 11: trailing dot
+SELECT doc->'$.items[2 to 1]' FROM orders;   -- position 14: range start > end
+```
+
+Others in the same family: `$[1.5]` and `$[0x1]` (indexes are plain integers), `$[0to1]` (the word `to` needs spaces around it), `$[LAST]` (lowercase only), `$**` at the end of a path, and `$***`. A double-quoted key must also be valid JSON string syntax. An escape such as `\x41` inside the quotes is rejected, and the position then points just past the closing quote.
+
+## Cause 4: Backslashes Eaten by the SQL Literal
+
+With the default SQL mode, MySQL processes backslash escapes in string literals before the JSON function sees the path. That matters for keys containing quotes:
+
+```sql
+SELECT doc->'$."a\"b"' FROM orders;
+-- ERROR 3143 (42000): ... around character position 5.
+```
+
+The SQL literal turned `\"` into a plain `"`, so the path became `$."a"b"`. Double the backslash so the path keeps its JSON escape:
+
+```sql
+SELECT doc->'$."a\\"b"' FROM orders;   -- valid path (NULL here: no such key)
+```
+
+## Cause 5: Paths Built at Runtime
+
+Paths built from variables or user input fail the same way, just later:
+
+```sql
+SET @p = '$.order-id';
+SELECT JSON_EXTRACT(doc, @p) FROM orders;
+-- ERROR 3143 (42000): ... around character position 10.
+```
+
+When the key comes from data, always quote it and escape any double quotes inside it:
+
+```sql
+SELECT JSON_EXTRACT(doc, CONCAT('$."', REPLACE('order-id', '"', '\\"'), '"'))
+FROM orders;   -- "A-1001"
+```
+
+Application code should do the same. Build `$."<key>"` with the key JSON-escaped, rather than concatenating `$.` and a raw key.
+
+Prepared statements behave the same way. Passing the path as a parameter is fine, but MySQL only validates it when the statement executes, so the error comes from `EXECUTE`, not `PREPARE`:
+
+```sql
+PREPARE s FROM 'SELECT JSON_EXTRACT(doc, ?) FROM orders WHERE id = 1';
+SET @q = '$.order-id';
+EXECUTE s USING @q;
+-- ERROR 3143 (42000): ... around character position 10.
+```
+
+One more restriction: the `->` and `->>` operators accept only a string literal on the right. `doc->@p` is not a 3143 at all but a syntax error (`ERROR 1064 ... near '@p FROM orders'`). Use `JSON_EXTRACT(doc, @p)` or `JSON_UNQUOTE(JSON_EXTRACT(doc, @p))` whenever the path is not a literal.
+
+An empty string is also rejected, with position 0, so guard against empty keys or missing configuration values before building the path.
+
+## Related Error: 3149 for Wildcards in Write Functions
+
+A path can be valid for reading and still rejected by `JSON_SET`, `JSON_INSERT`, `JSON_REPLACE` and `JSON_REMOVE`, because they need one exact target:
+
+```sql
+SELECT JSON_SET(doc, '$.items[*].qty', 0) FROM orders;
+```
+
+```
+ERROR 3149 (42000): In this situation, path expressions may not contain the * and ** tokens or an array range.
+```
+
+Update each element with an exact path (`$.items[0].qty`, `$.items[1].qty`), or rebuild the array with `JSON_ARRAYAGG` over `JSON_TABLE`.
+
+## The Trap: A Generated Column With a Bad Path
+
+This is the most serious variant. A `VIRTUAL` generated column is not evaluated when you add it, so MySQL 8.4.11 accepted this without complaint:
+
+```sql
+ALTER TABLE orders ADD COLUMN order_code VARCHAR(20) AS (doc->>'$.order-id');
+-- Query OK, 0 rows affected
+```
+
+From then on, the table is broken for anything that touches the column:
+
+```sql
+SELECT * FROM orders;                                  -- ERROR 3143
+INSERT INTO orders (id, doc) VALUES (2, '{"order-id": "A-1002"}');  -- ERROR 3143
+ALTER TABLE orders ADD INDEX idx_code (order_code);    -- ERROR 3143
+ALTER TABLE orders MODIFY COLUMN order_code VARCHAR(20)
+  AS (doc->>'$."order-id"') VIRTUAL;                   -- ERROR 3143
+```
+
+`SELECT id FROM orders` still works, but every `INSERT` fails, and even the `MODIFY COLUMN` that would fix the path is rejected. A `STORED` column with the same path fails immediately at `ALTER TABLE`, because MySQL computes it for existing rows.
+
+The way out is to drop the column and add it again with a valid path:
+
+```sql
+ALTER TABLE orders DROP COLUMN order_code;
+
+ALTER TABLE orders
+  ADD COLUMN order_code VARCHAR(20) AS (doc->>'$."order-id"') VIRTUAL,
+  ADD INDEX idx_code (order_code);
+```
+
+After that, inserts work and lookups use the index:
+
+```sql
+EXPLAIN FORMAT=TREE SELECT id FROM orders WHERE order_code = 'A-1002';
+-- -> Covering index lookup on orders using idx_code (order_code='A-1002')
+```
+
+Always test a path with a `SELECT` before you put it into a generated column, a view or a stored routine, where the failure shows up later and somewhere else.
+
+## Valid Path, Wrong Result
+
+Once the error is gone, the next surprise is usually a `NULL`. A valid path that matches nothing returns `NULL` instead of failing, so these mistakes are silent:
+
+```sql
+SELECT JSON_EXTRACT(doc, '$.Items')     FROM orders;  -- NULL: keys are case-sensitive
+SELECT JSON_EXTRACT(doc, '$.items.sku') FROM orders;  -- NULL: items is an array
+SELECT JSON_EXTRACT(doc, '$.items[5]')  FROM orders;  -- NULL: index out of range
+```
+
+The second one trips up people coming from tools that map over arrays automatically. In MySQL, a member step on an array matches nothing. Add `[*]` to visit every element: `$.items[*].sku` returns `["A-1", "B-7"]`.
+
+The shape of the result also changes with the path. A path without wildcards or ranges returns the single value (`$.items[last-1].sku` gives `"A-1"`). A path with `[*]`, `.*`, `**` or a range always returns an array, even when it matches one element (`$.items[0 to last].qty` gives `[2, 1]`). Passing several paths to `JSON_EXTRACT` also returns an array, and paths that match nothing are simply left out: `JSON_EXTRACT(doc, '$."order-id"', '$.missing')` returns `["A-1001"]`, not an error. Code that expects a scalar should use a single, exact path.
+
+Whitespace between steps is allowed, so `'$ .items[0] .sku'` is valid and returns `"A-1"`. That is why a space inside an unquoted key does not fail at the space itself: MySQL ends the key there and then fails on the next character.
+
+## Testing Paths Before You Ship Them
+
+Two quick checks catch nearly everything:
+
+```sql
+-- does the path parse, and does it match anything?
+SELECT JSON_CONTAINS_PATH(doc, 'one', '$."order-id"') FROM orders LIMIT 1;
+
+-- what are the real key names?
+SELECT JSON_KEYS(doc) FROM orders LIMIT 1;
+-- ["2024", "items", "order-id", "shipping address"]
+```
+
+`JSON_SEARCH(doc, 'one', 'B-7')` returns the path of a known value (`$.items[1].sku`), which is a handy way to discover the right path in an unfamiliar document.
+
+You can also paste a sample document and your paths into our free [MySQL JSON Path Tester](https://chat2db.ai/tools/mysql-json-path-tester). It reports the same ERROR 3143 positions as MySQL 8.4 with the likely fix, and shows what `JSON_EXTRACT` and `->>` return and every location a wildcard path matches. For running the corrected queries against your own tables, [Chat2DB](https://chat2db.ai/download) shows JSON columns in a readable tree and its AI assistant can write the `JSON_TABLE` query for a nested array from a plain description.
+
+## Summary
+
+- ERROR 3143 means the path string is invalid, not the document. The position counts bytes from the start of the path.
+- Quote keys that contain hyphens, spaces, other punctuation or start with a digit: `$."order-id"`, `$."2024"`.
+- MySQL has no negative indexes, `..`, filters or single-quoted keys. Use `[last]`, `$**.key` and `JSON_TABLE` instead.
+- Double backslashes inside SQL literals, and quote keys when building paths at runtime.
+- Never put an untested path in a `VIRTUAL` generated column. If it happens, drop and re-add the column.

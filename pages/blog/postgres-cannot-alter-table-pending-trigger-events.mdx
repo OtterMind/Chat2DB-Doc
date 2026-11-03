@@ -1,0 +1,239 @@
+---
+title: "Postgres: ALTER TABLE Has Pending Trigger Events"
+description: "Fix PostgreSQL 55006: cannot ALTER TABLE because it has pending trigger events. Find the deferred constraint, use SET CONSTRAINTS or split the migration."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: November 2, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# Postgres: ALTER TABLE Has Pending Trigger Events
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="November 2, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+This error usually appears in the middle of a database migration that changes data and schema in one transaction:
+
+```
+ERROR:  cannot ALTER TABLE "order_items" because it has pending trigger events
+```
+
+The SQLSTATE is `55006` (`object_in_use`). The same check also produces `cannot TRUNCATE ...`, `cannot CREATE INDEX ...` and `cannot DROP TABLE ...` with the same ending. PostgreSQL refuses the DDL because the current transaction has queued trigger work for that table that has not run yet. Changing the table's structure underneath queued events would leave PostgreSQL unable to process them safely.
+
+In practice, the queued work is almost always a **deferred constraint check**. This guide shows how to confirm that, the three ways to fix it, and a related message that looks similar but has a different cause. All examples were run on PostgreSQL 18.6.
+
+## Where Pending Trigger Events Come From
+
+Foreign keys, deferrable unique constraints and constraint triggers are implemented as `AFTER` triggers. For a normal (`NOT DEFERRABLE`) constraint, those triggers fire at the end of each statement, so nothing is left over when the next statement starts.
+
+A constraint declared `DEFERRABLE INITIALLY DEFERRED` works differently. Its checks are put into a queue and only run at `COMMIT`. Until then they are "pending trigger events" for the table. Any statement in the same transaction that wants to restructure the table (`ALTER TABLE`, `TRUNCATE`, `CREATE INDEX`, `DROP TABLE`) first checks that queue and fails with 55006 if the table has entries.
+
+Frameworks create deferred constraints more often than people expect. Django, for example, creates foreign keys on PostgreSQL as `DEFERRABLE INITIALLY DEFERRED`. Django also runs each migration in a transaction. So a migration that inserts or updates rows and then alters the same table is the textbook way to hit this error.
+
+Why refuse the DDL instead of just running the checks later? A queued event records which row changed and which trigger has to run for it. `ALTER TABLE` can rewrite the table, change column types, drop the columns the check reads, or replace the triggers themselves. If PostgreSQL let that happen, the queued check would run at commit against a table that no longer matches what was recorded, and it could not reliably decide whether the constraint holds. Failing early is the safe choice, and it leaves you to decide when the checks should run.
+
+## Reproducing the Error
+
+A foreign key that is deferred until commit:
+
+```sql
+CREATE TABLE orders2 (id int PRIMARY KEY, total numeric);
+CREATE TABLE order_items (
+    id       int PRIMARY KEY,
+    order_id int REFERENCES orders2 (id) DEFERRABLE INITIALLY DEFERRED,
+    qty      int
+);
+INSERT INTO orders2 VALUES (1, 10);
+```
+
+Insert a child row and alter the table in the same transaction:
+
+```sql
+BEGIN;
+INSERT INTO order_items VALUES (1, 1, 2);
+ALTER TABLE order_items ADD COLUMN sku text;
+```
+
+```
+ERROR:  55006: cannot ALTER TABLE "order_items" because it has pending trigger events
+```
+
+The `INSERT` queued a foreign key check on `order_items`, to run at commit. Other DDL against the same table fails the same way while that check is queued:
+
+```
+ERROR:  55006: cannot TRUNCATE "order_items" because it has pending trigger events
+ERROR:  55006: cannot CREATE INDEX "order_items" because it has pending trigger events
+ERROR:  55006: cannot DROP TABLE "order_items" because it has pending trigger events
+```
+
+## Which Statements Queue Events
+
+Not every write leaves a pending event. Running each case on PostgreSQL 18.6 shows which statements queued a check (and made a following `ALTER TABLE` fail) and which did not:
+
+| Statement in the transaction | Table | Pending event? |
+|---|---|---|
+| `INSERT` into the child (deferred FK) | child | Yes |
+| `UPDATE` of a non-key column in the parent | parent | No |
+| `UPDATE` of the parent key to the same value | parent | No |
+| `DELETE` from the parent | parent | Yes |
+| `DELETE` from the child | child | No |
+| `UPDATE` that creates a temporary duplicate in a deferred `UNIQUE` column | that table | Yes |
+| `UPDATE` with no conflict in a deferred `UNIQUE` column | that table | No |
+| Any `INSERT`/`UPDATE` covered by a deferred `CONSTRAINT TRIGGER` | that table | Yes |
+
+PostgreSQL skips foreign key checks it can prove are unnecessary, for example when a parent update does not change the referenced key. That is why the same migration may work on one run and fail on another, depending on the data it touched.
+
+The deferred unique constraint case is a swap like this:
+
+```sql
+CREATE TABLE seats (id int PRIMARY KEY, pos int UNIQUE DEFERRABLE INITIALLY DEFERRED);
+INSERT INTO seats VALUES (1, 1), (2, 2);
+
+BEGIN;
+UPDATE seats SET pos = 2 WHERE id = 1;   -- temporary duplicate, recheck queued
+UPDATE seats SET pos = 1 WHERE id = 2;
+ALTER TABLE seats ADD COLUMN label text;
+```
+
+```
+ERROR:  55006: cannot ALTER TABLE "seats" because it has pending trigger events
+```
+
+## Find the Deferred Constraints
+
+List every constraint that is deferrable, and whether it is deferred by default:
+
+```sql
+SELECT conrelid::regclass AS table_name,
+       conname,
+       contype,
+       condeferred AS initially_deferred
+FROM pg_constraint
+WHERE condeferrable
+ORDER BY 1, 2;
+```
+
+```
+ table_name  |          conname          | contype | initially_deferred
+-------------+---------------------------+---------+--------------------
+ order_items | order_items_order_id_fkey | f       | t
+ seats       | seats_pos_key             | u       | t
+```
+
+`contype` is `f` for foreign keys, `u` for unique constraints, `p` for primary keys and `x` for exclusion constraints. Deferrable constraint triggers are listed in `pg_trigger` with `tgdeferrable = true`:
+
+```sql
+SELECT tgrelid::regclass, tgname, tginitdeferred
+FROM pg_trigger
+WHERE tgdeferrable AND NOT tgisinternal;
+```
+
+If the table in the error message appears here, you have found the cause.
+
+## Fix 1: Run the Pending Checks Before the DDL
+
+`SET CONSTRAINTS ... IMMEDIATE` makes PostgreSQL run all queued checks for those constraints right away, which empties the queue:
+
+```sql
+BEGIN;
+INSERT INTO order_items VALUES (1, 1, 2);
+SET CONSTRAINTS ALL IMMEDIATE;
+ALTER TABLE order_items ADD COLUMN sku text;
+COMMIT;
+```
+
+```
+BEGIN
+INSERT 0 1
+SET CONSTRAINTS
+ALTER TABLE
+COMMIT
+```
+
+You can name a single constraint instead of `ALL`:
+
+```sql
+SET CONSTRAINTS order_items_order_id_fkey IMMEDIATE;
+```
+
+The checks really run at that moment. If the data violates the constraint, you get the constraint error at `SET CONSTRAINTS` instead of at `COMMIT`:
+
+```
+ERROR:  23503: insert or update on table "order_items" violates foreign key constraint "order_items_order_id_fkey"
+DETAIL:  Key (order_id)=(99) is not present in table "orders2".
+```
+
+That is usually what you want in a migration anyway: an early, clear failure. Statements after `SET CONSTRAINTS ALL IMMEDIATE` also check constraints immediately for the rest of the transaction. If later steps rely on deferral, for example inserting rows in an order that only becomes valid at commit, switch back with `SET CONSTRAINTS ALL DEFERRED` after the DDL.
+
+In a Django migration, run it with `RunSQL` between the data step and the schema step:
+
+```python
+operations = [
+    migrations.RunPython(backfill_items),
+    migrations.RunSQL("SET CONSTRAINTS ALL IMMEDIATE", migrations.RunSQL.noop),
+    migrations.AddField("shop.OrderItem", "sku", models.TextField(null=True)),
+]
+```
+
+## Fix 2: Split Data and Schema Changes
+
+The cleanest structural fix is to keep data changes and DDL on the same table in separate transactions:
+
+1. Migration A changes the schema (`ALTER TABLE ... ADD COLUMN`).
+2. Migration B updates or inserts the data.
+3. If needed, Migration C finishes the schema change (for example `SET NOT NULL` once the backfill is done).
+
+Each migration commits on its own, so the deferred checks from the data step run at the end of B and nothing is pending when C alters the table. This order is also friendlier to production, because long data backfills do not hold DDL locks for their whole duration. In Django, putting the data step in its own migration does this; setting `atomic = False` on a migration also works, but it gives up all-or-nothing behavior.
+
+## Fix 3: Make the Constraint Not Deferrable
+
+If nothing in the application depends on deferring the check until commit, remove the deferral. For foreign keys, PostgreSQL can change it in place:
+
+```sql
+ALTER TABLE order_items
+    ALTER CONSTRAINT order_items_order_id_fkey NOT DEFERRABLE;
+```
+
+`ALTER CONSTRAINT` only changes deferrability for foreign keys. For a unique constraint it fails:
+
+```
+ERROR:  42809: constraint "seats_pos_key" of relation "seats" is not a foreign key constraint
+```
+
+For unique, primary key and exclusion constraints you have to drop and re-create the constraint without `DEFERRABLE`, which rebuilds the index.
+
+Be careful before removing deferral. Some code relies on it, for example inserting rows with circular foreign keys, or swapping unique values the way the `seats` example does. Search the application for `SET CONSTRAINTS` and for multi-step updates of unique columns before you change it. In Django the FK deferral is created by the framework, so prefer fixes 1 or 2 there.
+
+## A Similar Error: Used by Active Queries in This Session
+
+The same SQLSTATE comes with a different message when the DDL runs while a query in the same session is still reading the table:
+
+```sql
+CREATE FUNCTION add_col() RETURNS int LANGUAGE plpgsql AS $$
+BEGIN
+  EXECUTE 'ALTER TABLE seats ADD COLUMN IF NOT EXISTS x int';
+  RETURN 1;
+END $$;
+
+SELECT add_col() FROM seats LIMIT 1;
+```
+
+```
+ERROR:  55006: cannot ALTER TABLE "seats" because it is being used by active queries in this session
+CONTEXT:  SQL statement "ALTER TABLE seats ADD COLUMN IF NOT EXISTS x int"
+PL/pgSQL function add_col() line 1 at EXECUTE
+```
+
+Here nothing is deferred. The outer `SELECT` is still scanning `seats` when the function tries to alter it. Triggers that run DDL on their own table, and functions called row by row from a query on the table they modify, cause this. Move the DDL out of the query: run it as a separate statement, or from application code before the query.
+
+## Checklist for Migrations
+
+- Look for `DEFERRABLE INITIALLY DEFERRED` constraints on the table in the error. Frameworks such as Django create them for every foreign key.
+- Data change followed by DDL on the same table in one transaction is the trigger. Either insert `SET CONSTRAINTS ALL IMMEDIATE` before the DDL or split the work into separate transactions.
+- Deleting parent rows and creating temporary duplicates in deferred unique columns also queue events, not only inserts.
+- Expect constraint violations to surface at `SET CONSTRAINTS` once you add it; that is the queued check running early.
+- "being used by active queries in this session" is a different problem: DDL inside a query or trigger that reads the same table.
+
+Running the `pg_constraint` query above against each environment shows which tables carry deferred constraints before a migration reaches production. In [Chat2DB](https://chat2db.ai/download) you can keep it as a saved query next to your migration scripts and run it against development, staging and production connections side by side.

@@ -1,0 +1,238 @@
+---
+title: "Postgres: Cannot Run Inside a Transaction Block"
+description: "Fix PostgreSQL 25001 errors for VACUUM, CREATE INDEX CONCURRENTLY, CREATE DATABASE and ALTER SYSTEM in psql, drivers, ORMs and migration tools."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: November 2, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# Postgres: Cannot Run Inside a Transaction Block
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="November 2, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+A handful of PostgreSQL commands refuse to run inside a transaction:
+
+```
+ERROR:  VACUUM cannot run inside a transaction block
+ERROR:  CREATE INDEX CONCURRENTLY cannot run inside a transaction block
+ERROR:  CREATE DATABASE cannot run inside a transaction block
+```
+
+The SQLSTATE is `25001` (`active_sql_transaction`). The fix is always the same in principle: send the command on its own, in autocommit mode. The confusing part is that you often did not write a `BEGIN` yourself. A driver, an ORM, a migration tool, or psql itself opened the transaction for you. This guide lists the affected commands, shows the hidden ways a transaction gets started, and gives the exact setting to change in common tools. Everything was tested on PostgreSQL 18.6.
+
+## Why These Commands Need Their Own Transaction
+
+Most SQL in PostgreSQL is transactional. If you roll back, the changes disappear. A few commands cannot work that way:
+
+- `VACUUM` commits internally as it moves from table to table and between its phases, so it cannot be rolled back as one unit.
+- `CREATE INDEX CONCURRENTLY` and `REINDEX CONCURRENTLY` run several transactions in sequence and wait for other transactions to finish between them. That is how they avoid blocking writes.
+- `CREATE DATABASE`, `DROP DATABASE` and `CREATE TABLESPACE` create or remove directories on disk, which cannot be undone by a rollback.
+- `ALTER SYSTEM` rewrites `postgresql.auto.conf`, a file outside the transactional system.
+
+PostgreSQL protects these commands with a check that rejects them when a transaction block is already open.
+
+## Commands That Raise 25001
+
+Each command below was run after `BEGIN` on PostgreSQL 18.6:
+
+| Command | Error |
+|---|---|
+| `VACUUM`, `VACUUM (ANALYZE)` | `VACUUM cannot run inside a transaction block` |
+| `CREATE INDEX CONCURRENTLY` | `CREATE INDEX CONCURRENTLY cannot run inside a transaction block` |
+| `DROP INDEX CONCURRENTLY` | `DROP INDEX CONCURRENTLY cannot run inside a transaction block` |
+| `REINDEX ... CONCURRENTLY` | `REINDEX CONCURRENTLY cannot run inside a transaction block` |
+| `REINDEX DATABASE` | `REINDEX DATABASE cannot run inside a transaction block` |
+| `CLUSTER` (without a table name) | `CLUSTER cannot run inside a transaction block` |
+| `CREATE DATABASE`, `DROP DATABASE` | `CREATE DATABASE cannot run inside a transaction block` |
+| `CREATE TABLESPACE` | `CREATE TABLESPACE cannot run inside a transaction block` |
+| `ALTER SYSTEM` | `ALTER SYSTEM cannot run inside a transaction block` |
+| `COMMIT PREPARED`, `ROLLBACK PREPARED` | `COMMIT PREPARED cannot run inside a transaction block` |
+
+Some close relatives are allowed: plain `ANALYZE`, `REINDEX TABLE` without `CONCURRENTLY`, and `CREATE INDEX` without `CONCURRENTLY` all work inside a transaction. `ALTER TYPE ... ADD VALUE` also runs inside a transaction on current versions, but the new enum value cannot be used until you commit:
+
+```sql
+BEGIN;
+ALTER TYPE mood ADD VALUE 'happy';
+SELECT 'happy'::mood;
+```
+
+```
+ERROR:  55P04: unsafe use of new value "happy" of enum type mood
+HINT:  New enum values must be committed before they can be used.
+```
+
+## Hidden Ways a Transaction Gets Opened
+
+### Several Statements in One Query String
+
+When a client sends several statements in one simple-protocol query, PostgreSQL runs them as one implicit transaction. That is enough to trigger the error even with no `BEGIN`:
+
+```bash
+psql -c "VACUUM events; SELECT 1"
+```
+
+```
+ERROR:  25001: VACUUM cannot run inside a transaction block
+```
+
+The order does not matter. `psql -c "SELECT 1; CREATE INDEX CONCURRENTLY ..."` fails the same way. Send each of these commands as a separate `-c` option or a separate query:
+
+```bash
+psql -c "VACUUM events" -c "SELECT 1"
+```
+
+Scripts executed with `psql -f` are fine, because psql sends each statement separately, unless the script contains `BEGIN` or you run it with `--single-transaction` (`-1`), which wraps the whole file in one transaction.
+
+### psql With AUTOCOMMIT Off
+
+If your `.psqlrc` sets `\set AUTOCOMMIT off`, psql issues an invisible `BEGIN` before the first statement:
+
+```
+\set AUTOCOMMIT off
+SELECT 1;
+VACUUM events;
+```
+
+```
+ERROR:  VACUUM cannot run inside a transaction block
+```
+
+Run `\set AUTOCOMMIT on`, or `COMMIT` or `ROLLBACK` first, then run the command.
+
+### Functions, DO Blocks and Procedures
+
+These commands cannot run from server-side code at all, even from a procedure that commits:
+
+```sql
+DO $$ BEGIN EXECUTE 'VACUUM events'; END $$;
+```
+
+```
+ERROR:  25001: VACUUM cannot be executed from a function
+CONTEXT:  SQL statement "VACUUM events"
+PL/pgSQL function inline_code_block line 1 at EXECUTE
+```
+
+A procedure that calls `COMMIT` before `VACUUM` still fails with the same message. Schedule maintenance from outside the database instead: cron with psql, the `pg_cron` extension (its jobs run each command as a top-level statement), or your job scheduler.
+
+### Drivers and ORMs That Start Transactions Implicitly
+
+Many client libraries open a transaction before the first statement unless you switch on autocommit:
+
+**Python psycopg2** starts a transaction implicitly, so `cur.execute("VACUUM events")` raises `psycopg2.errors.ActiveSqlTransaction`. Enable autocommit on the connection:
+
+```python
+conn = psycopg2.connect(dsn)
+conn.autocommit = True
+with conn.cursor() as cur:
+    cur.execute("VACUUM (ANALYZE) events")
+```
+
+With psycopg 3, pass `autocommit=True` to `psycopg.connect()`.
+
+**SQLAlchemy** uses a transaction for every connection by default. Ask for autocommit on a dedicated connection:
+
+```python
+with engine.connect().execution_options(isolation_level="AUTOCOMMIT") as conn:
+    conn.execute(text("CREATE INDEX CONCURRENTLY events_kind_idx ON events (kind)"))
+```
+
+**JDBC** sends `BEGIN` when `setAutoCommit(false)` is in effect, which is the default inside Spring `@Transactional` methods and most connection pools configured for transactions. Run the statement from a method outside the transaction, on a connection with `setAutoCommit(true)`.
+
+**node-postgres** is in autocommit mode unless you send `BEGIN`, so the error usually means the command was sent through a client that is in the middle of a transaction. Use a separate client from the pool.
+
+## Migration Tools
+
+Migration frameworks wrap each migration in a transaction so a failure leaves no half-applied schema. Each one has a switch to turn that off for a migration that needs a concurrent index:
+
+**Django**: mark the migration non-atomic and use the concurrent operations from `django.contrib.postgres`:
+
+```python
+from django.contrib.postgres.operations import AddIndexConcurrently
+
+class Migration(migrations.Migration):
+    atomic = False
+    operations = [
+        AddIndexConcurrently("events", models.Index(fields=["kind"], name="events_kind_idx")),
+    ]
+```
+
+**Rails**: `disable_ddl_transaction!` at the top of the migration, then `add_index :events, :kind, algorithm: :concurrently`.
+
+**Alembic**: wrap the statement in an autocommit block:
+
+```python
+def upgrade():
+    with op.get_context().autocommit_block():
+        op.create_index("events_kind_idx", "events", ["kind"], postgresql_concurrently=True)
+```
+
+**Liquibase**: set `runInTransaction="false"` on the changeset.
+
+**Flyway**: put the statement in its own migration file. You can turn off the transaction for that script with a script configuration file that sets `executeInTransaction=false`. Keep transactional and non-transactional statements in separate migrations.
+
+Whichever tool you use, keep the non-transactional statement alone in its migration. If it is mixed with other DDL and something fails halfway, there is no rollback to clean up the parts that already ran.
+
+## What Changes When the Command Runs on Its Own
+
+Moving `CREATE INDEX CONCURRENTLY` out of the transaction removes the error, but it behaves differently from the plain `CREATE INDEX` you may have had before. It does not block writes, but it has to wait for every transaction that might still change the table to finish. A single session that sits in an open transaction can make it wait indefinitely. With one session holding an uncommitted `INSERT` into `events`, the index build waited on a `virtualxid` lock:
+
+```sql
+SELECT pid, wait_event_type, wait_event, state, left(query, 60)
+FROM pg_stat_activity
+WHERE query LIKE 'CREATE INDEX CONCURRENTLY%';
+```
+
+```
+ pid | wait_event_type | wait_event | state  |                          left
+-----+-----------------+------------+--------+----------------------------------------------------------
+ 242 | Lock            | virtualxid | active | CREATE INDEX CONCURRENTLY events_kind_idx ON events (kind)
+```
+
+With `statement_timeout = '4s'` the build was canceled (`canceling statement due to statement timeout`), and it left an invalid index behind, as described in the next section. Before a deployment, look for sessions that are `idle in transaction` and for long-running transactions, and set a timeout so the migration fails cleanly instead of hanging. Also note that the migration is no longer all-or-nothing: if a later step fails, the index stays. Write migrations so they can safely be run again, for example with `CREATE INDEX CONCURRENTLY IF NOT EXISTS`. Keep in mind that `IF NOT EXISTS` also skips an invalid index with the same name, so drop invalid leftovers first.
+
+## After the Fix: Check for Invalid Indexes
+
+Running `CREATE INDEX CONCURRENTLY` outside a transaction fixes the 25001 error, but the command can still fail later, for example on duplicate keys for a unique index or when it is canceled. Unlike a normal `CREATE INDEX`, a failed concurrent build leaves an invalid index behind:
+
+```sql
+CREATE UNIQUE INDEX CONCURRENTLY events_kind_uq ON events (kind);
+```
+
+```
+ERROR:  could not create unique index "events_kind_uq"
+DETAIL:  Key (kind)=(a) is duplicated.
+```
+
+```sql
+SELECT indexrelid::regclass, indisvalid
+FROM pg_index
+WHERE indrelid = 'events'::regclass;
+```
+
+```
+   indexrelid   | indisvalid
+----------------+------------
+ events_pkey    | t
+ events_kind_uq | f
+```
+
+`\d events` marks it `INVALID`. The planner ignores it, but writes still have to maintain it, so drop it and retry once the data is fixed:
+
+```sql
+DROP INDEX CONCURRENTLY events_kind_uq;
+```
+
+Run that check after every concurrent index migration. A schema-wide version catches leftovers from any failed deployment: `SELECT indexrelid::regclass, indrelid::regclass FROM pg_index WHERE NOT indisvalid;`. In [Chat2DB](https://chat2db.ai/download) you can save it as a snippet and run it against each environment right after a release.
+
+## Quick Reference
+
+- 25001 means the command was sent while a transaction block was open. The command itself is fine.
+- Find who opened the transaction: an explicit `BEGIN`, several statements in one query string, `psql -1`, `AUTOCOMMIT off`, a driver without autocommit, or a migration tool.
+- Send the command alone, in autocommit mode: `conn.autocommit = True`, `isolation_level="AUTOCOMMIT"`, `atomic = False`, `disable_ddl_transaction!`, `autocommit_block()`, `runInTransaction="false"`.
+- Functions, `DO` blocks and procedures can never run these commands. Schedule them from outside.
+- After `CREATE INDEX CONCURRENTLY`, check `pg_index.indisvalid` and drop invalid leftovers.

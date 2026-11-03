@@ -1,0 +1,289 @@
+---
+title: "Postgres: Prepared Transactions Are Disabled Fix"
+description: "Fix PostgreSQL ERROR: prepared transactions are disabled (55000): set max_prepared_transactions, restart safely, and find orphaned prepared transactions."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: November 2, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# Postgres: Prepared Transactions Are Disabled Fix
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="November 2, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+You run `PREPARE TRANSACTION`, or a Java application with an XA transaction manager commits its first distributed transaction, and PostgreSQL answers:
+
+```
+ERROR:  prepared transactions are disabled
+HINT:  Set "max_prepared_transactions" to a nonzero value.
+```
+
+The SQLSTATE is `55000` (`object_not_in_prerequisite_state`). Two-phase commit is switched off by default, and the fix is a configuration change. But that change needs a server restart, and it also affects replicas, so it pays to understand what happens before and after. Prepared transactions also have a well-known operational trap: one that is never finished keeps its locks and stops VACUUM from cleaning up, even across restarts.
+
+Every example in this guide was run on PostgreSQL 18.6.
+
+## What PREPARE TRANSACTION Does
+
+Two-phase commit (2PC) lets a transaction manager coordinate several resources, for example two databases, or a database and a message broker. In phase one each participant is asked to *prepare*: it writes everything needed to commit to disk and promises it can still commit later. In phase two the coordinator tells every participant to commit, or tells all of them to roll back.
+
+In PostgreSQL, phase one is `PREPARE TRANSACTION 'gid'`. The transaction is detached from your session and stored under a global identifier (the gid). Phase two is `COMMIT PREPARED 'gid'` or `ROLLBACK PREPARED 'gid'`, which any session in the same database can run later.
+
+You rarely type these commands yourself. They are issued by:
+
+- JTA/XA transaction managers in Java (Atomikos, Narayana, Bitronix and the ones built into application servers) through the PostgreSQL JDBC driver's XA support (`PGXADataSource`).
+- Other XA coordinators and frameworks that combine a PostgreSQL write with another resource in one atomic unit.
+- Tests or tools that exercise distributed transactions.
+
+If you see this error and nobody on the team chose to use 2PC, check the data source configuration first. An XA data source is sometimes configured by accident, and switching to a normal data source is a better fix than enabling a feature you do not need.
+
+## Reproducing the Error
+
+With the default setting the error appears at `PREPARE TRANSACTION`:
+
+```sql
+SHOW max_prepared_transactions;   -- 0
+
+CREATE TABLE orders (id int PRIMARY KEY, status text);
+
+BEGIN;
+INSERT INTO orders VALUES (1, 'new');
+PREPARE TRANSACTION 'order-1';
+```
+
+```
+ERROR:  55000: prepared transactions are disabled
+HINT:  Set "max_prepared_transactions" to a nonzero value.
+LOCATION:  MarkAsPreparing, twophase.c:373
+```
+
+The failed `PREPARE TRANSACTION` also ends the transaction. The insert is rolled back, and the next statement runs outside any transaction block:
+
+```sql
+SELECT count(*) FROM orders;   -- 0
+```
+
+So an application that sees this error has lost the work of that transaction. It is not left in a half-prepared state, and there is nothing to clean up. It does have to retry once the setting is fixed.
+
+Running `PREPARE TRANSACTION` with no open transaction gives a warning instead of an error, and the command tag is `ROLLBACK`:
+
+```
+ROLLBACK
+WARNING:  25P01: there is no transaction in progress
+```
+
+## Fix: Set max_prepared_transactions and Restart
+
+`max_prepared_transactions` is the number of transactions that can be in the prepared state at the same time. Its context is `postmaster`, so it only changes at server start:
+
+```sql
+SELECT name, setting, context, pending_restart
+FROM pg_settings
+WHERE name = 'max_prepared_transactions';
+```
+
+```
+           name            | setting |  context   | pending_restart
+---------------------------+---------+------------+-----------------
+ max_prepared_transactions | 0       | postmaster | f
+```
+
+Set it and restart:
+
+```sql
+ALTER SYSTEM SET max_prepared_transactions = 100;
+```
+
+```bash
+# systemd
+sudo systemctl restart postgresql
+# Docker
+docker restart my-postgres
+```
+
+On managed services, change the parameter in the instance's parameter group or configuration page, then reboot the instance.
+
+How large should it be? The PostgreSQL documentation recommends that, if you use prepared transactions at all, `max_prepared_transactions` should be at least as large as `max_connections`, so that every session can have a transaction in phase one at once. If 2PC is only used by a handful of connections, a smaller value works, but a value that is too small produces a different error:
+
+```
+ERROR:  53200: maximum number of prepared transactions reached
+HINT:  Increase "max_prepared_transactions" (currently 2).
+```
+
+That error usually means prepared transactions are piling up and never being finished, which is the problem described below, rather than a need for more slots.
+
+### Replicas Need the Same Setting or Higher
+
+A physical standby must have `max_prepared_transactions` at least as high as its primary. If you raise it on the primary and forget the standby, the standby refuses to replay WAL. Here is a standby started with `0` against a primary that uses `2`:
+
+```
+LOG:  entering standby mode
+FATAL:  recovery aborted because of insufficient parameter settings
+DETAIL:  max_prepared_transactions = 0 is a lower setting than on the primary server, where its value was 2.
+HINT:  You can restart the server after making the necessary configuration changes.
+```
+
+Raise the value on standbys first, restart them, then raise it on the primary. When lowering it, do the reverse.
+
+## How Prepared Transactions Work After the Fix
+
+With the setting enabled, the same transaction prepares successfully and shows up in `pg_prepared_xacts`:
+
+```sql
+BEGIN;
+INSERT INTO orders VALUES (1, 'new');
+PREPARE TRANSACTION 'order-1';
+
+SELECT gid, prepared, owner, database FROM pg_prepared_xacts;
+```
+
+```
+   gid   |           prepared            |  owner   | database
+---------+-------------------------------+----------+----------
+ order-1 | 2026-11-03 00:32:04.784642+00 | postgres | postgres
+```
+
+The row is not visible to other sessions until phase two. Then one of these finishes it:
+
+```sql
+COMMIT PREPARED 'order-1';
+-- or
+ROLLBACK PREPARED 'order-1';
+```
+
+A few rules are worth knowing because they produce their own errors:
+
+| Situation | Error |
+|---|---|
+| Reusing a gid that is still prepared | `42710: transaction identifier "order-1" is already in use` |
+| Finishing a gid that does not exist | `42704: prepared transaction with identifier "order-1" does not exist` |
+| `COMMIT PREPARED` inside `BEGIN ... COMMIT` | `25001: COMMIT PREPARED cannot run inside a transaction block` |
+| Finishing it from another database | `0A000: prepared transaction belongs to another database` |
+| Finishing it as a different, non-superuser role | `42501: permission denied to finish prepared transaction` |
+| gid longer than 200 bytes | `22023: transaction identifier "..." is too long` |
+| Transaction used a temporary table | `0A000: cannot PREPARE a transaction that has operated on temporary objects` |
+| Transaction ran `LISTEN`, `UNLISTEN` or `NOTIFY` | `0A000: cannot PREPARE a transaction that has executed LISTEN, UNLISTEN, or NOTIFY` |
+
+The temporary table rule surprises people. If application code uses temp tables inside an XA transaction, preparing will fail even after `max_prepared_transactions` is set.
+
+## The Real Risk: Orphaned Prepared Transactions
+
+A prepared transaction belongs to no session. If the transaction manager crashes, loses its log, or is simply misconfigured, the prepared transaction stays in the database until someone commits or rolls it back. It survives a server restart too. After `docker restart`, the transaction is still there:
+
+```sql
+SELECT gid, owner FROM pg_prepared_xacts;
+```
+
+```
+   gid    |  owner
+----------+----------
+ survivor | postgres
+```
+
+While it exists, it behaves like an open transaction that never ends.
+
+### It Keeps Its Locks
+
+A prepared transaction that updated a row still holds the row lock. Another session that wants the same row waits forever, or until a timeout:
+
+```sql
+-- prepared earlier: UPDATE orders SET status = 'shipped' WHERE id = 1;
+SET lock_timeout = '2s';
+UPDATE orders SET status = 'cancelled' WHERE id = 1;
+```
+
+```
+ERROR:  55P03: canceling statement due to lock timeout
+CONTEXT:  while updating tuple (0,2) in relation "orders"
+```
+
+In `pg_locks`, these locks have no `pid`, which is a quick way to tell them apart from locks held by live sessions:
+
+```sql
+SELECT locktype, relation::regclass, mode, granted, virtualtransaction
+FROM pg_locks
+WHERE pid IS NULL;
+```
+
+```
+   locktype    | relation |       mode       | granted | virtualtransaction
+---------------+----------+------------------+---------+--------------------
+ relation      | orders   | RowExclusiveLock | t       | 0/6
+ transactionid |          | ExclusiveLock    | t       | 0/6
+```
+
+Normal monitoring that looks only at `pg_stat_activity` misses them, because there is no backend to show.
+
+### It Blocks VACUUM
+
+A prepared transaction holds back the xmin horizon, so VACUUM cannot remove rows that died after it started. With a prepared transaction open, 10,000 deleted rows stay in the table:
+
+```sql
+INSERT INTO orders SELECT g, 'bulk' FROM generate_series(100, 10099) g;
+DELETE FROM orders WHERE status = 'bulk';
+VACUUM (VERBOSE) orders;
+```
+
+```
+tuples: 4 removed, 10001 remain, 10000 are dead but not yet removable
+```
+
+After `ROLLBACK PREPARED`, the same VACUUM removes them and truncates the table:
+
+```
+INFO:  table "orders": truncated 55 to 1 pages
+tuples: 10001 removed, 1 remain, 0 are dead but not yet removable
+```
+
+Left for weeks, an orphan causes table and index bloat everywhere, and eventually transaction ID wraparound warnings, because the database's oldest XID cannot advance past it.
+
+### Finding and Resolving Orphans
+
+Check regularly for prepared transactions that are older than any real 2PC should take:
+
+```sql
+SELECT gid,
+       database,
+       owner,
+       prepared,
+       now() - prepared AS waiting_for,
+       age(transaction) AS xid_age
+FROM pg_prepared_xacts
+ORDER BY prepared;
+```
+
+A prepared transaction normally lives for milliseconds. Anything older than a few minutes deserves an alert. To resolve one:
+
+1. Ask the transaction manager first. If its recovery log knows the global transaction, let it finish the transaction, because it knows whether the other participants committed.
+2. If the coordinator is gone for good, decide based on the other resources. If they committed, run `COMMIT PREPARED`; otherwise run `ROLLBACK PREPARED`.
+3. Connect to the database shown in the `database` column, as the owner or a superuser, and run the command outside a transaction block.
+
+```sql
+\c shop
+ROLLBACK PREPARED 'order-1';
+```
+
+You can run the monitoring query and inspect `pg_locks` from any SQL client. In [Chat2DB](https://chat2db.ai/download) you can save the query, run it against several servers, and ask the AI assistant to explain which sessions are waiting on a prepared transaction's locks.
+
+## Should You Enable It at All?
+
+Enable `max_prepared_transactions` when you really use XA or another 2PC coordinator. If you do not, leave it at `0`. Then a stray `PREPARE TRANSACTION` fails at once instead of leaving an orphan behind.
+
+If you enable it:
+
+- Set it on standbys before the primary, and keep it equal or higher there.
+- Alert on `pg_prepared_xacts` rows older than a few minutes.
+- Make sure the transaction manager's recovery log is on durable storage and that its recovery process can reach PostgreSQL after a crash.
+- Avoid temp tables and `LISTEN`/`NOTIFY` inside XA transactions.
+
+Many applications that turned on XA only to update one database plus a message queue can switch to the transactional outbox pattern instead. You write the outgoing message into a table in the same local transaction and publish it afterwards. That removes the need for prepared transactions entirely.
+
+## Summary
+
+- `prepared transactions are disabled` (55000) means `max_prepared_transactions` is `0`, the default.
+- Set it with `ALTER SYSTEM SET max_prepared_transactions = ...` and restart. It cannot change without a restart.
+- The failed `PREPARE TRANSACTION` rolls the whole transaction back; the application must retry.
+- Standbys need a value at least as high as the primary, or recovery aborts.
+- Prepared transactions survive restarts, hold their locks with no `pid` in `pg_locks`, and stop VACUUM from removing dead rows. Monitor `pg_prepared_xacts` and finish orphans with `COMMIT PREPARED` or `ROLLBACK PREPARED` from the right database.

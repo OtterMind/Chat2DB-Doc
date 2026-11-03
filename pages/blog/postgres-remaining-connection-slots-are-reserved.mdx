@@ -1,0 +1,222 @@
+---
+title: "Postgres: Remaining Connection Slots Are Reserved"
+description: "Fix PostgreSQL FATAL: remaining connection slots are reserved (53300): find what uses the slots, tune reserved_connections and pool connections properly."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: November 2, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# Postgres: Remaining Connection Slots Are Reserved
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="November 2, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+Your application suddenly cannot open new database connections, and the error looks like this:
+
+```
+psql: error: connection to server at "127.0.0.1", port 5432 failed: FATAL:  remaining connection slots are reserved for roles with privileges of the "pg_use_reserved_connections" role
+```
+
+or, depending on version and settings:
+
+```
+FATAL:  remaining connection slots are reserved for roles with the SUPERUSER attribute
+FATAL:  remaining connection slots are reserved for non-replication superuser connections
+```
+
+All of them carry SQLSTATE `53300` (`too_many_connections`). PostgreSQL is not completely full yet. It is keeping its last few connection slots free for administrators, so that someone can still log in and fix the problem. Your ordinary application role has used up every slot it is allowed to use.
+
+This guide shows exactly how the slots are divided, how to find what is consuming them, and the fixes that last, from connection pooling to timeouts. The examples were run on PostgreSQL 18.6 with a deliberately small `max_connections` so the limits are easy to hit.
+
+## How PostgreSQL Divides Connection Slots
+
+Three settings decide who may connect:
+
+| Setting | Default | Meaning |
+|---|---|---|
+| `max_connections` | 100 | Total client connection slots |
+| `superuser_reserved_connections` | 3 | Slots only superusers may use |
+| `reserved_connections` (PostgreSQL 16+) | 0 | Slots for superusers and members of `pg_use_reserved_connections` |
+
+Ordinary roles can use `max_connections - superuser_reserved_connections - reserved_connections` slots. Replication connections from standbys use their own slots (`max_wal_senders`), and autovacuum workers and other background processes are not counted against `max_connections`.
+
+The message tells you which tier you ran into:
+
+- `reserved for roles with privileges of the "pg_use_reserved_connections" role`: a normal role hit its limit and `reserved_connections` is set.
+- `reserved for roles with the SUPERUSER attribute`: a normal role (with `reserved_connections = 0`), or a member of `pg_use_reserved_connections`, hit the limit; only the superuser slots are left.
+- `reserved for non-replication superuser connections`: the wording used before PostgreSQL 16.
+- `sorry, too many clients already`: every slot is taken, even the superuser ones.
+
+## Reproducing Each Message
+
+With this configuration:
+
+```sql
+ALTER SYSTEM SET max_connections = 8;
+ALTER SYSTEM SET superuser_reserved_connections = 2;
+ALTER SYSTEM SET reserved_connections = 2;
+-- restart the server
+
+CREATE ROLE app LOGIN PASSWORD '...';
+CREATE ROLE ops LOGIN PASSWORD '...';
+GRANT pg_use_reserved_connections TO ops;
+```
+
+the application role `app` can use `8 - 2 - 2 = 4` slots. Opening connections one at a time:
+
+```
+app #1 ok
+app #2 ok
+app #3 ok
+app #4 ok
+app #5 53300 remaining connection slots are reserved for roles with privileges of the "pg_use_reserved_connections" role
+ops #1 ok
+ops #2 ok
+ops #3 53300 remaining connection slots are reserved for roles with the SUPERUSER attribute
+postgres #1 ok
+postgres #2 ok
+postgres #3 53300 sorry, too many clients already
+```
+
+So the reserved slots work as intended. When the application has exhausted its share, an operator role and then a superuser can still get in. That is your way in to diagnose the problem, so do not spend those slots on application traffic.
+
+## Step 1: Connect With a Reserved Role and Look
+
+Log in as a superuser (or a member of `pg_use_reserved_connections`) and group the current sessions:
+
+```sql
+SELECT usename, application_name, client_addr, state, count(*)
+FROM pg_stat_activity
+WHERE backend_type = 'client backend'
+GROUP BY 1, 2, 3, 4
+ORDER BY count(*) DESC;
+```
+
+```
+ usename  | application_name |        state        | count
+----------+------------------+---------------------+-------
+ app      | checkout-api     | idle                |     3
+ app      | checkout-api     | idle in transaction |     1
+ postgres | psql             | active              |     1
+```
+
+How to read the `state` column:
+
+- **idle**: connected and doing nothing. Many idle sessions from one application mean its pool is larger than it needs, or several application instances each keep their own full pool.
+- **idle in transaction**: a transaction is open but no query is running. These sessions hold locks and snapshots, and they usually point to a code path that forgot to commit, or that makes a slow external call inside a transaction.
+- **active**: actually running a query. If most sessions are active, the database is busy, and more connections will not make it faster.
+
+This grouping is only as useful as the `application_name` values. If every row says `PostgreSQL JDBC Driver` or is empty, you cannot tell services apart. Set a distinct name in each client's connection string, for example `?application_name=checkout-api` in a libpq URL or `ApplicationName=checkout-api` for JDBC, so the next incident takes minutes instead of hours. `client_addr` then tells you which host or container the sessions come from.
+
+Look at the oldest sessions too:
+
+```sql
+SELECT pid, usename, application_name, state,
+       now() - backend_start AS connected_for,
+       now() - state_change  AS in_state_for,
+       left(query, 60)       AS last_query
+FROM pg_stat_activity
+WHERE backend_type = 'client backend'
+ORDER BY state_change
+LIMIT 20;
+```
+
+## Step 2: Free Slots Right Now
+
+If the outage is ongoing, end the sessions that are doing nothing useful. Long `idle in transaction` sessions are the first candidates:
+
+```sql
+SELECT pid, pg_terminate_backend(pid)
+FROM pg_stat_activity
+WHERE backend_type = 'client backend'
+  AND state = 'idle in transaction'
+  AND now() - state_change > interval '5 minutes';
+```
+
+Terminating a session rolls back its open transaction. That is safe for the database, but the application gets an error for that connection, and a good pool will replace it. Restarting a misbehaving application instance has the same effect and is often simpler.
+
+## Step 3: Fix the Cause
+
+### Size Pools for the Database, Not for Each Instance
+
+The most common cause is arithmetic. Twenty application instances with a pool of 20 connections each can open 400 connections, no matter what `max_connections` says. Add up the maximum pool size of every client: application instances, workers, cron jobs, BI tools and migrations. Keep the total below the slots available to normal roles, with headroom for deployments, when old and new instances run at the same time.
+
+A database can only execute about as many queries in parallel as it has CPU cores and disk throughput. A few dozen active connections usually saturate a typical server, and hundreds of active connections are slower than a few dozen, not faster. Smaller pools with a queue in the application are the right shape.
+
+### Put a Pooler in Front
+
+When many processes need connections (serverless functions, many small services, PHP or Python workers), use a connection pooler such as PgBouncer in transaction mode. Thousands of client connections then share a small number of server connections. Managed platforms often include one. Note that transaction pooling changes session behavior: session-level `SET`, advisory locks held across transactions, and `LISTEN` need care.
+
+### Add Timeouts for Idle Sessions
+
+Two settings stop forgotten sessions from holding slots forever:
+
+```sql
+-- end sessions that sit inside an open transaction
+ALTER ROLE app SET idle_in_transaction_session_timeout = '2min';
+-- end sessions that are idle outside a transaction (PostgreSQL 14+)
+ALTER ROLE app SET idle_session_timeout = '30min';
+```
+
+Set them per role, not globally, so that interactive superuser sessions are not cut off. `idle_session_timeout` will also close idle pooled connections, so keep it longer than the pool's own idle timeout, or the pool will hand out connections that the server has already closed.
+
+### Limit Each Role
+
+A per-role limit keeps one application from starving the others:
+
+```sql
+ALTER ROLE app CONNECTION LIMIT 40;
+```
+
+When a role reaches its own limit the error is different, which makes the culprit obvious:
+
+```
+53300 too many connections for role "app"
+```
+
+### Raise max_connections Only After the Above
+
+Raising `max_connections` requires a restart and costs memory for every slot. It also does nothing for throughput, and with high values each connection's `work_mem` budget adds up. Increase it moderately if your measured peak of truly needed connections is above the limit. Do not use it to absorb leaked or oversized pools.
+
+## Step 4: Keep the Reserved Slots Useful
+
+Reserved slots only help if the people on call can use them:
+
+- Keep `superuser_reserved_connections` at its default of 3 or a little higher.
+- On PostgreSQL 16 and later, create an operator role, grant it `pg_use_reserved_connections`, and set `reserved_connections` to a few slots. Operators then do not need full superuser rights to log in during an incident.
+- Never let applications, monitoring agents or BI tools connect as a superuser or as a member of `pg_use_reserved_connections`. Otherwise they eat the reserve, and the next outage ends at `sorry, too many clients already` with nobody able to log in.
+
+Check who currently holds the reserved privilege:
+
+```sql
+SELECT r.rolname, r.rolsuper
+FROM pg_roles r
+WHERE r.rolcanlogin
+  AND (r.rolsuper OR pg_has_role(r.oid, 'pg_use_reserved_connections', 'MEMBER'))
+ORDER BY 1;
+```
+
+## Watching Connection Usage Before It Fails
+
+Alert well before the limit, for example at 80% of the slots available to normal roles:
+
+```sql
+SELECT count(*) AS used,
+       current_setting('max_connections')::int
+         - current_setting('superuser_reserved_connections')::int
+         - current_setting('reserved_connections')::int AS available_to_apps
+FROM pg_stat_activity
+WHERE backend_type = 'client backend';
+```
+
+Graph `used` by `application_name` so you can see which client grows during incidents. [Chat2DB](https://chat2db.ai/download) lets you keep these queries next to the connection they belong to and run them in one click during an incident. Its AI assistant can also turn a question like "which application holds the most idle connections" into the right `pg_stat_activity` query.
+
+## Summary
+
+- `remaining connection slots are reserved` (53300) means normal roles have used every slot they are allowed. The last slots are kept for superusers and, on PostgreSQL 16+, for members of `pg_use_reserved_connections`.
+- Log in with a reserved role, group `pg_stat_activity` by user, application and state, and terminate long `idle in transaction` sessions if you need slots immediately.
+- Fix the cause: total pool sizes across all instances, a pooler such as PgBouncer, idle timeouts per role, and `CONNECTION LIMIT` per role.
+- Raise `max_connections` only for real, measured demand, and never let applications use the reserved roles.

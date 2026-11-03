@@ -1,0 +1,238 @@
+---
+title: "MySQL Error 1241: Operand Should Contain 1 Column"
+description: "Fix MySQL ERROR 1241 Operand should contain 1 column(s): subqueries returning two columns, IN lists, stray parentheses, row comparisons and array parameters."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: November 2, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# MySQL Error 1241: Operand Should Contain 1 Column
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="November 2, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+MySQL reports this error when a place in the query that expects one value receives several:
+
+```
+ERROR 1241 (21000): Operand should contain 1 column(s)
+```
+
+An "operand" is one side of a comparison, an argument to a function, or an item in a list. The error means that operand is a row with more than one column, either a subquery that selects two columns or a pair of values in parentheses. The number in the message is what MySQL expected; the variant `Operand should contain 2 column(s)` means the opposite mistake, where a row comparison has too few values on one side.
+
+This guide shows the common causes with output from MySQL 8.4, and the right fix for each, including what to do when you really need two values from a subquery.
+
+The examples use two tables:
+
+```sql
+CREATE TABLE customers (id INT PRIMARY KEY, name VARCHAR(50), status VARCHAR(10));
+CREATE TABLE orders (
+  id INT PRIMARY KEY, customer_id INT, total DECIMAL(10,2),
+  created_at DATETIME, status VARCHAR(10));
+
+INSERT INTO customers VALUES (1, 'Ana', 'active'), (2, 'Ben', 'blocked');
+INSERT INTO orders VALUES
+  (10, 1, 40.00, '2026-03-01 12:00:00', 'paid'),
+  (11, 1, 15.50, '2026-03-04 08:30:00', 'open'),
+  (12, 2, 99.00, '2026-03-05 17:45:00', 'paid');
+```
+
+## Cause 1: A Subquery in IN Selects Two Columns
+
+The most frequent case. `IN` compares one value against one column, so the subquery must return one column:
+
+```sql
+SELECT name FROM customers
+WHERE id IN (SELECT customer_id, total FROM orders);
+-- ERROR 1241 (21000): Operand should contain 1 column(s)
+```
+
+The extra column is often left over from a query that was first written on its own to look at the data. Remove it:
+
+```sql
+SELECT name FROM customers
+WHERE id IN (SELECT customer_id FROM orders WHERE total > 50);
+```
+
+The same applies to `= ANY`, `= SOME`, `<> ALL` and `NOT IN`. `SELECT *` inside `IN` triggers the error as soon as the table has more than one column, and so does a CTE that selects two columns when you write `IN (SELECT * FROM cte)`.
+
+`EXISTS` is the exception. It only checks whether rows exist, so `WHERE EXISTS (SELECT * FROM customers c WHERE c.id = orders.customer_id)` is fine with any number of columns.
+
+## Cause 2: A Scalar Subquery Returns Two Columns
+
+A subquery used as a value, in the select list, in a comparison or as a function argument, must return exactly one column and at most one row:
+
+```sql
+SELECT name,
+       (SELECT id, total FROM orders o WHERE o.customer_id = c.id LIMIT 1)
+FROM customers c;
+-- ERROR 1241 (21000): Operand should contain 1 column(s)
+
+SELECT * FROM orders
+WHERE total > (SELECT AVG(total), MAX(total) FROM orders);
+-- ERROR 1241 (21000): Operand should contain 1 column(s)
+
+SELECT COALESCE((SELECT id, name FROM customers LIMIT 1), 0);
+-- ERROR 1241 (21000): Operand should contain 1 column(s)
+```
+
+For comparisons, decide which single value you mean: `total > (SELECT AVG(total) FROM orders)`.
+
+If the subquery is reduced to one column but can match several rows, you get the next error in line, `ERROR 1242 (21000): Subquery returns more than 1 row`. Add `LIMIT 1` with an `ORDER BY`, or use an aggregate.
+
+## When You Need Two Values From a Subquery
+
+Often the two columns are intentional: you want the latest order's id *and* total for each customer. A scalar subquery cannot return that, but there are three good alternatives.
+
+**A LATERAL derived table** (MySQL 8.0.14 and later) runs a subquery per outer row and lets it return any number of columns:
+
+```sql
+SELECT c.name, lo.id AS order_id, lo.total
+FROM customers c
+LEFT JOIN LATERAL (
+  SELECT o.id, o.total
+  FROM orders o
+  WHERE o.customer_id = c.id
+  ORDER BY o.created_at DESC
+  LIMIT 1
+) AS lo ON TRUE;
+```
+
+```
++------+----------+-------+
+| name | order_id | total |
++------+----------+-------+
+| Ana  |       11 | 15.50 |
+| Ben  |       12 | 99.00 |
++------+----------+-------+
+```
+
+`LEFT JOIN` keeps customers with no orders, with `NULL` in the order columns.
+
+**A row comparison with IN**, for "the row that matches a grouped result":
+
+```sql
+SELECT id, customer_id, total
+FROM orders
+WHERE (customer_id, created_at) IN (
+  SELECT customer_id, MAX(created_at) FROM orders GROUP BY customer_id
+);
+```
+
+This returns orders 11 and 12. Writing `WHERE id IN (SELECT customer_id, MAX(created_at) ...)` instead is a very common way to hit 1241. The left side must list as many columns as the subquery returns.
+
+**One value packed as JSON**, when the caller can parse it:
+
+```sql
+SELECT name,
+       (SELECT JSON_OBJECT('id', o.id, 'total', o.total)
+        FROM orders o WHERE o.customer_id = c.id
+        ORDER BY o.created_at DESC LIMIT 1) AS last_order
+FROM customers c;
+-- Ana | {"id": 11, "total": 15.50}
+```
+
+**A window function in a derived table** is a fourth option. Number the rows per customer and keep the first one:
+
+```sql
+SELECT id, customer_id, total
+FROM (
+  SELECT o.*,
+         ROW_NUMBER() OVER (PARTITION BY customer_id ORDER BY created_at DESC) AS rn
+  FROM orders o
+) AS x
+WHERE rn = 1;
+```
+
+It also returns orders 11 and 12, scans `orders` once instead of once per customer, and makes ties explicit: add a second sort column to `ORDER BY` if two orders can share a timestamp. Unlike the `IN` version, which returns every row that ties on `MAX(created_at)`, `ROW_NUMBER()` always picks exactly one.
+
+## Cause 3: Extra Parentheses Create a Row
+
+In MySQL, parentheses around a comma-separated list create a row constructor. Wrapping values or columns in one more pair of parentheses than needed turns them into a single two-column operand:
+
+```sql
+SELECT * FROM orders WHERE customer_id IN ((1, 2));
+-- ERROR 1241 (21000): Operand should contain 1 column(s)
+
+SELECT * FROM orders WHERE customer_id = (1, 2);
+-- ERROR 1241 (21000): Operand should contain 1 column(s)
+
+SELECT (id, name) FROM customers;
+-- ERROR 1241 (21000): Operand should contain 1 column(s)
+
+INSERT INTO latest (customer_id, total)
+SELECT (customer_id, total) FROM orders;
+-- ERROR 1241 (21000): Operand should contain 1 column(s)
+```
+
+The same mistake appears in `ORDER BY (customer_id, total)`, `GROUP BY (customer_id, status)`, `CONCAT((name, status))` and `UPDATE orders SET total = (total, 1)`. Remove the inner parentheses: `IN (1, 2)`, `SELECT id, name`, `ORDER BY customer_id, total`.
+
+A single column in parentheses is fine. `(customer_id) IN (SELECT id FROM customers)` works, because one item in parentheses is just a grouped expression, not a row.
+
+`UPDATE ... SET (a, b) = (1, 'x')`, valid in PostgreSQL, is not MySQL syntax at all and fails with ERROR 1064. Write `SET total = 1, status = 'x'`.
+
+## Cause 4: Row Comparisons With Different Sizes
+
+Row constructors are legal and useful, but both sides must have the same number of columns:
+
+```sql
+SELECT * FROM orders WHERE (customer_id, status) = (1, 'paid');        -- works
+SELECT * FROM orders WHERE (customer_id, status) = (1);
+-- ERROR 1241 (21000): Operand should contain 2 column(s)
+
+SELECT * FROM orders WHERE (customer_id, status) IN (SELECT id FROM customers);
+-- ERROR 1241 (21000): Operand should contain 2 column(s)
+
+SELECT name FROM customers WHERE (id, status) IN ((1, 'active'), 2);
+-- ERROR 1241 (21000): Operand should contain 2 column(s)
+```
+
+Here the message asks for 2 columns because the left side is a pair. Make every item on the right a pair too, for example `IN ((1, 'active'), (2, 'blocked'))`, or a subquery that selects two columns such as `SELECT id, 'paid' FROM customers`.
+
+Row comparisons also support `<` and `>`, comparing column by column. That is the basis of keyset pagination: `WHERE (customer_id, total) > (1, 20)` returns orders 10 and 12.
+
+## Cause 5: Array Parameters Expanded by the Driver
+
+Client libraries that substitute parameters on the client often turn arrays into lists. With Node.js `mysql2`, `query()` formats the SQL like this:
+
+| Code | SQL sent | Result |
+|---|---|---|
+| `query('... IN (?)', [[1, 2]])` | `IN (1, 2)` | Works |
+| `query('... IN (?)', [[[1, 2]]])` | `IN ((1, 2))` | ERROR 1241 |
+| `query('... (customer_id, status) IN (?)', [[[1, 'paid'], [2, 'paid']]])` | `IN ((1, 'paid'), (2, 'paid'))` | Works |
+
+A nested array becomes a row, so one level too many produces exactly the parentheses mistake from Cause 3. When this error comes from application code, print the final SQL your driver sends (in `mysql2`, `connection.format(sql, values)`) and look at the parentheses around the list. Other libraries and ORMs that expand lists or tuples can produce the same SQL, so the same check applies.
+
+## Related Errors
+
+| Error | Meaning |
+|---|---|
+| 1241 Operand should contain N column(s) | A value position received a row, or row sizes differ |
+| 1242 Subquery returns more than 1 row | A scalar subquery returned several rows |
+| 1136 Column count doesn't match value count | `INSERT ... VALUES` has the wrong number of values, including `VALUES ((1, 2, 3))` |
+| 1222 The used SELECT statements have a different number of columns | The parts of a `UNION` select different column counts |
+
+Note that extra parentheses in `INSERT ... VALUES ((200, 10, 'Z', 1))` give 1136, not 1241, because MySQL counts the values in the row first.
+
+## Finding the Operand in a Long Query
+
+The message has no position, so in a large query, check these places in order:
+
+1. Every `IN (SELECT ...)`, `= (SELECT ...)`, `ANY`/`ALL` subquery: does it select exactly one column?
+2. Subqueries in the `SELECT` list: one column each.
+3. Double parentheses anywhere: `((`, especially around `IN` lists and in generated SQL.
+4. Row constructors `(a, b)`: same size on both sides.
+
+Where the statement lives also changes when you see the error. `CREATE VIEW` checks the query immediately, so a view with a two-column `IN` subquery is rejected with 1241 at creation time. A stored procedure is only checked when it runs: `CREATE PROCEDURE` with the same query succeeds, and the error appears on the first `CALL`. After editing a procedure, call it once in a test environment instead of assuming that a successful `CREATE PROCEDURE` means the SQL inside is valid.
+
+Running subqueries on their own shows how many columns they return. In [Chat2DB](https://chat2db.ai/download) you can select just the subquery text in the editor and run the selection, which is a quick way to check each one; the AI assistant can also rewrite a two-column scalar subquery into a `LATERAL` join.
+
+## Summary
+
+- ERROR 1241 means a single-value position received a row of several columns, or a row comparison has mismatched sizes.
+- Subqueries used with `IN`, `=`, `ANY` or as values must select one column. `EXISTS` is exempt.
+- To get several values per row, use `LEFT JOIN LATERAL`, a row comparison `(a, b) IN (SELECT a, b ...)`, `JSON_OBJECT`, or a window function.
+- Remove extra parentheses: `IN ((1, 2))`, `SELECT (a, b)` and `ORDER BY (a, b)` all create rows.
+- When the SQL comes from a driver, print the final statement and check how arrays were expanded.

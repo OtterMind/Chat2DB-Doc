@@ -1,0 +1,261 @@
+---
+title: "Postgres: Cannot Use Subquery in Check Constraint"
+description: "Fix PostgreSQL 0A000: cannot use subquery in check constraint. Use foreign keys, EXCLUDE constraints or locked triggers instead of the function trick."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: November 2, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# Postgres: Cannot Use Subquery in Check Constraint
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="November 2, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+You want a rule that looks at another table: a member may only join an active team, an order line must not exceed stock, a team may have at most five members. The natural way to write it is a `CHECK` constraint with a subquery, and PostgreSQL rejects it:
+
+```sql
+CREATE TABLE members (
+  id      int PRIMARY KEY,
+  team_id int NOT NULL,
+  name    text,
+  CHECK (team_id IN (SELECT id FROM teams WHERE active))
+);
+```
+
+```
+ERROR:  0A000: cannot use subquery in check constraint
+LINE 5:   CHECK (team_id IN (SELECT id FROM teams WHERE active))
+                         ^
+```
+
+SQLSTATE `0A000` is `feature_not_supported`. This guide explains why the restriction exists, why the popular workaround of hiding the subquery in a function is a trap (with a real `pg_restore` failure), and the four designs that do enforce cross-row and cross-table rules correctly. Every example was run on PostgreSQL 18.6.
+
+## Why CHECK Constraints Cannot Look at Other Rows
+
+A `CHECK` constraint in PostgreSQL is evaluated for one row, at the moment that row is inserted or updated. That is the whole contract. PostgreSQL never re-evaluates it when *other* rows or tables change. A subquery would make the result depend on data the constraint cannot watch, so a constraint that passed at insert time could silently become false later. PostgreSQL refuses subqueries rather than offering a guarantee it cannot keep.
+
+The same rule produces related errors:
+
+| Expression | Error |
+|---|---|
+| `CHECK ((SELECT count(*) FROM members ...) < 5)` | `0A000: cannot use subquery in check constraint` |
+| `CHECK (EXISTS (SELECT 1 FROM teams ...))` | `0A000: cannot use subquery in check constraint` |
+| `CHECK (count(*) < 5)` | `42803: aggregate functions are not allowed in check constraints` |
+| `CHECK (row_number() OVER () < 5)` | `42P20: window functions are not allowed in check constraints` |
+| Domain: `CREATE DOMAIN ... CHECK (VALUE IN (SELECT ...))` | `0A000: cannot use subquery in check constraint` |
+| `GENERATED ALWAYS AS ((SELECT ...)) STORED` | `0A000: cannot use subquery in column generation expression` |
+
+The SQL standard has a feature for multi-table rules, `CREATE ASSERTION`, but PostgreSQL does not implement it. You choose one of the patterns below instead.
+
+## The Function Trick, and Why It Breaks
+
+PostgreSQL only checks for subqueries in the constraint expression itself. If you move the subquery into a function, the constraint is accepted:
+
+```sql
+CREATE FUNCTION team_is_active(p_team int) RETURNS boolean
+LANGUAGE sql STABLE AS $$
+  SELECT EXISTS (SELECT 1 FROM teams WHERE id = p_team AND active)
+$$;
+
+CREATE TABLE members (
+  id      int PRIMARY KEY,
+  team_id int NOT NULL REFERENCES teams,
+  name    text,
+  CONSTRAINT member_team_active CHECK (team_is_active(team_id))
+);
+```
+
+It seems to work. Inserting a member of inactive team 2 fails:
+
+```
+ERROR:  new row for relation "members" violates check constraint "member_team_active"
+DETAIL:  Failing row contains (2, 2, bo).
+```
+
+Now deactivate team 1, which already has a member:
+
+```sql
+UPDATE teams SET active = false WHERE id = 1;   -- UPDATE 1, no error
+```
+
+The constraint is now false for an existing row, and nothing noticed. The problem only surfaces later, at an unrelated moment. Renaming that member fails, because any update of the row re-runs the check:
+
+```sql
+UPDATE members SET name = 'Ana' WHERE id = 1;
+```
+
+```
+ERROR:  new row for relation "members" violates check constraint "member_team_active"
+DETAIL:  Failing row contains (1, 1, Ana).
+```
+
+It gets worse at restore time. `pg_dump` creates the check inside `CREATE TABLE` and loads tables without knowing that `members` depends on `teams` data. On a fresh database, `pg_restore` failed and lost every member row:
+
+```
+pg_restore: error: COPY failed for table "members": ERROR:  relation "teams" does not exist
+LINE 1:  SELECT EXISTS (SELECT 1 FROM teams WHERE id = p_team AND ac...
+CONTEXT:  SQL function "team_is_active" during inlining
+COPY members, line 1: "1	1	ana"
+```
+
+The restore runs with an empty `search_path`, so the unqualified `teams` cannot be found. Schema-qualifying it as `public.teams` only changes the error, because `members` is loaded before `teams` and the function sees an empty table:
+
+```
+pg_restore: error: COPY failed for table "members": ERROR:  new row for relation "members" violates check constraint "member_team_active"
+```
+
+Both times `SELECT count(*) FROM members` returned `0` after the restore. The PostgreSQL documentation warns about exactly this: check constraints must not depend on anything except the row being checked. Treat the function trick as a bug waiting to happen, and use one of the following designs.
+
+## Pattern 1: Foreign Keys, Including Composite Ones
+
+If the rule is "the value must exist in another table", that is a foreign key, and foreign keys *are* rechecked when the other table changes.
+
+Rules with a condition ("must exist and be active") can often be expressed with a composite foreign key. Add a unique constraint on the parent that includes the condition column, and a fixed column on the child that must match it:
+
+```sql
+CREATE TABLE teams (
+  id          int PRIMARY KEY,
+  max_members int NOT NULL DEFAULT 5,
+  active      boolean NOT NULL DEFAULT true,
+  UNIQUE (id, active)
+);
+
+CREATE TABLE members (
+  id          int PRIMARY KEY,
+  team_id     int NOT NULL,
+  team_active boolean NOT NULL DEFAULT true CHECK (team_active),
+  name        text,
+  FOREIGN KEY (team_id, team_active) REFERENCES teams (id, active) ON UPDATE CASCADE
+);
+```
+
+Joining an inactive team fails, because `(2, true)` does not exist in `teams`:
+
+```
+ERROR:  insert or update on table "members" violates foreign key constraint "members_team_id_team_active_fkey"
+DETAIL:  Key (team_id, team_active)=(2, t) is not present in table "teams".
+```
+
+Deactivating a team that still has members also fails. The cascade tries to set `team_active = false` on the members, and their check forbids it:
+
+```
+ERROR:  new row for relation "members" violates check constraint "members_team_active_check"
+DETAIL:  Failing row contains (1, 1, f, ana).
+```
+
+Both directions are enforced, concurrency is handled by the foreign key machinery, and `pg_dump` restores it correctly because foreign keys are added after the data is loaded.
+
+## Pattern 2: EXCLUDE Constraints for Overlap Rules
+
+"No two bookings for the same room may overlap" is another rule people try to write with a subquery. PostgreSQL has a constraint built for it:
+
+```sql
+CREATE EXTENSION IF NOT EXISTS btree_gist;
+
+CREATE TABLE bookings (
+  id      int GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  room_id int NOT NULL,
+  during  tstzrange NOT NULL,
+  EXCLUDE USING gist (room_id WITH =, during WITH &&)
+);
+
+INSERT INTO bookings (room_id, during) VALUES (7, '[2026-11-02 09:00+00, 2026-11-02 10:00+00)');
+INSERT INTO bookings (room_id, during) VALUES (7, '[2026-11-02 09:30+00, 2026-11-02 11:00+00)');
+```
+
+```
+ERROR:  conflicting key value violates exclusion constraint "bookings_room_id_during_excl"
+DETAIL:  Key (room_id, during)=(7, ["2026-11-02 09:30:00+00","2026-11-02 11:00:00+00")) conflicts with existing key (room_id, during)=(7, ["2026-11-02 09:00:00+00","2026-11-02 10:00:00+00")).
+```
+
+A booking from 10:00 to 11:00 is accepted, because `[)` ranges that only touch do not overlap. Exclusion constraints are safe under concurrency, because they use the index to detect conflicts the same way a unique constraint does.
+
+## Pattern 3: Triggers That Lock What They Read
+
+Rules about counts and sums ("at most five members per team", "order total must not exceed the credit limit") need a trigger. The trap here is concurrency. This trigger looks correct:
+
+```sql
+CREATE FUNCTION check_team_size() RETURNS trigger LANGUAGE plpgsql AS $$
+DECLARE v_max int; v_count int;
+BEGIN
+  SELECT max_members INTO v_max FROM teams WHERE id = NEW.team_id;
+  SELECT count(*) INTO v_count FROM members WHERE team_id = NEW.team_id;
+  IF v_count >= v_max THEN
+    RAISE EXCEPTION 'team % already has % members (max %)', NEW.team_id, v_count, v_max
+      USING ERRCODE = 'check_violation';
+  END IF;
+  RETURN NEW;
+END $$;
+
+CREATE TRIGGER members_team_size
+  BEFORE INSERT OR UPDATE OF team_id ON members
+  FOR EACH ROW EXECUTE FUNCTION check_team_size();
+```
+
+But with four members already in team 1, two sessions that each insert a fifth member at the same time both succeed. Neither transaction can see the other's uncommitted row, so both count four. The team ended up with **6** members in our test.
+
+The fix is to serialize on the parent row. Add `FOR UPDATE` to the first query:
+
+```sql
+SELECT max_members INTO v_max FROM teams WHERE id = NEW.team_id FOR UPDATE;
+```
+
+Now the second session waits until the first commits, then counts five and fails:
+
+```
+ERROR:  team 1 already has 5 members (max 5)
+```
+
+The team stayed at **5**. Other options are running these transactions at `SERIALIZABLE` isolation (and retrying on serialization failures) or keeping a counter column on `teams` that a trigger updates. Whatever you choose, also put a trigger on the *other* side when it matters: if `max_members` can be lowered, a trigger on `teams` should reject a value below the current count.
+
+## Pattern 4: Validate in a Single Write Path
+
+Some rules are business processes rather than invariants, for example "stock must cover the order when it is placed". They are often better enforced by the one function or service that performs the write, inside a transaction that locks the rows involved (`SELECT ... FOR UPDATE` on the stock row, then insert the order line). Combine this with ordinary constraints on each table (`CHECK (quantity >= 0)` on stock) as a safety net that does not need a subquery.
+
+## Finding Function-Based Checks You Already Have
+
+If the function trick is already in production, find every check constraint that calls a user-defined function. The dependency catalog records the link, and OIDs of 16384 and above belong to user objects rather than built-in functions:
+
+```sql
+SELECT c.conrelid::regclass         AS table_name,
+       c.conname,
+       pg_get_constraintdef(c.oid)  AS definition,
+       d.refobjid::regprocedure     AS function
+FROM pg_constraint c
+JOIN pg_depend d
+  ON d.classid = 'pg_constraint'::regclass
+ AND d.objid = c.oid
+ AND d.refclassid = 'pg_proc'::regclass
+WHERE c.contype = 'c'
+  AND d.refobjid >= 16384;
+```
+
+```
+ table_name |  conname   |     definition     |   function
+------------+------------+--------------------+---------------
+ tt         | tt_team_ok | CHECK (f_ok(team)) | f_ok(integer)
+```
+
+Not every match is a problem. A function that only looks at its arguments, such as a format validator, is fine. Read each function body. The ones that query tables are the ones to replace with a pattern from this guide. Until you replace them, at least make sure restores are tested, because that is where they fail first.
+
+## Choosing a Pattern
+
+| Rule | Use |
+|---|---|
+| Value must exist in another table | Foreign key |
+| Value must exist and satisfy a condition there | Composite foreign key with a fixed child column |
+| No overlapping ranges per key | `EXCLUDE` constraint |
+| Counts, sums, limits across rows | Trigger that locks the parent row, or `SERIALIZABLE` |
+| Process rules at write time | One write path with row locks, plus simple CHECKs |
+
+Before converting existing data, find rows that already break the rule. A query such as `SELECT m.* FROM members m JOIN teams t ON t.id = m.team_id WHERE NOT t.active;` shows the offenders, and you can add new constraints as `NOT VALID` first and `VALIDATE CONSTRAINT` once the data is clean. [Chat2DB](https://chat2db.ai/download) can help here: describe the rule in plain language and its AI assistant drafts the violation query and the trigger or constraint DDL for your actual schema, which you then review and run.
+
+## Summary
+
+- `cannot use subquery in check constraint` (0A000) is intentional: `CHECK` sees one row and is never re-evaluated when other data changes.
+- Hiding the subquery in a function is accepted but silently goes stale, blocks later updates of the row, and broke `pg_restore` in our test, losing all rows of the table.
+- Use foreign keys (composite ones for conditional rules), `EXCLUDE` constraints for overlaps, and triggers that lock the parent row for counts and limits.
+- Test concurrency: an unlocked trigger let two sessions push a team past its limit.
