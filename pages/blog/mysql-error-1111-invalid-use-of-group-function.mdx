@@ -1,0 +1,420 @@
+---
+title: "MySQL Error 1111: Invalid Use of Group Function"
+description: "Fix MySQL ERROR 1111 Invalid use of group function: move aggregates to HAVING, avoid nested SUM and MAX, and update rows from an aggregate with a derived table."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: November 3, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# MySQL Error 1111: Invalid Use of Group Function
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="November 3, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+You want the customers who have spent more than 100, and the query looks reasonable:
+
+```sql
+SELECT customer_id, SUM(amount)
+FROM orders
+WHERE SUM(amount) > 100
+GROUP BY customer_id;
+```
+
+```
+ERROR 1111 (HY000): Invalid use of group function
+```
+
+MySQL error 1111 means an aggregate function, such as `SUM`, `COUNT`, `AVG`, `MAX` or `MIN`, appears in a place where it cannot be calculated. The function itself is fine. The problem is its position in the statement. The cause is nearly always one of a few patterns: an aggregate in `WHERE`, one aggregate nested inside another, or an aggregate in an `UPDATE`, a `DELETE` or an `INSERT`.
+
+This guide shows each pattern and its fix, using a small sample schema. Every query ran on MySQL 8.4.11.
+
+## Sample Data
+
+```sql
+CREATE TABLE orders (
+  id INT PRIMARY KEY,
+  customer_id INT,
+  amount DECIMAL(10,2),
+  status VARCHAR(10)
+);
+INSERT INTO orders VALUES
+  (1, 1, 40, 'paid'), (2, 1, 70, 'paid'), (3, 2, 15, 'paid'),
+  (4, 3, 200, 'open'), (5, 3, 30, 'paid');
+
+CREATE TABLE customers (
+  id INT PRIMARY KEY,
+  name VARCHAR(20),
+  lifetime DECIMAL(10,2) DEFAULT 0
+);
+INSERT INTO customers (id, name) VALUES (1, 'Ada'), (2, 'Lin'), (3, 'Sam');
+```
+
+## Why MySQL Rejects It
+
+The reason is the order in which a query runs. MySQL logically evaluates the clauses in this sequence:
+
+1. `FROM` and `JOIN` build the rows.
+2. `WHERE` filters individual rows.
+3. `GROUP BY` forms groups.
+4. Aggregates are computed for each group.
+5. `HAVING` filters the groups.
+6. `SELECT` produces the output.
+7. `ORDER BY` sorts it.
+
+`SUM(amount)` for a customer does not exist until step 4, but `WHERE` runs at step 2. At that point each row is being looked at on its own, and there is no group to sum. Every fix below comes down to moving the aggregate to a step where its input exists.
+
+## Pattern 1: Aggregate in WHERE, Use HAVING
+
+To filter on an aggregate, use `HAVING`, which runs after grouping:
+
+```sql
+SELECT customer_id, SUM(amount) AS total
+FROM orders
+GROUP BY customer_id
+HAVING SUM(amount) > 100;
+```
+
+```
++-------------+--------+
+| customer_id | total  |
++-------------+--------+
+|           1 | 110.00 |
+|           3 | 230.00 |
++-------------+--------+
+```
+
+MySQL also lets you refer to the alias in `HAVING`, which saves repeating the expression:
+
+```sql
+SELECT customer_id, SUM(amount) AS total
+FROM orders
+GROUP BY customer_id
+HAVING total > 100
+ORDER BY total DESC;
+```
+
+Trying the alias in `WHERE` gives a different error, for the same underlying reason:
+
+```sql
+SELECT customer_id, SUM(amount) AS total
+FROM orders
+WHERE total > 100
+GROUP BY customer_id;
+```
+
+```
+ERROR 1054 (42S22): Unknown column 'total' in 'where clause'
+```
+
+A query often needs both clauses. Conditions on individual rows belong in `WHERE`, where they can use an index and reduce the work, while conditions on totals belong in `HAVING`. If you want to count only paid orders and keep customers above 100, the status test goes in `WHERE` and the total test in `HAVING`. See [WHERE vs HAVING](/blog/when-to-use-where-vs-having-in-sql) for more examples.
+
+## Pattern 2: Comparing a Row with an Aggregate
+
+Sometimes you want each row compared with an overall figure, such as orders larger than the average. Writing the aggregate directly fails:
+
+```sql
+UPDATE orders SET status = 'big' WHERE amount > AVG(amount);
+```
+
+```
+ERROR 1111 (HY000): Invalid use of group function
+```
+
+`AVG(amount)` must be computed over the whole table first, which makes it a separate query. Put it in a scalar subquery:
+
+```sql
+SELECT * FROM orders
+WHERE amount > (SELECT AVG(amount) FROM orders);
+```
+
+```
++----+-------------+--------+--------+
+| id | customer_id | amount | status |
++----+-------------+--------+--------+
+|  4 |           3 | 200.00 | open   |
++----+-------------+--------+--------+
+```
+
+The subquery runs on its own, so its aggregate has a complete set of rows to work with. The average of the five orders is 71, and only order 4 is above it.
+
+To use this in an `UPDATE` on the same table, there is one more obstacle. MySQL does not allow the target table in a subquery, and it raises [error 1093](/blog/mysql-error-1093-cant-specify-target-table). The usual approach is to join a derived table, which materializes the value first:
+
+```sql
+UPDATE orders o
+JOIN (SELECT AVG(amount) AS a FROM orders) s ON o.amount > s.a
+SET o.status = 'big';
+```
+
+That statement changed order 4, the same row the `SELECT` found.
+
+## Pattern 3: Nested Aggregates
+
+An aggregate cannot contain another aggregate in the same query level:
+
+```sql
+SELECT MAX(COUNT(*)) FROM orders GROUP BY customer_id;
+```
+
+```
+ERROR 1111 (HY000): Invalid use of group function
+```
+
+```sql
+SELECT AVG(SUM(amount)) FROM orders GROUP BY customer_id;
+```
+
+```
+ERROR 1111 (HY000): Invalid use of group function
+```
+
+These express a two-step calculation in one step. "The largest number of orders for any customer" means first count per customer, then take the largest count. Write those two steps as two query levels:
+
+```sql
+SELECT MAX(n) AS busiest
+FROM (
+  SELECT COUNT(*) AS n
+  FROM orders
+  GROUP BY customer_id
+) c;
+```
+
+```
++---------+
+| busiest |
++---------+
+|       2 |
++---------+
+```
+
+```sql
+SELECT AVG(total) AS avg_per_customer
+FROM (
+  SELECT SUM(amount) AS total
+  FROM orders
+  GROUP BY customer_id
+) t;
+```
+
+```
++------------------+
+| avg_per_customer |
++------------------+
+|       118.333333 |
++------------------+
+```
+
+The inner query produces one row per customer, and the outer query aggregates those rows. The alias on the derived table is required. Leaving it off gives [error 1248](/blog/mysql-error-1248-derived-table-alias).
+
+On MySQL 8.0 and later, a CTE reads better, particularly when there are several steps:
+
+```sql
+WITH per_customer AS (
+  SELECT customer_id, SUM(amount) AS total
+  FROM orders
+  GROUP BY customer_id
+)
+SELECT AVG(total) FROM per_customer;
+```
+
+There is one form of nesting that is valid. A window function can wrap an aggregate, because windows are evaluated after grouping:
+
+```sql
+SELECT customer_id,
+       SUM(amount) AS total,
+       SUM(SUM(amount)) OVER () AS grand_total
+FROM orders
+GROUP BY customer_id;
+```
+
+```
++-------------+--------+-------------+
+| customer_id | total  | grand_total |
++-------------+--------+-------------+
+|           1 | 110.00 |      355.00 |
+|           2 |  15.00 |      355.00 |
+|           3 | 230.00 |      355.00 |
++-------------+--------+-------------+
+```
+
+This is handy for showing each customer's share of the total, with no extra subquery.
+
+## Pattern 4: Aggregates in UPDATE and DELETE
+
+An `UPDATE` changes rows one at a time and has no grouping step, so an aggregate in `SET` has nothing to work on:
+
+```sql
+UPDATE customers c
+JOIN orders o ON o.customer_id = c.id
+SET c.lifetime = SUM(o.amount);
+```
+
+```
+ERROR 1111 (HY000): Invalid use of group function
+```
+
+Compute the totals in a derived table, then join to it:
+
+```sql
+UPDATE customers c
+JOIN (
+  SELECT customer_id, SUM(amount) AS total
+  FROM orders
+  WHERE status = 'paid'
+  GROUP BY customer_id
+) t ON t.customer_id = c.id
+SET c.lifetime = t.total;
+
+SELECT * FROM customers;
+```
+
+```
++----+------+----------+
+| id | name | lifetime |
++----+------+----------+
+|  1 | Ada  |   110.00 |
+|  2 | Lin  |    15.00 |
+|  3 | Sam  |    30.00 |
++----+------+----------+
+```
+
+Note that this only updates customers who have paid orders. A customer with none keeps the old value. If they should be reset to 0, use a `LEFT JOIN` with `COALESCE(t.total, 0)`.
+
+`DELETE` fails in the same way, as in `DELETE FROM orders WHERE amount < MAX(amount);`. It needs the same approach, a join to a derived table holding the maximum:
+
+```sql
+DELETE o
+FROM orders o
+JOIN (SELECT MAX(amount) AS top FROM orders) m ON o.amount < m.top;
+```
+
+In a test transaction, this removed every order except order 4, the largest. Run the same join as a `SELECT` first, so you can see which rows would go.
+
+Single-row inserts hit this too. `INSERT INTO customers (id, name, lifetime) VALUES (9, 'New', SUM(10));` raises the same error, since `VALUES` has no rows to aggregate. Use `INSERT ... SELECT` when the value really is a total.
+
+## Pattern 5: Aggregates in GROUP BY
+
+Grouping by an aggregate is circular, because the aggregate depends on the groups:
+
+```sql
+SELECT customer_id FROM orders GROUP BY SUM(amount);
+```
+
+```
+ERROR 1111 (HY000): Invalid use of group function
+```
+
+If you wanted to bucket customers by their totals, compute the totals in a derived table, and group by a bucket expression in the outer query:
+
+```sql
+SELECT CASE WHEN total >= 100 THEN 'high' ELSE 'low' END AS bucket,
+       COUNT(*) AS customers
+FROM (
+  SELECT customer_id, SUM(amount) AS total
+  FROM orders
+  GROUP BY customer_id
+) t
+GROUP BY bucket;
+```
+
+```
++--------+-----------+
+| bucket | customers |
++--------+-----------+
+| high   |         2 |
+| low    |         1 |
++--------+-----------+
+```
+
+`ORDER BY` itself is fine with an aggregate, since it runs after grouping, so `ORDER BY SUM(amount)` works. Nesting is still rejected there: `ORDER BY MAX(COUNT(*))` returns 1111.
+
+## Conditional Totals Without Filtering
+
+Some people reach for an aggregate in `WHERE` because they want a total for only some of the rows, while still seeing every group. A `WHERE` filter would remove customers with no matching rows. Put the condition inside the aggregate with `CASE` instead:
+
+```sql
+SELECT customer_id,
+       SUM(CASE WHEN status = 'paid' THEN amount ELSE 0 END) AS paid,
+       COUNT(*) AS orders
+FROM orders
+GROUP BY customer_id;
+```
+
+```
++-------------+--------+--------+
+| customer_id | paid   | orders |
++-------------+--------+--------+
+|           1 | 110.00 |      2 |
+|           2 |  15.00 |      1 |
+|           3 |  30.00 |      2 |
++-------------+--------+--------+
+```
+
+## Errors That Look Similar
+
+Two neighbors of this error come up when you move conditions around. If you use `HAVING` on a plain column, MySQL cannot find it, because `HAVING` sees the grouped output:
+
+```sql
+SELECT customer_id, SUM(amount) FROM orders
+GROUP BY customer_id
+HAVING amount > 10;
+```
+
+```
+ERROR 1054 (42S22): Unknown column 'amount' in 'having clause'
+```
+
+Move that condition to `WHERE`. And if you remove `GROUP BY` while keeping an ordinary column in the select list, you get error 1140:
+
+```sql
+SELECT customer_id, SUM(amount) FROM orders;
+```
+
+```
+ERROR 1140 (42000): In aggregated query without GROUP BY, expression #1 of SELECT list contains nonaggregated column 'lab.orders.customer_id'; this is incompatible with sql_mode=only_full_group_by
+```
+
+Add the `GROUP BY` back, or see [error 1055](/blog/mysql-error-1055-only-full-group-by) for the related rule. `HAVING` without `GROUP BY` is legal, though. It treats the whole table as one group, so `SELECT SUM(amount) AS total FROM orders HAVING SUM(amount) > 100;` returned one row with 355.00.
+
+## Window Functions Have a Similar Rule
+
+Window functions are computed late as well, so they cannot appear in `WHERE`. The error has a different number, but the idea is identical:
+
+```sql
+SELECT id, amount FROM orders
+WHERE RANK() OVER (ORDER BY amount DESC) = 1;
+```
+
+```
+ERROR 3593 (HY000): You cannot use the window function 'rank' in this context.'
+```
+
+The fix is also the same: compute the value at an inner level, then filter at the outer level.
+
+```sql
+SELECT id, amount
+FROM (
+  SELECT id, amount, RANK() OVER (ORDER BY amount DESC) AS r
+  FROM orders
+) x
+WHERE r = 1;
+```
+
+The PostgreSQL version of this mistake is covered in [aggregate functions are not allowed in WHERE](/blog/postgres-aggregate-functions-not-allowed-in-where).
+
+## Quick Reference
+
+| You wrote | Use instead |
+|---|---|
+| `WHERE SUM(x) > 100` | `HAVING SUM(x) > 100` |
+| `WHERE x > AVG(x)` | `WHERE x > (SELECT AVG(x) FROM t)` |
+| `MAX(COUNT(*))` | An aggregate over a derived table or CTE |
+| `SET col = SUM(x)` | Join a grouped derived table |
+| `GROUP BY SUM(x)` | Group in an outer query |
+| `WHERE RANK() OVER ...` | Filter in an outer query |
+
+## Build Aggregates Step by Step
+
+The easiest way to avoid this error is to build a query in stages: run the inner grouped query, look at the rows, then wrap it. A SQL client makes that loop quick. In [Chat2DB](https://chat2db.ai/download) you can run each stage and inspect the results in a grid, and the AI assistant can rewrite a failing aggregate from a description of what you want. It also runs in the browser at [app.chat2db.ai](https://app.chat2db.ai).

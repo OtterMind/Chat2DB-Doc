@@ -1,0 +1,247 @@
+---
+title: "PostgreSQL could not access status of transaction"
+description: "Diagnose PostgreSQL could not access status of transaction: a missing pg_xact file or corrupted tuple. What to check, what to back up and how to recover data."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: November 3, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# PostgreSQL could not access status of transaction
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="November 3, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+A query on a table that has worked for years suddenly fails:
+
+```
+ERROR:  58P01: could not access status of transaction 755
+DETAIL:  Could not open file "pg_xact/0000": No such file or directory.
+LOCATION:  SlruReportIOError, slru.c:1060
+```
+
+Unlike most PostgreSQL errors, this one is not about your SQL. PostgreSQL could not read the commit status of a transaction, which it needs to decide whether a row is visible. That means data files are damaged, or a tuple header holds a garbage transaction ID. **Stop and take a file-level copy of the data directory before you try anything else.** Some of the commonly suggested fixes destroy data permanently, and this guide shows real evidence of that.
+
+I reproduced each scenario on PostgreSQL 18.6 in throwaway containers, by deliberately deleting files and overwriting bytes. Do not try this on a database you care about.
+
+## What pg_xact Does
+
+Each row version stores the transaction ID that created it (`xmin`). To decide whether you can see that row, PostgreSQL must know whether the transaction committed. That answer lives in `pg_xact` (called `pg_clog` before version 10), which is a set of files in the data directory holding two status bits per transaction.
+
+Checking `pg_xact` for every row would be slow, so after the first lookup PostgreSQL stores the answer on the row itself, in hint bits. Eventually `VACUUM` freezes old rows, after which their status never needs to be looked up, and old `pg_xact` files can be removed. This explains the odd behavior of this error: it hits only rows that have not been hinted or frozen, so a table can look perfectly healthy until a query reaches the wrong page.
+
+Each `pg_xact` segment covers 1,048,576 transactions. You can compute which file an ID belongs to:
+
+```sql
+SELECT to_hex(755 / 1048576) AS for_755,
+       to_hex(3881462679 / 1048576) AS for_large_xid;
+```
+
+```
+ for_755 | for_large_xid
+---------+---------------
+ 0       | e75
+(1 row)
+```
+
+The file names are uppercase hex, padded to four digits, so these are `0000` and `0E75`. File names and the ID in the error should agree. If they do not, you have misread something.
+
+## The Two Situations
+
+The number in the message tells you which situation you are in. Compare it with the current transaction counter:
+
+```sql
+SELECT next_xid, oldest_xid FROM pg_control_checkpoint();
+```
+
+`next_xid` is shown as `epoch:xid`, and it comes from the most recent checkpoint, so it is a close approximation rather than the exact counter.
+
+- **The ID is plausible**, meaning it is smaller than the current counter and not ancient. The transaction really happened, and the `pg_xact` file that recorded it is missing or damaged. This points to a file-level problem: a bad restore, a failed disk, someone deleting files to free up space.
+- **The ID is impossibly large or makes no sense.** No such transaction ever existed, so the row header has been overwritten with garbage, and the `pg_xact` error is a side effect. This points to page corruption. PostgreSQL went looking for a status file that never existed.
+
+## Scenario 1: A Missing pg_xact Segment
+
+In my first test, I removed the current segment `pg_xact/0000` from a stopped server. The server then refused to start at all:
+
+```
+FATAL:  could not access status of transaction 755
+DETAIL:  Could not open file "pg_xact/0000": No such file or directory.
+LOG:  shutting down due to startup process failure
+```
+
+Startup needs the segment that holds the next transaction, so a missing current file shows up immediately. A missing older segment is sneakier. In the second test, I moved the transaction counter forward and removed `0000` while unhinted rows still referred to it. The server started normally, and only some queries failed:
+
+```sql
+SELECT count(*) FROM healthy;  -- a frozen table: works
+SELECT count(*) FROM accounts;
+```
+
+```
+ERROR:  58P01: could not access status of transaction 755
+DETAIL:  Could not open file "pg_xact/0000": No such file or directory.
+```
+
+The server stayed up, and it accepted new connections and writes. The failure is limited to reads of the affected rows, which is why these incidents can go unnoticed for a long time.
+
+## Scenario 2: A Corrupted Row Header
+
+In the third test, I overwrote the `xmin` of a single row with random bytes. On PostgreSQL 18, data checksums are on by default for new clusters, so the first thing I saw was not this error at all:
+
+```
+ERROR:  invalid page in block 0 of relation "base/5/16384"
+```
+
+The checksum caught the damage before the bad value was used. That is what checksums are for. On a cluster without them, or with checks turned off for investigation, the same page gives the error this article is about:
+
+```sql
+SET ignore_checksum_failure = on;
+SELECT count(*) FROM t;
+```
+
+```
+WARNING:  ignoring checksum failure in block 0 of relation "base/5/16384"
+ERROR:  could not access status of transaction 3881462679
+DETAIL:  Could not open file "pg_xact/0E75": No such file or directory.
+```
+
+That transaction number is absurd for a cluster that had run only a few hundred transactions, which is the giveaway. Nothing is wrong with `pg_xact`. Creating a `0E75` file would not fix the underlying problem, because the row header itself is wrong.
+
+## Step 1: Protect What You Have
+
+Before running any repair, do this:
+
+1. Stop the application from writing, if you can.
+2. Stop PostgreSQL cleanly and copy the entire data directory somewhere safe, including `pg_wal` and all tablespaces.
+3. Work from the copy where possible.
+4. Find your latest base backup and WAL archive, and check that they can be restored.
+
+An important warning concerns `pg_dump`. It is natural to reach for a dump, but check its exit code. In my test, the dump reported the failure on standard error and exited with status 1, yet it still left behind a file:
+
+```
+pg_dump: error: Dumping the contents of table "accounts" failed: PQgetResult() failed.
+pg_dump: detail: Error message from server: ERROR:  could not access status of transaction 755
+pg_dump: detail: Command was: COPY public.accounts (id, balance) TO stdout;
+```
+
+That output file contained an empty `COPY` section for the table. If a script ignores the exit status, it produces a backup that looks valid and is missing a whole table.
+
+## Step 2: Measure the Damage
+
+The `amcheck` extension scans tables without changing them and lists each bad tuple. `verify_heapam` is the SQL interface, and `pg_amcheck` is the command-line wrapper:
+
+```sql
+CREATE EXTENSION amcheck;
+SET ignore_checksum_failure = on;
+SELECT * FROM verify_heapam('t');
+```
+
+```
+ blkno | offnum | attnum |                            msg
+-------+--------+--------+------------------------------------------------------------
+     0 |      3 |        | xmin 3881462679 precedes oldest valid transaction ID 0:745
+(1 row)
+```
+
+```bash
+pg_amcheck -U postgres --table=t postgres
+```
+
+```
+heap table "postgres.public.t", block 0, offset 3:
+    xmin 3881462679 precedes oldest valid transaction ID 0:745
+```
+
+The command exited with status 2. It pinpoints block 0, offset 3, so one damaged row out of 50 stands out clearly. Run it on the whole database to find out whether the problem is one row or something larger.
+
+## Step 3: Restore the Real File if You Can
+
+If you have the genuine `pg_xact` segment, from a file-level backup or a replica, then restoring it is the best possible repair. In my test, I stopped the server, copied the saved `0000` back, set its owner to `postgres` and its mode to `600`, and started it:
+
+```sql
+SELECT count(*) FROM accounts;
+```
+
+```
+ count
+-------
+  1003
+(1 row)
+```
+
+Every row came back, including rows written while the file was missing. A healthy replica or a point-in-time restore is the general form of the same idea. If your backups are good, prefer a full recovery to a surgical repair, because a problem that removed one file may have removed other things.
+
+## Do Not Zero-Fill pg_xact Blindly
+
+The advice you will find most often is to create the missing file from zeros with `dd`. This does stop the error, but look at what happened in my test. I replaced the missing `0000` with 256 kB of zeros, then started the server and queried the table:
+
+```sql
+SELECT count(*) FROM accounts;
+```
+
+```
+ERROR:  relation "accounts" does not exist
+```
+
+The table vanished. Zero means "in progress", so every transaction in that range now looks as though it never committed. That applies not just to the table's rows, but to the catalog rows that define the table. Then I put the real `0000` back, and the result was the same: the table was still gone. PostgreSQL had already recorded the "invalid" verdict in hint bits, on disk, while reading those rows. So a change you might think of as reversible was not, which is why you take the file copy first.
+
+Zero-filling is a last resort for an expert who has decided to lose the affected data. It is only tolerable when the lost transactions are confined to rows you can afford to lose, and even then it should be done on a copy. If the data matters, consider a PostgreSQL support company before you take this step.
+
+## Salvaging the Rows That Can Be Read
+
+When no good copy of the file exists, you can still pull out every readable row. Selecting one row at a time means that a bad row fails alone rather than stopping a scan:
+
+```sql
+CREATE TABLE accounts_salvage (LIKE accounts);
+CREATE TABLE salvage_log (page int, line int, err text);
+
+DO $$
+DECLARE
+  pages int := pg_relation_size('accounts')
+             / current_setting('block_size')::int;
+  p int; l int;
+BEGIN
+  FOR p IN 0..pages-1 LOOP
+    FOR l IN 1..291 LOOP
+      BEGIN
+        INSERT INTO accounts_salvage
+        SELECT * FROM accounts WHERE ctid = format('(%s,%s)', p, l)::tid;
+      EXCEPTION WHEN OTHERS THEN
+        INSERT INTO salvage_log VALUES (p, l, SQLERRM);
+      END;
+    END LOOP;
+  END LOOP;
+END $$;
+
+SELECT err, count(*) FROM salvage_log GROUP BY err;
+```
+
+```
+                    err                     | count
+--------------------------------------------+-------
+ could not access status of transaction 755 |  1000
+(1 row)
+```
+
+The test table held 1,000 rows from the lost transaction and three newer rows, and the script recovered exactly those three. The limit of 291 is the most tuples that can fit on a standard 8 kB heap page. The block uses a subtransaction per row, so it is slow on big tables, but speed is not the priority here. Then dump the salvaged table somewhere safe.
+
+## After the Incident
+
+Once the data is safe, the job is to find out what happened. Common causes include a failing disk or storage layer, a restore that skipped files, antivirus or cleanup scripts that touched the data directory, and manual removal of files from `pg_xact` or `pg_wal` to free up disk space. If a disk filled up, read about [no space left on device](/blog/postgres-no-space-left-on-device) for the safe responses. Never delete from these directories by hand.
+
+Then rebuild trust in the cluster. The safest route is to initialize a new cluster and load a verified logical dump, because a damaged cluster can hide more problems. Keep data checksums on, as PostgreSQL 18 does by default, and run `pg_amcheck` regularly so that damage is found early. If you are moving between major versions at the same time, the [pg_upgrade guide](/blog/postgres-pg-upgrade-guide) covers the checks to run first. Above all, test your restores, because backups are the only real fix for this class of problem.
+
+## Checklist
+
+1. Do not delete, create or zero anything yet.
+2. Copy the entire data directory with the server stopped.
+3. Compare the transaction ID with the current counter to tell a missing file from a corrupted row.
+4. Run `pg_amcheck` to measure the damage.
+5. Restore from a backup, replica or the real file if you can.
+6. Otherwise salvage row by row, and check the exit code of every dump.
+7. Rebuild on a fresh cluster, and find the root cause.
+
+## Compare Data After a Recovery
+
+After a recovery, you need to confirm that the data is what you expect. [Chat2DB](https://chat2db.ai/download) can connect to the original and recovered databases side by side, so you can run row counts and spot checks in each and compare the results, and its AI assistant can help you write those validation queries. It is also available in the browser at [app.chat2db.ai](https://app.chat2db.ai).

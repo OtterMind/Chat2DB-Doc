@@ -1,0 +1,319 @@
+---
+title: "PostgreSQL could not create unique index: Fix"
+description: "Fix PostgreSQL could not create unique index, Key is duplicated (23505): find duplicates, clean them safely, and recover from a failed CONCURRENTLY build."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: November 3, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# PostgreSQL could not create unique index: Fix
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="November 3, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+You want to guarantee that emails are unique, so you add an index or a constraint, and PostgreSQL stops you:
+
+```sql
+CREATE UNIQUE INDEX users_email_key ON users (email);
+```
+
+```
+ERROR:  23505: could not create unique index "users_email_key"
+DETAIL:  Key (email)=(a@x.io) is duplicated.
+```
+
+SQLSTATE `23505` is `unique_violation`, the same code as a failed `INSERT`. The difference is that nothing is being inserted. PostgreSQL built the index, found two rows with the same key, and refused to finish. The table already breaks the rule you are trying to add.
+
+The important detail is that the `DETAIL` line names only the first duplicate it found. There may be thousands. This guide shows how to find all of them, how to remove them without losing the wrong rows, how to clean up after a failed `CREATE INDEX CONCURRENTLY`, and how to add the constraint without blocking writes. Every example ran on PostgreSQL 18.6.
+
+## The Sample Table
+
+```sql
+CREATE TABLE users (id int PRIMARY KEY, email text);
+INSERT INTO users VALUES
+  (1, 'a@x.io'), (2, 'b@x.io'), (3, 'a@x.io'),
+  (4, 'A@x.io'), (5, NULL), (6, NULL);
+```
+
+Rows 1 and 3 are exact duplicates. Row 4 differs only by case. Rows 5 and 6 are both `NULL`.
+
+## Every Way to Hit This Error
+
+The message appears whenever a unique structure is built on existing data, and the statement you ran may not mention an index at all:
+
+```sql
+ALTER TABLE users ADD CONSTRAINT users_email_uq UNIQUE (email);
+```
+
+```
+ERROR:  23505: could not create unique index "users_email_uq"
+DETAIL:  Key (email)=(a@x.io) is duplicated.
+```
+
+A constraint is enforced by an index, so adding one builds an index first. The same is true for `ALTER TABLE ... ADD PRIMARY KEY`, which reported `could not create unique index "m_pkey"` in my test. A `CREATE UNIQUE INDEX` with no name fails with the generated name, such as `m_a_b_idx`, and a multicolumn key lists all its columns: `Key (a, b)=(1, x) is duplicated.`
+
+Two further situations surprise people:
+
+- **Restoring a dump.** `pg_restore` loads data first and creates constraints afterward, so duplicates that appeared in a table without a constraint surface at the end of the restore.
+- **Rebuilding an existing index.** `REINDEX` builds a new index and can fail here too, which means the live index was missing duplicates. This usually points to a collation change after an operating system upgrade. If so, read [collation version mismatch](/blog/postgres-collation-version-mismatch) before you touch any rows.
+
+## Step 1: Find All the Duplicates
+
+Group by exactly the expression you want to make unique:
+
+```sql
+SELECT email, count(*), array_agg(id ORDER BY id) AS ids
+FROM users
+WHERE email IS NOT NULL
+GROUP BY email
+HAVING count(*) > 1;
+```
+
+```
+ email  | count | ids
+--------+-------+-------
+ a@x.io |     2 | {1,3}
+(1 row)
+```
+
+The `NULL` filter is there because `GROUP BY` puts all `NULL`s in one group, while a unique index by default treats them as distinct. Without the filter, you would see rows 5 and 6 as a false duplicate.
+
+Now look at the case-insensitive version. If you meant email to be unique regardless of case, the plain index would not have protected you:
+
+```sql
+CREATE UNIQUE INDEX users_email_lower ON users (lower(email));
+```
+
+```
+ERROR:  23505: could not create unique index "users_email_lower"
+DETAIL:  Key (lower(email))=(a@x.io) is duplicated.
+```
+
+```sql
+SELECT lower(email), count(*), array_agg(id ORDER BY id) AS ids
+FROM users
+WHERE email IS NOT NULL
+GROUP BY 1
+HAVING count(*) > 1;
+```
+
+```
+ lower  | count |   ids
+--------+-------+---------
+ a@x.io |     3 | {1,3,4}
+(1 row)
+```
+
+So decide what "the same value" means before you delete anything. Trailing spaces, case differences and Unicode variants all count as different values to the index, even when they count as the same to your users.
+
+## Step 2: Decide Which Row Survives
+
+This is a business decision, and it is the step people rush. Duplicates often have different data in their other columns: one row has the newer profile, while another has the orders pointing at it. Before you delete a row, check the foreign keys that reference it:
+
+```sql
+SELECT conrelid::regclass AS referencing_table, conname
+FROM pg_constraint
+WHERE contype = 'f' AND confrelid = 'users'::regclass;
+```
+
+If child rows point at the duplicates, repoint them at the survivor first. Otherwise the delete fails with a foreign key error, or worse, an `ON DELETE CASCADE` silently removes child data.
+
+Also run the cleanup in a transaction, and save what you remove:
+
+```sql
+BEGIN;
+CREATE TABLE users_removed AS
+  SELECT * FROM users a
+  WHERE EXISTS (
+    SELECT 1 FROM users b WHERE b.email = a.email AND b.id < a.id
+  );
+-- delete, check the row count, then COMMIT or ROLLBACK
+```
+
+## Step 3: Delete the Duplicates
+
+The simplest case keeps the row with the lowest id:
+
+```sql
+DELETE FROM users a
+USING users b
+WHERE a.email = b.email
+  AND a.id > b.id
+RETURNING a.id;
+```
+
+The comparison `a.email = b.email` is false for `NULL`, so rows 5 and 6 are safe.
+
+To keep the most recently updated row instead, rank the rows with a window function. Here is a table where the rule only applies to rows that are not soft-deleted:
+
+```sql
+CREATE TABLE accounts (
+  id int GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  email text, deleted_at timestamptz, updated_at timestamptz
+);
+INSERT INTO accounts (email, deleted_at, updated_at) VALUES
+  ('a@x.io', NULL, '2026-01-01'),
+  ('a@x.io', NULL, '2026-03-01'),
+  ('a@x.io', '2026-02-01', '2026-02-01'),
+  ('b@x.io', NULL, '2026-01-05');
+
+WITH ranked AS (
+  SELECT id, row_number() OVER (
+           PARTITION BY email ORDER BY updated_at DESC, id DESC
+         ) AS rn
+  FROM accounts
+  WHERE deleted_at IS NULL
+)
+DELETE FROM accounts a
+USING ranked r
+WHERE a.id = r.id AND r.rn > 1
+RETURNING a.id, a.email, a.updated_at;
+```
+
+```
+ id | email  |       updated_at
+----+--------+------------------------
+  1 | a@x.io | 2026-01-01 00:00:00+00
+(1 row)
+```
+
+The older active row is gone, the newer one remains, and the soft-deleted row is untouched. The unique index can now be built as a partial index, which enforces the rule only for active rows:
+
+```sql
+CREATE UNIQUE INDEX accounts_email_active
+  ON accounts (email)
+  WHERE deleted_at IS NULL;
+```
+
+If the table has no primary key, use the physical row address `ctid` to tell identical rows apart:
+
+```sql
+CREATE TABLE logins (user_id int, day date);
+INSERT INTO logins VALUES
+  (1, '2026-11-01'), (1, '2026-11-01'), (1, '2026-11-01'), (2, '2026-11-01');
+
+DELETE FROM logins a
+USING logins b
+WHERE a.user_id = b.user_id
+  AND a.day = b.day
+  AND a.ctid > b.ctid;
+```
+
+```
+DELETE 2
+```
+
+On a large table, delete in batches so you do not hold locks on many rows for a long time, and run `VACUUM` afterward so the dead rows do not bloat the new index. If the duplicates keep arriving through inserts, see [duplicate key value violates unique constraint](/blog/postgres-duplicate-key-value-violates-unique-constraint), which covers the runtime version of this error.
+
+## The Trap: A Failed CREATE INDEX CONCURRENTLY
+
+On a busy table you will probably use `CONCURRENTLY`, which avoids blocking writes. It fails with the same message, but it does not clean up after itself:
+
+```sql
+CREATE UNIQUE INDEX CONCURRENTLY users_email_cc ON users (email);
+```
+
+```
+ERROR:  23505: could not create unique index "users_email_cc"
+DETAIL:  Key (email)=(a@x.io) is duplicated.
+```
+
+The statement failed, yet the index exists:
+
+```sql
+SELECT c.relname, i.indisvalid, i.indisready
+FROM pg_index i
+JOIN pg_class c ON c.oid = i.indexrelid
+WHERE i.indrelid = 'users'::regclass;
+```
+
+```
+    relname     | indisvalid | indisready
+----------------+------------+------------
+ users_email_cc | f          | f
+ users_pkey     | t          | t
+(2 rows)
+```
+
+`\d users` shows it as `"users_email_cc" UNIQUE, btree (email) INVALID`. An invalid index is worse than none because it looks like protection and provides none. In my test, an `INSERT` of another `a@x.io` succeeded while this index was in place. Queries cannot use it either, and depending on how far the build got it may still slow down writes. Rerunning the same `CREATE` fails with `relation "users_email_cc" already exists`, even though the index never worked, so drop it first:
+
+```sql
+DROP INDEX CONCURRENTLY users_email_cc;
+```
+
+A leftover invalid index can also break later, unrelated work. In my test, an `ALTER TABLE ... ADD COLUMN` that rewrote the table failed with `could not create unique index` for that old index name, because a rewrite rebuilds every index on the table. If an error names an index you do not remember creating, this is a likely reason.
+
+To check for leftovers across a whole database, look for invalid indexes:
+
+```sql
+SELECT indexrelid::regclass AS index, indrelid::regclass AS table
+FROM pg_index
+WHERE NOT indisvalid;
+```
+
+## Adding the Constraint Without a Long Lock
+
+A plain `ALTER TABLE ... ADD CONSTRAINT ... UNIQUE` holds an `ACCESS EXCLUSIVE` lock for the whole index build, which blocks reads and writes. On a large table, build the index first, then attach it:
+
+```sql
+CREATE UNIQUE INDEX CONCURRENTLY users_email_key ON users (email);
+
+ALTER TABLE users
+  ADD CONSTRAINT users_email_uq UNIQUE USING INDEX users_email_key;
+```
+
+```
+NOTICE:  ALTER TABLE / ADD CONSTRAINT USING INDEX will rename index "users_email_key" to "users_email_uq"
+```
+
+The `ALTER TABLE` is nearly instant because the work is already done. New duplicates can arrive during the build, because the application keeps writing, and they make it fail at the last moment. So fix the application first: make it normalize values and handle conflicts before you start, or run a cleanup immediately before the build. The difference between the two objects is covered in [unique constraint vs unique index](/blog/postgres-unique-constraint-vs-unique-index).
+
+## NULL Handling Can Cause It Too
+
+By default, `NULL` values never conflict, which is why rows 5 and 6 did no harm. PostgreSQL 15 added `NULLS NOT DISTINCT`, which treats them as equal. With that option, the same two rows become duplicates:
+
+```sql
+CREATE UNIQUE INDEX users_email_nnd ON users (email) NULLS NOT DISTINCT;
+```
+
+```
+ERROR:  23505: could not create unique index "users_email_nnd"
+DETAIL:  Key (email)=(null) is duplicated.
+```
+
+If you see `(null)` in the `DETAIL` line, either remove the option or decide which of the `NULL` rows should stay.
+
+## Keep Duplicates from Coming Back
+
+Removing today's duplicates does not explain how they got in. Most of them come from an application that checks for an existing row and then inserts, which leaves a gap between the two steps where another request can do the same thing. Once the index exists, that race turns into an error instead of bad data, so the application needs to handle it. `INSERT ... ON CONFLICT` is the usual answer.
+
+If the real rule is about a normalized value, store that value in a generated column and make it unique, so every writer gets the same treatment without any application changes:
+
+```sql
+ALTER TABLE users
+  ADD COLUMN email_norm text
+  GENERATED ALWAYS AS (lower(trim(email))) STORED;
+
+CREATE UNIQUE INDEX users_email_norm ON users (email_norm);
+
+INSERT INTO users (id, email) VALUES (7, ' A@X.IO ')
+ON CONFLICT (email_norm) DO NOTHING;
+```
+
+The expression must be immutable, and `lower` and `trim` both qualify. Adding a stored generated column rewrites the table, so plan this step for a quiet period on a large table.
+
+## Checklist
+
+1. Read the `DETAIL` line, but do not assume it is the only duplicate.
+2. Count duplicates using the exact key expression, and filter `NULL`s unless you use `NULLS NOT DISTINCT`.
+3. Decide which row survives, and repoint foreign keys first.
+4. Delete inside a transaction, keep a copy, and check the row count.
+5. Drop any invalid index left behind by `CONCURRENTLY`.
+6. Build the index concurrently, then attach it as a constraint if you need one.
+
+## Review Duplicates Before You Delete
+
+Removing the wrong duplicate is hard to undo, so it helps to see the rows side by side first. In [Chat2DB](https://chat2db.ai/download) you can run the grouping query, open the conflicting rows in a result grid, compare their columns and ask the AI assistant to draft the delete for your survival rule. You can also use it in the browser at [app.chat2db.ai](https://app.chat2db.ai). Review any generated `DELETE` before you run it.

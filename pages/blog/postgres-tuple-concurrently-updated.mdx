@@ -1,0 +1,177 @@
+---
+title: "Fix PostgreSQL: tuple concurrently updated"
+description: "Fix the PostgreSQL XX000 error tuple concurrently updated: why parallel GRANT, ALTER ROLE and CREATE OR REPLACE collide, and how to serialize or retry them."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: November 3, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# Fix PostgreSQL: tuple concurrently updated
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="November 3, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+Your migration job has run a thousand times without trouble. Then you scale the deployment to four replicas, each one runs its startup grants at the same moment, and one of them dies with a message that sounds alarming:
+
+```
+ERROR:  XX000: tuple concurrently updated
+LOCATION:  simple_heap_update, heapam.c:4711
+```
+
+The SQLSTATE is `XX000`, the class PostgreSQL reserves for internal errors, and the wording looks like a bug or even corruption. It is neither. This error means two sessions tried to change the same row of a system catalog at the same time, and PostgreSQL has no way to wait and merge the second change. Your data is safe, and the failed statement simply rolled back. This guide shows how to reproduce the error, which statements cause it, how to find the sessions involved, and the two fixes that work. Every result below comes from PostgreSQL 18.6.
+
+## What the Error Actually Means
+
+When you update a row in an ordinary table, PostgreSQL handles concurrency for you. The second `UPDATE` waits for the first transaction to finish, then rereads the row and applies its change to the newest version. You never see a conflict.
+
+System catalogs such as `pg_class`, `pg_proc` and `pg_authid` are also tables, but much of the DDL code changes them through a simpler internal routine called `simple_heap_update`. That routine has no retry path. It assumes the caller already holds a lock strong enough to keep everyone else away from the row. If the row has changed since this session read it, there is nothing sensible for the routine to do, so it raises the error you see.
+
+So the error appears when two conditions are true at once:
+
+1. Two sessions run DDL that rewrites the same catalog row.
+2. No heavyweight lock forces them to take turns.
+
+The second condition is the interesting one. Many DDL commands take a strong lock on the object first, and those commands queue up peacefully. Others take a weak lock or none at all, so they can overlap.
+
+## Reproducing It
+
+The test is simple: four sessions run the same statement in a loop against one table. I ran each statement 150 times per session.
+
+```sql
+CREATE ROLE r1;
+CREATE TABLE t1 (id int);
+CREATE FUNCTION f1() RETURNS int LANGUAGE sql AS 'select 1';
+
+-- run in four sessions at the same time
+GRANT SELECT ON t1 TO r1;
+REVOKE SELECT ON t1 FROM r1;
+```
+
+The results split cleanly into statements that collided and statements that did not:
+
+| Statement, run in 4 parallel sessions | Result |
+|---|---|
+| `GRANT` and `REVOKE` on one table | `tuple concurrently updated`, about 600 times |
+| `ALTER ROLE r1 ...` | `tuple concurrently updated`, about 880 times |
+| `CREATE OR REPLACE FUNCTION f1()` | `tuple concurrently updated`, about 450 times |
+| `COMMENT ON TABLE t1` | No errors |
+| `ANALYZE t1` | No errors |
+| `ALTER TABLE t1 ALTER COLUMN id SET DEFAULT 1` | No errors |
+
+A `GRANT` writes the new access list into the table's `pg_class` row, and it does not take a lock that blocks another `GRANT` on the same table. `ALTER ROLE` and `CREATE OR REPLACE FUNCTION` behave the same way on `pg_authid` and `pg_proc`. In contrast, `ALTER TABLE` takes an `ACCESS EXCLUSIVE` lock and `ANALYZE` takes a lock that conflicts with itself, so those sessions simply waited. The counts come from a single run and yours will differ with timing, but the difference between the two groups follows from the locks each command takes.
+
+The `ALTER ROLE` run also produced a close relative of this error. `ALTER ROLE ... SET` stores its setting in `pg_db_role_setting`, and when several sessions created the first setting for a role at once, one of them failed like this:
+
+```
+ERROR:  duplicate key value violates unique constraint "pg_db_role_setting_databaseid_rol_index"
+DETAIL:  Key (setdatabase, setrole)=(0, 182539) already exists.
+```
+
+That has the same cause and the same fix. If you see a unique violation on a `pg_` index during parallel DDL, treat it as part of this family.
+
+## Where It Shows Up in Practice
+
+Nobody runs `GRANT` in a tight loop on purpose. These are the patterns that produce the error in real systems:
+
+- **Several replicas running startup scripts.** Each application instance runs the same migrations or grant statements on boot.
+- **Parallel CI jobs against a shared database.** Test suites run `CREATE OR REPLACE FUNCTION` from separate runners.
+- **Infrastructure tools with parallelism.** Terraform, Ansible or a similar tool applies many role or grant changes at once, and several touch the same object.
+- **A scheduled permissions job overlapping a deployment.** A nightly script that reapplies grants runs at the same time as a migration that does the same.
+- **Dashboards or tenant provisioning.** A service creates or alters roles on demand, and two requests arrive together.
+
+The common thread is the same change arriving more than once, or two different changes to one object. Note that the rows must match: `GRANT` on table `a` and `GRANT` on table `b` do not collide, because they rewrite different `pg_class` rows.
+
+## Finding Which Sessions Collided
+
+The error reaches the client, and by default the server log records it with the failing statement, because `log_min_error_statement` defaults to `error`. That gives you one side of the collision. To see the other side while it is happening, look at active DDL:
+
+```sql
+SELECT pid, usename, application_name, state,
+       now() - xact_start AS xact_age,
+       left(query, 80) AS query
+FROM pg_stat_activity
+WHERE state <> 'idle'
+  AND pid <> pg_backend_pid()
+  AND query ~* '^\s*(grant|revoke|alter role|alter user|create or replace)'
+ORDER BY xact_start;
+```
+
+This only catches overlaps in progress, so for a past incident add `%a` (application name) and `%h` (client host) to `log_line_prefix`, then look for what else ran in the same second. A long-running transaction makes the window much wider. If a migration runs `GRANT` early and commits ten minutes later, any other session that touches the same row during those ten minutes fails. Keep transactions that contain DDL short.
+
+## Fix 1: Serialize the DDL with an Advisory Lock
+
+The cleanest fix supplies the lock that PostgreSQL does not take for you. An advisory lock is an application-defined lock on a number. Every session that wants to run the sensitive statements takes the same lock first, so they run one at a time:
+
+```sql
+BEGIN;
+SELECT pg_advisory_xact_lock(hashtext('grants:t1'));
+GRANT SELECT ON t1 TO r1;
+REVOKE SELECT ON t1 FROM r1;
+COMMIT;
+```
+
+`pg_advisory_xact_lock` releases automatically at commit or rollback, which is what you want here. If you released the lock before the transaction committed, the next session could still read a catalog row that is about to change. `hashtext` turns a readable name into the integer key. A name for the whole job, such as `'startup-grants'`, is usually better than one per object, because it stops separate scripts from collecting locks in different orders.
+
+I reran the earlier test with this change, with four sessions and 150 iterations each. The error count dropped to zero in all four sessions. The trade-off is that the sessions now queue. For grants that take a few milliseconds this does not matter, but do not hold the lock across slow work.
+
+## Fix 2: Retry on XX000
+
+If you cannot change every client, or the collisions come from a tool you do not control, retry the statement. The failure is harmless and the retry usually succeeds, because the competing transaction has finished by then. In PL/pgSQL, the condition name for `XX000` is `internal_error`:
+
+```sql
+DO $$
+BEGIN
+  FOR i IN 1..8 LOOP
+    BEGIN
+      GRANT SELECT ON t1 TO r1;
+      EXIT;
+    EXCEPTION WHEN internal_error THEN
+      IF i = 8 THEN RAISE; END IF;
+      PERFORM pg_sleep(0.05 * i);
+    END;
+  END LOOP;
+END $$;
+```
+
+With this block, four sessions running 150 iterations each finished with zero errors. Two details matter. First, the attempt count is capped and the last failure is raised again, so a real internal error is not swallowed forever. `XX000` covers more than this one message, which is why the block should stay small and wrap only the statement you expect to collide. Second, the delay grows on each attempt, so sessions spread out instead of colliding again.
+
+In application code, the same approach is a matter of checking the SQLSTATE and the message together, then retrying the transaction from the start. A failed statement inside a transaction aborts it, so you must roll back before you retry. Otherwise you get [current transaction is aborted](/blog/postgres-current-transaction-is-aborted).
+
+## Better Design: Run the Change Once
+
+Both fixes treat the symptom of a design that does the same work many times. It is often simpler to stop doing that:
+
+- Run migrations as a single job before rolling out application replicas, not from each replica at startup. A Kubernetes init job or a release step in your pipeline does this well.
+- Grant to a group role once, and add login roles to that group. Then new services need `GRANT app_read TO service_x` rather than a fresh grant on every table.
+- Use `ALTER DEFAULT PRIVILEGES` so that new tables pick up the right grants automatically. Our guide to [granting usage on a schema and its tables](/blog/postgres-grant-usage-on-schema-select-all-tables) covers the patterns, and the free [Postgres GRANT Generator](https://chat2db.ai/tools/postgres-grant-generator) can write the statements.
+- Make `CREATE OR REPLACE FUNCTION` conditional in deployment scripts, so it runs only when the function body has changed.
+
+Most migration tools already protect themselves. Flyway and similar tools take a lock of their own before applying changes, so migrations that go through them collide less often than ad hoc scripts. The risky statements are usually those outside the tool, in startup hooks or a separate permissions script.
+
+## Is It Safe to Ignore?
+
+The failed statement rolled back completely, and the other session's change stands. No data is damaged, so there is no need for `REINDEX`, `VACUUM` or any recovery work. Do not confuse this message with real corruption errors such as [could not access status of transaction](/blog/postgres-could-not-access-status-of-transaction). You still should not ignore it, though, because the statement that failed did not take effect. If a `GRANT` lost the race and nothing retried it, a role may be missing a privilege your application needs, and you will see `permission denied` later. After an incident, check the final state rather than assuming it:
+
+```sql
+SELECT grantee, privilege_type
+FROM information_schema.role_table_grants
+WHERE table_name = 't1';
+```
+
+## Troubleshooting Checklist
+
+When this error appears, work through these questions in order:
+
+1. Is the failing statement DDL on a shared object? It nearly always is: a `GRANT`, an `ALTER ROLE` or a `CREATE OR REPLACE`.
+2. What else ran at that moment? Check the log for a second instance of the same job.
+3. Can the job run once? If so, move it to a single step.
+4. If not, take a shared advisory lock around it.
+5. If you cannot change the caller, retry on `XX000`, with a limit and a growing delay.
+6. Afterward, confirm that the object ended up in the state you wanted.
+
+## Inspect Grants and Roles Faster
+
+After a collision, the useful question is what state the catalog ended up in. [Chat2DB](https://chat2db.ai/download) lets you run the grant and session queries above from one workspace, browse roles and table privileges without writing catalog joins, and ask its AI assistant to explain an unfamiliar error such as this one. You can also try it in the browser at [app.chat2db.ai](https://app.chat2db.ai).

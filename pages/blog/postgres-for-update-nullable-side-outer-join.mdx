@@ -1,0 +1,267 @@
+---
+title: "PostgreSQL FOR UPDATE on Outer Join Error: Fix"
+description: "Fix FOR UPDATE cannot be applied to the nullable side of an outer join in PostgreSQL with FOR UPDATE OF, subqueries or CTEs, plus Hibernate and Django fixes."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: November 3, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# PostgreSQL FOR UPDATE on Outer Join Error: Fix
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="November 3, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+You add row locking to a query that already works, and PostgreSQL refuses to run it:
+
+```sql
+SELECT o.id, p.amount
+FROM orders o
+LEFT JOIN payments p ON p.order_id = o.id
+WHERE o.status = 'new'
+FOR UPDATE;
+```
+
+```
+ERROR:  0A000: FOR UPDATE cannot be applied to the nullable side of an outer join
+LOCATION:  make_outerjoininfo, initsplan.c:1802
+```
+
+SQLSTATE `0A000` is `feature_not_supported`. The query is valid SQL, and the join itself is fine. The problem is what `FOR UPDATE` was asked to lock. This guide explains the rule, shows which join types trigger it, and gives four fixes, including how to deal with ORMs such as Hibernate and Django that generate these joins for you. Every query below ran on PostgreSQL 18.6.
+
+## The Sample Schema
+
+All the examples use three small tables, so you can follow along:
+
+```sql
+CREATE TABLE customers (id int PRIMARY KEY, name text);
+CREATE TABLE orders (
+  id int PRIMARY KEY,
+  customer_id int REFERENCES customers,
+  status text,
+  total numeric
+);
+CREATE TABLE payments (
+  id int PRIMARY KEY,
+  order_id int REFERENCES orders,
+  amount numeric
+);
+
+INSERT INTO customers VALUES (1, 'Ada'), (2, 'Lin');
+INSERT INTO orders VALUES (10, 1, 'new', 50), (11, 1, 'new', 20), (12, 2, 'new', 70);
+INSERT INTO payments VALUES (100, 10, 50);
+```
+
+Only order 10 has a payment. Orders 11 and 12 come back from a `LEFT JOIN` with `NULL` for every payment column.
+
+## Why PostgreSQL Rejects It
+
+`FOR UPDATE` locks the actual table rows behind each result row. In a plain `SELECT ... FOR UPDATE`, every table in the `FROM` clause is included. That is the catch: the query above asks to lock a row in `payments` for each result, but for orders 11 and 12 no such row exists. The `NULL` values were invented by the outer join.
+
+PostgreSQL could lock the rows that do exist and skip the rest, but that would give you a misleading guarantee. Suppose you lock order 11 and its nonexistent payment, then another session inserts a payment for order 11. Your transaction would not notice, even though the lock seemed to cover "the payment". A lock on nothing protects nothing, and row locks cannot cover rows that do not exist yet. Rather than silently leaving that gap, PostgreSQL makes you say exactly what you want locked.
+
+The "nullable side" is the side of an outer join that can produce those `NULL` rows. It depends on the join type:
+
+| Join | Nullable side | `FOR UPDATE OF` the preserved table |
+|---|---|---|
+| `a LEFT JOIN b` | `b` | `FOR UPDATE OF a` works |
+| `a RIGHT JOIN b` | `a` | `FOR UPDATE OF b` works |
+| `a FULL JOIN b` | Both | No table can be locked |
+| `a INNER JOIN b` | Neither | Both can be locked |
+
+I confirmed each row of that table. For example, `RIGHT JOIN ... FOR UPDATE OF p` returned a row, while `RIGHT JOIN ... FOR UPDATE OF o` failed with the same error, because `orders` is the nullable side there. With `FULL JOIN`, both `FOR UPDATE OF o` and `FOR UPDATE OF p` failed.
+
+## Fix 1: Name the Tables with FOR UPDATE OF
+
+In most cases you only meant to lock the main table. Say so:
+
+```sql
+SELECT o.id, p.amount
+FROM orders o
+LEFT JOIN payments p ON p.order_id = o.id
+WHERE o.status = 'new'
+ORDER BY o.id
+FOR UPDATE OF o;
+```
+
+```
+ id | amount
+----+--------
+ 10 |     50
+ 11 |
+ 12 |
+(3 rows)
+```
+
+The name after `OF` must be the alias if the table has one. Writing `FOR UPDATE OF orders` here fails with `relation "orders" in FOR UPDATE clause not found in FROM clause`, because the alias hides the table name. You can list several tables as long as none of them is on a nullable side. This query locks both the order and its customer while still reading the optional payment:
+
+```sql
+SELECT o.id, c.name, p.amount
+FROM orders o
+JOIN customers c ON c.id = o.customer_id
+LEFT JOIN payments p ON p.order_id = o.id
+ORDER BY o.id
+FOR UPDATE OF o, c;
+```
+
+Adding `p` to that list, as in `FOR UPDATE OF o, p`, brings the error back.
+
+## What Is Actually Locked
+
+Be clear about what `FOR UPDATE OF o` means. The `orders` rows are locked, and the `payments` rows are not. I tested this by holding the lock in one session and trying updates from a second session with `lock_timeout` set to one second:
+
+```sql
+-- Session 1
+BEGIN;
+SELECT o.id, p.amount
+FROM orders o
+LEFT JOIN payments p ON p.order_id = o.id
+WHERE o.id = 10
+FOR UPDATE OF o;
+
+-- Session 2
+SET lock_timeout = '1s';
+UPDATE payments SET amount = amount WHERE id = 100;  -- succeeds immediately
+UPDATE orders SET status = status WHERE id = 10;     -- waits, then fails
+```
+
+```
+ERROR:  canceling statement due to lock timeout
+CONTEXT:  while updating tuple (0,1) in relation "orders"
+```
+
+Session 2 changed the payment freely, so the amount that session 1 read could already be out of date. If your logic depends on the payment staying the same, read this as a warning. In that case you need to lock the payment row as well, as Fix 3 shows, or make every writer lock the parent order first. The second option is common and works well: if all code paths that change payments start by locking the order, then the lock on the order protects its payments, including ones that do not exist yet.
+
+## Fix 2: Move the Optional Data into a Subquery
+
+If you only need a value from the optional table, read it in a scalar subquery rather than a join. Nothing is nullable any more, so plain `FOR UPDATE` is accepted, and it locks only `orders`:
+
+```sql
+SELECT o.id,
+       (SELECT sum(p.amount) FROM payments p WHERE p.order_id = o.id) AS paid
+FROM orders o
+WHERE o.status = 'new'
+ORDER BY o.id
+FOR UPDATE;
+```
+
+```
+ id | paid
+----+------
+ 10 |   50
+ 11 |
+ 12 |
+(3 rows)
+```
+
+This is also how you combine locking with an aggregate. A direct `GROUP BY` is not allowed with locking at all:
+
+```sql
+SELECT o.id, sum(p.amount)
+FROM orders o LEFT JOIN payments p ON p.order_id = o.id
+GROUP BY o.id
+FOR UPDATE OF o;
+```
+
+```
+ERROR:  0A000: FOR UPDATE is not allowed with GROUP BY clause
+```
+
+`DISTINCT` gives the matching error, `FOR UPDATE is not allowed with DISTINCT clause`, for the same reason: a grouped result row does not correspond to one table row. The scalar subquery avoids both problems because the outer query stays row-by-row.
+
+A `LEFT JOIN LATERAL` also works when you need more than one column from the optional table, as long as you still name the table to lock:
+
+```sql
+SELECT o.id, p.amount
+FROM orders o
+LEFT JOIN LATERAL (
+  SELECT amount FROM payments p WHERE p.order_id = o.id LIMIT 1
+) p ON true
+ORDER BY o.id
+FOR UPDATE OF o;
+```
+
+## Fix 3: Lock First in a CTE, Then Join
+
+When the locking step and the reading step are logically separate, split them. The CTE picks and locks the rows, and the outer query joins whatever it needs:
+
+```sql
+WITH locked AS (
+  SELECT id
+  FROM orders
+  WHERE status = 'new'
+  ORDER BY id
+  FOR UPDATE
+)
+SELECT l.id, p.amount
+FROM locked l
+LEFT JOIN payments p ON p.order_id = l.id
+ORDER BY l.id;
+```
+
+This returns the same three rows, and the outer join no longer has any effect on the locking clause. The pattern combines well with `FOR UPDATE SKIP LOCKED`, which is how many job queues pull work. See [SELECT FOR UPDATE SKIP LOCKED](/blog/postgres-select-for-update-skip-locked) for that design.
+
+If you also need to lock the payments that do exist, lock them explicitly in a second statement inside the same transaction:
+
+```sql
+BEGIN;
+SELECT id FROM orders WHERE id = 10 FOR UPDATE;
+SELECT id, amount FROM payments WHERE order_id = 10 FOR UPDATE;
+-- do the work
+COMMIT;
+```
+
+This is more honest than the rejected query, because it makes the gap visible: the second statement can lock only rows that exist. A new payment inserted later is stopped only if the writer locks the order first.
+
+## Fix 4: Use INNER JOIN When the Row Must Exist
+
+Sometimes the `LEFT JOIN` is a leftover, and the query only makes sense for rows that have a match. When that is true, an inner join removes the nullable side and plain `FOR UPDATE` locks both tables. Do not make this change just to silence the error, though. Orders without a payment would quietly drop out of the results, and a job that scans for unpaid orders would find nothing.
+
+## When an ORM Generates the Join
+
+Most reports of this error come from ORMs, where nobody wrote the SQL by hand.
+
+**Hibernate and Spring Data JPA.** A method with `@Lock(LockModeType.PESSIMISTIC_WRITE)` on an entity with an eager optional relation, such as a `@ManyToOne(optional = true)` with `FetchType.EAGER` or an `@EntityGraph`, generates a `LEFT JOIN` plus `FOR UPDATE`. The simplest fix is to make the relation lazy and load it after taking the lock. Lazy fetching is the better default for `@ManyToOne` in any case.
+
+**Django.** `select_related` on a nullable foreign key produces a `LEFT JOIN`, so `select_for_update()` hits this error. Pass the tables to lock with `of`, which maps directly to `FOR UPDATE OF`:
+
+```python
+Order.objects.select_related("payment").select_for_update(of=("self",))
+```
+
+**Rails.** `lock` accepts custom SQL, so with `includes` or `left_joins` you can write the clause yourself:
+
+```ruby
+Order.left_joins(:payment).lock("FOR UPDATE OF orders").where(status: "new")
+```
+
+Here the table has no alias in the generated SQL, so its real name is correct. In all three cases, log the SQL the ORM really sends before you change anything, because the join may come from a default scope or a global fetch plan rather than the query you are looking at.
+
+## Consider a Weaker Lock
+
+While you are here, check whether you need `FOR UPDATE` at all. If you will not delete the row or change its key columns, `FOR NO KEY UPDATE` is enough, and it does not block other sessions inserting rows with a foreign key to it. It obeys the same outer join rule, so you still need `OF`:
+
+```sql
+SELECT o.id, p.amount
+FROM orders o
+LEFT JOIN payments p ON p.order_id = o.id
+WHERE o.status = 'new'
+ORDER BY o.id
+FOR NO KEY UPDATE OF o;
+```
+
+The other lock strengths, and what conflicts with what, are covered in [PostgreSQL lock modes](/blog/postgres-lock-table-lock-modes). If you want to check two specific modes, the free [Postgres Lock Conflict Checker](https://chat2db.ai/tools/postgres-lock-conflict-checker) shows the answer directly.
+
+## Which Fix Should You Use?
+
+- You only want to lock the main table: use `FOR UPDATE OF alias`.
+- You need one value or an aggregate from the optional table: use a scalar subquery.
+- Selecting and locking are separate steps, or you want `SKIP LOCKED`: use a CTE.
+- The optional rows must not change either: lock them in a second statement, and make writers lock the parent first.
+- An ORM wrote the query: make the relation lazy, or use the framework's `of` option.
+
+## Test the Locking Before You Ship
+
+Locking bugs rarely show up with one user, so it pays to try a query in two sessions before you trust it. With [Chat2DB](https://chat2db.ai/download) you can open two consoles against the same database, hold a transaction in one and watch the other block, and have the AI assistant explain why a generated query was rejected. It also runs in the browser at [app.chat2db.ai](https://app.chat2db.ai).

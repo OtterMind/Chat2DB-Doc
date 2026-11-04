@@ -1,0 +1,281 @@
+---
+title: "PostgreSQL no partition of relation found: Fix"
+description: "Fix the PostgreSQL 23514 error no partition of relation found for row: add the missing partition, use a default partition safely and automate new ranges."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: November 3, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# PostgreSQL no partition of relation found: Fix
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="November 3, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+The classic version of this incident happens just after midnight on the first of the month. Inserts that worked yesterday start failing across the application:
+
+```
+ERROR:  23514: no partition of relation "events" found for row
+DETAIL:  Partition key of the failing row contains (created_at) = (2026-11-03 09:30:00+00).
+```
+
+A partitioned table stores no rows itself. Every row must be routed to one of its partitions, and if none of them accepts the key, PostgreSQL rejects the row. SQLSTATE `23514` is `check_violation`, because each partition's bounds act as a constraint. The `DETAIL` line tells you the exact key that had nowhere to go, so the diagnosis is usually quick.
+
+The immediate fix is to create the missing partition. The lasting fix is to make sure this cannot happen next month. This guide covers both, along with the less obvious causes: `NULL` keys, list and hash partitions, updates that move rows, and the trap you hit when a default partition already holds data. Every example ran on PostgreSQL 18.6.
+
+## Reproducing the Error
+
+Here is a monthly range-partitioned table with only October defined:
+
+```sql
+SET timezone = 'UTC';
+
+CREATE TABLE events (
+  id bigint GENERATED ALWAYS AS IDENTITY,
+  created_at timestamptz NOT NULL,
+  kind text
+) PARTITION BY RANGE (created_at);
+
+CREATE TABLE events_2026_10 PARTITION OF events
+  FOR VALUES FROM ('2026-10-01 00:00+00') TO ('2026-11-01 00:00+00');
+
+INSERT INTO events (created_at, kind) VALUES ('2026-10-15', 'a');  -- works
+INSERT INTO events (created_at, kind) VALUES ('2026-11-03 09:30', 'b');  -- fails
+```
+
+The second insert has no matching partition and fails with the error above. Range bounds include the lower value and exclude the upper one, so `2026-11-01 00:00:00+00` is already outside `events_2026_10`.
+
+## Step 1: See What Partitions Exist
+
+Before you add anything, list the partitions and their bounds:
+
+```sql
+SELECT c.relname, pg_get_expr(c.relpartbound, c.oid) AS bounds
+FROM pg_inherits i
+JOIN pg_class c ON c.oid = i.inhrelid
+WHERE i.inhparent = 'events'::regclass
+ORDER BY 1;
+```
+
+```
+    relname     |                              bounds
+----------------+--------------------------------------------------------------------------
+ events_2026_10 | FOR VALUES FROM ('2026-10-01 00:00:00+00') TO ('2026-11-01 00:00:00+00')
+(1 row)
+```
+
+To see the partition key itself, use `pg_get_partkeydef`:
+
+```sql
+SELECT pg_get_partkeydef('events'::regclass);
+```
+
+```
+ pg_get_partkeydef
+--------------------
+ RANGE (created_at)
+(1 row)
+```
+
+Compare the value in the `DETAIL` line with these bounds. Most of the time the key is simply past the last range. If it looks like it should fit, check its time zone. A `timestamptz` bound is an exact moment, so a partition that begins at midnight UTC begins at a different local time for a session in another zone.
+
+## Step 2: Create the Missing Partition
+
+For the failing row above, add November:
+
+```sql
+CREATE TABLE events_2026_11 PARTITION OF events
+  FOR VALUES FROM ('2026-11-01 00:00+00') TO ('2026-12-01 00:00+00');
+```
+
+Inserts recover immediately. The rows that failed before this are gone unless the application queued them, so check whether you need to replay anything from logs or a message queue. Once the service is back, read on for why this will happen again unless you change something.
+
+Bounds of neighboring partitions may touch but cannot overlap. A mistake here gets a clear error, such as `partition "x" would overlap partition "y"`, and no damage is done.
+
+## Other Ways to Get This Error
+
+The same message has several causes, and the fix differs for each.
+
+**A list partition with a new value.** List partitioning only accepts the values you named. A new tenant or status with no partition fails:
+
+```sql
+CREATE TABLE tenants (tenant_id int, v text) PARTITION BY LIST (tenant_id);
+CREATE TABLE tenants_1 PARTITION OF tenants FOR VALUES IN (1);
+INSERT INTO tenants VALUES (2, 'x');
+```
+
+```
+ERROR:  23514: no partition of relation "tenants" found for row
+DETAIL:  Partition key of the failing row contains (tenant_id) = (2).
+```
+
+**A NULL key.** `NULL` matches no range and no ordinary list value. The output shows it plainly:
+
+```sql
+INSERT INTO tenants VALUES (NULL, 'x');
+```
+
+```
+ERROR:  23514: no partition of relation "tenants" found for row
+DETAIL:  Partition key of the failing row contains (tenant_id) = (null).
+```
+
+A list partition can accept it with `FOR VALUES IN (NULL)`, but ordinarily the key should be `NOT NULL`. Our `events.created_at` column is `NOT NULL`, yet the insert of a `NULL` still reported the partition error rather than a not-null violation, because routing happens first. Either way, the fix is in the application.
+
+**An incomplete hash partition set.** With hash partitioning, you must create every remainder for the chosen modulus. If one is missing, some keys work and others do not, which makes the failure look random:
+
+```sql
+CREATE TABLE h (id int, v text) PARTITION BY HASH (id);
+CREATE TABLE h0 PARTITION OF h FOR VALUES WITH (MODULUS 2, REMAINDER 0);
+INSERT INTO h SELECT g, 'x' FROM generate_series(1, 5) g;
+```
+
+```
+ERROR:  23514: no partition of relation "h" found for row
+DETAIL:  Partition key of the failing row contains (id) = (3).
+```
+
+A multi-row insert fails as a whole, so none of the five rows was stored.
+
+**An update that moves a row.** Changing the partition key moves the row to another partition. If the new value has none, the `UPDATE` fails with the same error:
+
+```sql
+UPDATE events SET created_at = '2026-12-01' WHERE kind = 'a';
+```
+
+```
+ERROR:  23514: no partition of relation "events" found for row
+DETAIL:  Partition key of the failing row contains (created_at) = (2026-12-01 00:00:00+00).
+```
+
+**Bad data from a client.** A timestamp in the year 2206 or 1970, usually from a broken default or a device clock, fails with the same error, and creating a partition would be the wrong response. If the value in the `DETAIL` line looks absurd, fix the source.
+
+**A bulk load with one bad row.** `COPY` stops at the first row with no partition and stores nothing, and the error names the line in the input:
+
+```sql
+COPY p2 FROM '/tmp/load.csv' WITH (FORMAT csv);
+```
+
+```
+ERROR:  no partition of relation "p2" found for row
+DETAIL:  Partition key of the failing row contains (d) = (2026-11-02).
+CONTEXT:  COPY p2, line 2: "2,2026-11-02"
+```
+
+The tolerant options do not help. `ON_ERROR ignore`, added to `COPY` in PostgreSQL 17, only skips rows with data type conversion problems, so the same load failed in the same way with that option. `INSERT ... ON CONFLICT DO NOTHING` also failed, because a conflict arbiter deals with unique violations and this is a routing failure. For loads you cannot control, copy the data into a staging table first, check the range of the key, create any missing partitions, and then insert from staging.
+
+**A late row after retention.** Detaching or dropping old partitions creates a gap at the low end of the range. When I detached the October partition and then inserted a row dated in October, it failed in the same way. If your producers can send late data, either keep partitions longer than the longest delay or route those rows through a default partition that you check regularly.
+
+## Should You Add a Default Partition?
+
+A default partition catches every row that matches no other partition:
+
+```sql
+CREATE TABLE events_default PARTITION OF events DEFAULT;
+
+INSERT INTO events (created_at, kind)
+VALUES ('2026-11-03 09:30', 'b'), ('2026-11-04', 'b');
+
+SELECT tableoid::regclass, kind, created_at FROM events ORDER BY created_at;
+```
+
+```
+    tableoid    | kind |       created_at
+----------------+------+------------------------
+ events_2026_10 | a    | 2026-10-15 00:00:00+00
+ events_default | b    | 2026-11-03 09:30:00+00
+ events_default | b    | 2026-11-04 00:00:00+00
+(3 rows)
+```
+
+The inserts no longer fail, which is valuable if losing a write is worse than anything else. But a default partition has a cost: it hides the missing-partition problem instead of reporting it, and it makes the eventual fix harder. A later `CREATE TABLE ... PARTITION OF` also has to scan the default partition, so keep an alert on its size. Treat a default partition as a safety net that should stay empty, and monitor it:
+
+```sql
+SELECT count(*) AS stray_rows FROM events_default;
+```
+
+The default partition also does not accept a `NULL` in a `NOT NULL` column. With it in place, that insert fails with the ordinary error instead: `null value in column "created_at" of relation "events_default" violates not-null constraint`.
+
+## The Trap: Creating a Partition When the Default Has Matching Rows
+
+Now try to add November in the usual way:
+
+```sql
+CREATE TABLE events_2026_11 PARTITION OF events
+  FOR VALUES FROM ('2026-11-01 00:00+00') TO ('2026-12-01 00:00+00');
+```
+
+```
+ERROR:  23514: updated partition constraint for default partition "events_default" would be violated by some row
+```
+
+PostgreSQL refuses, because those rows would then sit in the wrong partition. You need to move them in one transaction. Create a standalone table, copy the rows, delete them from the default partition, then attach the new table:
+
+```sql
+BEGIN;
+
+CREATE TABLE events_2026_11
+  (LIKE events INCLUDING DEFAULTS INCLUDING CONSTRAINTS);
+
+INSERT INTO events_2026_11 OVERRIDING SYSTEM VALUE
+SELECT * FROM events_default
+WHERE created_at >= '2026-11-01 00:00+00'
+  AND created_at <  '2026-12-01 00:00+00';
+
+DELETE FROM events_default
+WHERE created_at >= '2026-11-01 00:00+00'
+  AND created_at <  '2026-12-01 00:00+00';
+
+ALTER TABLE events ATTACH PARTITION events_2026_11
+  FOR VALUES FROM ('2026-11-01 00:00+00') TO ('2026-12-01 00:00+00');
+
+COMMIT;
+```
+
+```
+    tableoid    | kind |       created_at
+----------------+------+------------------------
+ events_2026_10 | a    | 2026-10-15 00:00:00+00
+ events_2026_11 | b    | 2026-11-03 09:30:00+00
+ events_2026_11 | b    | 2026-11-04 00:00:00+00
+(3 rows)
+```
+
+`OVERRIDING SYSTEM VALUE` is required here because `id` is `GENERATED ALWAYS`. Without it, the copy stops with `cannot insert a non-DEFAULT value into column "id"`. `ATTACH PARTITION` takes a lock on the default partition and scans it, and this transaction holds locks until commit, so run it at a quiet time if the table is busy. New indexes are created on the new partition during the attach, to match the parent.
+
+## Stop It from Happening Again
+
+The real fix is to create partitions before they are needed. A small scheduled job can create next month's partition well ahead of time:
+
+```sql
+DO $$
+DECLARE
+  start_d date := date_trunc('month', now() + interval '1 month');
+  stop_d  date := start_d + interval '1 month';
+  part    text := format('events_%s', to_char(start_d, 'YYYY_MM'));
+BEGIN
+  EXECUTE format(
+    'CREATE TABLE IF NOT EXISTS %I PARTITION OF events FOR VALUES FROM (%L) TO (%L)',
+    part, start_d, stop_d
+  );
+END $$;
+```
+
+Run on November 3, this created `events_2026_12` with bounds from `2026-12-01` to `2027-01-01`. `IF NOT EXISTS` makes it safe to run daily, which is better than running it once a month: if one run fails, tomorrow's run still gets the partition in place. The bounds use the session time zone, so run the job in the same zone as your partitions, as this test did in UTC.
+
+For anything more than a handful of tables, use a tool made for this. The [pg_partman guide](/blog/pg-partman-partition-maintenance) covers premaking partitions and retention, and you can generate the `CREATE TABLE` statements with the free [Postgres Partition Generator](https://chat2db.ai/tools/postgres-partition-generator). Whichever you choose, add monitoring that fails loudly: an alert when the newest partition's upper bound is less than a week or two away gives you time to react before inserts fail. Partition design more broadly is covered in the [PostgreSQL table partitioning guide](/blog/postgres-table-partitioning-guide).
+
+## Checklist
+
+1. Read the key in the `DETAIL` line. Is the value legitimate?
+2. List the partitions and compare the bounds, taking the time zone into account.
+3. For a missing range or list value, create the partition.
+4. For `NULL` or nonsense keys, fix the application.
+5. If a default partition blocks the new one, move its rows in a transaction.
+6. Schedule partition creation, and alert on the remaining runway.
+
+## See Your Partitions at a Glance
+
+During an incident, it helps to see the partition layout without writing catalog queries. In [Chat2DB](https://chat2db.ai/download) you can browse a partitioned table and its children in the schema tree, run the bounds query above, and ask the AI assistant to write the statement for the next partition. A browser version is available at [app.chat2db.ai](https://app.chat2db.ai).

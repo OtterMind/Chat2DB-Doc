@@ -1,0 +1,218 @@
+---
+title: "MySQL Error 1524: Plugin Is Not Loaded Fix"
+description: "Fix MySQL ERROR 1524 Plugin mysql_native_password is not loaded on 8.4 and 9: re-enable it short term, then migrate accounts to caching_sha2_password."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: November 3, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# MySQL Error 1524: Plugin Is Not Loaded Fix
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="November 3, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+You upgrade MySQL to 8.4, restart the server, and an application that has connected for years gets this:
+
+```
+ERROR 1524 (HY000): Plugin 'mysql_native_password' is not loaded
+```
+
+MySQL error 1524 means an account refers to an authentication plugin the server cannot use. The account still exists, and its password has not changed, but the code that would check the password is switched off or was never installed. The most common cause today is `mysql_native_password`, which MySQL 8.4 disables by default and MySQL 9.0 removed. The same error appears with `auth_socket` and other plugins.
+
+This guide shows how to confirm the cause, how to get applications working again quickly, and how to move accounts to `caching_sha2_password` for good. The tests used MySQL 8.4.11 and 8.0.46 in Docker.
+
+## Why It Happens on MySQL 8.4
+
+Here is the timeline for the plugin:
+
+| Version | State of `mysql_native_password` |
+|---|---|
+| MySQL 5.7 | Default authentication plugin |
+| MySQL 8.0 | Available and `ACTIVE`, but deprecated. The default is `caching_sha2_password` |
+| MySQL 8.4 | Present but `DISABLED` by default |
+| MySQL 9.0 and later | Removed |
+
+An in-place upgrade from 8.0 to 8.4 keeps your users and their plugin assignments, so an account created years ago still has `mysql_native_password` in `mysql.user`. The upgrade succeeds, and the failure only appears when somebody tries to log in.
+
+To reproduce it, I created a user on 8.4 with the plugin enabled, restarted without the option, and logged in:
+
+```bash
+mysql -ulegacy -p -h127.0.0.1
+```
+
+```
+ERROR 1524 (HY000): Plugin 'mysql_native_password' is not loaded
+```
+
+Creating such a user on a default 8.4 server fails the same way:
+
+```sql
+CREATE USER 'legacy'@'%' IDENTIFIED WITH mysql_native_password BY 'S3cret!pass';
+```
+
+```
+ERROR 1524 (HY000): Plugin 'mysql_native_password' is not loaded
+```
+
+That second form often comes from an old install script or an ORM migration that hardcodes the plugin name.
+
+## Step 1: Check the Plugin and the Accounts
+
+Connect as an account that still works, usually `root` over the local socket. First, check the plugin:
+
+```sql
+SELECT plugin_name, plugin_status, plugin_library
+FROM information_schema.plugins
+WHERE plugin_name LIKE '%password%' OR plugin_name LIKE '%sha2%';
+```
+
+```
++-----------------------+---------------+----------------+
+| plugin_name           | plugin_status | plugin_library |
++-----------------------+---------------+----------------+
+| sha256_password       | ACTIVE        | NULL           |
+| caching_sha2_password | ACTIVE        | NULL           |
+| sha2_cache_cleaner    | ACTIVE        | NULL           |
+| mysql_native_password | DISABLED      | NULL           |
++-----------------------+---------------+----------------+
+```
+
+`DISABLED` confirms the cause. On 8.0.46 the same plugin showed `ACTIVE`, which is why the upgrade to 8.4 is the point where this breaks. A plugin that is absent from this list altogether is not loaded at all, and that is the situation on 9.0 and later.
+
+Next, list the accounts that depend on it:
+
+```sql
+SELECT user, host, plugin
+FROM mysql.user
+WHERE plugin = 'mysql_native_password';
+```
+
+```
+user    host    plugin
+legacy  %       mysql_native_password
+```
+
+Every row returned here will fail to log in until you do something about it. Save this list, because it is your migration checklist. If the only admin account is affected and you cannot log in at all, see the section on lockouts below.
+
+## Step 2: Short-Term Fix, Re-Enable the Plugin
+
+On 8.4 you can turn the plugin back on with a server option. It is read at startup, so a restart is required. Add this to `my.cnf`:
+
+```ini
+[mysqld]
+mysql-native-password=ON
+```
+
+Or pass it on the command line, for example in a Docker container:
+
+```bash
+docker run -d --name db -e MYSQL_ROOT_PASSWORD=pw \
+  mysql:8.4 --mysql-native-password=ON
+```
+
+After the restart, the plugin was `ACTIVE`, and the `legacy` account logged in again:
+
+```
+current_user()  login ok
+legacy@%        login ok
+```
+
+Use this to restore service, then carry out the migration. The option does not exist on MySQL 9.0 and later, so this only buys time, and a future upgrade will bring the error back. If you are already on 9.x, there is no switch to flip, so go straight to Step 3.
+
+## Step 3: Permanent Fix, Move to caching_sha2_password
+
+Change each account to the current default plugin:
+
+```sql
+ALTER USER 'legacy'@'%'
+  IDENTIFIED WITH caching_sha2_password BY 'S3cret!pass';
+```
+
+The important limitation is that you need the password. A native hash is `SHA1(SHA1(password))`, and it cannot be converted into a `caching_sha2_password` hash. You must supply the plain password again or set a new one. If nobody knows it, this is the moment to rotate it.
+
+If you would rather not type a password into SQL, build the hash first and apply that. Our free [MySQL Password Hash Generator](https://chat2db.ai/tools/mysql-password-hash-generator) computes the value in your browser and writes the statement for you:
+
+```sql
+ALTER USER 'legacy'@'%'
+  IDENTIFIED WITH caching_sha2_password AS 0x2441243030352447...; -- hex shortened here
+```
+
+I tested this path on 8.4.11 and 8.0.46, and accounts created from those hashes logged in normally.
+
+After migrating, the check from before should come back empty:
+
+```sql
+SELECT user, host, plugin
+FROM mysql.user
+WHERE plugin = 'mysql_native_password';
+```
+
+## Check Your Clients Before You Migrate
+
+The server side is the easy part. Each client must also support `caching_sha2_password`, and this is where a migration can cause a second outage. Very old connectors fail with an error such as:
+
+```
+Authentication plugin 'caching_sha2_password' cannot be loaded
+```
+
+That usually means the driver or client library is too old and has to be upgraded. Any maintained connector from the last several years supports the plugin, so check your versions and test against a staging server first.
+
+A second issue appears only on unencrypted connections. `caching_sha2_password` never sends a password in the clear. Over TLS this is automatic, and the MySQL client uses TLS by default. Without TLS, the first login after a restart or a cache flush needs an RSA key exchange, and if the client has not been told to do that, it fails. I reproduced this by running `FLUSH PRIVILEGES` to clear the cache, then connecting with TLS turned off:
+
+```bash
+mysql -uapp -p -h127.0.0.1 --ssl-mode=DISABLED
+```
+
+```
+ERROR 2061 (HY000): Authentication plugin 'caching_sha2_password' reported error: Authentication requires secure connection.
+```
+
+Adding `--get-server-public-key` let the same login succeed:
+
+```bash
+mysql -uapp -p -h127.0.0.1 --ssl-mode=DISABLED --get-server-public-key
+```
+
+This failure is deceptive, because a client that logged in over TLS earlier has filled the server's cache, and then logins without TLS work until the next restart. Everything passes in testing and breaks on the first reboot. Connector options for this have other names, such as `allowPublicKeyRetrieval=true` in MySQL Connector/J. Using TLS everywhere is the better answer, since it removes the problem altogether.
+
+## Other Plugins That Trigger 1524
+
+The error is not unique to native passwords. Any account plugin that the server has not loaded behaves the same way. `auth_socket`, which authenticates local users by their operating system user, is a common example. It is not loaded on the official `mysql:8.4` Docker image:
+
+```sql
+CREATE USER 'sock'@'localhost' IDENTIFIED WITH auth_socket;
+```
+
+```
+ERROR 1524 (HY000): Plugin 'auth_socket' is not loaded
+```
+
+Installing the plugin fixes it:
+
+```sql
+INSTALL PLUGIN auth_socket SONAME 'auth_socket.so';
+CREATE USER 'sock'@'localhost' IDENTIFIED WITH auth_socket;
+```
+
+Dumps are another source. A `mysql.user` dump taken on a server with a plugin installed fails on a server without it, so check `SELECT DISTINCT plugin FROM mysql.user` before you migrate users between servers. On MariaDB the same error number is commonly seen with `unix_socket`, though MariaDB has its own plugin defaults, and I did not test it for this article.
+
+## If You Are Locked Out
+
+If every administrator account uses the disabled plugin, you cannot run `ALTER USER`. On 8.4, add `mysql-native-password=ON` and restart, which is the least invasive route. On 9.x, or if you do not know any password, use the recovery procedure: start the server with `--skip-grant-tables --skip-networking`, connect locally, run `FLUSH PRIVILEGES` to reload the grant tables, then `ALTER USER` for your admin account, and restart normally. Do not leave a server running with `--skip-grant-tables`, because anyone who can connect can do anything. The `--skip-networking` option limits that risk while you work.
+
+## A Safe Migration Plan
+
+1. On 8.0, before upgrading, list accounts with `mysql_native_password`.
+2. Upgrade drivers and confirm that each one supports `caching_sha2_password`.
+3. Move accounts one at a time, in staging first, then production.
+4. Turn on TLS for application connections, or set the public key option.
+5. Restart the test server, to confirm that logins work with a cold cache.
+6. Upgrade to 8.4, and use `mysql-native-password=ON` only for stragglers.
+7. Remove the option before you move to 9.x.
+
+## Audit Accounts in One Place
+
+A migration like this comes down to tracking which accounts are done. In [Chat2DB](https://chat2db.ai/download) you can connect to MySQL 8.0, 8.4 and 9.x from one client, keep the account queries above in a saved console, and test a connection after each change. There is also a browser version at [app.chat2db.ai](https://app.chat2db.ai).
