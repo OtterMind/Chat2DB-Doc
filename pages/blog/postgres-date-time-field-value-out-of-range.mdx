@@ -1,0 +1,295 @@
+---
+title: "PostgreSQL date/time field value out of range"
+description: "Fix the PostgreSQL 22008 error date/time field value out of range: DateStyle mix-ups, invalid dates, bad imports and finding broken rows with pg_input_is_valid."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: November 4, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# PostgreSQL date/time field value out of range
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="November 4, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+An import that ran happily for weeks suddenly stops on the 13th of the month, or a report fails only when one row is reached:
+
+```
+ERROR:  date/time field value out of range: "25/12/2026"
+LINE 1: select '25/12/2026'::date;
+               ^
+HINT:  Perhaps you need a different "DateStyle" setting.
+```
+
+SQLSTATE `22008` means PostgreSQL understood the shape of your value, but one of its fields holds a number that cannot be right, such as month 25. The value in quotes tells you what failed. The question is why, and there are two very different answers: either the date is really impossible, or it is fine and PostgreSQL is reading the fields in the wrong order.
+
+This guide covers both, along with the safest way to find bad rows in a table. All the output comes from PostgreSQL 18.6.
+
+## Two Errors That Look Alike
+
+First, make sure you have the right error. PostgreSQL has separate messages for values it cannot parse and values it can parse but cannot accept:
+
+```sql
+SELECT 'n/a'::date;
+-- ERROR:  invalid input syntax for type date: "n/a"
+
+SELECT '2026-02-30'::date;
+-- ERROR:  date/time field value out of range: "2026-02-30"
+```
+
+The first has SQLSTATE `22007`, and it means the text does not look like a date at all. An empty string lands here too. The second has `22008`, and it means the text looks like a date but holds an invalid field. For the first kind, see the [invalid input syntax guide](/blog/postgres-invalid-input-syntax-for-type-fix).
+
+Note the `HINT`, because it is a useful signal. With a month out of range, PostgreSQL adds `Perhaps you need a different "DateStyle" setting`. With `2026-02-30` it does not, since no setting can save February 30.
+
+## Cause 1: Day and Month Are in the Wrong Order
+
+This is the classic cause. `DateStyle` tells PostgreSQL how to read ambiguous dates, and on a default US-English setup it is `MDY`:
+
+```sql
+SHOW datestyle;
+```
+
+```
+ DateStyle
+-----------
+ ISO, MDY
+```
+
+Under that setting, `25/12/2026` means month 25, which fails. Change the order and the same text works, while the American form then fails:
+
+```sql
+SET datestyle = 'ISO, DMY';
+
+SELECT '25/12/2026'::date;
+-- 2026-12-25
+
+SELECT '12/25/2026'::date;
+-- ERROR:  date/time field value out of range: "12/25/2026"
+```
+
+The dangerous part is what this does to data that does not fail. Under `MDY`, the value `03/04/2026` loads as March 4 even if the sender meant April 3. Nothing warns you. An import with `DD/MM/YYYY` dates only errors on days above 12, so the first error you see may be a sign that earlier rows were loaded with the wrong month. This is why a job that "worked until the 13th" deserves a check of the rows it already loaded, not just a fix for the failing one.
+
+### The Fix: Stop Depending on DateStyle
+
+For one-off values, say what the format is with `to_date()` or `to_timestamp()`:
+
+```sql
+SELECT to_date('31/01/2026', 'DD/MM/YYYY');
+-- 2026-01-31
+```
+
+For new data, use ISO 8601 (`2026-12-25`) wherever you can, because PostgreSQL reads it the same way under every `DateStyle`.
+
+For a file import, set `DateStyle` for the session before you run `COPY`:
+
+```sql
+SET datestyle = 'ISO, DMY';
+\copy c1 FROM 'dates.csv' CSV
+```
+
+You can make it permanent for one role, which suits a dedicated import account, without changing behavior for everyone else:
+
+```sql
+ALTER ROLE importer SET datestyle = 'ISO, DMY';
+```
+
+## Cause 2: The Date Is Impossible
+
+Sometimes the date simply does not exist. These all fail:
+
+```sql
+SELECT '2026-02-30'::date;
+SELECT '2026-02-29'::date;     -- 2026 is not a leap year
+SELECT '2026-06-31 10:00:00'::timestamptz;
+SELECT '2026-01-32'::timestamp;
+```
+
+Other databases and languages are more forgiving. MySQL in older modes stored `0000-00-00`, and JavaScript's `Date` rolls `February 30` into March, so bad values often arrive from a migration or from application code that does its own date arithmetic. The usual source is logic like "same day next month". PostgreSQL's interval arithmetic handles month ends properly, so let it do the work:
+
+```sql
+SELECT date '2026-01-31' + interval '1 month';
+-- 2026-02-28 00:00:00
+
+SELECT (date_trunc('month', date '2026-02-15') + interval '1 month - 1 day')::date;
+-- 2026-02-28
+```
+
+Year zero is another one. MySQL-style zero dates fail too, because the calendar has no year 0:
+
+```sql
+SELECT '0000-01-01'::date;
+-- ERROR:  date/time field value out of range: "0000-01-01"
+```
+
+During a MySQL migration, turn those into `NULL` first with `NULLIF(col, '0000-00-00')`, while the column is still text. The [MySQL zero date guide](/blog/mysql-error-1292-incorrect-datetime-value) explains where they come from.
+
+Times follow the same rule:
+
+```sql
+SELECT '25:00:00'::time;
+-- ERROR:  date/time field value out of range: "25:00:00"
+
+SELECT '60:00'::time;
+-- ERROR:  date/time field value out of range: "60:00"
+
+SELECT '24:00:01'::time;
+-- ERROR:  date/time field value out of range: "24:00:01"
+```
+
+## Cause 3: A Format Function Rejects the Value
+
+`to_date()` and `to_timestamp()` give the same error, and they include the value but not the format, which makes a mismatch harder to see:
+
+```sql
+SELECT to_date('31/12/2026', 'MM/DD/YYYY');
+-- ERROR:  date/time field value out of range: "31/12/2026"
+
+SELECT to_date('2026-13-01', 'YYYY-MM-DD');
+-- ERROR:  date/time field value out of range: "2026-13-01"
+```
+
+Current versions validate these values. Older PostgreSQL releases could be more lenient with `to_date()`, so a query that passed for years may start failing after a major upgrade.
+
+The constructor functions have a slightly different message with no quotes, which is a clue when you search your code:
+
+```sql
+SELECT make_date(2026, 2, 30);
+-- ERROR:  date field value out of range: 2026-02-30
+```
+
+## Cause 4: A Number That Is Not What You Think
+
+Unix timestamps are worth a section of their own, because of one failure that gives no error. `to_timestamp()` takes seconds. Pass milliseconds, as JavaScript and Java produce, and you may get a date far in the future without any complaint:
+
+```sql
+SELECT to_timestamp(1793837947123);
+-- 58814-06-18 06:38:43.000064+00
+```
+
+A larger value finally fails, with a message that hides the cause:
+
+```sql
+SELECT to_timestamp(99999999999999);
+-- ERROR:  timestamp out of range: "1e+14"
+```
+
+Divide by 1000 first. Use a numeric divisor, since dividing two integers would drop the fraction:
+
+```sql
+SELECT to_timestamp(1793837947123 / 1000.0);
+-- 2026-11-05 00:19:07.123+00
+```
+
+The free [Postgres Epoch Converter](https://chat2db.ai/tools/postgres-epoch-converter) shows which unit a value uses and writes the conversion for you. The limits themselves are far away: `timestamp` ends in the year 294276, and `date` in the year 5874897, so a value beyond them is almost always a unit mistake or corrupt data.
+
+## Find the Bad Rows in a Table
+
+When a cast fails on a whole column, the error shows the value but not the row, and a single bad row stops the entire query:
+
+```sql
+CREATE TABLE ev (d text);
+INSERT INTO ev VALUES ('2026-01-15'), ('2026-02-30'), ('15/01/2026'), ('n/a'), ('');
+
+SELECT d::date FROM ev;
+-- ERROR:  date/time field value out of range: "2026-02-30"
+```
+
+Since PostgreSQL 16, `pg_input_is_valid()` tests a value without raising an error, and `pg_input_error_info()` tells you what is wrong:
+
+```sql
+SELECT d,
+       (pg_input_error_info(d, 'date')).message,
+       (pg_input_error_info(d, 'date')).sql_error_code
+FROM ev;
+```
+
+```
+     d      |                     message                      | sql_error_code
+------------+--------------------------------------------------+----------------
+ 2026-01-15 |                                                  |
+ 2026-02-30 | date/time field value out of range: "2026-02-30" | 22008
+ 15/01/2026 | date/time field value out of range: "15/01/2026" | 22008
+ n/a        | invalid input syntax for type date: "n/a"        | 22007
+            | invalid input syntax for type date: ""           | 22007
+```
+
+That gives you a complete list of the problems in one pass. To convert only what is valid, use `CASE`, which guarantees the order of evaluation:
+
+```sql
+SELECT d,
+       CASE WHEN pg_input_is_valid(d, 'date') THEN d::date END AS parsed
+FROM ev;
+```
+
+A plain `WHERE pg_input_is_valid(d, 'date')` next to a cast worked in our simple test, but SQL does not promise to evaluate conditions in the order you wrote them, so `CASE` is the safer habit in a larger query.
+
+On older versions, a small function does the same job:
+
+```sql
+CREATE OR REPLACE FUNCTION try_date(t text) RETURNS date
+LANGUAGE plpgsql AS $$
+BEGIN
+  RETURN t::date;
+EXCEPTION WHEN others THEN
+  RETURN NULL;
+END $$;
+
+SELECT try_date('2026-02-30'), try_date('2026-02-28');
+-- NULL | 2026-02-28
+```
+
+It works, but each exception sets up a subtransaction, so it is slow on large tables. Use it for a one-time cleanup and not on a hot path.
+
+## Fixing Errors During COPY
+
+`COPY` stops at the first bad line, and its error includes the line number and column, which is very helpful:
+
+```
+ERROR:  date/time field value out of range: "31/01/2026"
+HINT:  Perhaps you need a different "DateStyle" setting.
+CONTEXT:  COPY c1, line 2, column d: "31/01/2026"
+```
+
+If the file is mostly fine, a staging table is the most reliable pattern. Load everything as text, inspect it with the functions above, then insert the clean rows:
+
+```sql
+CREATE TEMP TABLE staging (d text);
+\copy staging FROM 'dates.csv' CSV
+
+INSERT INTO c1 (d)
+SELECT parsed
+FROM (
+  SELECT CASE WHEN pg_input_is_valid(d, 'date') THEN d::date END AS parsed
+  FROM staging
+) s
+WHERE parsed IS NOT NULL;
+
+-- Rows to review
+SELECT d FROM staging WHERE NOT pg_input_is_valid(d, 'date');
+```
+
+Keep the rejected rows so somebody can review them, and do not lose them silently. PostgreSQL 17 also added `ON_ERROR ignore` for `COPY`, which skips bad values. In our test, `COPY c1 FROM stdin WITH (ON_ERROR ignore)` loaded two of three lines and reported `COPY 2`, so always compare that count with the number of lines in the file before you trust the result.
+
+## Prevent It
+
+- Store dates in `date` or `timestamptz` columns, not text, so bad values are rejected on the way in.
+- Send ISO 8601 from applications, or better, use bound parameters of a real date type.
+- Keep `DateStyle` at the server default, and set it only for import sessions.
+- Add a test that loads a date with a day above 12, so a swapped format fails in CI and not in production.
+- Check the date range after every import, which catches day and month swaps that do not raise errors.
+
+## Checklist
+
+1. Read the value in the error. Is it a real date?
+2. Check the `HINT` and `SHOW datestyle`.
+3. For swapped fields, use `to_date()` with a format, or set `DateStyle`.
+4. Audit earlier rows from the same source for silent swaps.
+5. Use `pg_input_is_valid()` to find every bad row.
+6. Convert with `CASE`, and keep rejected rows.
+7. For Unix numbers, confirm seconds or milliseconds.
+
+## Inspect Bad Dates Visually
+
+Cleaning a text column is easier when you can see the rows. In [Chat2DB](https://chat2db.ai/download) you can run the validation query above, sort and filter the results in a grid, and ask the AI assistant to write a `to_date()` format that matches your data. The free [to_char Format Builder](https://chat2db.ai/tools/postgres-to-char-format-builder) helps with format strings too, and you can work in the browser at [app.chat2db.ai](https://app.chat2db.ai/).

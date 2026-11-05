@@ -1,0 +1,170 @@
+---
+title: "PGlite vs SQLite: Embedded Postgres Compared"
+description: "PGlite vs SQLite tested in Node.js: startup time, query speed, disk size, concurrency and features, plus clear guidance on which embedded database to choose."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: November 4, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# PGlite vs SQLite: Embedded Postgres Compared
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="November 4, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+For more than twenty years, "embedded SQL database" has meant SQLite. It lives inside your process, stores everything in one file, and needs no server. PGlite offers something new: the real PostgreSQL engine compiled to WebAssembly, which you install from npm and run in Node.js, Bun, Deno or a browser tab, with no Postgres server anywhere.
+
+Both are embedded, both are free, and both run SQL, but they are built on very different foundations. We ran them side by side in Node.js 20 to get real numbers, using PGlite 0.5.15 (PostgreSQL 18.6 compiled to WebAssembly) and SQLite 3.53.2 through the `better-sqlite3` driver. This guide covers what we measured, what each one can and cannot do, and how to choose.
+
+## At a Glance
+
+| | PGlite | SQLite |
+| --- | --- | --- |
+| Engine | PostgreSQL compiled to WebAssembly | Native C library |
+| SQL dialect | PostgreSQL | SQLite |
+| Runs in the browser | Yes, with IndexedDB or OPFS storage | Through a WebAssembly build |
+| Connections | One at a time, queries run in series | Many readers, one writer |
+| Storage format | A Postgres data directory | One file |
+| Type enforcement | Strict | Flexible by default |
+| Extensions | pgvector, pg_trgm and others packaged for PGlite | Loadable C extensions |
+| Best fit | Postgres compatibility without a server | Fast local storage |
+
+The one-line summary: SQLite is much faster and lighter, while PGlite gives you real PostgreSQL behavior. Most decisions come down to whether you need that behavior.
+
+## A First Look at the Code
+
+Both are a few lines to set up. The biggest difference you will notice is that PGlite is asynchronous.
+
+```js
+import { PGlite } from '@electric-sql/pglite';
+
+const db = await PGlite.create('./data');          // or no path for in-memory
+await db.exec('CREATE TABLE t (id int PRIMARY KEY, b text)');
+await db.query('INSERT INTO t VALUES ($1, $2)', [1, 'hello']);
+const { rows } = await db.query('SELECT * FROM t');
+```
+
+```js
+import Database from 'better-sqlite3';
+
+const db = new Database('./data.db');              // or ':memory:'
+db.exec('CREATE TABLE t (id INTEGER PRIMARY KEY, b TEXT)');
+db.prepare('INSERT INTO t VALUES (?, ?)').run(1, 'hello');
+const rows = db.prepare('SELECT * FROM t').all();
+```
+
+The PGlite version would run unchanged against a real PostgreSQL server, once you swap the client. That is the main reason it exists.
+
+## What We Measured
+
+All timings come from one Apple Silicon Mac running Node.js 20.19. Each table holds 100,000 rows. These are small, single-threaded tests in a single process, so use them to compare the two options on this kind of workload and not as general benchmarks. Where a step was repeated, the figure is the median.
+
+| Test | PGlite | SQLite |
+| --- | --- | --- |
+| Open an in-memory database | 445 ms | 0.1 ms |
+| 100,000 parameterized inserts in one transaction | 3,119 ms | 37 ms |
+| 1,000 primary-key lookups | 43 ms | 0.5 ms |
+| `GROUP BY` aggregate over 100,000 rows | 14.2 ms | 8.3 ms |
+| Disk size for 100,000 short rows | 60.4 MB | 1.6 MB |
+| Installed package size | 27 MB | 28 MB |
+
+### Startup
+
+Opening SQLite is close to free. PGlite has to start a Postgres instance inside WebAssembly, which took about 445 ms each time. That rarely matters for a long-running desktop app or a test suite that opens once, but it does matter for a short-lived serverless function or a CLI that runs in a fraction of a second. It also affects browsers, where the WebAssembly binary (about 9 MB before compression) and data file (about 6 MB) must be downloaded before first use.
+
+### Small Queries
+
+Point lookups and single-row inserts show the largest gap, about 84 times for inserts and 86 times for lookups. Most of this is not query execution. Each PGlite call crosses from JavaScript into WebAssembly and goes through the Postgres wire protocol and executor, while `better-sqlite3` calls a native library synchronously. For a loop of tiny queries, that overhead dominates.
+
+A practical note follows from this. PGlite's `exec()` can run a batch, and set-based SQL avoids most of the crossings. One `INSERT ... SELECT` from `generate_series` loaded the same 100,000 rows in 122 ms, against 3,119 ms row by row, so prefer set-based SQL or `COPY` for bulk work.
+
+### Analytical Queries
+
+The gap nearly disappears for real work inside the engine. The aggregate took 14.2 ms against 8.3 ms, less than twice as long, because the time goes to the query itself. If your queries do joins and aggregates, the PostgreSQL planner may serve you well, particularly on complex statements where SQLite's simpler planner has fewer options.
+
+### Disk Size
+
+Here SQLite has a clear win. Its file was 1.6 MB, while the PGlite directory was 60.4 MB. Much of that is not your data. A Postgres data directory includes system catalogs and write-ahead log segments, so it starts large and grows from there. For an app that keeps a small local database for each user, that overhead is real.
+
+## Concurrency: The Limit People Miss
+
+PGlite runs in a single process, and that process handles one connection. Its queries run one after another. To confirm this, we started four `pg_sleep(0.1)` queries in parallel:
+
+```js
+await Promise.all(
+  [1, 2, 3, 4].map((i) => db.query('SELECT pg_sleep(0.1), $1::int', [i]))
+);
+// took 406 ms: four queries, one at a time
+```
+
+On a real Postgres server, the same call would finish in about 100 ms. So PGlite gives you PostgreSQL's SQL, but not its multi-process concurrency. Its worker option helps in the browser by sharing one instance among tabs, but there is still one active connection.
+
+SQLite also allows one writer at a time, but in WAL mode many separate processes can read while one writes. For a local web server with several processes reading from one file, SQLite is the more capable choice.
+
+Be careful about sharing a PGlite directory. In our test, a second `PGlite.create()` on the same path in the same process opened without complaint and read the data. That is not a promise of safety, since a Postgres data directory is designed to have one owner. Treat a PGlite directory as owned by one instance, and do not point two instances at it.
+
+## Features: Where PGlite Pulls Ahead
+
+The case for PGlite is everything you get from being real PostgreSQL. All of this worked in our test:
+
+```sql
+SELECT jsonb_path_query('{"a":[1,2]}', '$.a[*]');
+SELECT uuidv7();
+
+CREATE EXTENSION vector;
+CREATE TABLE e (id int, v vector(3));
+INSERT INTO e VALUES (1, '[1,2,3]'), (2, '[3,2,1]');
+CREATE INDEX ON e USING hnsw (v vector_l2_ops);
+SELECT id, v <-> '[1,2,3]' AS d FROM e ORDER BY 2;
+```
+
+That last query means vector search with an HNSW index, inside a Node.js process or a browser, with no separate service. pgvector comes as its own npm package, which you pass in when creating the database. In PGlite 0.5.15 the import is `import { vector } from '@electric-sql/pglite-pgvector'`, and this has moved between versions, so check the documentation for yours. Only `plpgsql` is enabled by default, and extensions are opt-in to keep the core small.
+
+Other strengths come from PostgreSQL itself. Types are enforced, so a text value in an integer column is an error and not a surprise later. You get `JSONB` with indexing, window functions, recursive CTEs, arrays, `RETURNING`, and rich date handling. Most valuable of all, the SQL you write works against your production database.
+
+SQLite has grown too. It offers JSON functions, window functions, generated columns, and `STRICT` tables that enforce types. But its dialect is its own, and queries written for it often need changes before they run on PostgreSQL. The [SQLite to PostgreSQL migration guide](/blog/sqlite-to-postgres-migration) shows how many small differences there are.
+
+## When to Choose PGlite
+
+PGlite is a strong fit in these situations.
+
+**Fast tests for a PostgreSQL application.** Replace a Docker container with an in-process database and run your real migrations and queries. Startup of half a second beats a container, and each test can have a fresh database. Since it runs real Postgres, it will catch errors that a SQLite stand-in would miss, such as a type mismatch or a `jsonb` operator.
+
+**Local development without Docker.** New contributors can run `npm install` and have a working database that matches production.
+
+**In-browser applications.** Local-first apps, interactive documentation, and SQL playgrounds can run a real PostgreSQL engine with no backend, persisting to IndexedDB or OPFS. A tool that needs PostgreSQL semantics in a browser now has a direct route.
+
+**AI features with local vector search.** pgvector in a browser or desktop app gives you embeddings and similarity search in one database.
+
+## When to Choose SQLite
+
+SQLite remains the better default for embedded storage.
+
+**Mobile and desktop apps.** It is small, mature and fast, and it ships on nearly every phone. Its reliability record is hard to match, and PGlite is a much younger project, which was still in a 0.x version when we tested it.
+
+**Read-heavy services.** One server process with a local SQLite file can serve a remarkable amount of traffic, as long as writes stay modest.
+
+**Short-lived processes.** CLIs and scripts that open a database for a moment should not pay a 445 ms startup.
+
+**Portable data files.** One file is easy to copy, email, back up and inspect with many tools. Applications that use the database file as their document format have no real PGlite equivalent.
+
+## How to Decide
+
+Ask these questions in order:
+
+1. **Will the same SQL run on a PostgreSQL server later?** If yes, PGlite avoids rewriting your queries when you move up.
+2. **Do you need `jsonb`, pgvector or strict types in the embedded database?** If yes, choose PGlite.
+3. **Do many small queries dominate your workload?** If yes, choose SQLite. The gap of about 85 times per call is hard to ignore.
+4. **Must several processes read at once?** If yes, choose SQLite in WAL mode.
+5. **Is disk size or startup time critical?** If yes, choose SQLite.
+6. **Are you running in a browser?** Both work, and the choice goes back to question 1.
+
+If none of these apply, start with SQLite for an embedded product, and PGlite for development and testing of a PostgreSQL application. The two are not really rivals: many teams will use SQLite on a device and PGlite in their test suite.
+
+For a wider view of the server-side options, see [Postgres vs MySQL vs SQLite](/blog/postgres-vs-mysql-vs-sqlite).
+
+## Work With Both From One Client
+
+Whichever you choose, you will want to inspect the data. [Chat2DB](https://chat2db.ai/download) opens SQLite files directly and connects to PostgreSQL servers, so you can design a schema, run queries and check plans in one app, then move to a server when you outgrow embedded storage. Its AI assistant can also convert SQLite queries to PostgreSQL. You can try it in the browser at [app.chat2db.ai](https://app.chat2db.ai/).

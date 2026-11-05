@@ -1,0 +1,265 @@
+---
+title: "Migrate SQLite to PostgreSQL: Step-by-Step Guide"
+description: "Move a SQLite database to PostgreSQL: export with .dump, fix types, booleans, blobs and sequences, load with psql, and verify every table before you switch."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: November 4, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# Migrate SQLite to PostgreSQL: Step-by-Step Guide
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="November 4, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+SQLite is a great place to start a project, and PostgreSQL is where many of those projects end up. The usual trigger is concurrency: a second application server, a background worker, or enough writes that the single-writer lock starts to hurt. At that point you need to move real data, and the obvious plan of piping the dump into `psql` fails on the very first statement.
+
+This guide walks through a complete migration. We built a small SQLite database, loaded its raw dump into PostgreSQL to see exactly what breaks, then fixed each problem and verified the result. All commands and error messages below come from SQLite 3.51 and PostgreSQL 18.6.
+
+## Why a SQLite Dump Does Not Load as It Stands
+
+Here is a small database with the kind of data real applications accumulate:
+
+```sql
+CREATE TABLE posts (
+  id        INTEGER PRIMARY KEY AUTOINCREMENT,
+  title     VARCHAR(5),
+  published BOOLEAN DEFAULT 0,
+  cover     BLOB,
+  created   DATETIME DEFAULT (datetime('now'))
+);
+
+INSERT INTO posts (title, published, cover, created)
+VALUES ('a long title', 1, X'89504E47', '2026-11-04 09:30:00');
+
+INSERT INTO posts (title, published, created)
+VALUES ('line
+break', 0, 1793800000);
+```
+
+Two of those values would be rejected by most databases. The title is longer than `VARCHAR(5)`, and the second row puts an integer in a `DATETIME` column. SQLite accepts both, because by default it treats a declared type as a preference and not as a rule. Your production database may have years of this.
+
+The dump looks like this:
+
+```sql
+PRAGMA foreign_keys=OFF;
+BEGIN TRANSACTION;
+CREATE TABLE posts(id INTEGER PRIMARY KEY AUTOINCREMENT, title VARCHAR(5), published BOOLEAN DEFAULT 0, cover BLOB, created DATETIME DEFAULT (datetime('now')));
+INSERT INTO posts VALUES(1,'a long title',1,X'89504e47','2026-11-04 09:30:00');
+INSERT INTO posts VALUES(2,unistr('line\u000abreak'),0,NULL,1793800000);
+INSERT INTO sqlite_sequence VALUES('posts',2);
+COMMIT;
+```
+
+Pipe that straight into `psql` and you get this:
+
+```
+ERROR:  syntax error at or near "PRAGMA"
+LINE 1: PRAGMA foreign_keys=OFF;
+BEGIN
+ERROR:  syntax error at or near "AUTOINCREMENT"
+LINE 1: CREATE TABLE posts(id INTEGER PRIMARY KEY AUTOINCREMENT, tit...
+ERROR:  current transaction is aborted, commands ignored until end of transaction block
+ROLLBACK
+```
+
+Removing `PRAGMA` and `AUTOINCREMENT` does not get you far, because each later statement has its own problem. These are the errors PostgreSQL gives for the rest of the data:
+
+```
+ERROR:  column "published" is of type boolean but expression is of type integer
+ERROR:  column "cover" is of type bytea but expression is of type bit
+ERROR:  value too long for type character varying(5)
+ERROR:  column "created" is of type timestamp without time zone but expression is of type integer
+```
+
+Each one reflects a real difference between the two systems, so a search-and-replace on the dump only goes so far. You need to know what each column actually contains.
+
+## Step 1: Export the SQLite Database
+
+Take the export from a quiet copy. The `.backup` command gives you a consistent snapshot even if the application is still writing:
+
+```bash
+sqlite3 app.db ".backup app-copy.db"
+sqlite3 app-copy.db .dump > app.sql
+```
+
+Two details of the dump format are easy to miss. Recent versions of the shell write text containing line breaks through `unistr()`, as you can see in the example, while older versions use `replace('line\nbreak','\n',char(10))`. PostgreSQL 16 and later accept that `unistr()` call, but older servers do not, and the `replace()` form fails on every version because `char(10)` is a syntax error in PostgreSQL, where the function is called `chr()`. Resolve these strings into plain literals before loading.
+
+Floating-point values also deserve attention. In our tests, the `.dump` output wrote `1e300` as `9.99999999999999956e+299`, which differs from the original in its last bit. If you store values where that matters, read the database file directly with a tool that uses SQLite's `quote()` function, which round-trips exactly.
+
+## Step 2: Decide on the Target Types
+
+This is the most important step. The declared type tells you what the developer intended, and the rows tell you what is really there. Before you create anything, check how each column is stored:
+
+```sql
+SELECT typeof(created) AS storage_class, count(*)
+FROM posts
+GROUP BY 1;
+```
+
+```
+integer|1
+text|1
+```
+
+That result shows a problem. A column with both text and integers cannot become a `TIMESTAMP` without conversion, so you have to choose: convert the integers first, or load the column as `TEXT` and clean it up in PostgreSQL. Run the same check on every column you are unsure of, especially dates and booleans.
+
+Use this mapping as the starting point:
+
+| SQLite declared type | PostgreSQL type | Watch out for |
+| --- | --- | --- |
+| `INTEGER PRIMARY KEY` | `BIGINT GENERATED BY DEFAULT AS IDENTITY` | Sequence must be set after load |
+| `INTEGER`, `INT` | `BIGINT` | SQLite integers are 64-bit |
+| `REAL`, `DOUBLE`, `FLOAT` | `DOUBLE PRECISION` | Infinity is written as `9.0e+999` |
+| `TEXT`, `VARCHAR(n)` | `TEXT` | Length was never enforced |
+| `BLOB` | `BYTEA` | Literal format differs |
+| `BOOLEAN` | `BOOLEAN` | Values are integers 0 and 1 |
+| `DATETIME`, `TIMESTAMP` | `TIMESTAMP` or `TIMESTAMPTZ` | May hold Unix or Julian numbers |
+| No declared type | Infer from the data | PostgreSQL requires a type |
+
+Keeping `INT` as `BIGINT` is the safe choice, since SQLite stores up to 64 bits regardless of how the column was declared. Mapping `VARCHAR(n)` to `TEXT` is also deliberate. In PostgreSQL, `TEXT` performs the same as `VARCHAR`, and you can add a `CHECK` constraint after cleaning the data if the length limit matters to you.
+
+## Step 3: Rewrite the Schema and Data
+
+You can make these changes by hand for a few tables, or use the free [SQLite to PostgreSQL Converter](https://chat2db.ai/tools/sqlite-to-postgresql-converter), which reads the dump or the `.sqlite` file in your browser and picks types from the actual rows. For the database above, it reports one column to review and produces this script:
+
+```sql
+BEGIN;
+
+CREATE TABLE posts (
+  id BIGINT GENERATED BY DEFAULT AS IDENTITY,
+  title TEXT,
+  published BOOLEAN DEFAULT FALSE,
+  cover BYTEA,
+  created TEXT DEFAULT to_char((now() AT TIME ZONE 'UTC'), 'YYYY-MM-DD HH24:MI:SS'),
+  PRIMARY KEY (id)
+);
+
+INSERT INTO posts VALUES (1, 'a long title', TRUE, '\x89504e47', '2026-11-04 09:30:00');
+INSERT INTO posts VALUES (2, 'line
+break', FALSE, NULL, '1793800000');
+
+SELECT setval(pg_get_serial_sequence('posts', 'id'), GREATEST(COALESCE(MAX(id), 0), 2)) FROM posts;
+
+COMMIT;
+```
+
+Each change answers one of the errors from earlier. `AUTOINCREMENT` became an identity column. Integers in the boolean column became `TRUE` and `FALSE`. The blob became a `bytea` hex literal. The default that used `datetime('now')` became a PostgreSQL expression that keeps the same UTC format, and `created` stayed as text because the data is mixed.
+
+## Step 4: Handle What Cannot Be Translated Mechanically
+
+Some objects need a human decision. Plan for these four.
+
+### Triggers
+
+A SQLite trigger keeps its logic inline between `BEGIN` and `END`. PostgreSQL needs a separate trigger function plus a `CREATE TRIGGER` statement, and references like `new.id` become `NEW.id` inside PL/pgSQL. Rewrite these by hand. The [Postgres Trigger Generator](https://chat2db.ai/tools/postgres-trigger-generator) gives you the skeleton.
+
+### Case-Insensitive Text
+
+`COLLATE NOCASE` has no direct equivalent. If you rely on it for unique emails, create a unique index on `lower(email)`. Remember that `LIKE` is case-insensitive for ASCII in SQLite and case-sensitive in PostgreSQL, so queries may need `ILIKE`. This one often surfaces late, in a search box that silently returns fewer results.
+
+### Full-Text Search
+
+FTS5 virtual tables do not move across. The dump also contains their internal `_data`, `_idx` and `_docsize` tables, which are useless in PostgreSQL. Keep the original text and build a `tsvector` column with a GIN index instead, as described in our [full-text search guide](/blog/postgres-full-text-search-guide).
+
+### Application Queries
+
+SQLite functions such as `datetime()`, `strftime()`, `ifnull()` and `group_concat()` need PostgreSQL equivalents in your code. Search for `rowid` too, because PostgreSQL has no such column. Boolean comparisons are a common casualty: `WHERE active = 1` fails with `operator does not exist: boolean = integer`, so it must become `WHERE active`.
+
+## Step 5: Load the Data
+
+Create an empty database and load the script with `ON_ERROR_STOP`, which makes `psql` stop at the first failure and not plough on through a broken transaction:
+
+```bash
+createdb myapp
+psql -v ON_ERROR_STOP=1 -d myapp -f app-postgres.sql
+```
+
+Load foreign keys after the data. The dump keeps creation order, so a table can reference one that comes later, and a self-referencing table can reference rows that have not been inserted yet. Adding the constraints at the end avoids both problems.
+
+Expect to find orphaned rows. SQLite does not enforce foreign keys unless each connection enables `PRAGMA foreign_keys=ON`, so many databases contain children whose parents are long gone. A normal `ADD FOREIGN KEY` then fails and rolls back the whole load. Add it as `NOT VALID` instead, which enforces the rule on new rows, then clean up and validate:
+
+```sql
+ALTER TABLE orders
+  ADD FOREIGN KEY (customer_id) REFERENCES customers (id) NOT VALID;
+
+SELECT o.id, o.customer_id
+FROM orders o
+LEFT JOIN customers c ON c.id = o.customer_id
+WHERE o.customer_id IS NOT NULL
+  AND c.id IS NULL;
+
+ALTER TABLE orders VALIDATE CONSTRAINT orders_customer_id_fkey;
+```
+
+For very large databases, a text dump becomes slow. [pgloader](/blog/pgloader-mysql-to-postgres-tutorial) can read the SQLite file directly and load rows in bulk with a single command, such as `pgloader ./app.db postgresql:///myapp`. It has its own casting rules, so review the resulting types just as carefully.
+
+## Step 6: Verify the Result
+
+A load with no errors is not proof of a correct migration. Check three things before you change the connection string.
+
+First, compare row counts for each table. Run the same query on both sides and diff the output:
+
+```sql
+SELECT 'posts' AS table_name, count(*) FROM posts
+UNION ALL
+SELECT 'users', count(*) FROM users;
+```
+
+Second, check that the sequences moved. This is the classic post-migration failure, because the identity column still starts at 1 unless you set it. A test insert should return the next id:
+
+```sql
+INSERT INTO posts (title) VALUES ('next') RETURNING id, published, created;
+```
+
+```
+ id | published |       created
+----+-----------+---------------------
+  3 | f         | 2026-11-05 00:29:25
+```
+
+Without the `setval()` call, that insert would return `id = 1`, which then fails with a duplicate key error. If it does happen after the fact, the [Postgres Sequence Reset Generator](https://chat2db.ai/tools/postgres-sequence-reset-generator) writes the fix for every table.
+
+Third, run your application's test suite against PostgreSQL. It is the only check that will find `LIKE` differences, boolean comparisons and date handling in your own code.
+
+To check that the converter behaves, we generated 500 random SQLite databases with dirty data, reserved-word column names and mixed types, loaded them into PostgreSQL 18.6 and compared 7,821 rows with the source. The only differences were the last-bit float rounding in `.dump` described in Step 1.
+
+## Clean Up After the Migration
+
+Once the application runs on PostgreSQL, finish the job. Convert columns you loaded as text, like the mixed `created` column above. Drop the text default first, or you get `default for column "created" cannot be cast automatically to type timestamp without time zone`:
+
+```sql
+BEGIN;
+
+ALTER TABLE posts ALTER COLUMN created DROP DEFAULT;
+
+ALTER TABLE posts
+  ALTER COLUMN created TYPE timestamp
+  USING CASE
+    WHEN created ~ '^[0-9]+$' THEN to_timestamp(created::bigint) AT TIME ZONE 'UTC'
+    ELSE created::timestamp
+  END;
+
+ALTER TABLE posts ALTER COLUMN created SET DEFAULT (now() AT TIME ZONE 'UTC');
+
+COMMIT;
+```
+
+After this, the row that held `1793800000` reads `2026-11-04 13:46:40`, and the mixed column has one type. Then run `ANALYZE` so the planner has statistics, because a freshly loaded database has none, and add the constraints SQLite never enforced now that your data is clean.
+
+## Migration Checklist
+
+1. Take a consistent copy with `.backup`, then run `.dump`.
+2. Use `typeof()` to check what each suspicious column holds.
+3. Map types from the data, not only from the declarations.
+4. Move foreign keys after the data, using `NOT VALID` for dirty relationships.
+5. Set every identity sequence past the highest id.
+6. Port triggers, `COLLATE NOCASE`, FTS tables and application SQL by hand.
+7. Load with `ON_ERROR_STOP=1`, then compare row counts and run your tests.
+8. Run `ANALYZE` and tighten the column types.
+
+## Compare Both Databases Side by Side
+
+The verification step is much easier when both databases are open in one place. [Chat2DB](https://chat2db.ai/download) connects to SQLite and PostgreSQL in the same app, so you can run the same counts on each side, inspect the migrated schema, and ask the AI assistant to rewrite a SQLite query for PostgreSQL. You can also try it in the browser at [app.chat2db.ai](https://app.chat2db.ai/).

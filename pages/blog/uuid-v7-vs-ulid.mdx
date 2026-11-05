@@ -1,0 +1,210 @@
+---
+title: "UUID v7 vs ULID: Which ID for Postgres in 2026?"
+description: "UUID v7 vs ULID compared on real PostgreSQL 18 tests: index size, insert speed, sort order, uuid columns and when each ID format is the right primary key."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: November 4, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# UUID v7 vs ULID: Which ID for Postgres in 2026?
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="November 4, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+UUID v4 has a well-known weakness as a primary key: the values are random, so every insert lands on a random page of the index. Two formats fix this in almost the same way. ULID appeared first as a community specification, and UUID v7 became a standard in RFC 9562. Both begin with a 48-bit Unix timestamp in milliseconds, so new values sort after old ones.
+
+The formats are so similar that the choice looks unimportant. In PostgreSQL it is not, mainly because of how you store them. We loaded one million rows into each option on PostgreSQL 18.6 to measure the difference. Here is the short answer, followed by the evidence.
+
+| | UUID v7 | ULID |
+| --- | --- | --- |
+| Size | 128 bits | 128 bits |
+| Timestamp | 48-bit Unix milliseconds | 48-bit Unix milliseconds |
+| Random bits | 74 | 80 |
+| Text form | 36 characters, hex and hyphens | 26 characters, Crockford Base32 |
+| Standard | RFC 9562 | Community specification |
+| PostgreSQL support | Native `uuid` type, `uuidv7()` in version 18 | No native type or generator |
+
+For a new PostgreSQL schema, use UUID v7. Choose ULID when your system already uses it, or when short, URL-friendly text IDs matter more than native database support.
+
+## How the Bits Are Laid Out
+
+Both formats hold 128 bits, and they share the same first 48. A ULID spends the remaining 80 bits on randomness. A UUID v7 gives up 6 of those bits to mark its version and variant, which leaves 74 random bits. The extra version marker is what lets software recognize the value as a UUID v7.
+
+Because the layout is the same, you can convert between them without losing anything. Here is one value in three forms:
+
+```
+UUID:    017f22e2-79b0-7cc3-98c4-dc0c0c07398f
+ULID:    01FWHE4YDGFK1SHH6W1G60EECF
+Base64:  AX8i4nmwfMOYxNwMDAc5jw==
+```
+
+All three are the same bytes, and all three decode to 2022-02-22T19:22:22Z. You can check this, or decode your own IDs, with the free [UUID Decoder](https://chat2db.ai/tools/uuid-decoder).
+
+## The Test: One Million Rows
+
+We created six tables with the same shape, each with a primary key and one integer column, and inserted one million rows. All IDs were generated in order of time, as they would be in a live system.
+
+```sql
+CREATE TABLE t_big (id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY, v int);
+CREATE TABLE t_v4  (id uuid PRIMARY KEY DEFAULT gen_random_uuid(), v int);
+CREATE TABLE t_v7  (id uuid PRIMARY KEY DEFAULT uuidv7(), v int);
+
+-- ULID bytes stored in a uuid column, and ULID text in text columns
+CREATE TABLE t_ulid_uuid (id uuid PRIMARY KEY, v int);
+CREATE TABLE t_ulid_text (id text PRIMARY KEY, v int);
+CREATE TABLE t_ulid_c    (id text COLLATE "C" PRIMARY KEY, v int);
+```
+
+The results below come from one run on a local Docker container, so treat them as a comparison between options and not as a benchmark of absolute speed. The ULID values were generated ahead of time and read from a staging table, while the `bigint` and UUID rows were generated during the insert. Compare insert times within each of those two groups, not between them.
+
+| Primary key | Table size | Index size | Leaf density | Insert time |
+| --- | --- | --- | --- | --- |
+| `bigint` | 42 MB | 21 MB | 90% | 0.88 s |
+| UUID v7 (`uuid`) | 50 MB | 30 MB | 90% | 1.39 s |
+| ULID bytes (`uuid`) | 50 MB | 30 MB | 90% | 2.52 s |
+| UUID v4 (`uuid`) | 50 MB | 38 MB | 71% | 2.06 s |
+| ULID text, `C` collation | 57 MB | 47 MB | 90% | 2.84 s |
+| ULID text, default collation | 57 MB | 47 MB | 90% | 3.94 s |
+
+Several things stand out.
+
+## What the Numbers Show
+
+### Time-Ordered IDs Keep the Index Compact
+
+The leaf density column tells the story of UUID v4. Random inserts split pages all over the index, leaving them about 71% full. Ordered inserts fill each page and move on, so density stays at 90%. That is why the v4 index takes 38 MB against 30 MB for v7, even though both hold the same 16-byte values.
+
+The gap also shows in the table itself. After `ANALYZE`, PostgreSQL reports how closely the physical row order matches the index order:
+
+```sql
+SELECT tablename, round(correlation::numeric, 4)
+FROM pg_stats
+WHERE attname = 'id' AND tablename IN ('t_big', 't_v4', 't_v7');
+```
+
+```
+ tablename |  round
+-----------+---------
+ t_big     |  1.0000
+ t_v4      | -0.0095
+ t_v7      |  1.0000
+```
+
+With v7, rows for a recent time range sit together on disk. With v4 they are scattered. For workloads that mostly read recent data, that matters more than the size of the index, because a range scan touches far fewer pages.
+
+### Storing ULID as Text Is the Expensive Choice
+
+The biggest difference between ULID and UUID v7 is not in the format. It comes from how ULIDs are usually stored. As text, a ULID takes 30 bytes in PostgreSQL against 16 for a `uuid`, which you can confirm with `pg_column_size()`. That is why the text index is 47 MB against 30 MB, and the cost repeats in every foreign key and secondary index that references the ID.
+
+Collation adds to it. Comparing text under the default `en_US.utf8` collation is slower than a byte comparison, which is why the same data took 3.94 s to load against 2.84 s with `COLLATE "C"`. If you do keep ULIDs as text, always declare the column with `COLLATE "C"`. It also guarantees the sort order you expect.
+
+### ULID in a uuid Column Costs Nothing Extra in Space
+
+The best way to store a ULID in PostgreSQL is as its 16 raw bytes in a `uuid` column. The table and index came out exactly the same size as UUID v7, and sorting the bytes matches sorting the text forms under `COLLATE "C"`, which we confirmed on a 20,000-row sample.
+
+There is one catch. The `uuid` type accepts any 128 bits and does not check the version, so the bytes load without complaint, but functions that read the version see noise:
+
+```sql
+SELECT uuid_extract_version(id), count(*)
+FROM t_ulid_uuid
+GROUP BY 1
+ORDER BY 1
+LIMIT 4;
+```
+
+```
+ uuid_extract_version | count
+----------------------+-------
+                    0 | 15667
+                    1 | 15514
+                    2 | 15576
+                    3 | 16076
+```
+
+Of the million ULIDs, 749,847 returned `NULL` because their variant bits did not look like RFC 9562, and the rest reported a random version. `uuid_extract_timestamp()` returned `NULL` for the row we sampled. Nothing breaks, but you lose the built-in tools, and anyone reading a value will assume it is a UUID.
+
+## Native Support Decides It in PostgreSQL
+
+PostgreSQL 18 ships everything you need for UUID v7, with no extension:
+
+```sql
+SELECT uuidv7();
+SELECT uuid_extract_timestamp('017f22e2-79b0-7cc3-98c4-dc0c0c07398f');
+-- 2022-02-22 19:22:22+00
+SELECT uuid_extract_version('017f22e2-79b0-7cc3-98c4-dc0c0c07398f');
+-- 7
+```
+
+ULID has no equivalent, so you must generate it in the application or install a third-party extension. Generating in the application is perfectly reasonable, but `DEFAULT uuidv7()` means that a `psql` session, a migration script and every service produce valid IDs with no extra code.
+
+PostgreSQL's generator also does more than the minimum. It stores a sub-millisecond clock in the 12 bits after the version, so values created by one backend stay in order even within the same millisecond. In our test, all 999,999 consecutive pairs in the million-row table were in strictly increasing order. We also generated 2,000 values, each with a `clock_timestamp()` reading on either side. Decoding the timestamp plus that 12-bit fraction put all 2,000 within about 3 microseconds of the readings, so the extra precision is real.
+
+ULID's specification has its own monotonic mode, which increments the random part within a millisecond. Whether you get it depends on the library you choose, so check before you rely on it.
+
+If you are on PostgreSQL 17 or older, you can still store UUID v7 values in a `uuid` column and generate them in the application. To read the time back, use this expression, which we checked returns the same result as the built-in function:
+
+```sql
+SELECT to_timestamp(
+  ('x' || substr(replace(id::text, '-', ''), 1, 12))::bit(48)::bigint / 1000.0
+) FROM t_v7 LIMIT 1;
+```
+
+## Range Queries Without a created_at Column
+
+Time-ordered IDs give you a bonus: the primary key doubles as a time index. Build the lowest possible UUID v7 for a date and compare against it:
+
+```sql
+SELECT count(*)
+FROM orders
+WHERE id >= '01a19467-e800-7000-8000-000000000000'  -- 2026-11-01
+  AND id <  '01a1a66e-2a00-7000-8000-000000000000'; -- 2026-11-04 12:00
+```
+
+On a 200,000-row table, the query returned 5,040 rows, the same count as filtering on `uuid_extract_timestamp(id)`. The difference is in the plan. The comparison on `id` uses an index-only scan, while a filter on the extracted timestamp needs a sequential scan:
+
+```
+Index Only Scan using o_pkey on o
+  Index Cond: ((id >= '01a19467-e800-7000-8000-000000000000'::uuid)
+           AND (id <  '01a1a66e-2a00-7000-8000-000000000000'::uuid))
+
+Parallel Seq Scan on o
+  Filter: ((uuid_extract_timestamp(id) >= '2026-11-01 00:00:00+00'::timestamp with time zone)
+       AND (uuid_extract_timestamp(id) <  '2026-11-04 12:00:00+00'::timestamp with time zone))
+```
+
+The UUID Decoder builds these boundary values and the query for you when you enter dates. The same trick works with ULID bytes, because the first 48 bits are the same.
+
+## Where ULID Still Wins
+
+ULID has real strengths, and they are all about text.
+
+- **It is shorter.** Twenty-six characters fit better in URLs, logs and support tickets than 36.
+- **It is friendlier to read and type.** Crockford Base32 leaves out I, L, O and U, so it avoids look-alike characters, and it has no hyphens. A double-click in most editors selects the whole value.
+- **It works across databases that lack a UUID type.** Text sorts the same way everywhere, given a byte-order collation.
+
+Be careful with case, though. ULIDs are defined as case-insensitive, but a database text comparison is not. In our test, a lowercase value sorted before its uppercase twin under `en_US.utf8` and after it under `COLLATE "C"`, and the two are never equal. A value that passes through a system that changes its case can break ordering and equality checks, so normalize to one case at the edge of your system.
+
+## Security: Both Reveal the Time
+
+Neither format is a secret. Anyone holding an ID can read when it was created, as the decoded example above shows. For most tables that is harmless, but it can leak business information, such as how many orders you take in a day or when an account was created.
+
+If that matters, keep UUID v7 or ULID as the internal key, and expose a separate random token in public URLs. Do not rely on an ID being hard to guess for access control in any format.
+
+## Decision Guide
+
+Use this short list to decide:
+
+1. **New PostgreSQL schema, single-node or a few services:** `bigint` identity is still the smallest and fastest, if IDs can be generated by the database.
+2. **IDs generated outside the database, or merged from several sources:** UUID v7 in a `uuid` column.
+3. **Existing system already using ULID:** Keep it, and store new values in a `uuid` column, not as text.
+4. **Text IDs in URLs matter most:** Use ULID in text form with `COLLATE "C"`, and accept the larger indexes, or store UUID v7 and encode it as Base32 at the API layer.
+5. **Moving away from UUID v4:** Switch new rows to UUID v7. The column type does not change, and old and new values live together in the same `uuid` column.
+
+If you are starting from the broader question of how to store UUIDs at all, see our [PostgreSQL UUID guide](/blog/postgres-uuid-guide), and for `bigint` trade-offs read [bigint vs int](/blog/postgres-bigint-vs-int).
+
+## Inspect Your IDs and Index Sizes
+
+To compare options on your own data, run these size and correlation queries in [Chat2DB](https://chat2db.ai/download). You can browse `uuid` columns next to their decoded timestamps, compare `EXPLAIN` plans for a range query, and ask the AI assistant to write the conversion for your schema. It also runs in the browser at [app.chat2db.ai](https://app.chat2db.ai/).

@@ -1,0 +1,230 @@
+---
+title: "Postgres requested WAL segment has been removed"
+description: "Fix requested WAL segment has already been removed in PostgreSQL: recover a standby from an archive or base backup, repair lost slots and stop it happening."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: November 4, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# Postgres requested WAL segment has been removed
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="November 4, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+A standby was down for maintenance or fell behind during a bulk load. When it reconnects, it logs this every few seconds and never catches up:
+
+```
+FATAL:  could not receive data from WAL stream: ERROR:  requested WAL segment 000000010000000000000003 has already been removed
+LOG:  waiting for WAL to become available at 0/3000018
+```
+
+The replica needs a piece of the write-ahead log that the primary has already recycled. The primary keeps WAL only as long as it needs it, and nothing told it to keep this segment. Until the standby gets that file from somewhere, it cannot move forward, because WAL has to be replayed in order with no gaps.
+
+The fix depends on whether the file still exists anywhere. If you archive WAL, recovery takes minutes. If you do not, you have to rebuild the standby. We reproduced each scenario on PostgreSQL 18.6 in a disposable container, so the logs and commands below are real.
+
+## What Is Happening
+
+PostgreSQL writes changes to WAL segments, which are 16 MB files by default, in `pg_wal`. After a checkpoint, older segments are no longer needed for crash recovery, so the server removes or reuses them. A connected standby streams changes as they happen, but a disconnected standby has no way to ask the primary to wait.
+
+By default, nothing protects a disconnected standby. The setting `wal_keep_size` is 0, and without a replication slot the primary has no record that this standby exists. A short outage combined with heavy writes is enough to lose the WAL.
+
+Reading the segment name helps. The first eight digits are the timeline, and the rest locate the position in the log. Compare the missing file with what the primary has now:
+
+```sql
+SELECT pg_walfile_name(pg_current_wal_lsn());
+SELECT count(*), min(name) FROM pg_ls_waldir();
+```
+
+```
+ 000000010000000000000021
+
+ 4 | 000000010000000000000021
+```
+
+In our test the standby wanted segment `03`, while the primary's oldest was `21`. That is a gap of 30 segments, so the data is gone from the primary and restarting will not help. Note that you run the query above on the primary, while the `FATAL` line appears in the standby's log. The primary logs the matching side of the same failure:
+
+```
+ERROR:  requested WAL segment 000000010000000000000003 has already been removed
+STATEMENT:  START_REPLICATION 0/3000000 TIMELINE 1
+```
+
+## Step 1: Check Whether the WAL Still Exists
+
+Do not rebuild anything yet. A rebuild copies the whole database, so first check two places:
+
+- **A WAL archive.** Look at `archive_command` or `archive_library` on the primary, and at your backup tool, such as pgBackRest, Barman or WAL-G.
+- **Your backup repository.** Tools that archive WAL keep the same segments, so the standby can use them.
+
+On the primary, this shows whether archiving is healthy:
+
+```sql
+SELECT archived_count, last_archived_wal, failed_count
+FROM pg_stat_archiver;
+```
+
+If `last_archived_wal` is recent, `failed_count` is 0 and your archive reaches back to the missing segment, go to Step 2. If you have no archive or it has a gap, go to Step 3.
+
+## Step 2: Recover the Standby From the Archive
+
+Tell the standby how to fetch archived WAL by setting `restore_command`. It will replay from the archive, then switch back to streaming by itself when it catches up:
+
+```bash
+# On the standby, with a simple file archive
+echo "restore_command = 'cp /tmp/arch/%f %p'" >> "$PGDATA/postgresql.auto.conf"
+pg_ctl -D "$PGDATA" restart
+```
+
+Use the matching command for your backup tool, for example `pgbackrest --stanza=main archive-get %f "%p"`. In our test, the standby had missed about 30 segments, and it replayed them in a few seconds:
+
+```
+LOG:  restored log file "00000001000000000000001F" from archive
+LOG:  restored log file "000000010000000000000020" from archive
+LOG:  restored log file "000000010000000000000021" from archive
+```
+
+Then confirm it is streaming again. On the primary:
+
+```sql
+SELECT application_name, state, sync_state, replay_lag
+FROM pg_stat_replication;
+```
+
+```
+ application_name |   state   | sync_state |   replay_lag
+------------------+-----------+------------+-----------------
+ walreceiver      | streaming | async      | 00:00:00.053878
+```
+
+All 1.8 million rows from our test load were on the standby afterward, and `pg_is_in_recovery()` returned true there. Keep `restore_command` in place, because it is exactly what protects you next time. See our guide to [WAL archiving](/blog/postgres-wal-archiving-archive-command) if you need to set this up.
+
+## Step 3: Rebuild the Standby
+
+Without the WAL, the gap cannot be closed, so you take a fresh copy of the primary. This is safe for the primary, although it adds read load and network traffic for the duration. In our test, the rebuild took one command and the standby streamed again as soon as it started:
+
+```bash
+pg_ctl -D "$PGDATA" -m fast stop
+rm -rf "$PGDATA"
+
+pg_basebackup -h primary -U replicator -D "$PGDATA" -R -X stream -c fast -P
+
+chmod 700 "$PGDATA"
+pg_ctl -D "$PGDATA" start
+```
+
+Check three things before you delete anything. Make sure you are on the standby, because a mistake here destroys data. Make sure `$PGDATA` is the path you expect, and if you use custom tablespaces, check where those files live. Then check there is enough disk on the standby for a full copy.
+
+The options matter. `-R` writes `standby.signal` and the connection settings, so the server starts as a replica. `-X stream` copies the WAL produced during the backup, which avoids a repeat of this same error on a busy primary. `-c fast` starts with an immediate checkpoint, because the default spread checkpoint can make the command seem to hang for minutes.
+
+If the database is large and only a little has changed, a rebuild from scratch may be wasteful. Backup tools can often restore a recent backup and then fetch WAL from the archive, which leads back to Step 2. The [streaming replication setup guide](/blog/postgres-streaming-replication-setup) covers the full procedure.
+
+## The Same Error With Replication Slots
+
+Replication slots exist to prevent this. A slot makes the primary keep WAL until the standby has received it. The trade-off is that a dead standby makes `pg_wal` grow until the disk fills, which is why many teams set a limit with `max_slot_wal_keep_size`. When a slot crosses that limit, PostgreSQL gives up on it to protect the primary.
+
+We reproduced this with a limit of 128 MB. The slot went from `reserved` to `lost`:
+
+```sql
+SELECT slot_name, active, wal_status, safe_wal_size, invalidation_reason
+FROM pg_replication_slots;
+```
+
+```
+ slot_name | active | wal_status | safe_wal_size | invalidation_reason
+-----------+--------+------------+---------------+---------------------
+ sb1       | f      | lost       |               | wal_removed
+```
+
+The primary's log shows the moment it happened, and the standby then gets a different message from the one at the top of this article:
+
+```
+DETAIL:  The slot's restart_lsn 0/23000000 exceeds the limit by 16777216 bytes.
+
+FATAL:  could not start WAL streaming: ERROR:  can no longer access replication slot "sb1"
+DETAIL:  This replication slot has been invalidated due to "wal_removed".
+```
+
+A lost slot cannot be repaired. Drop it, create a new one, and recover the standby with Step 2 or Step 3:
+
+```sql
+SELECT pg_drop_replication_slot('sb1');
+SELECT pg_create_physical_replication_slot('sb1');
+```
+
+```bash
+pg_basebackup -h primary -U replicator -D "$PGDATA" -R -X stream -S sb1 -c fast
+```
+
+Watch `wal_status` to get ahead of this. `reserved` is healthy, `extended` means the slot is beyond `max_wal_size` but still safe, `unreserved` means WAL will be removed at the next checkpoint, and `lost` means it is too late. `safe_wal_size` shows how many more bytes can be written before the slot is at risk, so it makes a good alert.
+
+## Logical Replication and CDC
+
+Logical slots fail in the same way, and the effect on downstream tools is similar. We invalidated a logical slot, then tried to read it:
+
+```sql
+SELECT * FROM pg_logical_slot_get_changes('ls1', NULL, NULL);
+```
+
+```
+ERROR:  can no longer access replication slot "ls1"
+DETAIL:  This replication slot has been invalidated due to "wal_removed".
+```
+
+For a subscriber or a tool like Debezium, there is no catching up from this point. The changes are gone, so you have to create a new slot and resynchronize the affected tables. On a subscription, this usually means recreating it with `copy_data = true`. Plan for duplicates downstream, and read the [replication slots guide](/blog/postgres-replication-slots-guide) before you drop anything.
+
+## How to Prevent It
+
+No single setting fits everyone, so combine them based on how long a standby may be away.
+
+### Keep a Buffer With wal_keep_size
+
+```sql
+ALTER SYSTEM SET wal_keep_size = '2GB';
+SELECT pg_reload_conf();
+```
+
+This keeps at least that much WAL for standbys. It is simple and cannot fill the disk beyond its size. It also gives no guarantee: a large batch job can write more than the buffer during a short outage. Estimate your WAL rate first, by comparing `pg_current_wal_lsn()` at two points in time with `pg_wal_lsn_diff()`. The [pg_lsn guide](/blog/postgres-pg-lsn-guide) shows how, and the free [LSN Calculator](https://chat2db.ai/tools/postgres-lsn-calculator) does the arithmetic.
+
+### Use Slots With a Limit
+
+```sql
+ALTER SYSTEM SET max_slot_wal_keep_size = '50GB';
+SELECT pg_reload_conf();
+```
+
+A slot gives an exact guarantee until the limit, and the limit protects the primary. Set it well below your free disk space, because a full `pg_wal` volume will stop the server, which is a much worse outage than one lost standby. PostgreSQL 18 also adds `idle_replication_slot_timeout`, which invalidates a slot after it has been idle for a set time, and it is 0 (disabled) by default.
+
+### Archive WAL
+
+An archive is the only option that survives a long outage, and you need it for point-in-time recovery anyway. Check it stays healthy by alerting on `failed_count` in `pg_stat_archiver`. If archiving fails, the primary keeps the WAL until it succeeds, so a broken `archive_command` can also fill the disk. Our [PITR guide](/blog/postgres-point-in-time-recovery-guide) covers the setup.
+
+### Monitor Lag
+
+Standbys rarely fall off the end without warning. Watch `pg_stat_replication` for lag, and alert when a standby disappears from it. Include the slot query above in your monitoring, and treat a standby that has been down for longer than your retention as a planned rebuild, not a surprise.
+
+## Which Fix Do You Need?
+
+| Situation | What to do |
+| --- | --- |
+| WAL exists in an archive | Set `restore_command`, restart the standby |
+| No archive, physical standby | Rebuild with `pg_basebackup` |
+| Slot shows `lost` | Drop and recreate the slot, then recover or rebuild |
+| Logical slot invalidated | Recreate the slot, resynchronize the tables |
+| Standby is down often | Add a slot with `max_slot_wal_keep_size` and archive WAL |
+
+## Checklist
+
+1. Compare the missing segment with the oldest file on the primary.
+2. Check for a WAL archive before you rebuild anything.
+3. If WAL exists, set `restore_command` and let the standby catch up.
+4. If it does not, rebuild with `pg_basebackup -R -X stream -c fast`.
+5. Confirm `state = streaming` in `pg_stat_replication`.
+6. Drop and recreate any slot with `wal_status = lost`.
+7. Set `wal_keep_size`, or a slot with a limit, and keep an archive.
+8. Alert on replication lag and on `safe_wal_size`.
+
+## Keep an Eye on Replication
+
+The queries in this guide are easier to use when they are saved in one place. In [Chat2DB](https://chat2db.ai/download) you can keep a replication health script, run it against the primary and each standby from one window, and ask the AI assistant to explain what a `wal_status` value means for your setup. You can also use it in the browser at [app.chat2db.ai](https://app.chat2db.ai/).

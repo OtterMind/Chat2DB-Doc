@@ -1,0 +1,216 @@
+---
+title: "MySQL Error 2006: MySQL Server Has Gone Away Fix"
+description: "Fix MySQL error 2006 server has gone away: wait_timeout, max_allowed_packet, killed connections and pools, tested on MySQL 8.4 with real clients and drivers."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: November 4, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# MySQL Error 2006: MySQL Server Has Gone Away Fix
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="November 4, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+Few MySQL errors are as vague as this one:
+
+```
+ERROR 2006 (HY000): MySQL server has gone away
+```
+
+It does not mean your server crashed, although it can. The number `2006` is a client error, and it means one narrow thing: the client tried to send data over a connection that was no longer open. The connection could have closed for many reasons, so the message tells you what the client noticed and nothing about why.
+
+Most articles list every possible cause and tell you to raise `wait_timeout` values until it stops. We took a different route and reproduced the failures on MySQL 8.4.11 and 8.0.46 with the `mysql` client, PyMySQL, mysql2 for Node.js and SQLAlchemy. The results show that modern clients often report these failures with a different number, which is useful to know, since a search for 2006 may not find your real problem.
+
+## Which Error Do You Actually Have?
+
+Here is what we saw when the same three events hit different clients:
+
+| Event | `mysql` client | PyMySQL 2.2 | mysql2 for Node.js |
+| --- | --- | --- | --- |
+| Idle past `wait_timeout` | 4031, then 2013 | 2013 | 4031 on the connection |
+| Connection killed | 2013 | 2013 | Not tested |
+| Packet over `max_allowed_packet` | 1153 | 2006 with `Broken pipe` | Not tested |
+
+The `mysql` client results for idle and killed sessions were the same on 8.0.46 and 8.4.11, and we ran the packet test with the 8.4 client. So in our tests, error 2006 appeared only when a large packet broke the connection in PyMySQL, on both server versions. An older client or a different driver may report 2006 for other events, and the causes below are the same whichever number you see. If you get `4031` or `2013`, this guide still applies, and our [error 2013 guide](/blog/mysql-error-2013-lost-connection) goes deeper into failures during a query.
+
+## Cause 1: The Connection Sat Idle Too Long
+
+This is the most common cause by far. The server closes any connection that stays idle longer than `wait_timeout`, which is 28,800 seconds (8 hours) by default. A shared host or a managed service may set it much lower.
+
+To see it happen, shorten the timeout for one session:
+
+```sql
+SET SESSION wait_timeout = 2;
+SELECT 1;
+-- wait 4 seconds
+SELECT 2;
+SELECT 3;
+```
+
+```
+ERROR 4031 (HY000) at line 2: The client was disconnected by the server because of inactivity. See wait_timeout and interactive_timeout for configuring this behavior.
+ERROR 2013 (HY000) at line 3: Lost connection to MySQL server during query
+```
+
+Since MySQL 8.0.24, the server sends this explicit reason before closing, so 8.x clients can show `4031`. That is a real improvement, because the message names the cause.
+
+The usual victims are overnight jobs, a worker that waits on a queue, and pools that hold connections through a quiet weekend. The first query after the pause fails, and if you retry it, a new connection often works, so the error looks random.
+
+Find out what your server uses:
+
+```sql
+SHOW VARIABLES WHERE Variable_name IN
+  ('wait_timeout', 'interactive_timeout', 'max_allowed_packet',
+   'net_read_timeout', 'net_write_timeout');
+```
+
+### The Fix: Validate Connections Instead of Raising the Timeout
+
+Setting `wait_timeout` very high hides the symptom and leaves dead sessions holding memory and connection slots. It also does nothing about firewalls and load balancers, which drop idle connections on their own timers. The better fix is for the client to expect closed connections.
+
+In SQLAlchemy, this is one option. We tested three engines against a session that had timed out:
+
+```python
+engine = create_engine(url)                      # plain
+engine = create_engine(url, pool_pre_ping=True)  # tests the connection first
+engine = create_engine(url, pool_recycle=1)      # replaces old connections
+```
+
+```
+plain    OperationalError (2013, 'Lost connection to MySQL server during query')
+pre_ping 1
+recycle  1
+```
+
+Both options recovered with no error in the application. `pool_pre_ping` runs a light check when it hands out a connection, so it handles every cause. `pool_recycle` replaces connections older than a set number of seconds, which you should set below `wait_timeout` and below any firewall timeout. Using both is common.
+
+With plain PyMySQL, call `ping` before you use a connection that may have been idle:
+
+```python
+conn.ping(reconnect=True)
+cur = conn.cursor()
+```
+
+That worked in our test, and the connection came back with a new ID. PyMySQL 2.2 warns that the `reconnect` argument is deprecated, so for new code, open a fresh connection or use a pool.
+
+In mysql2 for Node.js, a single connection that has been closed stays closed, and later queries fail with `Can't add new command when connection is in closed state`. Use a pool, which replaced the dead connection in our test and returned a new connection ID with no error. HikariCP and other Java pools have the same idea in `maxLifetime` and connection validation.
+
+## Cause 2: The Packet Is Too Large
+
+The server rejects any single packet larger than `max_allowed_packet`, which is 64 MB by default on MySQL 8.x. A long `INSERT` with many rows, a large BLOB or a big dump can exceed it.
+
+We set the limit to 1 MB and inserted a 5 MB value. The `mysql` client gave a clear error:
+
+```
+ERROR 1153 (08S01) at line 1: Got a packet bigger than 'max_allowed_packet' bytes
+```
+
+PyMySQL produced the exact message this article is about, because the server closed the connection while the driver was still writing:
+
+```
+OperationalError (2006, "MySQL server has gone away (BrokenPipeError(32, 'Broken pipe'))")
+```
+
+The `Broken pipe` detail is the clue. Later queries on that connection failed with `InterfaceError (0, '')`, because the driver had marked the connection as closed. If you log only the later errors, you will miss the real one.
+
+Raise the limit on the server:
+
+```sql
+SET GLOBAL max_allowed_packet = 67108864;  -- 64 MB, for new connections
+```
+
+Keep it across restarts by adding it to the configuration file, or use `SET PERSIST`:
+
+```ini
+[mysqld]
+max_allowed_packet = 64M
+```
+
+A `SET GLOBAL` change does not apply to connections that are already open, so reconnect before you retest. The client has its own limit too, so a dump needs both sides set:
+
+```bash
+mysql --max-allowed-packet=64M mydb < big-dump.sql
+```
+
+Raising the limit is fine, but also ask whether the statement should be so large. Splitting a huge `INSERT` into batches of a few thousand rows is often better for replication and lock times. The [error 1153 guide](/blog/mysql-error-1153-max-allowed-packet) covers this in full. MySQL's limit for this variable is 1 GB, so very large objects need a different approach anyway.
+
+## Cause 3: Something Killed the Connection
+
+A connection can also end because something closed it on purpose:
+
+- An administrator or a script ran `KILL`.
+- A query killer, such as `pt-kill` or a managed service's long-query limit, removed the session.
+- A proxy or load balancer ended an idle or long-lived connection.
+- A failover moved the primary, and old connections were dropped.
+
+We ran `KILL` on an idle session. Its next query reported `2013` in every client we tried:
+
+```
+ERROR 2013 (HY000) at line 2: Lost connection to MySQL server during query
+```
+
+To see whether this is happening, look at the status counters and error log:
+
+```sql
+SHOW GLOBAL STATUS LIKE 'Aborted_%';
+```
+
+A rising `Aborted_clients` means connections are ending without a proper close. `Aborted_connects` counts failed connection attempts, which point in a different direction. In our test, `Aborted_clients` stood at 7 after the experiments, which matches the sessions we broke on purpose. Set `log_error_verbosity = 3` for a while to log aborted connections with their reasons, and return it to the default of 2 afterward so the log stays small.
+
+## Cause 4: The Server Restarted or Crashed
+
+Sometimes the server really is gone. Compare its uptime with the time of the error:
+
+```sql
+SHOW GLOBAL STATUS LIKE 'Uptime';
+```
+
+If `Uptime` is shorter than you expect, read the error log for the restart. On Linux, also check the system log for the out-of-memory killer, which is a frequent reason for a sudden MySQL restart on a small machine:
+
+```bash
+dmesg -T | grep -i -E 'killed process|out of memory'
+```
+
+The fix there is a matter of memory settings and not of timeouts. Our [MySQL config guide](/blog/mysql-performance-tuning-optimizing-server-configuration-and-resource-utilization-for-better-performance) and the free [MySQL Config Calculator](https://chat2db.ai/tools/mysql-config-calculator) can help you size `innodb_buffer_pool_size` for your hardware.
+
+## Cause 5: A Slow Network or a Long Transfer
+
+`net_read_timeout` (30 seconds) and `net_write_timeout` (60 seconds) limit how long the server waits on the network during a transfer. A slow link, or a client that reads a huge result set slowly, can pass these limits. This matters most for `mysqldump` of a large table and for a client doing heavy work between fetching rows. Raise them for that session:
+
+```sql
+SET SESSION net_read_timeout = 300;
+SET SESSION net_write_timeout = 300;
+```
+
+## Do Not Just Enable Auto-Reconnect
+
+The `mysql` client reconnects by default, and many drivers offer the same option. It looks like a complete fix, but a silent reconnect gives you a new session. You lose temporary tables, user variables, session settings and any open transaction. In our test, `wait_timeout` read 28800 again after the reconnect, because the `SET SESSION` from the old connection was gone.
+
+For a transaction, this is dangerous. If the connection dropped after the first of two updates, an automatic retry of the second update commits half of the work. Reconnect only at a safe boundary, and retry the whole transaction.
+
+## How to Diagnose It Quickly
+
+Follow this order:
+
+1. Note the exact error number and any detail, such as `Broken pipe` or `4031`.
+2. Measure how long the connection had been idle, and compare it with `wait_timeout`.
+3. Check the size of the failing statement against `max_allowed_packet`.
+4. Check `Uptime` and the error log for a restart.
+5. Watch `Aborted_clients`, and look for query killers and proxies.
+6. Check timeouts on any load balancer or firewall between client and server.
+
+## Checklist
+
+- Use a connection pool that validates connections.
+- Set the pool's maximum lifetime below every idle timeout in the path.
+- Keep `max_allowed_packet` the same on the server and on tools like `mysqldump`.
+- Split very large statements into batches.
+- Retry whole transactions, not single statements.
+- Monitor `Uptime` and `Aborted_clients`.
+
+## Test Your Connection Settings
+
+When the cause is not obvious, it helps to compare settings across servers. In [Chat2DB](https://chat2db.ai/download) you can check variables and status counters on each connection, run the diagnostic queries above, and paste an error into the AI assistant for likely causes on your setup. It also works in the browser at [app.chat2db.ai](https://app.chat2db.ai/).

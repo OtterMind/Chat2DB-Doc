@@ -1,0 +1,292 @@
+---
+title: "PostgreSQL function does not exist: How to Fix It"
+description: "Fix the PostgreSQL 42883 error function does not exist: spot wrong argument types, missing extensions, search_path problems and overloads, with tested SQL."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: November 4, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# PostgreSQL function does not exist: How to Fix It
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="November 4, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+This error is confusing because the function often does exist. You can see it in `\df`, you created it five minutes ago, and PostgreSQL still insists otherwise:
+
+```
+ERROR:  function add_numbers(integer, numeric) does not exist
+LINE 1: select add_numbers(1, 2.5);
+               ^
+HINT:  No function matches the given name and argument types. You might need to add explicit type casts.
+```
+
+The key is in the message. PostgreSQL is not saying that no function has this name. It is saying that no function matches this name **and these argument types** in a schema it can see. A function is identified by its name and its argument types together, so `add_numbers(integer, integer)` and `add_numbers(integer, numeric)` are two different things.
+
+SQLSTATE `42883` covers all of these cases. This guide goes through each cause, using errors captured on PostgreSQL 18.6, and shows how to tell them apart quickly.
+
+## Read the Signature in the Error First
+
+The error tells you what PostgreSQL went looking for, so compare it with what exists. The types in parentheses are the types of the values you passed, after PostgreSQL worked them out, and this is usually enough to spot the problem.
+
+Then list every function with that name, in any schema:
+
+```sql
+SELECT proname,
+       pronamespace::regnamespace AS schema,
+       pg_get_function_identity_arguments(oid) AS args
+FROM pg_proc
+WHERE proname = 'add_numbers';
+```
+
+In `psql`, `\df *add_numbers*` shows the same thing, but only for schemas in your `search_path`. The catalog query is better for debugging, because it finds functions that `\df` would miss. Use the result to pick a cause:
+
+| Query result | Likely cause |
+| --- | --- |
+| No rows | Typo, missing extension, or the function was never created here |
+| A row in another schema | `search_path` problem |
+| A row with different argument types | Type mismatch, needs a cast |
+| Several rows | Overloads, possibly an ambiguous call |
+
+## Cause 1: Argument Types Do Not Match
+
+This is the most common cause. Here is a function that takes two integers:
+
+```sql
+CREATE FUNCTION add_numbers(a int, b int) RETURNS int
+LANGUAGE sql AS 'SELECT a + b';
+
+SELECT add_numbers(1, 2.5);
+-- ERROR:  function add_numbers(integer, numeric) does not exist
+
+SELECT add_numbers(1::bigint, 2);
+-- ERROR:  function add_numbers(bigint, integer) does not exist
+```
+
+Both fail, because PostgreSQL will not narrow a value implicitly. It can widen `integer` to `bigint` for a function that takes `bigint`, but it will not go from `bigint` or `numeric` down to `integer`, since that could lose data.
+
+The result can look inconsistent, because this call works:
+
+```sql
+SELECT add_numbers('1', '2');
+-- 3
+```
+
+Quoted literals have type `unknown`, so PostgreSQL is free to treat them as whatever the function wants. A value from a column or a typed parameter does not get that flexibility. This is why a query can work when you paste it into `psql` with literals and fail from your application, which sends typed parameters.
+
+To fix it, cast the argument to the type the function declares, or change the function to accept what you actually have:
+
+```sql
+SELECT add_numbers(1, 2.5::int);
+
+CREATE FUNCTION add_numbers(a numeric, b numeric) RETURNS numeric
+LANGUAGE sql AS 'SELECT a + b';
+```
+
+### Built-In Functions Fail the Same Way
+
+Plenty of reports of this error involve functions everyone knows. These all failed in our test, and each has a simple fix:
+
+```sql
+SELECT round(1.2345::double precision, 2);
+-- ERROR:  function round(double precision, integer) does not exist
+SELECT round(1.2345::numeric, 2);
+
+SELECT lower(1);
+-- ERROR:  function lower(integer) does not exist
+SELECT lower(1::text);
+
+SELECT string_agg(1, ',');
+-- ERROR:  function string_agg(integer, unknown) does not exist
+SELECT string_agg(1::text, ',');
+
+SELECT to_char(now());
+-- ERROR:  function to_char(timestamp with time zone) does not exist
+SELECT to_char(now(), 'YYYY-MM-DD');
+
+SELECT array_length(ARRAY[1, 2]);
+-- ERROR:  function array_length(integer[]) does not exist
+SELECT array_length(ARRAY[1, 2], 1);
+```
+
+The `round()` case catches many people, because the two-argument form only exists for `numeric`. If a `real` or `double precision` column needs rounding to two places, cast it to `numeric` first.
+
+`substring('abc', 1::bigint, 2)` fails too, because the position must be an `integer`. These are worth remembering when a value comes from `count(*)`, which returns `bigint`.
+
+## Cause 2: A Missing Extension
+
+Many functions come from extensions and do not exist until the extension is installed in the current database:
+
+```sql
+SELECT uuid_generate_v4();
+-- ERROR:  function uuid_generate_v4() does not exist
+
+SELECT similarity('a', 'b');
+-- ERROR:  function similarity(unknown, unknown) does not exist
+
+SELECT gen_salt('bf');
+-- ERROR:  function gen_salt(unknown) does not exist
+```
+
+Those three need `uuid-ossp`, `pg_trgm` and `pgcrypto`. Check what is available, then install what you need:
+
+```sql
+SELECT name, default_version, installed_version
+FROM pg_available_extensions
+WHERE name IN ('pgcrypto', 'uuid-ossp', 'pg_trgm');
+
+CREATE EXTENSION IF NOT EXISTS pg_trgm;
+```
+
+An empty `installed_version` means the extension is available but not installed. Remember that extensions are installed per database, so a database restored or created after the fact can lack one that your other databases have. If the extension is missing from that list, the server needs the operating system package first, which leads to a different error covered in [could not open extension control file](/blog/postgres-could-not-open-extension-control-file).
+
+For UUIDs specifically, you may not need an extension at all. `gen_random_uuid()` has been built in since PostgreSQL 13, and `uuidv7()` since version 18.
+
+## Cause 3: The Function Is in Another Schema
+
+PostgreSQL only finds an unqualified name by searching the schemas in `search_path`. An extension installed in a separate schema is a common way to hit this:
+
+```sql
+CREATE SCHEMA ext;
+CREATE EXTENSION pg_trgm SCHEMA ext;
+
+SELECT similarity('abc', 'abd');
+-- ERROR:  function similarity(unknown, unknown) does not exist
+
+SELECT ext.similarity('abc', 'abd');
+-- 0.33333334
+```
+
+The catalog query from the first step shows `ext` in the schema column, which gives it away. There are three fixes, in rough order of preference:
+
+```sql
+-- Qualify the call
+SELECT ext.similarity('abc', 'abd');
+
+-- Add the schema to the search path for a role or database
+ALTER ROLE app_user SET search_path = public, ext;
+ALTER DATABASE mydb SET search_path = public, ext;
+
+-- Or move the extension
+ALTER EXTENSION pg_trgm SET SCHEMA public;
+```
+
+`ALTER ROLE` and `ALTER DATABASE` take effect for new sessions, not for one that is already open. Connection poolers can also leave a session with a different `search_path` from the one you expect, so if the error comes and goes, run `SHOW search_path` from the failing code path. Our [search_path guide](/blog/postgres-search-path-and-schemas) covers this in depth.
+
+Permissions can produce the same message. A role that cannot use a schema gets a clear error when it names the schema, but a misleading one when it relies on `search_path`:
+
+```sql
+SET ROLE r1;
+
+SELECT s1.h();
+-- ERROR:  permission denied for schema s1
+
+SET search_path = s1, public;
+SELECT h();
+-- ERROR:  function h() does not exist
+```
+
+PostgreSQL skips schemas the role cannot use, so the function is simply not found. If a function works for an admin and not for your application, run `GRANT USAGE ON SCHEMA s1 TO r1`.
+
+## Cause 4: Case and Quoting
+
+Unquoted names fold to lowercase, so a function created with double quotes must always be called with them:
+
+```sql
+SELECT "Lower"('A');
+-- ERROR:  function Lower(unknown) does not exist
+```
+
+The capital letter in the error shows what happened. If a migration tool or ORM created `"getTotal"`, then calling `getTotal()` looks for `gettotal`, and that fails. Quote the name in the call, or rename the function to lowercase.
+
+## Cause 5: Wrong Number of Arguments or Named Parameters
+
+If you pass too few or too many arguments, you get the same error with the shorter or longer signature. Check the arguments against the definition.
+
+Named notation has a variation of this. When a parameter name is wrong, the error shows the names you used:
+
+```sql
+CREATE FUNCTION g(p_id int, p_name text) RETURNS text
+LANGUAGE sql AS 'SELECT p_name';
+
+SELECT g(id => 1, p_name => 'x');
+-- ERROR:  function g(id => integer, p_name => unknown) does not exist
+
+SELECT g(p_name => 'x', p_id => 1);
+-- x
+```
+
+## Cause 6: CREATE OR REPLACE Created an Overload
+
+`CREATE OR REPLACE FUNCTION` only replaces a function with the same argument types. Change an argument type, and you get a second function next to the first:
+
+```sql
+CREATE FUNCTION f(a int) RETURNS int LANGUAGE sql AS 'SELECT 1';
+CREATE OR REPLACE FUNCTION f(a bigint) RETURNS int LANGUAGE sql AS 'SELECT 2';
+
+SELECT f(1), f(1::bigint);
+-- 1 | 2
+```
+
+Now old code keeps running the old version without any error, which is arguably worse than failing. To remove the old one, name its signature, since a bare name is ambiguous:
+
+```sql
+DROP FUNCTION f;
+-- ERROR:  function name "f" is not unique
+-- HINT:  Specify the argument list to select the function unambiguously.
+
+DROP FUNCTION f(int);
+```
+
+Overloads also produce a related error with SQLSTATE `42725`, when PostgreSQL finds several candidates and cannot choose. Default values often cause it:
+
+```sql
+CREATE FUNCTION f2(a int, b int DEFAULT 1) RETURNS int LANGUAGE sql AS 'SELECT 1';
+CREATE FUNCTION f2(a int) RETURNS int LANGUAGE sql AS 'SELECT 2';
+
+SELECT f2(1);
+-- ERROR:  function f2(integer) is not unique
+-- HINT:  Could not choose a best candidate function. You might need to add explicit type casts.
+```
+
+Literals can trigger it too. `SELECT sum('a')` and `SELECT pg_size_pretty(1)` both fail this way in PostgreSQL 18. Fix it with an explicit cast, such as `pg_size_pretty(1::bigint)`, or drop the overload you do not need.
+
+## Cause 7: A Function Instead of a Procedure, or the Reverse
+
+Functions and procedures have separate calling syntax, and PostgreSQL gives a specific error for each mix-up:
+
+```sql
+CALL add_numbers(1, 2);
+-- ERROR:  add_numbers(integer, integer) is not a procedure
+-- HINT:  To call a function, use SELECT.
+
+SELECT p1();
+-- ERROR:  p1() is a procedure
+-- HINT:  To call a procedure, use CALL.
+```
+
+Also check that the code is calling a PostgreSQL function at all. Names from other databases, such as `ISNULL()`, `GETDATE()`, `NVL()`, `IFNULL()` and `DATEDIFF()`, do not exist in PostgreSQL. Use `COALESCE()`, `now()` and date subtraction. The [DATEDIFF guide](/blog/postgres-datediff-calculate-date-difference) lists the replacements.
+
+## Fixing This in Application Code
+
+Drivers add a layer of confusion, because they choose the parameter types. Sometimes a string parameter arrives as `character varying`, or a JavaScript number as `numeric` or `bigint`, and the signature in the error reflects that. Cast inside the SQL so the query does not depend on the driver:
+
+```sql
+SELECT add_numbers($1::int, $2::int);
+```
+
+## Checklist
+
+1. Read the signature in the error, including every argument type.
+2. Query `pg_proc` to see what exists and in which schema.
+3. For a type mismatch, cast the argument or add a suitable function.
+4. For a missing function, install the extension in this database.
+5. For another schema, qualify the name or fix `search_path`, and check `USAGE`.
+6. Look for quoted mixed-case names and wrong parameter names.
+7. After `CREATE OR REPLACE`, check for an accidental overload.
+
+## Find the Right Signature Faster
+
+Comparing a signature against the catalog is simple but tedious during an incident. In [Chat2DB](https://chat2db.ai/download) you can browse functions by schema with their argument types, run the diagnostic queries above, and paste the error into the AI assistant to get a corrected cast for your query. If you just need to look up an error, the free [Postgres Error Code Lookup](https://chat2db.ai/tools/postgres-error-code-lookup) explains any SQLSTATE, and you can also work in the browser at [app.chat2db.ai](https://app.chat2db.ai/).
