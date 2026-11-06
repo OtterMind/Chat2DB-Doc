@@ -1,0 +1,259 @@
+---
+title: "Peer Authentication Failed for User: Postgres Fix"
+description: "Fix FATAL: Peer authentication failed for user in PostgreSQL: why psql fails on a Unix socket, and how to use sudo, -h localhost, pg_ident.conf or pg_hba.conf."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: November 5, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# Peer Authentication Failed for User: Postgres Fix
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="November 5, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+You installed PostgreSQL, created a role with a password, typed `psql -U app -d appdb`, and got this:
+
+```text
+psql: error: connection to server on socket "/var/run/postgresql/.s.PGSQL.5432" failed:
+FATAL:  Peer authentication failed for user "app"
+```
+
+The password is not wrong. PostgreSQL never asked for one. The error means the server compared your operating system user with the database role you requested, and the two did not match.
+
+This guide explains how peer authentication works, then gives the fix for each situation. We reproduced every error below on PostgreSQL 18.6 on Debian, using a `pg_hba.conf` like the one Debian and Ubuntu packages install.
+
+## What Peer Authentication Does
+
+PostgreSQL decides how to authenticate a connection by reading `pg_hba.conf` from top to bottom and using the first line that matches. On Debian and Ubuntu, the file starts with rules like these:
+
+```text
+local   all   postgres                    peer
+local   all   all                         peer
+host    all   all       127.0.0.1/32      scram-sha-256
+host    all   all       ::1/128           scram-sha-256
+```
+
+The `local` lines apply to connections over a Unix socket, and those are what you get when you run `psql` without `-h`. The `peer` method asks the kernel which operating system user owns the other end of the socket. It then requires that name to equal the database role you asked for. No password is involved, because the kernel has already vouched for who you are.
+
+So the whole rule fits in one sentence: to connect as role `app` over the socket, you must be logged in to Linux as user `app`.
+
+Here is that rule in action, with three different operating system users:
+
+| Linux user | Command | Result |
+| --- | --- | --- |
+| `postgres` | `psql` | Connected as `postgres` |
+| `root` | `psql -U postgres` | `Peer authentication failed for user "postgres"` |
+| `root` | `psql -U app -d appdb` | `Peer authentication failed for user "app"` |
+| `deploy` | `psql -d postgres` | Connected as `deploy`, because that role exists |
+| `deploy` | `psql -U app -d appdb` | `Peer authentication failed for user "app"` |
+
+The second row surprises people. Being `root` on the machine does not help, because the names still differ. Peer authentication has no idea that `root` is special.
+
+## Read the Server Log First
+
+The message `psql` prints is deliberately short. The server log says exactly what happened, including which rule matched:
+
+```text
+LOG:  provided user name (app) and authenticated user name (deploy) do not match
+FATAL:  Peer authentication failed for user "app"
+DETAIL:  Connection matched file "/var/lib/postgresql/18/docker/pg_hba.conf"
+         line 2: "local   all   all        peer"
+```
+
+The `DETAIL` line is the useful one. It gives the file path and the line number, so you know which rule to look at and you do not have to guess. On Debian and Ubuntu, the log is usually under `/var/log/postgresql/`.
+
+If you are already connected as a superuser, you can ask the server where its files are and which rules it has loaded:
+
+```sql
+SHOW hba_file;
+SHOW ident_file;
+
+SELECT line_number, type, database, user_name, address, auth_method, error
+FROM pg_hba_file_rules
+ORDER BY rule_number;
+```
+
+On our test server, this returned:
+
+```text
+ line_number | type  | database | user_name  |  address  |  auth_method  | error
+-------------+-------+----------+------------+-----------+---------------+-------
+           1 | local | {all}    | {postgres} |           | peer          |
+           2 | local | {all}    | {all}      |           | peer          |
+           3 | host  | {all}    | {all}      | 127.0.0.1 | scram-sha-256 |
+           4 | host  | {all}    | {all}      | ::1       | scram-sha-256 |
+```
+
+`pg_hba_file_rules` reads the file on disk, not what the server has loaded, so it also lets you check an edit before you reload.
+
+## Fix 1: You Want to Be the postgres Superuser
+
+This is the most common case on a fresh install. Switch to the Linux user that matches the role:
+
+```bash
+sudo -u postgres psql
+```
+
+That connects as the `postgres` operating system user, so peer authentication succeeds. It is the intended way to reach the superuser on a Debian or Ubuntu server, and nothing needs to change.
+
+Do not set a password on the `postgres` role and switch the rule to `scram-sha-256` just to avoid typing `sudo`. Peer access for the superuser is a good thing: it means nobody can reach that account over the socket without first having OS-level access.
+
+## Fix 2: Your Application Has a Password, So Use TCP
+
+If the role has a password and you only want to log in with it, connect over TCP. Those connections match the `host` lines, which use `scram-sha-256`:
+
+```bash
+psql -h localhost -U app -d appdb
+```
+
+Adding `-h localhost` is often the entire fix. In our test, the same user that failed over the socket connected at once:
+
+```text
+ current_user | inet_client_addr
+--------------+------------------
+ app          | ::1
+```
+
+This is also why most applications never see the error. A connection string such as `postgresql://app:secret@localhost:5432/appdb` uses TCP. Tools hit peer authentication when they leave the host empty, because libpq then chooses the Unix socket.
+
+If you do not want to type the password each time, add it to `~/.pgpass` and restrict the file:
+
+```bash
+echo 'localhost:5432:appdb:app:secret' >> ~/.pgpass
+chmod 600 ~/.pgpass
+```
+
+Moving to TCP can expose the next error in the chain. These two mean you have reached the password check, which is progress:
+
+```text
+psql: error: connection to server at "127.0.0.1", port 5432 failed:
+fe_sendauth: no password supplied
+
+psql: error: connection to server at "127.0.0.1", port 5432 failed:
+FATAL:  password authentication failed for user "app"
+```
+
+The first means the client had no password to send. The second means it sent the wrong one, or the role has no password. Our [password authentication guide](/blog/postgres-password-authentication-failed-fix) covers the second case.
+
+## Fix 3: Map Linux Users to a Role with pg_ident.conf
+
+Sometimes you want peer authentication but the names cannot match. A deploy script runs as `deploy`, a colleague logs in as `alice`, and both should connect as role `app` with no password stored anywhere. That is what a user name map is for.
+
+Add a map to `pg_ident.conf`. Each line gives the map name, the Linux user and the database role:
+
+```text
+# MAPNAME  SYSTEM-USERNAME  PG-USERNAME
+appmap     deploy           app
+appmap     alice            app
+```
+
+Then point a `pg_hba.conf` rule at that map. Put it above the general `local all all peer` line, because the first match wins:
+
+```text
+local   all     postgres            peer
+local   appdb   app                 peer map=appmap
+local   all     all                 peer
+host    all     all   127.0.0.1/32  scram-sha-256
+```
+
+Reload the server and confirm the map loaded:
+
+```sql
+SELECT pg_reload_conf();
+
+SELECT map_number, map_name, sys_name, pg_username, error
+FROM pg_ident_file_mappings;
+```
+
+```text
+ map_number | map_name | sys_name | pg_username | error
+------------+----------+----------+-------------+-------
+          1 | appmap   | deploy   | app         |
+          2 | appmap   | alice    | app         |
+```
+
+The `pg_ident_file_mappings` view exists in PostgreSQL 15 and later. After the reload, both `deploy` and `alice` connected as `app`, and `root`, which is not in the map, was refused. The failure message for a user outside the map is the same as before, but the log line changes:
+
+```text
+LOG:  no match in usermap "appmap" for user "app" authenticated as "root"
+FATAL:  Peer authentication failed for user "app"
+```
+
+A map only allows the listed pairs. Once a rule uses `map=`, the plain same-name match no longer applies on that line, unless you add that pair to the map too.
+
+## Fix 4: Change the Rule
+
+If you want password logins over the socket as well, change the `local` rule for that role. Keep the `postgres` line as peer:
+
+```text
+local   all   postgres                  peer
+local   all   all                       scram-sha-256
+host    all   all       127.0.0.1/32    scram-sha-256
+```
+
+Reload, and `psql -U app -d appdb` now asks for a password:
+
+```sql
+SELECT pg_reload_conf();
+```
+
+Order matters here, and it trips people up. We tested a narrower rule placed below a broader one:
+
+```text
+local   all   all    peer
+local   all   app    scram-sha-256
+```
+
+The second line does nothing. PostgreSQL stops at the first line that matches the connection type, database and user. If authentication then fails, it does not move on to the next rule. So `app` still got `Peer authentication failed`. Specific rules go first.
+
+Avoid switching a rule to `trust` to get past the error. That lets anyone who can reach the socket connect as any role without a password, including a superuser.
+
+## A Reload Can Silently Keep the Old Rules
+
+If you edit `pg_hba.conf` and nothing changes, check for a mistake in the file. A rule with a bad method name does not take effect, and the server keeps running on the old rules. We added a line with `scram` instead of `scram-sha-256`, ran `SELECT pg_reload_conf()`, and it returned `t`, which only means the signal was sent. The log showed the real result:
+
+```text
+LOG:  /var/lib/postgresql/18/docker/pg_hba.conf was not reloaded
+```
+
+`pg_hba_file_rules` showed the cause:
+
+```text
+ line_number |  auth_method  |                 error
+-------------+---------------+---------------------------------------
+           1 | peer          |
+           2 | scram-sha-256 |
+           3 |               | invalid authentication method "scram"
+```
+
+A malformed `pg_ident.conf` line behaves the same way: `pg_ident_file_mappings` reports `missing entry at end of line`, and the log says the file was not reloaded. After any edit, run those two queries and read the `error` column.
+
+## Related Errors You May Hit Next
+
+Fixing peer authentication often reveals a different problem:
+
+- `FATAL: database "deploy" does not exist` means authentication worked. `psql` used your Linux user name as the database name, so add `-d postgres` or the right database.
+- `FATAL: role "deploy" does not exist` means the role has not been created. See our [role does not exist guide](/blog/postgres-role-does-not-exist-fix).
+- `no pg_hba.conf entry for host` means no rule matched at all. See our [pg_hba.conf entry guide](/blog/postgres-no-pg-hba-conf-entry-fix).
+- `Ident authentication failed` is the TCP equivalent on older Red Hat style defaults. It asks an ident service instead of the kernel, and the same fixes apply.
+
+Peer authentication works only on Unix sockets on systems that can report the peer's identity, which is why you will not see it on Windows, where the default rules use passwords.
+
+## Which Fix Should You Use?
+
+| You want to | Do this |
+| --- | --- |
+| Open a superuser shell on the server | `sudo -u postgres psql` |
+| Log in with a password | Add `-h localhost` |
+| Connect an application | Use a connection string with a host |
+| Let Linux users act as a shared role | Use `pg_ident.conf` with `map=` |
+| Use passwords on the socket too | Change the `local` rule to `scram-sha-256` |
+
+Most people need one of the first two, and no configuration change at all.
+
+## Connect Without the Guesswork
+
+Authentication errors are easier to solve when you can see exactly what a connection uses. [Chat2DB](https://chat2db.ai/download) connects over TCP with the host, port, role and SSL settings laid out in one form, and its connection test shows the server's error straight away, so you can tell a peer problem from a password problem. You can then browse `pg_hba_file_rules` and `pg_ident_file_mappings` like any other table. There is also a browser version at [app.chat2db.ai](https://app.chat2db.ai/).

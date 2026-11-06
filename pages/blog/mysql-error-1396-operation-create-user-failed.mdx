@@ -1,0 +1,271 @@
+---
+title: "MySQL Error 1396: Operation CREATE USER Failed"
+description: "Fix MySQL error 1396 for CREATE, DROP, ALTER and RENAME USER: existing accounts, wrong hosts, roles, leftover grant rows and mysql.user edits, tested on 8.4."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: November 5, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# MySQL Error 1396: Operation CREATE USER Failed
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="November 5, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+MySQL error 1396 usually appears when you run a setup script a second time:
+
+```text
+ERROR 1396 (HY000): Operation CREATE USER failed for 'app'@'%'
+```
+
+The message says that an account statement failed for that account, and it does not say why. In practice there are only a few causes. Either the account already exists, or it does not exist in the exact form you typed, or leftover rows in the grant tables say it exists when `mysql.user` says it does not.
+
+The tricky part is the last one, because `SELECT` from `mysql.user` shows nothing and the error still fires. We reproduced every case below on MySQL 8.4.11, and the statements and output are from those runs.
+
+## What Error 1396 Means
+
+MySQL identifies an account by the pair of user and host, and `'app'@'%'` and `'app'@'localhost'` are two separate accounts. Error 1396 (SQLSTATE HY000, symbol `ER_CANNOT_USER`) is raised by any account management statement that cannot act on that exact pair:
+
+| Statement | Fails when |
+| --- | --- |
+| `CREATE USER` | The account already exists |
+| `CREATE ROLE` | The account already exists |
+| `DROP USER` | The account does not exist |
+| `DROP ROLE` | The role does not exist |
+| `ALTER USER` | The account does not exist |
+| `RENAME USER` | The old name is missing, or the new name is taken |
+
+The operation name in the message tells you which statement failed, so read it first.
+
+## Step 1: Look for the Account
+
+List every account with that name, across all hosts:
+
+```sql
+SELECT user, host, plugin, account_locked
+FROM mysql.user
+WHERE user = 'app';
+```
+
+Then compare the result with what your statement said. Most error 1396 cases end here.
+
+## Cause 1: The Account Already Exists
+
+Run `CREATE USER` twice and the second attempt fails:
+
+```sql
+CREATE USER 'app'@'%' IDENTIFIED BY 'Secret#123';
+CREATE USER 'app'@'%' IDENTIFIED BY 'Secret#123';
+-- ERROR 1396 (HY000): Operation CREATE USER failed for 'app'@'%'
+```
+
+If you want a repeatable script, use `IF NOT EXISTS`. The statement then succeeds with a note instead of an error:
+
+```sql
+CREATE USER IF NOT EXISTS 'app'@'%' IDENTIFIED BY 'Secret#123';
+SHOW WARNINGS;
+```
+
+```text
++-------+------+--------------------------------------------+
+| Level | Code | Message                                    |
++-------+------+--------------------------------------------+
+| Note  | 3163 | Authorization ID 'app'@'%' already exists. |
++-------+------+--------------------------------------------+
+```
+
+Be careful with what that note hides: `IF NOT EXISTS` does not update the existing account, so the password stays as it was. If the script should also set the password, follow it with `ALTER USER`:
+
+```sql
+CREATE USER IF NOT EXISTS 'app'@'%' IDENTIFIED BY 'Secret#123';
+ALTER USER 'app'@'%' IDENTIFIED BY 'Secret#123';
+```
+
+## Cause 2: The Host Does Not Match
+
+This is the usual cause for `DROP USER` and `ALTER USER`. The name is right, but the host is not:
+
+```sql
+CREATE USER 'app'@'localhost' IDENTIFIED BY 'Secret#123';
+
+ALTER USER 'app'@'127.0.0.1' IDENTIFIED BY 'x';
+-- ERROR 1396 (HY000): Operation ALTER USER failed for 'app'@'127.0.0.1'
+
+DROP USER 'app'@'10.0.0.%';
+-- ERROR 1396 (HY000): Operation DROP USER failed for 'app'@'10.0.0.%'
+```
+
+MySQL does not match host patterns here. `'%'` means the literal host value `%`, and `localhost` and `127.0.0.1` are different strings. Omitting the host means `'%'`, which can hide the mistake. We had `'app'@'%'` and `'app'@'localhost'`:
+
+```sql
+DROP USER 'app';                 -- removes 'app'@'%' and leaves 'app'@'localhost'
+DROP USER 'app';
+-- ERROR 1396 (HY000): Operation DROP USER failed for 'app'@'%'
+```
+
+The second statement looks odd, since `'app'` is still in `mysql.user`, but it is the `'%'` account that no longer exists. Always write the full `'user'@'host'` form.
+
+For cleanup scripts, `IF EXISTS` turns the error into a note, for `DROP USER`, `DROP ROLE` and `ALTER USER`:
+
+```sql
+DROP USER IF EXISTS 'ghost'@'%';
+ALTER USER IF EXISTS 'ghost'@'%' IDENTIFIED BY 'x';
+SHOW WARNINGS;
+```
+
+```text
++-------+------+----------------------------------------------+
+| Level | Code | Message                                      |
++-------+------+----------------------------------------------+
+| Note  | 3162 | Authorization ID 'ghost'@'%' does not exist. |
++-------+------+----------------------------------------------+
+```
+
+`RENAME USER` has no `IF EXISTS` form, and it needs a real change of name. Renaming an account to itself also fails:
+
+```sql
+RENAME USER 'app'@'%' TO 'app'@'%';
+-- ERROR 1396 (HY000): Operation RENAME USER failed for 'app'@'%'
+```
+
+## Cause 3: A Role Has the Same Name
+
+Roles live in `mysql.user` too. A role is a locked account, so `CREATE ROLE 'reader'` creates `'reader'@'%'`, and a user with the same name then collides:
+
+```sql
+CREATE ROLE 'reader';
+CREATE USER 'reader'@'%' IDENTIFIED BY 'Secret#123';
+-- ERROR 1396 (HY000): Operation CREATE USER failed for 'reader'@'%'
+```
+
+The reverse fails too. `CREATE ROLE 'app'` returns `Operation CREATE ROLE failed for 'app'@'%'` if that user exists. The `SELECT` from Step 1 shows the row with `account_locked = 'Y'`, which is how you can spot a role. Use different names, such as `reader_role`.
+
+## Cause 4: Someone Edited mysql.user Directly
+
+This is the case where the account seems not to exist. Deleting from `mysql.user` changes the table but not the in-memory privilege cache, so MySQL still believes the account is there:
+
+```sql
+CREATE USER 'stale'@'%' IDENTIFIED BY 'Secret#123';
+DELETE FROM mysql.user WHERE user = 'stale';
+
+CREATE USER 'stale'@'%' IDENTIFIED BY 'Secret#123';
+-- ERROR 1396 (HY000): Operation CREATE USER failed for 'stale'@'%'
+
+SELECT user, host FROM mysql.user WHERE user = 'stale';
+-- Empty set
+```
+
+Reload the cache and the statement works:
+
+```sql
+FLUSH PRIVILEGES;
+CREATE USER 'stale'@'%' IDENTIFIED BY 'Secret#123';
+-- Query OK
+```
+
+If you have a backup or a dump that restored the grant tables, the same `FLUSH PRIVILEGES` applies. In any case, use `DROP USER` rather than `DELETE`, because of the next cause.
+
+## Cause 5: Orphan Rows in Other Grant Tables
+
+This is the case that `FLUSH PRIVILEGES` does not fix. If a user had grants, and only the `mysql.user` row was deleted, the rows in `mysql.db`, `mysql.tables_priv` and related tables stay behind:
+
+```sql
+CREATE USER 'orph'@'%' IDENTIFIED BY 'Secret#123';
+GRANT SELECT ON lab.* TO 'orph'@'%';
+DELETE FROM mysql.user WHERE user = 'orph';
+FLUSH PRIVILEGES;
+
+SELECT user, host, db FROM mysql.db WHERE user = 'orph';
+```
+
+```text
++------+------+-----+
+| user | host | db  |
++------+------+-----+
+| orph | %    | lab |
++------+------+-----+
+```
+
+Now `CREATE USER` fails with 1396, and flushing again changes nothing:
+
+```sql
+CREATE USER 'orph'@'%' IDENTIFIED BY 'Secret#123';
+-- ERROR 1396 (HY000): Operation CREATE USER failed for 'orph'@'%'
+```
+
+The clean fix may look wrong at first, but it works: run `DROP USER` on the account that is not in `mysql.user`. In our test, it succeeded with no warning and removed the orphan row:
+
+```sql
+DROP USER 'orph'@'%';
+SELECT user, host, db FROM mysql.db WHERE user = 'orph';
+-- Empty set
+
+CREATE USER 'orph'@'%' IDENTIFIED BY 'Secret#123';
+-- Query OK
+```
+
+That is better than deleting rows by hand, because it clears every grant table in one statement.
+
+To find leftovers in general, check the grant tables for names that have no account:
+
+```sql
+SELECT d.user, d.host, d.db
+FROM mysql.db d
+LEFT JOIN mysql.user u ON u.user = d.user AND u.host = d.host
+WHERE u.user IS NULL;
+```
+
+Run the same pattern against `mysql.tables_priv` and `mysql.columns_priv` if you still see the error.
+
+## Details That Catch People Out
+
+User names are case-sensitive, so `'App'@'%'` and `'app'@'%'` are separate accounts. In our test, both were created and a `LIKE 'app%'` search returned only the lowercase one. Host names, on the other hand, are stored in lowercase.
+
+A statement that names several accounts is atomic. If one fails, none of them is created:
+
+```sql
+CREATE USER 'ip'@'%' IDENTIFIED BY 'Secret#123';
+CREATE USER 'ip'@'%' IDENTIFIED BY 'Secret#123',
+            'ip2'@'%' IDENTIFIED BY 'Secret#123';
+-- ERROR 1396 (HY000): Operation CREATE USER failed for 'ip'@'%'
+-- 'ip2'@'%' was not created
+```
+
+If you run MySQL in Docker, a 1396 from a script in `/docker-entrypoint-initdb.d` often means that `MYSQL_USER` already created the account. Those scripts run after the environment variables are applied, so use `IF NOT EXISTS` there.
+
+## Error 1396 on a Replica
+
+The error can also stop replication. If an account already exists on a replica, for example because someone created it there by hand, the same `CREATE USER` arriving from the source fails, and the applier thread stops. `SHOW REPLICA STATUS` reports it in `Last_SQL_Errno` as 1396, with the failed statement in `Last_SQL_Error`. We did not reproduce this case in the runs for this article, but it follows directly from Cause 1: the replica runs the same statement against a server where the account is already there.
+
+Fix it by making the two servers agree, and do not skip the event blindly. If the account on the replica is the same one, drop it there and restart the applier, so that the statement can apply:
+
+```sql
+STOP REPLICA;
+DROP USER IF EXISTS 'app'@'%';
+START REPLICA;
+```
+
+To prevent this, manage accounts only on the source, and keep replicas in `super_read_only` mode so that nobody can create local accounts by accident.
+
+## Do Not Expect GRANT to Create the Account
+
+Older scripts often relied on `GRANT ... IDENTIFIED BY` to create a user. MySQL 8.0 removed that, so create the account first, then grant. If you are porting such a script, you may see error 1396 from a new `CREATE USER` that sits next to a user the old script already made, so add `IF NOT EXISTS` while you are there.
+
+## Quick Reference
+
+| Situation | Fix |
+| --- | --- |
+| `CREATE USER` on an existing account | `CREATE USER IF NOT EXISTS`, then `ALTER USER` |
+| `DROP USER` or `ALTER USER` with a wrong host | Check `mysql.user`, and use the exact pair |
+| Scripts that must be repeatable | `IF EXISTS` and `IF NOT EXISTS` |
+| A role has the same name | Choose a different name |
+| Row deleted from `mysql.user` | `FLUSH PRIVILEGES` |
+| Rows left in `mysql.db` | `DROP USER` on that account, then `CREATE USER` |
+
+Once the account exists, you may still need to fix access: see our guides to [error 1045](/blog/mysql-error-1045) and [granting privileges](/blog/mysql-create-user-grant-privileges). Never change `mysql.*` tables with `INSERT`, `UPDATE` or `DELETE` when an account statement can do the job.
+
+## Manage Accounts Without Guesswork
+
+Account errors are much easier when you can see every `user@host` pair at once. [Chat2DB](https://chat2db.ai/download) lets you query the grant tables side by side, keeps your connection settings in one place, and its AI assistant can explain a failed statement against your real accounts. You can try it in the browser at [app.chat2db.ai](https://app.chat2db.ai/).

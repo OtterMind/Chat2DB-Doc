@@ -1,0 +1,226 @@
+---
+title: "MySQL Error 1698: Access Denied for root@localhost"
+description: "Fix MySQL error 1698 access denied for root@localhost: why auth_socket ignores your password, how sudo mysql works, and how to switch root to password login."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: November 5, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# MySQL Error 1698: Access Denied for root@localhost
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="November 5, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+You just installed MySQL on Ubuntu, you type the password you think you set, and you get this:
+
+```text
+ERROR 1698 (28000): Access denied for user 'root'@'localhost'
+```
+
+Then you try `sudo mysql`, and it logs in with no password at all. That combination confuses a lot of people, but it is the giveaway. The password was never checked. Your `root` account uses the `auth_socket` plugin, which identifies you by your Linux user instead.
+
+We reproduced this on MySQL 8.4.11 with the `auth_socket` plugin, and all of the output below comes from those tests.
+
+## Error 1698 vs Error 1045
+
+These two look alike, but they mean different things:
+
+| Error | Meaning |
+| --- | --- |
+| 1045 | The password check ran and failed |
+| 1698 | The authentication plugin refused you, usually `auth_socket` |
+
+So if you see 1698, stop retrying passwords. Our [error 1045 guide](/blog/mysql-error-1045) covers real password problems.
+
+## How auth_socket Works
+
+Each MySQL account stores an authentication plugin in `mysql.user`. With `caching_sha2_password`, the client proves that it knows a password. With `auth_socket`, there is no password. The plugin asks the kernel which operating system user owns the client side of the Unix socket, and it lets you in only if that name equals the MySQL user name.
+
+The `mysql-server` package on Ubuntu sets up `root` this way on a new install, so that anyone with `sudo` can administer the server and no root password has to exist. MariaDB on Debian and Ubuntu does something similar with its `unix_socket` plugin. The consequence is simple: to log in as MySQL `root` over the socket, you must be Linux `root`.
+
+Here are the results from our test server, where `'root'@'localhost'` uses `auth_socket`:
+
+| Linux user | Command | Result |
+| --- | --- | --- |
+| `root` | `mysql -uroot` | Connected |
+| `root` | `mysql -uroot -pwrong` | Connected |
+| `deploy` | `mysql -uroot` | Error 1698 |
+| `deploy` | `mysql -uroot -pCorrectPassword` | Error 1698 |
+| `mysql` | `mysql -uroot` | Error 1698 |
+
+Row two is worth a second look: a wrong password logged in, because `auth_socket` ignores whatever you send. Row four is the failure people report. The password was correct, and it still failed.
+
+## Step 1: Confirm the Plugin
+
+Log in with `sudo`, then check the account:
+
+```bash
+sudo mysql
+```
+
+```sql
+SELECT user, host, plugin FROM mysql.user WHERE user = 'root';
+```
+
+```text
++------+-----------+-------------+
+| user | host      | plugin      |
++------+-----------+-------------+
+| root | localhost | auth_socket |
++------+-----------+-------------+
+```
+
+If the plugin is `auth_socket`, you have found the cause. Now decide what you actually want, because there are two good answers.
+
+## Option 1: Keep auth_socket and Use sudo
+
+If you only need an admin shell on the server, nothing is broken. Use:
+
+```bash
+sudo mysql
+```
+
+This is a sound setup. Root has no password to steal, and access follows your server's `sudo` rules. Do not change it just because a tutorial tells you to type `mysql -u root -p`. Most of the time, the better question is why your application is logging in as `root` at all.
+
+## Option 2: Create a Separate User for Applications
+
+Applications and GUI tools should have their own account. This is the fix we recommend most, and it leaves `root` alone:
+
+```sql
+CREATE USER 'app'@'localhost' IDENTIFIED BY 'Strong#Password1';
+GRANT SELECT, INSERT, UPDATE, DELETE ON appdb.* TO 'app'@'localhost';
+```
+
+If you need a full administrator with a password, for example for a GUI client over an SSH tunnel, create one rather than converting `root`:
+
+```sql
+CREATE USER 'admin'@'localhost' IDENTIFIED BY 'Strong#Password1';
+GRANT ALL ON *.* TO 'admin'@'localhost' WITH GRANT OPTION;
+```
+
+If `CREATE USER` fails with [error 1396](/blog/mysql-error-1396-operation-create-user-failed), the account already exists, and if it fails with [error 1819](/blog/mysql-error-1819-password-policy), the password does not meet the policy.
+
+## Option 3: Switch root to Password Login
+
+If you really do want a password on `root`, change the plugin. Log in with `sudo mysql` and run:
+
+```sql
+ALTER USER 'root'@'localhost'
+  IDENTIFIED WITH caching_sha2_password BY 'NewStrong#Pass1';
+
+SELECT user, host, plugin FROM mysql.user WHERE user = 'root';
+```
+
+```text
++------+-----------+-----------------------+
+| user | host      | plugin                |
++------+-----------+-----------------------+
+| root | localhost | caching_sha2_password |
++------+-----------+-----------------------+
+```
+
+The change takes effect at once, with no `FLUSH PRIVILEGES` and no restart. After it, `mysql -uroot -p` works for any Linux user who knows the password. In our test, the `deploy` user that had been refused now connected.
+
+Two things change at the same time, so be ready for them:
+
+- `sudo mysql` with no password stops working, and now fails with error 1045 and `(using password: NO)`. Use `mysql -uroot -p` from then on.
+- Scripts that relied on `sudo mysql`, such as maintenance jobs, will start failing. Check cron jobs and your package's maintenance scripts before you switch.
+
+Do not use `mysql_native_password` for this on MySQL 8.4. The plugin is not loaded by default there, so the statement fails:
+
+```text
+ERROR 1524 (HY000): Plugin 'mysql_native_password' is not loaded
+```
+
+That error has its own guide: [MySQL error 1524](/blog/mysql-error-1524-plugin-not-loaded). Use `caching_sha2_password`, the default plugin.
+
+## Socket and TCP Reach Different Accounts
+
+Sometimes `mysql -uroot -h127.0.0.1 -p` works when `mysql -uroot -p` does not. That is not a bug. Our test server had two accounts named `root`, and the connection method selected which one applied:
+
+```text
++------+-----------+-----------------------+
+| user | host      | plugin                |
++------+-----------+-----------------------+
+| root | %         | caching_sha2_password |
+| root | localhost | auth_socket           |
++------+-----------+-----------------------+
+```
+
+Without `-h`, the client uses the Unix socket and matches `'root'@'localhost'`, which is `auth_socket`, so it failed with 1698. With `-h127.0.0.1`, it uses TCP, and `SELECT current_user()` returned `root@%`, the account with a password.
+
+The official Docker image creates a `'root'@'%'` account, so this pattern is common there. A plain Ubuntu install usually has only `'root'@'localhost'`, so TCP gives you no second account to fall back on. Check `mysql.user` on your own server rather than assuming either layout.
+
+## Other auth_socket Uses
+
+The plugin is useful beyond `root`. Your deploy user can log in with no stored password:
+
+```sql
+CREATE USER 'deploy'@'localhost' IDENTIFIED WITH auth_socket;
+GRANT SELECT ON appdb.* TO 'deploy'@'localhost';
+```
+
+From the `deploy` Linux account, plain `mysql` now connects as `deploy@localhost`. That means there is no password in a config file.
+
+The plugin also takes an `AS` clause, so the MySQL name can differ from the Linux name:
+
+```sql
+CREATE USER 'report'@'localhost' IDENTIFIED WITH auth_socket AS 'deploy';
+```
+
+With that, Linux user `deploy` can run `mysql -ureport` and connects as `report@localhost`.
+
+If the plugin is missing, you may need to load it. Our container did not have it active, so we ran:
+
+```sql
+INSTALL PLUGIN auth_socket SONAME 'auth_socket.so';
+
+SELECT plugin_name, plugin_status
+FROM information_schema.plugins
+WHERE plugin_name = 'auth_socket';
+```
+
+Be careful with `UNINSTALL PLUGIN`, because accounts that use the plugin are not changed by it. In our test, the uninstall succeeded while `report` still used `auth_socket`, and that account could no longer log in:
+
+```text
+ERROR 1524 (HY000): Plugin 'auth_socket' is not loaded
+```
+
+Check `SELECT user, host FROM mysql.user WHERE plugin = 'auth_socket'` before you remove it.
+
+## If You Cannot Log In at All
+
+If `sudo mysql` fails too, you need the recovery route. Stop the server, start it with grant checks disabled, and only allow local connections:
+
+```bash
+sudo systemctl stop mysql
+sudo mysqld_safe --skip-grant-tables --skip-networking &
+mysql -uroot
+```
+
+Then reload the grant tables, so that account statements work, and set the plugin:
+
+```sql
+FLUSH PRIVILEGES;
+ALTER USER 'root'@'localhost'
+  IDENTIFIED WITH caching_sha2_password BY 'NewStrong#Pass1';
+```
+
+Stop that instance and start the service normally. We did not run this recovery sequence in our test containers, so treat it as the general procedure from the MySQL manual and read the steps for your version first. `--skip-networking` matters, because without it anyone who can reach the port could log in with no password while the server is in this state.
+
+## Quick Reference
+
+| You want to | Do this |
+| --- | --- |
+| Get an admin shell on the server | `sudo mysql` |
+| Connect an application | Create a dedicated user |
+| Use a GUI as an admin | Create an `admin` user, and connect through an SSH tunnel |
+| Log in as root with a password | `ALTER USER ... IDENTIFIED WITH caching_sha2_password` |
+| Find out why it failed | `SELECT user, host, plugin FROM mysql.user` |
+
+## Connect with a Dedicated Account
+
+Once you have a proper account, you no longer need a shell on the server to work with your data. [Chat2DB](https://chat2db.ai/download) connects with that account over TCP or an SSH tunnel, so MySQL root can keep `auth_socket`, and its AI assistant turns plain questions into SQL against your schema. It also runs in the browser at [app.chat2db.ai](https://app.chat2db.ai/).

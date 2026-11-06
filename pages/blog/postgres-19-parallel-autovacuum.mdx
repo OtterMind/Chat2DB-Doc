@@ -1,0 +1,176 @@
+---
+title: "PostgreSQL 19 Parallel Autovacuum and Scoring"
+description: "Set up parallel autovacuum in PostgreSQL 19, learn how worker limits interact, and read the new pg_stat_autovacuum_scores view, with results from RC1."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: November 5, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# PostgreSQL 19 Parallel Autovacuum and Scoring
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="November 5, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+Autovacuum has been single-threaded per table for its whole history, and it has processed tables in whatever order `pg_class` listed them. PostgreSQL 19 changes both. Autovacuum can now use parallel workers for a table's indexes, and it ranks tables by a score before it picks one.
+
+Both changes are easy to overestimate, so we tested them on PostgreSQL 19rc1. The parallel feature works as documented, and on our test table it made almost no difference to run time, for reasons that will help you decide where it is worth using. RC1 is not the final release, so check the behavior again after GA.
+
+## What Is Parallel, and What Is Not
+
+A vacuum has several phases. Only two can run in parallel: index vacuuming, which removes dead entries from indexes, and index cleanup. The heap scan and the heap vacuuming stay in a single process. This is the same model the manual `VACUUM (PARALLEL n)` command has used for years, and PostgreSQL 19 extends it to autovacuum.
+
+So the benefit depends on how your vacuum spends its time. A large table with many large indexes gains the most. A table with one index gains nothing, and a small table has little to gain.
+
+The rules, from the PostgreSQL 19 documentation:
+
+- Each index is handled by at most one worker.
+- A table needs at least two indexes before workers are launched.
+- An index takes part only if it is larger than `min_parallel_index_scan_size`.
+- The worker count is also limited by `max_parallel_workers`.
+- A run may get fewer workers than planned, or none.
+
+## Turn It On
+
+Parallel autovacuum is off by default, because `autovacuum_max_parallel_workers` defaults to 0. It needs only a reload:
+
+```sql
+ALTER SYSTEM SET autovacuum_max_parallel_workers = 4;
+SELECT pg_reload_conf();
+```
+
+That setting is a cap per autovacuum worker. Each table can then adjust its own value with a storage parameter:
+
+```sql
+ALTER TABLE orders SET (autovacuum_parallel_workers = 2);  -- limit this table
+ALTER TABLE audit  SET (autovacuum_parallel_workers = 0);  -- no parallel vacuum
+```
+
+The storage parameter defaults to -1, which means use the server setting.
+
+## How the Limits Interact
+
+We ran each combination on a table with six indexes, and read the result from the autovacuum log:
+
+| `autovacuum_max_parallel_workers` | Table setting | Log line |
+| --- | --- | --- |
+| 0 | default | no parallel line |
+| 4 | default | `4 planned, 4 launched in total` |
+| 4 | 2 | `2 planned, 2 launched in total` |
+| 4 | 0 | no parallel line |
+| 2 | 4 | `2 planned, 2 launched in total` |
+
+The last row is the one to remember. A table setting cannot exceed the server cap, so `autovacuum_parallel_workers = 4` with a cap of 2 gives you two workers and no warning.
+
+To see this in your own server, log autovacuum runs:
+
+```sql
+ALTER SYSTEM SET log_autovacuum_min_duration = 0;
+SELECT pg_reload_conf();
+```
+
+A parallel run then includes a line like this in its report:
+
+```text
+LOG:  automatic vacuum of table "postgres.public.av": index scans: 1
+        ...
+        parallel workers: index vacuum: 4 planned, 4 launched in total
+```
+
+## What We Measured
+
+The test table had one million rows, a primary key and six secondary indexes, and we updated half of the rows before each run. To keep the cost-based delay out of the measurement, we set `autovacuum_vacuum_cost_delay = 0`. The test ran on a laptop, with the table cached in memory.
+
+| Run | Parallel workers | Elapsed |
+| --- | --- | --- |
+| Serial | 0 | 1.22 s |
+| Serial, table set to 0 | 0 | 1.12 s |
+| Serial, earlier run | 0 | 1.25 s |
+| Parallel | 2 | 1.23 s |
+| Parallel, capped | 2 | 1.07 s |
+| Parallel | 4 | 1.15 s |
+| Parallel, earlier run | 4 | 1.18 s |
+
+There is no meaningful difference. The ranges overlap, and the gap is smaller than the noise between identical runs.
+
+That is not a flaw in the feature. It is what you should expect from this table. The largest index was only 14,417 pages, about 113 MB, and the others ranged from about 1,300 to 5,500 pages. Starting workers has a cost, and those indexes were small enough that one process finished quickly, with the heap work taking its share of the time.
+
+So treat parallel autovacuum as a tool for tables where index vacuuming is the slow part. You can find those in the same log. If a run spends most of its time on indexes, and they are large and on storage that handles parallel I/O, then it is worth trying. We did not have a table of that size for this test, so we cannot give you a speedup number, and we suggest being careful with claims that quote one without saying what the table looked like.
+
+## Check I/O Before You Turn It On
+
+Parallel workers do more work at once. The documentation says they use the same cost delay parameters as the leader worker. As with manual parallel vacuum, you should test the effect on your storage, since autovacuum runs next to your production queries.
+
+Keep these limits in mind while you plan:
+
+```sql
+SELECT name, setting, context
+FROM pg_settings
+WHERE name IN (
+  'autovacuum_max_parallel_workers',
+  'autovacuum_max_workers',
+  'max_parallel_workers',
+  'max_worker_processes',
+  'min_parallel_index_scan_size'
+);
+```
+
+Parallel maintenance workers come from the same pool as parallel queries, so a busy server may launch fewer than you asked for. That is why the log line reports both planned and launched.
+
+## The New Scoring System
+
+The second change affects which table goes first. In earlier versions, an autovacuum worker went through its list in `pg_class` order, so a critical table could wait behind dozens of unimportant ones.
+
+In PostgreSQL 19, the worker builds its list and sorts it by score. A table's score is the maximum of five components:
+
+| Component | Measures | Weight setting |
+| --- | --- | --- |
+| Transaction ID | Age of `relfrozenxid` | `autovacuum_freeze_score_weight` |
+| Multixact | Age of `relminmxid` | `autovacuum_multixact_freeze_score_weight` |
+| Vacuum | Updated and deleted rows against the threshold | `autovacuum_vacuum_score_weight` |
+| Vacuum insert | Inserted rows against the threshold | `autovacuum_vacuum_insert_score_weight` |
+| Analyze | Changed rows against the threshold | `autovacuum_analyze_score_weight` |
+
+Each weight defaults to 1.0 and multiplies its component, and each can be set in `postgresql.conf`. The documentation adds that the two age components rise sharply once a table passes its failsafe age, so wraparound risk rises to the top by design. It also says that raising either of those two weights lowers the age at which that sharp increase begins.
+
+To go back to the old order, set all five weights to 0.0.
+
+## See the Scores
+
+The new view shows exactly what autovacuum sees, which used to be guesswork:
+
+```sql
+SELECT relname, score, xid_score, mxid_score,
+       vacuum_score, vacuum_insert_score, analyze_score,
+       do_vacuum, do_analyze, for_wraparound
+FROM pg_stat_autovacuum_scores
+ORDER BY score DESC
+LIMIT 10;
+```
+
+The columns on RC1 are `relid`, `schemaname`, `relname`, `score`, the five component scores, and the flags `do_vacuum`, `do_analyze` and `for_wraparound`.
+
+This view answers two questions that used to take a long time. "Is this table due for vacuum?" is `do_vacuum`. "Why not?" is in the component scores. When autovacuum seems to be ignoring a table, start here, and then check for long transactions that hold back cleanup.
+
+## Should You Change the Weights?
+
+Probably not at first. The defaults are designed so that wraparound risk comes first, and the view lets you watch what happens. Change a weight only if you can name the problem. For example, if a reporting schema depends on fresh statistics and analyze keeps losing to vacuum work, raising `autovacuum_analyze_score_weight` to 2.0 doubles that component. Remember that scores only affect order inside a worker's list. If autovacuum cannot keep up in general, change capacity instead, with `autovacuum_max_workers` and the cost settings, as our [autovacuum tuning guide](/blog/postgres-vacuum-and-autovacuum-tuning) explains.
+
+Our [Autovacuum Calculator](https://chat2db.ai/tools/postgres-autovacuum-calculator) can help you estimate when a table will be vacuumed under given thresholds.
+
+## A Short Rollout Plan
+
+1. Upgrade a test server, and set `log_autovacuum_min_duration = 0`.
+2. Find tables whose vacuum runs are long, and check whether the time goes to indexes.
+3. Set `autovacuum_max_parallel_workers = 2`, which needs only a reload.
+4. Compare the elapsed time and I/O in the log for the same table.
+5. Raise the cap only if the numbers justify it, and use the table setting to exclude tables that do not benefit.
+6. Watch `pg_stat_autovacuum_scores` for a few days before changing any weight.
+
+For the rest of the release, see [PostgreSQL 19 new features](/blog/postgres-19-new-features).
+
+## Watch Vacuum from One Place
+
+Vacuum tuning is mostly reading: logs, views and table sizes. [Chat2DB](https://chat2db.ai/download) lets you save queries such as the scores view above, compare results across servers, and chart them over time. Its AI assistant can explain an autovacuum log entry or suggest settings for a specific table. You can also use it in the browser at [app.chat2db.ai](https://app.chat2db.ai/).

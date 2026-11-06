@@ -1,0 +1,183 @@
+---
+title: "PostgreSQL 19 New Features: Tested on RC1"
+description: "What is really in PostgreSQL 19: REPACK, plan advice, parallel autovacuum and WAIT, tested on RC1, plus the features that were reverted, such as SQL/PGQ."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: November 5, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# PostgreSQL 19 New Features: Tested on RC1
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="November 5, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+PostgreSQL 19 is close. RC1 came out on October 15, 2026, a second release candidate is planned for November 12, and general availability is planned for November 19, assuming nothing delays it.
+
+There is a catch if you read about this release during the summer: several headline features from the beta were removed before the release candidate. Plenty of articles still describe them as if they shipped, including SQL/PGQ graph queries. So we installed 19rc1 and ran each feature instead of relying on a list. This article covers what works on RC1, what is gone, and what we think matters most. Since RC1 is not the final release, details can still change.
+
+## What Was Removed Before RC1
+
+Start here, because this is where most existing write-ups are wrong. We tried each of these on 19rc1, and all of them failed:
+
+| Feature | What we ran | Result on 19rc1 |
+| --- | --- | --- |
+| SQL/PGQ property graphs | `CREATE PROPERTY GRAPH g VERTEX TABLES (t);` | `syntax error at or near "PROPERTY"` |
+| Temporal updates | `UPDATE t FOR PORTION OF x FROM 1 TO 2 SET ...` | `syntax error at or near "FOR"` |
+| `GROUP BY ALL` | `SELECT id, count(*) FROM t GROUP BY ALL;` | `syntax error at or near ";"` |
+| Partition split | `ALTER TABLE p SPLIT PARTITION ...` | `syntax error at or near "SPLIT"` |
+| Role DDL function | `SELECT pg_get_role_ddl('postgres');` | `function pg_get_role_ddl(unknown) does not exist` |
+
+Community reports also list online data checksums and some `pg_dumpall` output formats among the reverted items. They are absent from the overview in the official release notes too. Those notes list REPACK, plan advice, performance work, logical replication changes, `WAIT` and parallel autovacuum, and SQL/PGQ does not appear. If your plans depend on graph queries in PostgreSQL 19, treat them as gone, and look to a later release.
+
+## REPACK: VACUUM FULL Gets a Better Name and a Concurrent Mode
+
+`REPACK` is a new command that rewrites a table to return space to the operating system:
+
+```sql
+REPACK orders;
+REPACK orders USING INDEX orders_created_at_idx;
+REPACK (CONCURRENTLY) orders;
+```
+
+The plain form does the job of `VACUUM FULL`, and the `USING INDEX` form does the job of `CLUSTER`. Both of those commands remain. The news is `CONCURRENTLY`, which keeps writes running for almost the whole rewrite, so you may no longer need the `pg_repack` extension.
+
+It is not free of blocking, though. Under a write load on a 795 MB table, `VACUUM FULL` stalled writers for 16.1 seconds, while `REPACK (CONCURRENTLY)` stalled them for between 1.3 and 5.7 seconds across runs, during the final swap. It also has a real sharp edge: a transaction holding an older snapshot can see the table as empty. In our test, such a transaction counted 0 rows out of 1,000.
+
+Our [REPACK comparison](/blog/postgres-19-repack-concurrently) has the full numbers and restrictions, and you should read that warning before you use it on production.
+
+## pg_plan_advice: Planner Control, Officially
+
+For the first time, PostgreSQL ships an official way to influence plans. `pg_plan_advice` is a contrib module with a small language for join order, join method, scan method and parallelism:
+
+```sql
+LOAD 'pg_plan_advice';
+
+EXPLAIN (COSTS OFF, PLAN_ADVICE)
+SELECT * FROM orders o WHERE status = 'open' AND customer_id = 5;
+```
+
+`EXPLAIN` then prints the advice that would reproduce the plan, and you can apply your own with a setting:
+
+```sql
+SET pg_plan_advice.advice = 'INDEX_SCAN(o pa.orders_customer)';
+```
+
+The result tells you whether each piece of advice worked:
+
+```text
+ Index Scan using orders_customer on orders o
+   Index Cond: (customer_id = 5)
+   Filter: (status = 'open'::text)
+ Supplied Plan Advice:
+   INDEX_SCAN(o orders_customer) /* matched */
+```
+
+A companion module, `pg_stash_advice`, attaches advice to a query ID so that you can fix one bad plan without changing the application. See our [pg_plan_advice guide](/blog/postgres-19-pg-plan-advice) for the syntax, and for the feedback labels that tell you when advice failed silently.
+
+## Parallel Autovacuum and a New Scoring System
+
+Autovacuum can now process a table's indexes in parallel. It is off by default, so you opt in:
+
+```sql
+ALTER SYSTEM SET autovacuum_max_parallel_workers = 4;
+SELECT pg_reload_conf();
+```
+
+The server log then reports the workers:
+
+```text
+parallel workers: index vacuum: 4 planned, 4 launched in total
+```
+
+Autovacuum also changes how it chooses work. Before version 19, tables were processed in `pg_class` order. Now each table gets a score, and the new `pg_stat_autovacuum_scores` view shows it, which is a big step for diagnosing why a table is waiting.
+
+Do not expect miracles on small tables. On a table of one million rows with six indexes, parallel and serial runs both took about 1.1 to 1.25 seconds. Read our [parallel autovacuum guide](/blog/postgres-19-parallel-autovacuum) for the details.
+
+## WAIT: Read Your Own Writes on a Standby
+
+Read replicas have a classic problem. You write to the primary, read from a standby, and your own row is not there yet. PostgreSQL 19 adds a command for that:
+
+```sql
+-- on the primary, after the write
+SELECT pg_current_wal_insert_lsn();
+
+-- on the standby, before the read
+WAIT FOR LSN 'E/4D0147F8' WITH (TIMEOUT '5s');
+```
+
+We tested this on a real standby. With replay running, `WAIT` returned `success` and the row was visible. With replay paused, it failed cleanly:
+
+```text
+ERROR:  timed out while waiting for target LSN E/4D014860 to be replayed;
+        current standby_replay LSN E/4D0147F8
+```
+
+Add the `NO_THROW` option to get the status `timeout` as a result instead of an error, which is easier to handle in application code. There is one restriction to design around. `WAIT` cannot run in a transaction that already holds a snapshot, so a `REPEATABLE READ` transaction that has already run a query gets an error:
+
+```text
+ERROR:  WAIT cannot be executed while the current transaction holds a snapshot
+```
+
+Run it first, before the read transaction starts.
+
+## Logical Replication Changes
+
+Two changes make logical replication much easier to adopt.
+
+First, you no longer need to restart to turn it on. With `wal_level = replica`, the server raises its effective level when it needs logical decoding. The new read-only `effective_wal_level` setting shows the current state. We watched this happen: during a `REPACK (CONCURRENTLY)`, which uses logical decoding internally, it read `logical`, and later it dropped back to `replica` by itself.
+
+Second, sequences can now be replicated, which removes a long-standing chore from logical upgrades:
+
+```sql
+CREATE PUBLICATION all_seq FOR ALL SEQUENCES;
+```
+
+That statement works on RC1, and `pg_publication` shows `puballsequences = t`. We tested only the publication side here. The release notes describe `ALTER SUBSCRIPTION ... REFRESH SEQUENCES` for the subscriber side, which we did not run.
+
+## Smaller Features Worth Knowing
+
+**COPY to JSON.** You can export query results directly as JSON, one object per line, or as a single array with `FORCE_ARRAY`:
+
+```sql
+COPY (SELECT 1 AS a, 'x' AS b) TO STDOUT (FORMAT json);
+```
+
+```text
+{"a":1,"b":"x"}
+```
+
+**New monitoring views.** `pg_stat_lock` adds lock statistics, and `pg_stat_recovery` shows replay state on a standby.
+
+**I/O worker scaling.** The number of I/O workers now adjusts automatically between `io_min_workers` (default 2) and `io_max_workers` (default 8). This replaces `io_workers` from version 18.
+
+**Eager aggregation.** The new `enable_eager_aggregate` setting appears in the parameter list, and the planner can push aggregation below a join. Our generated plans in the plan advice tests did show a `Partial HashAggregate` beneath a nested loop.
+
+**Password expiry warnings.** `password_expiration_warning_threshold` warns users as a password nears expiry, seven days ahead by default.
+
+**TLS SNI.** Server-side SNI, configured through `hosts_file` and the `ssl_sni` setting, is in the parameter list. We did not test it.
+
+## Defaults That Changed
+
+A major upgrade can change behavior with no line in your configuration. We compared `pg_settings` between 18.6 and 19rc1:
+
+| Parameter | PostgreSQL 18 | PostgreSQL 19 |
+| --- | --- | --- |
+| `jit` | `on` | `off` |
+| `log_lock_waits` | `off` | `on` |
+| `max_locks_per_transaction` | `64` | `128` |
+| `default_toast_compression` | `pglz` | `lz4` |
+
+The JIT change is the one most likely to affect analytical workloads. You will find these, and the settings that now stop the server from starting, in our [PostgreSQL 19 upgrade guide](/blog/postgres-19-upgrade-breaking-changes).
+
+## Should You Upgrade?
+
+Test RC1 now, and wait for the GA release, and probably the first minor release, before moving production. The release team deliberately moved GA to November so that a large batch of fixes could land in version 19 first.
+
+To prepare, run your `postgresql.conf` through our [postgresql.conf Diff tool](https://chat2db.ai/tools/postgresql-conf-diff), which compares your file against the version 19 parameter list and flags anything that would stop the server. For a feature-by-feature view of the previous release, see [PostgreSQL 18 new features](/blog/postgres-18-new-features).
+
+## Try the New Features in a Client
+
+Most of this release is easier to explore with a good SQL client. [Chat2DB](https://chat2db.ai/download) connects to PostgreSQL 19 like any other version, shows `EXPLAIN` output next to your query, and lets you browse new views such as `pg_stat_autovacuum_scores`. Its AI assistant can also explain a plan or draft plan advice for you. It also runs in the browser at [app.chat2db.ai](https://app.chat2db.ai/).

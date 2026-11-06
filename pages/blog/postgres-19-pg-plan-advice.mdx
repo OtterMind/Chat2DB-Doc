@@ -1,0 +1,321 @@
+---
+title: "pg_plan_advice: Query Plan Hints in PostgreSQL 19"
+description: "Use pg_plan_advice in PostgreSQL 19 to control join order, join method and scans, read its feedback, and pin plans by query ID with pg_stash_advice."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: November 5, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# pg_plan_advice: Query Plan Hints in PostgreSQL 19
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="November 5, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+For years the PostgreSQL answer to "how do I force this plan?" was that you can't, you should fix your statistics, or you should install `pg_hint_plan`. PostgreSQL 19 changes that. It ships `pg_plan_advice`, a contrib module with a small language for describing and constraining plans, and `pg_stash_advice`, which applies that advice automatically by query ID.
+
+This guide shows how to use both. We ran everything on PostgreSQL 19rc1 against a one-million-row `orders` table and a 100,000-row `customers` table, and all of the plans below are real output. RC1 is not the final release, so check the release notes after GA.
+
+## Setup
+
+The module is part of contrib, and you can load it in three ways:
+
+```sql
+-- one session only
+LOAD 'pg_plan_advice';
+```
+
+```text
+# all sessions, in postgresql.conf, followed by a restart
+shared_preload_libraries = 'pg_plan_advice'
+```
+
+There is also `session_preload_libraries`, which applies to new sessions. Once the module is loaded, `EXPLAIN` gains a `PLAN_ADVICE` option. No `CREATE EXTENSION` is needed for `pg_plan_advice`.
+
+Here is the schema for the examples:
+
+```sql
+CREATE TABLE customers (id int PRIMARY KEY, region text, tier text);
+CREATE TABLE orders (
+  id bigint PRIMARY KEY,
+  customer_id int REFERENCES customers,
+  status text,
+  total numeric,
+  created_at timestamptz
+);
+CREATE INDEX orders_customer ON orders (customer_id);
+CREATE INDEX orders_status   ON orders (status);
+CREATE INDEX customers_tier  ON customers (tier);
+```
+
+## Step 1: Generate Advice from a Plan
+
+Start by asking PostgreSQL to describe the plan it chose:
+
+```sql
+EXPLAIN (COSTS OFF, PLAN_ADVICE)
+SELECT c.region, sum(o.total)
+FROM customers c JOIN orders o ON o.customer_id = c.id
+WHERE c.tier = 'gold'
+GROUP BY c.region;
+```
+
+```text
+ Finalize GroupAggregate
+   Group Key: c.region
+   ->  Gather Merge
+         Workers Planned: 2
+         ->  Sort
+               Sort Key: c.region
+               ->  Partial HashAggregate
+                     Group Key: c.region
+                     ->  Hash Join
+                           Hash Cond: (o.customer_id = c.id)
+                           ->  Parallel Seq Scan on orders o
+                           ->  Hash
+                                 ->  Index Scan using customers_tier on customers c
+                                       Index Cond: (tier = 'gold'::text)
+ Generated Plan Advice:
+   JOIN_ORDER(o c)
+   HASH_JOIN(c)
+   SEQ_SCAN(o)
+   INDEX_SCAN(c pa.customers_tier)
+   GATHER_MERGE((c o))
+```
+
+Those five lines are a compact description of the plan. Save this output when a query is running well. If the plan changes later, you can compare the advice text instead of two long plans, or apply it to bring the old plan back. That alone makes this feature useful, even if you never force anything.
+
+## Step 2: Apply Advice
+
+Set the advice for your session with `pg_plan_advice.advice`. The targets are table aliases, so here `c` and `o`:
+
+```sql
+SET pg_plan_advice.advice = 'SEQ_SCAN(c) HASH_JOIN(o)';
+
+EXPLAIN (COSTS OFF)
+SELECT c.region, sum(o.total)
+FROM customers c JOIN orders o ON o.customer_id = c.id
+WHERE c.tier = 'gold'
+GROUP BY c.region;
+```
+
+```text
+ HashAggregate
+   Group Key: c.region
+   ->  Hash Join
+         Hash Cond: (c.id = o.customer_id)
+         ->  Seq Scan on customers c
+               Filter: (tier = 'gold'::text)
+         ->  Hash
+               ->  Seq Scan on orders o
+ Supplied Plan Advice:
+   SEQ_SCAN(c) /* matched */
+   HASH_JOIN(o) /* matched */
+```
+
+The plan changed, and `EXPLAIN` confirms both pieces of advice. A join method tag names the relation on the inner side of the join, which is why `HASH_JOIN(o)` put `orders` under the `Hash` node.
+
+Join order works the same way. This makes `orders` the driving table, with a plain nested loop into `customers`:
+
+```sql
+SET pg_plan_advice.advice = 'JOIN_ORDER(o c) NESTED_LOOP_PLAIN(c)';
+```
+
+```text
+ ->  Nested Loop
+       ->  Partial HashAggregate
+             Group Key: o.customer_id
+             ->  Parallel Seq Scan on orders o
+       ->  Index Scan using customers_pkey on customers c
+             Index Cond: (id = o.customer_id)
+             Filter: (tier = 'gold'::text)
+```
+
+## The Advice Tags
+
+| Purpose | Tags |
+| --- | --- |
+| Scan method | `SEQ_SCAN`, `INDEX_SCAN`, `INDEX_ONLY_SCAN`, `BITMAP_HEAP_SCAN`, `TID_SCAN`, `DO_NOT_SCAN`, `FOREIGN_JOIN` |
+| Join order | `JOIN_ORDER` |
+| Join method | `HASH_JOIN`, `NESTED_LOOP_PLAIN`, `NESTED_LOOP_MATERIALIZE`, `NESTED_LOOP_MEMOIZE`, `MERGE_JOIN_PLAIN`, `MERGE_JOIN_MATERIALIZE` |
+| Parallelism | `GATHER`, `GATHER_MERGE`, `NO_GATHER` |
+| Other | `PARTITIONWISE`, `SEMIJOIN_UNIQUE`, `SEMIJOIN_NON_UNIQUE` |
+
+Index tags take the table alias and an index name. For example, this query normally uses `orders_customer`, and advice can choose another index:
+
+```sql
+SET pg_plan_advice.advice = 'INDEX_SCAN(o orders_status)';
+
+EXPLAIN (COSTS OFF)
+SELECT * FROM orders o WHERE status = 'open' AND customer_id = 5;
+```
+
+```text
+ Gather
+   Workers Planned: 2
+   ->  Parallel Index Scan using orders_status on orders o
+         Index Cond: (status = 'open'::text)
+         Filter: (customer_id = 5)
+```
+
+This is a useful warning, since the advice applied exactly as asked and produced a clearly worse plan. Advice constrains the planner's choices. It does not judge them.
+
+To turn off parallelism for one table, use `NO_GATHER`. It removed the `Gather` node in our test, and the plan became a plain aggregate over a sequential scan:
+
+```sql
+SET pg_plan_advice.advice = 'NO_GATHER(o)';
+```
+
+## Read the Feedback, Because Failures Are Quiet
+
+Bad advice does not raise an error. The query still runs, and the only sign of a problem is the comment in `EXPLAIN`. We gave it four deliberate mistakes in one string:
+
+```sql
+SET pg_plan_advice.advice =
+  'INDEX_SCAN(o no_such_index) HASH_JOIN(zz) SEQ_SCAN(c) INDEX_SCAN(c customers_pkey)';
+```
+
+```text
+ Supplied Plan Advice:
+   INDEX_SCAN(o no_such_index) /* matched, inapplicable, failed */
+   SEQ_SCAN(c) /* matched, conflicting, failed */
+   INDEX_SCAN(c customers_pkey) /* matched, conflicting */
+   HASH_JOIN(zz) /* not matched */
+```
+
+Here is how to read those labels:
+
+| Label | Meaning |
+| --- | --- |
+| `matched` | The targets were seen and the advice could be applied |
+| `partially matched` | Only some targets were found, or they were not together |
+| `not matched` | No target was found, often a wrong alias |
+| `inapplicable` | The tag cannot apply, such as a missing index |
+| `conflicting` | Two pieces of advice disagree |
+| `failed` | The final plan does not follow the advice |
+
+The alias problem is the one to watch. If someone rewrites a query and changes the alias, the advice stops applying with no error:
+
+```text
+ Index Scan using orders_pkey on orders x
+   Index Cond: (id = 1)
+ Supplied Plan Advice:
+   SEQ_SCAN(o) /* not matched */
+```
+
+To catch this outside of `EXPLAIN`, turn on warnings:
+
+```sql
+SET pg_plan_advice.feedback_warnings = on;
+SET pg_plan_advice.advice = 'INDEX_SCAN(o no_such_index)';
+SELECT count(*) FROM orders o WHERE id = 1;
+```
+
+```text
+WARNING:  supplied plan advice was not enforced
+DETAIL:  advice INDEX_SCAN(o no_such_index) feedback is "matched, inapplicable, failed"
+```
+
+Syntax errors are different, and those do fail immediately when you set the value:
+
+```text
+ERROR:  invalid value for parameter "pg_plan_advice.advice": "HASHJOIN(o)"
+DETAIL:  Could not parse advice: syntax error at or near "HASHJOIN"
+```
+
+## What Advice Cannot Do
+
+Advice only chooses among plans the planner already considers possible. It cannot make an impossible plan appear. Asking for an index scan on a query with no usable condition gives you this:
+
+```text
+ Seq Scan on customers c
+   Disabled: true
+ Supplied Plan Advice:
+   INDEX_SCAN(c customers_pkey) /* matched, failed */
+```
+
+`Disabled: true` is the sign that the planner had no compliant plan. The documentation warns that such plans can be much worse than the unadvised plan, so check the output every time.
+
+The documentation also lists these limits: you cannot control hash versus sort aggregation, you cannot control set operations such as `UNION`, and join advice is only probabilistic when the genetic optimizer (GEQO) is in use.
+
+## Apply Advice Without Touching the Application
+
+`SET` works for one session, but a bad plan in production usually comes from an application you can't change quickly. That is the job of `pg_stash_advice`. It stores advice in shared memory, keyed by query ID, and applies it when a matching query is planned.
+
+Load it, then create the extension and a stash:
+
+```text
+shared_preload_libraries = 'pg_plan_advice,pg_stash_advice'
+```
+
+```sql
+CREATE EXTENSION pg_stash_advice;
+SELECT pg_create_advice_stash('prod_stash');
+```
+
+Get the query ID from `EXPLAIN (VERBOSE)`, which prints a `Query Identifier` line, then store the advice under that ID:
+
+```sql
+SELECT pg_set_stashed_advice(
+  'prod_stash',
+  -8652711852078276978,
+  'INDEX_SCAN(o pa.orders_status)'
+);
+
+SELECT * FROM pg_get_advice_stash_contents('prod_stash');
+```
+
+```text
+ stash_name |       query_id       |         advice_string
+------------+----------------------+--------------------------------
+ prod_stash | -8652711852078276978 | INDEX_SCAN(o pa.orders_status)
+```
+
+The stash only applies to sessions that select it. You can set `pg_stash_advice.stash_name` per session, or per role or database:
+
+```sql
+SET pg_stash_advice.stash_name = 'prod_stash';
+EXPLAIN (COSTS OFF)
+SELECT * FROM pa.orders o WHERE status = 'open' AND customer_id = 5;
+```
+
+```text
+ Gather
+   Workers Planned: 2
+   ->  Parallel Index Scan using orders_status on orders o
+ Supplied Plan Advice:
+   INDEX_SCAN(o pa.orders_status) /* matched */
+```
+
+A query ID ignores constant values. In our test, the same query with `customer_id = 6` picked up the advice too. That is what you want for a parameterized query, but it also means you are pinning a plan for every value. A plan that suits one customer may be wrong for another.
+
+Remove an entry by passing `NULL`, and remove the stash with `pg_drop_advice_stash`:
+
+```sql
+SELECT pg_set_stashed_advice('prod_stash', -8652711852078276978, NULL);
+SELECT pg_drop_advice_stash('prod_stash');
+```
+
+## pg_plan_advice vs pg_hint_plan
+
+`pg_hint_plan` puts hints in SQL comments and has been the standard answer for years. The main practical differences are where advice lives and the feedback. `pg_plan_advice` works from a setting or a stash, so you do not edit queries, and it reports whether each item applied. It also ships with PostgreSQL. We did not test `pg_hint_plan` for this article, so check its own documentation for coverage of your version.
+
+## Three Practical Workflows
+
+**Keep a baseline.** Run `EXPLAIN (COSTS OFF, PLAN_ADVICE)` on your most important queries and store the generated advice in version control. It is short and readable, so a later diff shows exactly what moved, for example a `HASH_JOIN` that became a `NESTED_LOOP_PLAIN` after a statistics change. This is useful before a major version upgrade, when many plans can change at once.
+
+**Test an alternative.** Before you add an index or rewrite a query, use advice to see what the planner would do with a different join order or scan, and run `EXPLAIN ANALYZE` to compare real timings. Costs tell you what the planner thinks, and the timings tell you whether it was right.
+
+**Stop the bleeding.** When a plan flips in production, copy the good plan's advice from your baseline, keep only the item that matters, and put it in a stash. Then find the root cause while the stash holds the line.
+
+Two more settings help here. `pg_plan_advice.always_explain_supplied_advice` is on by default and controls whether `EXPLAIN` always shows supplied advice. `pg_plan_advice.always_store_advice_details` lets `EXPLAIN EXECUTE` show details for prepared statements, at some cost, so enable it only in the session that needs it.
+
+## When to Use It
+
+Use advice as a temporary fix, or as a way to study a plan. The right permanent fix is usually better statistics, a better index or a rewritten query, and our guides to [reading EXPLAIN ANALYZE](/blog/postgres-explain-analyze-query-plans) and [planner statistics](/blog/postgres-analyze-and-planner-statistics) cover those. A pinned plan cannot adapt when the data changes, so review each stash entry regularly, and keep advice strings short. Copy only the items you need instead of pasting the whole generated block. The documentation also notes that using advice has a cost, even when the plan does not change.
+
+## See Plans Side by Side
+
+Comparing plans is where a good client helps most. [Chat2DB](https://chat2db.ai/download) lets you run `EXPLAIN` with and without advice in separate tabs, keep the generated advice with your saved queries, and ask its AI assistant why the planner chose a particular join. You can also try it in the browser at [app.chat2db.ai](https://app.chat2db.ai/).

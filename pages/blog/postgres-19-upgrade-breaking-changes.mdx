@@ -1,0 +1,230 @@
+---
+title: "PostgreSQL 19 Upgrade: What Breaks, How to Check"
+description: "Prepare for PostgreSQL 19: settings that stop the server from starting, removed parameters, changed defaults such as JIT off, and how to test. Checked on RC1."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: November 5, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# PostgreSQL 19 Upgrade: What Breaks, How to Check
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="November 5, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+PostgreSQL 19 is planned for general availability on November 19, 2026. Most upgrades will be uneventful, but this release has some changes that fail hard, including a parameter that was new in version 18 and now stops the server from starting.
+
+We checked the items below on PostgreSQL 19rc1, by starting real servers with each setting and by comparing `pg_settings` between versions. We tested settings, defaults and SQL behavior on RC1, but we did not run a full `pg_upgrade` from a production-like cluster for this article, so rehearse that yourself. RC1 is not the final release, and items can still change.
+
+## How Major Upgrades Work
+
+A major upgrade needs one of three methods: `pg_upgrade`, `pg_dump` and restore, or logical replication. All three have one thing in common: your new cluster has its own `postgresql.conf`. You usually carry your old settings over by hand, and that is where the first failure appears. Our [pg_upgrade guide](/blog/postgres-pg-upgrade-guide) covers the mechanics, and this article covers what is specific to version 19.
+
+## Settings That Stop the Server from Starting
+
+PostgreSQL refuses to start if `postgresql.conf` contains an unknown parameter. We added each of these lines to a new 19rc1 cluster and ran `pg_ctl start`.
+
+### io_workers
+
+This is the one most likely to catch you, since it appeared only one release ago:
+
+```text
+LOG:  unrecognized configuration parameter "io_workers" in file "postgresql.conf" line 934
+FATAL:  configuration file "postgresql.conf" contains errors
+```
+
+PostgreSQL 19 replaces it with two settings, because the number of I/O workers now scales automatically. Remove `io_workers` and use these:
+
+```text
+io_min_workers = 2      # default
+io_max_workers = 8      # default
+```
+
+### escape_string_warning
+
+This parameter was removed too, and it gives the same error:
+
+```text
+LOG:  unrecognized configuration parameter "escape_string_warning" in file "postgresql.conf" line 934
+FATAL:  configuration file "postgresql.conf" contains errors
+```
+
+### standard_conforming_strings = off
+
+The parameter still exists, but it is now always on, and setting it to `off` also stops the server:
+
+```text
+LOG:  non-standard string literals are not supported
+FATAL:  configuration file "postgresql.conf" contains errors
+```
+
+Inside a session, `SET standard_conforming_strings = off` returns the same error. If your application depends on backslash escapes in ordinary strings, change it to use `E'...'` strings before you upgrade.
+
+There is a related warning for dumps. According to the release notes, a dump made by an older `pg_dump` with `standard_conforming_strings = off` will not load correctly into version 19. Use the version 19 `pg_dump`, or dump with the setting on.
+
+### Parameters Removed in Earlier Versions
+
+If you are jumping several versions, you collect all of the removals along the way. These parameters are absent from the 19rc1 parameter list, based on our comparison of `pg_settings` across versions 14 to 19:
+
+| Removed in | Parameter |
+| --- | --- |
+| 15 | `stats_temp_directory` |
+| 16 | `force_parallel_mode`, `promote_trigger_file`, `vacuum_defer_cleanup_age` |
+| 17 | `db_user_namespace`, `old_snapshot_threshold`, `trace_recovery_messages` |
+| 19 | `escape_string_warning`, `io_workers` |
+
+We confirmed the failure directly for `force_parallel_mode`, `stats_temp_directory` and `promote_trigger_file`. Some old names survive as aliases, though. `sort_mem`, `vacuum_mem` and `ssl_ecdh_curve` are not listed in `pg_settings`, and they were still accepted on 19rc1.
+
+Extension parameters with a dot, such as `pg_stat_statements.max`, do not stop the server when the extension is not loaded. A made-up `myext.setting = 1` started normally.
+
+The quickest way to find these problems is to run your config through our [postgresql.conf Diff tool](https://chat2db.ai/tools/postgresql-conf-diff). Paste the same file into both boxes, choose your current version for A and 19 for B, and it lists every line that would fail, using parameter data exported from real servers. You can also copy the file into a scratch 19 cluster and run `pg_ctl start`, which gives you the real error for the first bad line.
+
+## Defaults That Change with No Warning
+
+These are harder to spot, because nothing fails. We compared `pg_settings` on 18.6 and 19rc1, and four defaults changed.
+
+### jit Is Now off
+
+```sql
+SHOW jit;
+-- off
+```
+
+JIT was on by default before, and it activated based on cost estimates. The release notes say that this costing proved unreliable, so it is now off. Many short queries will benefit. Large analytical queries that gained from JIT may slow down, so compare them, and enable it for those workloads:
+
+```sql
+ALTER ROLE reporting SET jit = on;
+```
+
+### log_lock_waits Is Now on
+
+Sessions that wait longer than `deadlock_timeout` for a lock now write a log line. This is useful, but on a busy system with heavy lock contention, your log volume can grow. Check it in testing.
+
+### max_locks_per_transaction Is Now 128
+
+The default went from 64 to 128, because lock memory allocation changed. The release notes say that settings must effectively be doubled to match the capacity of earlier versions. So if you set this by hand, double your value when you carry it over. A system with thousands of partitions is where this matters. If you relied on the default, you already have the new one.
+
+### default_toast_compression Is Now lz4
+
+New values in TOAST columns use LZ4 instead of pglz, on builds that include LZ4 support. Existing data stays as it is. If you build from source, check that LZ4 support is enabled.
+
+If you are coming from an older version, more defaults have changed along the way. Here are the differences from 14 to 19, for settings you have not set:
+
+| Parameter | 14 | 19 |
+| --- | --- | --- |
+| `hash_mem_multiplier` | 1 | 2 |
+| `effective_io_concurrency` | 1 | 16 |
+| `maintenance_io_concurrency` | 10 | 16 |
+| `log_checkpoints` | off | on |
+| `log_autovacuum_min_duration` | -1 | 600000 |
+
+The `log_autovacuum_min_duration` value is in milliseconds, which is ten minutes.
+
+## SQL and Behavior Changes
+
+We ran each of these on 19rc1:
+
+**`json_array()` with an empty subquery** now returns an empty array. Before, it returned NULL:
+
+```sql
+SELECT json_array(SELECT 1 WHERE false);
+-- []
+```
+
+Code that checks for NULL here will take a different branch.
+
+**`COPY FROM ... WHERE` rejects system columns:**
+
+```text
+ERROR:  system columns are not supported in COPY FROM WHERE conditions
+DETAIL:  Column "tableoid" is a system column.
+```
+
+**Role names can't contain line breaks.** The rule also covers database and tablespace names, and the release notes say `pg_upgrade` refuses such clusters:
+
+```text
+ERROR:  role name "a
+b" contains a newline or carriage return character
+```
+
+Check for these ahead of time:
+
+```sql
+SELECT rolname FROM pg_roles WHERE rolname ~ E'[\\r\\n]';
+SELECT datname FROM pg_database WHERE datname ~ E'[\\r\\n]';
+SELECT spcname FROM pg_tablespace WHERE spcname ~ E'[\\r\\n]';
+```
+
+**MD5 passwords now warn.** Creating one prints a deprecation warning:
+
+```text
+WARNING:  setting an MD5-encrypted password
+DETAIL:  MD5 password support is deprecated and will be removed in a future release of PostgreSQL.
+```
+
+The release notes say a warning also follows a successful MD5 login, which you can silence with `md5_password_warnings`. Some drivers may log or surface it, so this is a good time to finish a [migration from MD5 to SCRAM](/blog/postgres-md5-to-scram-sha-256-migration).
+
+## Monitoring Queries to Update
+
+Dashboards and exporters are easy to forget. Two names changed:
+
+```sql
+-- pg_stat_subscription_stats: sync_error_count is gone
+SELECT subname, sync_table_error_count, sync_seq_error_count
+FROM pg_stat_subscription_stats;
+```
+
+The wait event type `BufferPin` also changed. On RC1, `pg_wait_events` lists a type called `Buffer`. Update any query or alert that filters on the old name. Our [Prometheus exporter guide](/blog/postgres-exporter-prometheus-grafana) may be a useful place to start if you use that stack, but check your exporter's own release notes too.
+
+## Other Items from the Release Notes
+
+We did not test these, but they are in the official list, so check whether they apply to you:
+
+- RADIUS authentication was removed, so any `radius` line in `pg_hba.conf` needs a replacement.
+- The `MULE_INTERNAL` encoding was removed. Databases that use it need a dump and restore into another encoding.
+- `btree_gist` no longer provides the default opclass for `inet` and `cidr`, and `pg_upgrade` refuses clusters with those `btree_gist` indexes. On RC1, a new GiST index on `inet` used `inet_ops`.
+- `READ ONLY` and `DEFERRABLE` status now passes to `postgres_fdw` sessions, so a read-only transaction can no longer change remote rows through a foreign table.
+- `psql`'s `\crosstabview` now honors `\pset null`.
+
+Query the catalogs for the two that are easy to check:
+
+```sql
+SELECT type, auth_method, line_number
+FROM pg_hba_file_rules
+WHERE auth_method = 'radius';
+
+SELECT datname, pg_encoding_to_char(encoding)
+FROM pg_database
+WHERE pg_encoding_to_char(encoding) = 'MULE_INTERNAL';
+```
+
+## Extensions and Drivers
+
+An upgrade needs each extension to have a build for version 19. In our test, packages were already available for some, such as `pg_repack`, on the PGDG testing repository, but do not assume yours are. List what you use:
+
+```sql
+SELECT extname, extversion FROM pg_extension ORDER BY extname;
+```
+
+For each one, confirm a version 19 package exists, then test it. Connection poolers, CDC tools and backup software all need the same check.
+
+## An Upgrade Checklist
+
+1. Read the final release notes after GA, since this article is based on RC1.
+2. Compare your `postgresql.conf` with version 19 and fix each failure.
+3. Run the catalog checks above for names and encodings.
+4. List your extensions and confirm that version 19 builds exist.
+5. Build a test cluster from a recent backup.
+6. Run `pg_upgrade --check`, then a real upgrade on the copy.
+7. Compare key query plans and timings, especially analytical ones, now that JIT is off.
+8. Double any custom `max_locks_per_transaction`.
+9. Update dashboards for the renamed columns and wait events.
+10. Run `ANALYZE` after `pg_upgrade`, then decide when to switch production.
+
+Do not rush into the first release. The project moved GA to November specifically to fold in a large batch of fixes, and waiting for the first minor release is a reasonable policy for most production systems. You can read what you gain in [PostgreSQL 19 new features](/blog/postgres-19-new-features).
+
+## Compare Both Versions Side by Side
+
+The most valuable step in this list is comparing behavior on the old and new versions, and that is much easier from a single client. [Chat2DB](https://chat2db.ai/download) connects to both servers at once, so you can run the same query and `EXPLAIN` on each, compare the catalog checks above, and keep them as saved queries for the next upgrade. It also runs in the browser at [app.chat2db.ai](https://app.chat2db.ai/).

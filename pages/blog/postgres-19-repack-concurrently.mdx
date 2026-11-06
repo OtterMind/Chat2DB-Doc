@@ -1,0 +1,204 @@
+---
+title: "REPACK vs VACUUM FULL vs pg_repack in Postgres 19"
+description: "PostgreSQL 19 REPACK compared with VACUUM FULL and pg_repack: measured write stalls, restrictions, and why CONCURRENTLY can show old snapshots an empty table."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: November 5, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# REPACK vs VACUUM FULL vs pg_repack in Postgres 19
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="November 5, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+Table bloat has always had an awkward solution. `VACUUM FULL` gives space back but blocks everything while it runs, and `pg_repack` avoids most of the blocking but is a third-party extension. PostgreSQL 19 adds a built-in option, `REPACK`, with a `CONCURRENTLY` mode.
+
+The obvious question is whether you can now stop using the other two. We tested this on PostgreSQL 19rc1 under a write load. The short answer is that `REPACK (CONCURRENTLY)` is a big improvement, but it is not lock-free, it has a dangerous MVCC side effect, and it has restrictions you need to check first. RC1 is not the final release, so re-test your own workload after GA.
+
+## The Problem: VACUUM Does Not Shrink Tables
+
+Plain `VACUUM` marks dead space as reusable, but it rarely returns that space to the operating system. Here is what that looks like on a table of two million rows after deleting 90% of them:
+
+```sql
+CREATE TABLE rp (
+  id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  k int,
+  payload text
+);
+INSERT INTO rp (k, payload)
+SELECT i % 1000, repeat('x', 200) FROM generate_series(1, 2000000) i;
+CREATE INDEX rp_k ON rp (k);
+
+DELETE FROM rp WHERE id % 10 <> 0;
+VACUUM rp;
+
+SELECT pg_size_pretty(pg_table_size('rp')) AS table_size;
+```
+
+```text
+ table_size
+------------
+ 474 MB
+```
+
+After `VACUUM`, the table is still 474 MB, the same as before the delete. Reclaiming that requires rewriting the table. Each of the rewrite methods brought the total size, with indexes, from about 530 MB to about 60 MB:
+
+| Method | Size after |
+| --- | --- |
+| `VACUUM FULL` | 57 MB |
+| `REPACK` | 58 MB |
+| `REPACK (CONCURRENTLY)` | 60 MB |
+| `pg_repack` 1.5.3 | 60 MB |
+
+So all of them do the job. The difference is what happens to your application meanwhile.
+
+## The Three Syntaxes
+
+`REPACK` covers two older commands:
+
+```sql
+REPACK orders;                       -- like VACUUM FULL
+REPACK orders USING INDEX orders_k;  -- like CLUSTER
+REPACK (CONCURRENTLY) orders;        -- keeps writes running
+REPACK (VERBOSE, ANALYZE) orders;    -- rewrite, then update statistics
+```
+
+`VACUUM FULL` and `CLUSTER` both remain. With `USING INDEX` and no index name, `REPACK` reuses the table's clustering index. We confirmed that `REPACK tb1 USING INDEX tb1_k` wrote rows in index order and set `indisclustered`, and that a later `REPACK (CONCURRENTLY) tb1 USING INDEX` kept that order.
+
+Running `REPACK` with no table processes every table you have `MAINTAIN` on. The privilege is enough: a role with only `GRANT MAINTAIN ON tb1` could run it, and a role without it got `permission denied for table tb1`.
+
+## How Much Do Writes Actually Stall?
+
+This is the test that matters. We used a table of three million rows, 795 MB with indexes and little bloat, so that each rewrite had real work to do. While it ran, four `pgbench` clients updated random rows at full speed. We recorded how long the rewrite took and the longest time any single write waited. This was on a laptop with PostgreSQL 19rc1 built from source, so compare the methods with each other and do not read the times as absolute numbers.
+
+| Method | Rewrite took | Longest write stall |
+| --- | --- | --- |
+| `VACUUM FULL` | 16.5 s | 16.1 s |
+| `REPACK` | 11.7 s | 11.4 s |
+| `REPACK (CONCURRENTLY)`, run 1 | 9.6 s | 5.7 s |
+| `REPACK (CONCURRENTLY)`, run 2 | 8.9 s | 1.3 s |
+
+Plain `REPACK` and `VACUUM FULL` behave the same way: the longest stall roughly equals the whole rewrite, because they hold `ACCESS EXCLUSIVE` from start to finish.
+
+`REPACK (CONCURRENTLY)` is far better, but note the two runs, because the stall is not a fixed cost. It varied by a factor of four on an identical test. We then limited the load to 2,000 transactions per second, which is closer to a normal production table:
+
+| Method, at 2,000 tps | Rewrite took | Longest write stall |
+| --- | --- | --- |
+| `VACUUM FULL` | 5.4 s | 5.4 s |
+| `REPACK (CONCURRENTLY)` | 4.9 s | 1.6 s |
+
+So plan for a stall of a second or more, not zero. Sampling `pg_stat_progress_repack` and `pg_locks` showed where it comes from:
+
+```text
+seq scanning heap    ShareUpdateExclusiveLock
+rebuilding index     ShareUpdateExclusiveLock
+catch-up             ShareUpdateExclusiveLock
+catch-up             AccessExclusiveLock          waiters: 4
+```
+
+Almost the entire run holds only `SHARE UPDATE EXCLUSIVE`, which allows reads and writes. At the very end, it takes `ACCESS EXCLUSIVE` to apply the remaining changes and swap the files, and all four writers queued behind it. The documentation says the lock is typically held for a short time, depending on how many changes accumulated, which matches what we saw.
+
+## The Warning: Old Snapshots Can See an Empty Table
+
+The documentation says `REPACK (CONCURRENTLY)` is not MVCC-safe, and a table can appear empty to transactions using an older snapshot. We tested this, because it sounds alarming.
+
+A `REPEATABLE READ` transaction took its snapshot on an unrelated table, and it had not yet touched `mv`:
+
+```sql
+-- session 1
+BEGIN ISOLATION LEVEL REPEATABLE READ;
+SELECT count(*) FROM other;     -- snapshot taken here
+
+-- session 2
+REPACK (CONCURRENTLY) mv;       -- finishes
+
+-- session 1
+SELECT count(*) FROM mv;
+```
+
+```text
+ count
+-------
+     0
+```
+
+The table has 1,000 rows. A new transaction saw all 1,000. There was no error and no warning, just a wrong answer. With plain `REPACK`, the same test returned 1,000.
+
+The rewritten rows are simply not visible to a snapshot older than the repack. A reader that has already touched the table is protected, because it holds a lock. In our test, `REPACK (CONCURRENTLY)` waited for that transaction to finish before it completed, and the reader kept seeing all of its rows. The risk is limited to long transactions that reach the table for the first time after the swap.
+
+Before running it, look for those transactions:
+
+```sql
+SELECT pid, xact_start, state, left(query, 60) AS query
+FROM pg_stat_activity
+WHERE backend_xmin IS NOT NULL
+  AND xact_start < now() - interval '1 minute'
+ORDER BY xact_start;
+```
+
+Long-running reports and `pg_dump` sessions are the usual suspects. Note that `pg_dump` takes its locks at the start, so it holds a lock on the tables it dumps. The case to worry about is any reporting job that uses a `REPEATABLE READ` transaction and reads tables one by one.
+
+## What REPACK (CONCURRENTLY) Refuses
+
+We ran each of these, and the errors are from RC1:
+
+| Table | Result |
+| --- | --- |
+| No primary key or replica identity index | `Relation "np" has no identity index.` |
+| `REPLICA IDENTITY FULL` | `This operation does not support tables with REPLICA IDENTITY FULL.` |
+| Temporary or unlogged | `This operation is only supported for permanent relations.` |
+| Partitioned parent | `REPACK (CONCURRENTLY) is not supported for partitioned tables` |
+| System catalog | `This operation is not supported for system catalogs.` |
+| Inside `BEGIN` | `REPACK (CONCURRENTLY) cannot run inside a transaction block` |
+
+A table without a primary key can work if it has a replica identity index. After adding a `NOT NULL` unique index and `REPLICA IDENTITY USING INDEX`, the same table repacked normally. For a partitioned table, run the command on each partition, which we confirmed works.
+
+Plain `REPACK` and `REPACK (CONCURRENTLY)` both refuse a table with an invalid index, so clear those first:
+
+```text
+ERROR:  cannot execute REPACK on relation "inv"
+DETAIL:  An invalid index cannot be processed correctly: "inv_v".
+HINT:  Use DROP INDEX or REINDEX.
+```
+
+## Operational Details
+
+**It uses logical decoding, automatically.** While running, it creates a temporary logical slot named like `pg_repack_15910`, using a built-in `pgrepack` plugin. You do not need `wal_level = logical`. With `wal_level = replica`, `effective_wal_level` rose to `logical` during the run, then returned to `replica` on its own. Slots come from `max_repack_replication_slots`, which defaults to 5.
+
+**Only one runs at a time.** When we started a second `REPACK (CONCURRENTLY)` on a different table, it waited on the `RepackWorkerExport` event until the first one finished. The first ended at 2.8 seconds and the second at 6.9, on two equal tables. Plan a queue, not a parallel job.
+
+**DDL has to wait.** `ALTER TABLE ... ADD COLUMN` queued behind it, and with `lock_timeout` set, the DDL failed and the repack carried on. The documentation warns that DDL from other transactions can cause the repack to fail, so avoid migrations while it runs.
+
+**Disk space.** You need free space for a full copy of the table and its indexes, plus storage for changes captured during the run. Check this before you start, because running out of disk mid-rewrite affects everything else on the volume.
+
+**It is not a wraparound tool.** The documentation says to use `VACUUM` for that, since `REPACK` takes longer and can fail late. It also limits concurrent changes to about 104 million updated or deleted rows.
+
+Track progress in the new view:
+
+```sql
+SELECT phase, heap_blks_scanned, heap_blks_total, heap_tuples_inserted
+FROM pg_stat_progress_repack;
+```
+
+## Comparison
+
+| | `VACUUM FULL` | `REPACK` | `REPACK (CONCURRENTLY)` | `pg_repack` |
+| --- | --- | --- | --- | --- |
+| Available in | All versions | 19+ | 19+ | Extension |
+| Blocks writes | Whole run | Whole run | Final swap | Short locks at start and end |
+| Needs a key | No | No | Yes | Yes |
+| Old snapshots see empty table | No | No | Yes | Not tested |
+| Install needed | No | No | No | Yes |
+
+We ran `pg_repack` 1.5.3 on RC1 on the smaller table, and it completed. We left it out of the stall tables, because that run was smaller and shared the server with another job, so a fair comparison would need a new test. For how the extension works, read our [pg_repack guide](/blog/pg-repack-online-bloat-removal).
+
+## Which One Should You Use?
+
+Use `REPACK (CONCURRENTLY)` on PostgreSQL 19 when the table must stay writable, it has a primary key, and you have checked for long transactions. Use plain `REPACK` in a maintenance window, because it is simpler and has no MVCC risk. On older versions, or when you need more control, `pg_repack` remains the choice. And for many tables, the right answer is none of these: fix autovacuum first, as described in our [VACUUM FULL vs VACUUM guide](/blog/postgres-vacuum-full-vs-vacuum).
+
+## Find the Tables Worth Rewriting
+
+The hard part is usually knowing which tables are bloated in the first place. [Chat2DB](https://chat2db.ai/download) can run size and bloat queries across your tables, save them, and show the results next to `pg_stat_progress_repack` while a rewrite is running. Its AI assistant can also write the query to find long transactions before you start. It also runs in the browser at [app.chat2db.ai](https://app.chat2db.ai/).

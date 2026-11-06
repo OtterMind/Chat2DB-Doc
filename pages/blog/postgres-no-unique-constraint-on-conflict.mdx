@@ -1,0 +1,278 @@
+---
+title: "Postgres ON CONFLICT: No Unique Constraint Error"
+description: "Fix PostgreSQL 42P10, no unique or exclusion constraint matching the ON CONFLICT specification: partial, expression, composite and invalid indexes explained."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: November 5, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# Postgres ON CONFLICT: No Unique Constraint Error
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="November 5, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+You write an upsert, it looks correct, and PostgreSQL rejects it before touching a single row:
+
+```text
+ERROR:  there is no unique or exclusion constraint matching the ON CONFLICT specification
+```
+
+The SQLSTATE is `42P10`. The name is misleading, because a unique index often does exist. The real rule is narrower: PostgreSQL must find a valid, non-deferrable unique index whose definition matches your `ON CONFLICT` target exactly. It does not look for an index that is close enough.
+
+We ran every case below on PostgreSQL 18.6. Each one produces the same error text for a different reason, so the fix is to find which mismatch you have.
+
+## Why PostgreSQL Needs the Index
+
+`ON CONFLICT` works by checking a unique index for a conflicting row. The columns in parentheses, called the conflict target, tell PostgreSQL which index to use. This step is called inference, and it happens at planning time, which is why the statement fails on an empty table too. The planner matches your target against the indexes on the table and stops with `42P10` if none qualifies.
+
+Start with the simplest failure, a table with no unique index on `email`:
+
+```sql
+CREATE TABLE users (
+  id         bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  email      text NOT NULL,
+  tenant_id  int,
+  deleted_at timestamptz,
+  name       text
+);
+
+INSERT INTO users (email, name) VALUES ('a@x.io', 'A')
+ON CONFLICT (email) DO NOTHING;
+-- ERROR:  there is no unique or exclusion constraint matching the ON CONFLICT specification
+```
+
+## Step 1: List the Indexes PostgreSQL Can See
+
+Before changing anything, look at what exists. This query shows each index with the properties that matter here:
+
+```sql
+SELECT i.indexrelid::regclass AS index,
+       i.indisunique,
+       i.indisvalid,
+       i.indimmediate,
+       i.indpred IS NOT NULL AS partial,
+       pg_get_indexdef(i.indexrelid) AS definition
+FROM pg_index i
+WHERE i.indrelid = 'users'::regclass;
+```
+
+A usable arbiter index needs `indisunique`, `indisvalid` and `indimmediate` all true, and its `definition` must match your target. Each section below corresponds to a way this check fails.
+
+## Case 1: The Index Exists but Is Not Unique
+
+An ordinary index is not enough, even on exactly the right column:
+
+```sql
+CREATE INDEX users_email_idx ON users (email);
+
+INSERT INTO users (email, name) VALUES ('a@x.io', 'A')
+ON CONFLICT (email) DO NOTHING;
+-- ERROR:  42P10 ...
+```
+
+Create a unique constraint or unique index instead:
+
+```sql
+ALTER TABLE users ADD CONSTRAINT users_email_key UNIQUE (email);
+```
+
+If the table has duplicates, that statement fails with `could not create unique index`. Our guide on [fixing duplicate keys before adding a unique index](/blog/postgres-could-not-create-unique-index) shows how to find and clear them. On a busy table, build the index with `CREATE UNIQUE INDEX CONCURRENTLY` first, then attach it with `ADD CONSTRAINT ... UNIQUE USING INDEX`.
+
+## Case 2: A Partial Unique Index
+
+Now suppose the table has no constraint on `email`, and uniqueness comes from a partial index. Soft deletes often work this way, so the same email can return after deletion:
+
+```sql
+CREATE UNIQUE INDEX users_email_live ON users (email)
+WHERE deleted_at IS NULL;
+```
+
+Now `ON CONFLICT (email)` fails, because a partial index only covers some rows, and PostgreSQL will not assume it protects your insert. You must repeat the predicate after the column list:
+
+```sql
+INSERT INTO users (email, name) VALUES ('a@x.io', 'A2')
+ON CONFLICT (email) WHERE deleted_at IS NULL
+DO UPDATE SET name = excluded.name;
+-- INSERT 0 1
+```
+
+That `WHERE` belongs to the conflict target. It is easy to confuse with the `WHERE` at the end of `DO UPDATE`, which filters the rows being updated and does not help inference.
+
+## Case 3: An Expression Index
+
+For case-insensitive uniqueness, the only unique index is often on `lower(email)`:
+
+```sql
+CREATE UNIQUE INDEX users_email_lower ON users (lower(email));
+```
+
+A target of `(email)` does not match this index, because the indexed value is the expression and not the column. Use the same expression, in parentheses:
+
+```sql
+INSERT INTO users (email, name) VALUES ('A@X.io', 'A3')
+ON CONFLICT (lower(email)) DO UPDATE SET name = excluded.name;
+-- INSERT 0 1
+```
+
+The row stored as `a@x.io` was updated, which is the behavior you wanted. The expression must match the index definition, so check `pg_get_indexdef` if the two look alike but still fail.
+
+## Case 4: A Composite Index with a Partial Target
+
+In a multi-tenant schema, uniqueness usually spans two columns, and `email` alone is not unique:
+
+```sql
+ALTER TABLE users ADD CONSTRAINT users_t_e UNIQUE (tenant_id, email);
+
+INSERT INTO users (email, name, tenant_id) VALUES ('c@x.io', 'C', 1)
+ON CONFLICT (email) DO NOTHING;
+-- ERROR:  42P10 ...
+```
+
+A leading column is enough for a query to use the index, but not for inference. The target must list every column. The order does not matter, so this works even though the constraint is `(tenant_id, email)`:
+
+```sql
+INSERT INTO users (email, name, tenant_id) VALUES ('c@x.io', 'C', 1)
+ON CONFLICT (email, tenant_id) DO UPDATE SET name = 'C2';
+-- INSERT 0 1
+```
+
+You can also name the constraint directly, which is unambiguous and reads well in code:
+
+```sql
+INSERT INTO users (email, name, tenant_id) VALUES ('c@x.io', 'C3', 1)
+ON CONFLICT ON CONSTRAINT users_t_e
+DO UPDATE SET name = excluded.name;
+```
+
+`ON CONSTRAINT` only works with real constraints. A unique index created with `CREATE UNIQUE INDEX` is not a constraint, so use the column form for those. A misspelled name gives a different error, `42704: constraint "nope" for table "users" does not exist`.
+
+## Case 5: An Invalid Index
+
+This is the case that wastes the most time, because the index looks right in `\d`. A failed `CREATE UNIQUE INDEX CONCURRENTLY` leaves an invalid index behind:
+
+```sql
+CREATE TABLE q (k int, v int);
+INSERT INTO q VALUES (1, 1), (1, 2);
+
+CREATE UNIQUE INDEX CONCURRENTLY q_k ON q (k);
+-- ERROR:  could not create unique index "q_k"
+-- DETAIL:  Key (k)=(1) is duplicated.
+
+SELECT indexrelid::regclass, indisvalid, indisunique
+FROM pg_index WHERE indrelid = 'q'::regclass;
+```
+
+```text
+ indexrelid | indisvalid | indisunique
+------------+------------+-------------
+ q_k        | f          | t
+```
+
+Even after you delete the duplicates, the index stays invalid and the upsert still fails with `42P10`. Rebuild it, and the same statement works:
+
+```sql
+DELETE FROM q WHERE v = 2;
+REINDEX INDEX CONCURRENTLY q_k;
+
+INSERT INTO q VALUES (1, 9)
+ON CONFLICT (k) DO UPDATE SET v = excluded.v;
+-- INSERT 0 1
+```
+
+## Case 6: Partitioned Tables
+
+On a partitioned table, the arbiter must exist on the parent. A unique index created only on one partition does not count:
+
+```sql
+CREATE TABLE p (id int, region text, v int) PARTITION BY LIST (region);
+CREATE TABLE p_e PARTITION OF p FOR VALUES IN ('eu');
+CREATE UNIQUE INDEX p_e_id ON p_e (id);
+
+INSERT INTO p VALUES (1, 'eu', 1) ON CONFLICT (id) DO NOTHING;
+-- ERROR:  42P10 ...
+```
+
+You cannot fix this by creating `UNIQUE (id)` on the parent, because a unique index on a partitioned table must include the partition key:
+
+```text
+ERROR:  unique constraint on partitioned table must include all partitioning columns
+DETAIL:  UNIQUE constraint on table "p" lacks column "region" which is part of the partition key.
+```
+
+So add the partition key to both the constraint and the target:
+
+```sql
+ALTER TABLE p ADD CONSTRAINT p_pk PRIMARY KEY (id, region);
+
+INSERT INTO p VALUES (1, 'eu', 1)
+ON CONFLICT (id, region) DO UPDATE SET v = 2;
+```
+
+## Errors That Look Similar
+
+Several related messages come from the same statement, and each one has its own cause. Here is what we saw for each:
+
+| Message | SQLSTATE | Meaning |
+| --- | --- | --- |
+| `ON CONFLICT DO UPDATE requires inference specification or constraint name` | 42601 | `DO UPDATE` needs a target. Only `DO NOTHING` can omit it |
+| `ON CONFLICT does not support deferrable unique constraints/exclusion constraints as arbiters` | 55000 | The constraint is `DEFERRABLE` |
+| `ON CONFLICT DO UPDATE not supported with exclusion constraints` | 42809 | Exclusion constraints work only with `DO NOTHING` |
+| `ON CONFLICT DO UPDATE command cannot affect row a second time` | 21000 | Two input rows have the same key |
+
+The last one deserves an example, because it comes from your data and not your schema. Two rows in a single statement aim at the same key:
+
+```sql
+CREATE TABLE s (sku text PRIMARY KEY, qty int);
+
+INSERT INTO s VALUES ('A', 1), ('A', 2)
+ON CONFLICT (sku) DO UPDATE SET qty = excluded.qty;
+-- ERROR:  ON CONFLICT DO UPDATE command cannot affect row a second time
+-- HINT:  Ensure that no rows proposed for insertion within the same command
+--        have duplicate constrained values.
+```
+
+Deduplicate the input first, for example with `SELECT DISTINCT ON (sku)`. `DO NOTHING` does not raise this error. It simply keeps the first row, so the same insert with `DO NOTHING` stored `qty = 1`.
+
+If you do not need a specific constraint and just want to skip any conflict, omit the target completely:
+
+```sql
+INSERT INTO users (email, name) VALUES ('a@x.io', 'A')
+ON CONFLICT DO NOTHING;
+```
+
+That form needs no matching index at all. It treats a conflict on any unique or exclusion constraint as a reason to skip the row, and without any unique index it simply inserts. This is also the only way to use an exclusion constraint without naming it. In our test on a table with a `tstzrange` exclusion constraint, the overlapping row was skipped with `INSERT 0 0`, while `DO UPDATE` on the same constraint failed with `42809`.
+
+## A Trap: NULL Never Conflicts
+
+A correct target can still let duplicates through. Standard unique indexes treat NULLs as distinct, so a row with a NULL in the key never conflicts:
+
+```sql
+INSERT INTO users (email, name, tenant_id) VALUES ('n@x.io', 'N', NULL)
+ON CONFLICT (tenant_id, email) DO NOTHING;
+-- run it twice: INSERT 0 1 both times
+
+SELECT count(*) FROM users WHERE email = 'n@x.io';
+-- 2
+```
+
+No error, and two rows. If NULL should count as a value, declare the constraint with `UNIQUE NULLS NOT DISTINCT`, which is available from PostgreSQL 15, or make the column `NOT NULL`.
+
+## Checklist
+
+Work through these in order:
+
+1. Run the `pg_index` query above for the table.
+2. Is there a unique index or constraint at all? If not, add one.
+3. Does `indisvalid` say true? If not, fix the data and run `REINDEX`.
+4. Is the index partial? Add its `WHERE` clause to the target.
+5. Is it on an expression? Use the same expression in the target.
+6. Is it composite? List every column.
+7. Is the table partitioned? Include the partition key, on the parent.
+8. Is the constraint deferrable? Recreate it as not deferrable, or use a different index.
+
+## Test Upserts Against the Real Schema
+
+Most of these errors come from an assumption about an index that changed later, often in a migration that nobody connected to the upsert. With [Chat2DB](https://chat2db.ai/download) you can see a table's indexes and constraints next to your query, run the `pg_index` check above in one click, and ask the AI assistant to write an `ON CONFLICT` target that matches the actual definition. It also runs in the browser at [app.chat2db.ai](https://app.chat2db.ai/). For more background, read our [complete guide to ON CONFLICT DO UPDATE](/blog/postgres-on-conflict-do-update-guide) and our comparison of [MERGE and ON CONFLICT](/blog/postgres-merge-vs-on-conflict).
