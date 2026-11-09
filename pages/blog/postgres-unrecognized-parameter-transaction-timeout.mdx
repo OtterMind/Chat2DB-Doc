@@ -1,0 +1,177 @@
+---
+title: "Postgres transaction_timeout Error on Restore"
+description: "Fix ERROR: unrecognized configuration parameter transaction_timeout when you restore a pg_dump 17 or 18 dump into PostgreSQL 16 or older, even in strict modes."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: November 8, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# Postgres transaction_timeout Error on Restore
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="November 8, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+You restored a dump into an older PostgreSQL server, and the very first statement failed:
+
+```text
+pg_restore: error: could not execute query: ERROR:  unrecognized configuration parameter "transaction_timeout"
+Command was: SET transaction_timeout = 0;
+```
+
+Or, with a plain SQL dump and `psql`:
+
+```text
+psql:shop.sql:13: ERROR:  unrecognized configuration parameter "transaction_timeout"
+```
+
+The dump was made with `pg_dump` 17 or newer, and the server you are restoring into is version 16 or older. This guide explains why the line is there, when the error is harmless, when it stops your restore completely, and three ways around it. We tested each case by restoring a `pg_dump` 18.6 dump into PostgreSQL 15.19 and 14.24.
+
+## Why the Dump Sets transaction_timeout
+
+PostgreSQL 17 added the `transaction_timeout` setting, which ends any transaction that runs longer than the given time. If an administrator sets it in `postgresql.conf` or on a role, a long restore could be cancelled halfway through. To prevent that, `pg_dump` 17 and newer write this line at the top of every restore script, next to the other timeout resets:
+
+```sql
+SET statement_timeout = 0;
+SET lock_timeout = 0;
+SET idle_in_transaction_session_timeout = 0;
+SET transaction_timeout = 0;
+```
+
+On a 17 or 18 server the line does what it should. On 16 or older, the server has never heard of the setting:
+
+```sql
+SET transaction_timeout = 0;
+```
+
+```text
+ERROR:  unrecognized configuration parameter "transaction_timeout"
+```
+
+The line is written by the client tool, based on the client's own version. It is not based on the server the data came from. A `pg_dump` 18 that dumps a 14 server still writes `SET transaction_timeout = 0;`. Restoring such a dump back into another 14 server hits the error, even though both servers are 14.
+
+## When It Is Harmless
+
+In a default `pg_restore` or `psql` run, a failed statement is reported and the restore continues. We restored a `pg_dump` 18 archive into PostgreSQL 15 with `pg_restore` 18:
+
+```text
+pg_restore: error: could not execute query: ERROR:  unrecognized configuration parameter "transaction_timeout"
+Command was: SET transaction_timeout = 0;
+pg_restore: warning: errors ignored on restore: 1
+```
+
+All tables, data, indexes and grants arrived. The test table had its 5,000 rows. The only cost is the error count: `pg_restore` exits with status 1 because one error happened. A script that treats any non-zero exit as failure will mark the restore as failed. Look at the error list before you decide. If this is the only error, the restore is complete.
+
+## When It Stops Everything
+
+Strict restore modes stop at the first error, and this error is always first. With `--exit-on-error`:
+
+```bash
+pg_restore -d shop --exit-on-error shop.dump
+```
+
+```text
+pg_restore: error: could not execute query: ERROR:  unrecognized configuration parameter "transaction_timeout"
+Command was: SET transaction_timeout = 0;
+```
+
+The target database stayed empty. Our query for the `sales` schema afterwards returned `schema "sales" does not exist`. The same happens with `--single-transaction`, which rolls back everything after the error, and with `psql -v ON_ERROR_STOP=1`, which stops at line 13 of the script.
+
+These are exactly the modes careful people use for production restores, so the error hits the people who try hardest to do it right.
+
+## Check Whether Your Dump Has the Line
+
+For a plain SQL dump, search the first lines of the file:
+
+```bash
+head -40 shop.sql | grep -n transaction_timeout
+```
+
+```text
+13:SET transaction_timeout = 0;
+```
+
+For an archive, have a recent `pg_restore` print the SQL and search that:
+
+```bash
+pg_restore -f - shop.dump | head -40 | grep -n transaction_timeout
+```
+
+If the line is there and the target server is 16 or older, plan for one of the fixes below before you start a strict restore.
+
+You cannot make an old server accept the setting. `ALTER SYSTEM SET transaction_timeout = 0` fails on 15 with the same "unrecognized configuration parameter" error. PostgreSQL only accepts unknown setting names that contain a dot, such as `myapp.timeout`, which extensions and applications use as custom settings. `transaction_timeout` has no dot, so the server rejects it. The fix has to happen on the dump side.
+
+## Fix 1: Remove the Line From a Plain SQL Script
+
+For plain dumps, delete the line before running the script:
+
+```bash
+sed -i '/^SET transaction_timeout/d' shop.sql
+psql -d shop -v ON_ERROR_STOP=1 --single-transaction -f shop.sql
+```
+
+On macOS, BSD `sed` needs an empty suffix: `sed -i '' '/^SET transaction_timeout/d' shop.sql`. The pattern is anchored to the start of the line, so it cannot touch data inside `COPY` blocks. In our test the edited script restored cleanly into PostgreSQL 15 with `ON_ERROR_STOP` and a single transaction.
+
+For a dump that is too big to edit in place, filter it as a stream:
+
+```bash
+sed '/^SET transaction_timeout/d' shop.sql | psql -d shop -v ON_ERROR_STOP=1 --single-transaction
+```
+
+## Fix 2: Convert the Archive to SQL, Then Filter
+
+A custom, tar or directory archive is binary, so you cannot edit it with `sed`. Let `pg_restore` write the SQL to standard output instead of sending it to a server, filter it, and pipe it into `psql`:
+
+```bash
+pg_restore -f - shop.dump \
+  | sed '/^SET transaction_timeout/d' \
+  | psql -d shop -v ON_ERROR_STOP=1 --single-transaction
+```
+
+The `pg_restore` here must be new enough to read the archive, version 17 or newer for a `pg_dump` 17 or 18 file. It does not connect to anything with `-f -`, so its version does not have to match the server. We restored all 5,000 rows into PostgreSQL 15 this way with both strict options on.
+
+This route loses parallel restore with `-j`, because the SQL runs in one session. For large databases, see the next fix.
+
+## Fix 3: Accept One Error, Then Verify
+
+For big restores where you want `pg_restore -j 8`, the simplest reliable approach is to run without `--exit-on-error` and check the result afterwards:
+
+```bash
+pg_restore -d shop -j 8 shop.dump 2> restore.log
+grep -c "ERROR" restore.log
+grep "ERROR" restore.log | grep -v transaction_timeout
+```
+
+If the second `grep` prints nothing, the only error was the harmless one. Then compare object counts and row counts between source and target. A database client makes this quicker. [Chat2DB](https://chat2db.ai/download) can open both servers side by side, so you can run the same count queries on each and compare.
+
+## Related Version Problems in the Same Dump
+
+A dump from a newer `pg_dump` can carry other things an old server does not understand. The ones we hit in testing:
+
+- **Statistics.** `pg_dump` 18 can include optimizer statistics with `--statistics`. Restoring those into 17 or older fails once per statistics entry, because the target lacks `pg_restore_relation_stats`. In our test that produced 28 ignored errors. Restore with `--no-statistics` and run `ANALYZE` afterwards.
+- **The archive version.** `pg_restore` 16 and older cannot read a `pg_dump` 17 or 18 archive at all and fail with `unsupported version (1.16) in file header`. See our [pg_restore unsupported version guide](/blog/pg-restore-unsupported-version-in-file-header).
+- **The \restrict line.** Plain dumps from current minor releases start with a `\restrict` line, added as a security fix in August 2025. A `psql` older than 17.6, 16.10, 15.14 or 14.19 does not know that command. Use a current `psql` to run the script.
+
+Our [pg_dump File Inspector](https://chat2db.ai/tools/pg-dump-file-inspector) reads a dump file in your browser and lists these issues for a target version you choose, including whether `transaction_timeout` and statistics entries are present.
+
+## Is Restoring Into an Older Version Supported?
+
+Not officially. PostgreSQL supports dump and restore into the same or a newer major version. Restoring into an older one works for many simple schemas, but anything the old server lacks fails: newer syntax in function bodies, new column options, new index types. The `transaction_timeout` line is just the first and most visible of these.
+
+If you are moving data down a version, for example to match a staging server, restore without strict mode, read every error, and fix the objects that failed by hand. If the target is old because nobody has upgraded it, upgrade it instead. PostgreSQL 14, for example, reaches [end of life on November 12, 2026](/blog/postgres-14-end-of-life-upgrade).
+
+## The Real Fix: Upgrade the Target
+
+All of these workarounds treat a symptom. The underlying issue is that the target server is older than the tools that made the dump. PostgreSQL 16 is supported until November 2028, so there is no urgency there. But if the target is 14 or older, it is at or past end of life, and every new dump you restore into it will carry more lines it does not understand. Upgrading the target to 17 or 18 removes this error and the others in this article at once.
+
+## Quick Reference
+
+| Situation | Result | What to do |
+|---|---|---|
+| Default `pg_restore` or `psql` | One error, restore completes | Check the log, ignore this one error |
+| `--exit-on-error` | Stops, nothing restored | Fix 2, or drop the flag |
+| `--single-transaction` | Rolls back, nothing restored | Fix 1 or Fix 2 |
+| `psql -v ON_ERROR_STOP=1` | Stops at the SET line | Fix 1 |
+| Target is 17 or newer | No error | Nothing to do |

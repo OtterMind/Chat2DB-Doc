@@ -1,0 +1,220 @@
+---
+title: "PostgreSQL 14 End of Life: Upgrade Guide"
+description: "PostgreSQL 14 support ends on November 12, 2026. Check your version, pick 18, and upgrade with pg_upgrade, including the checksum error and steps after."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: November 8, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# PostgreSQL 14 End of Life: Upgrade Guide
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="November 8, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+PostgreSQL 14 reaches end of life on November 12, 2026. The project's [versioning page](https://www.postgresql.org/support/versioning/) lists that date as the final release for the 14 branch. Under the project's policy, one last minor release ships, and after that 14 gets no more fixes, including security fixes.
+
+Your servers keep running after that date. Nothing switches off. The risk comes later: the next security bug found in PostgreSQL gets fixed in 15, 16, 17 and 18, and 14 stays exposed. The same applies to data corruption bugs and crashes.
+
+This guide covers how to find every 14 server you run, which version to move to, and how to do the upgrade with `pg_upgrade`. We ran every command below against PostgreSQL 14.24 and 18.6, and we show the errors we hit on the way. The most likely one comes from data checksums.
+
+## Check Which Servers Still Run 14
+
+Start with an inventory, because 14 often survives in places nobody looks at: a reporting replica, a staging box, a Docker image pinned two years ago. On each server, run:
+
+```sql
+SELECT version();
+SHOW server_version_num;
+```
+
+`server_version_num` returns a number such as `140024`. Anything from `140000` to `149999` is version 14. If you manage many servers, run the query from a script, or open each connection in a client and read the version from the connection details. Our article on [checking the Postgres version](/blog/check-postgres-version) lists more ways, including from the shell when you cannot log in.
+
+While you are on each server, write down three more things. You will need them to plan the upgrade:
+
+```sql
+SELECT pg_size_pretty(sum(pg_database_size(datname))) AS total_size
+FROM pg_database;
+
+SELECT extname, extversion FROM pg_extension ORDER BY 1;
+
+SHOW data_checksums;
+```
+
+The total size tells you whether a dump and restore is realistic, or whether you need `pg_upgrade`. The extension list tells you which packages the new server needs. The checksum setting decides the most common upgrade failure, which we cover below.
+
+## Which Version to Upgrade To
+
+Go to PostgreSQL 18 unless you have a reason not to. It is the newest stable release, and the versioning page lists support until November 14, 2030. That gives you four years before you have to repeat this work.
+
+PostgreSQL 19 is close. The release candidate came out on October 15, 2026, and general availability is planned for November 19, 2026. Moving a production system to a .0 release in its first week is a gamble, so treat 19 as your next upgrade, not this one. Our [PostgreSQL 19 upgrade notes](/blog/postgres-19-upgrade-breaking-changes) list what changes if you plan for it later.
+
+A jump from 14 to 15 or 16 is also possible, but it only buys one or two years before the next end-of-life date. The upgrade work costs about the same whatever target you pick, so go to the newest stable version.
+
+## Pick an Upgrade Method
+
+There are three standard ways to move a cluster to a new major version:
+
+- **pg_upgrade** rewrites the system catalogs for the new version and reuses your data files. With `--link`, `--clone` or the new `--swap` mode it takes minutes even for large clusters, because it does not copy table data.
+- **pg_dump and restore** exports every database as SQL or an archive and loads it into the new server. It is simple and reliable, but it takes time in proportion to your data size, and the old server must stay read-only while it runs.
+- **Logical replication** keeps a new 18 server in sync with the 14 server while both run, so the cutover takes seconds. It needs more setup, and it does not copy schema changes or sequences on its own. See our [logical replication guide](/blog/postgres-logical-replication-guide) if you need near-zero downtime.
+
+For most self-managed servers, `pg_upgrade` is the right choice, so the rest of this guide follows it. Our full [pg_upgrade guide](/blog/postgres-pg-upgrade-guide) goes deeper into each option. If you go the dump route instead, use the `pg_dump` from version 18. The old 14 client cannot read the new server, and the newer client reads old servers without trouble.
+
+## Step 1: Install 18 and Create the New Cluster
+
+Install the PostgreSQL 18 server packages next to 14, plus the 18 builds of every extension you listed. On Debian and Ubuntu with the PGDG repository that means packages such as `postgresql-18` and `postgresql-18-pgvector`. Then create the new, empty cluster.
+
+This is where the first trap is. Since PostgreSQL 18, `initdb` turns data checksums on by default:
+
+```bash
+initdb -D /srv/pg18/data -U postgres
+pg_controldata /srv/pg18/data | grep -i checksum
+```
+
+```text
+Data page checksum version:           1
+```
+
+A cluster created by version 14 had checksums off unless someone asked for them. `pg_upgrade` requires both clusters to match, so its check fails:
+
+```bash
+pg_upgrade -b /usr/lib/postgresql/14/bin -B /usr/lib/postgresql/18/bin \
+  -d /srv/pg14/data -D /srv/pg18/data -U postgres --check
+```
+
+```text
+Performing Consistency Checks
+-----------------------------
+Checking cluster versions                                     ok
+
+old cluster does not use data checksums but the new one does
+Failure, exiting
+```
+
+You have two fixes. The quick one is to create the new cluster without checksums:
+
+```bash
+rm -rf /srv/pg18/data
+initdb -D /srv/pg18/data -U postgres --no-data-checksums
+```
+
+The better long-term fix is to turn checksums on in the old cluster first, so the new one keeps the 18 default. Checksums let PostgreSQL detect pages damaged by storage problems. `pg_checksums` does this offline, so stop the 14 server first:
+
+```bash
+pg_ctl -D /srv/pg14/data stop
+/usr/lib/postgresql/14/bin/pg_checksums -D /srv/pg14/data --enable
+```
+
+```text
+pg_checksums: syncing data directory
+pg_checksums: updating control file
+Checksums enabled in cluster
+```
+
+On our small test cluster this took under a second, but it reads and rewrites every data page. Expect it to take about as long as reading the whole cluster from disk. On a large database that can be hours, so run it on a copy first to measure. After that, the default `initdb` cluster works and the upgrade went through.
+
+## Step 2: Run the Check
+
+Run `pg_upgrade --check` with both servers stopped, or with the old one running if you want a check during business hours. It reads the old cluster and reports problems without changing anything:
+
+```text
+Checking data type usage                                      ok
+Checking for not-null constraint inconsistencies              ok
+Checking for presence of required libraries                   ok
+Checking database user is the install user                    ok
+Checking for prepared transactions                            ok
+Checking for new cluster tablespace directories               ok
+
+*Clusters are compatible*
+```
+
+The "required libraries" check is where missing extension packages show up. If it fails, `pg_upgrade` writes a file listing the shared libraries it could not find in the new installation. Install the matching 18 packages and run the check again. Do not move on until you see "Clusters are compatible."
+
+## Step 3: Upgrade
+
+Stop the old server and run the real upgrade. PostgreSQL 18 added a `--swap` mode, which moves the data directories into the new cluster instead of copying or hard-linking files. It is usually the fastest option:
+
+```bash
+pg_upgrade -b /usr/lib/postgresql/14/bin -B /usr/lib/postgresql/18/bin \
+  -d /srv/pg14/data -D /srv/pg18/data -U postgres --swap
+```
+
+```text
+Upgrade Complete
+----------------
+Some statistics are not transferred by pg_upgrade.
+Once you start the new server, consider running these two commands:
+    vacuumdb -U postgres --all --analyze-in-stages --missing-stats-only
+    vacuumdb -U postgres --all --analyze-only
+Running this script will delete the old cluster's data files:
+    ./delete_old_cluster.sh
+```
+
+Like `--link`, `--swap` means you cannot start the old cluster again once the new one has run. Take a backup before this step, and keep it until the new server has run for a while. If you need a fallback that leaves the old cluster untouched, use `--copy` (the default) and accept the extra time and disk space.
+
+## Step 4: Finish the Job After the Upgrade
+
+Start the new server. Before you send traffic to it, work through these four items.
+
+**Statistics.** Older upgrade paths threw away planner statistics, and the first hours after an upgrade often brought slow queries until `ANALYZE` ran. In 18, `pg_upgrade` carries most statistics over. On our test table the counts were there right away:
+
+```sql
+SELECT count(*) FROM pg_stats WHERE tablename = 'orders';
+-- 4
+
+SELECT relname, reltuples FROM pg_class WHERE relname = 'orders';
+-- orders | 100000
+```
+
+Extended statistics and a few other items are not carried over, so run the first command the upgrade printed. The `--missing-stats-only` flag is new in 18 and only analyzes what is missing, so it finishes quickly:
+
+```bash
+vacuumdb --all --analyze-in-stages --missing-stats-only
+```
+
+**Extensions.** The new server runs the old extension versions until you update them. `pg_upgrade` writes `update_extensions.sql` when it finds any. In our test, `pg_stat_statements` stayed at 1.9 while 18 ships 1.12:
+
+```sql
+SELECT name, default_version, installed_version
+FROM pg_available_extensions
+WHERE installed_version IS NOT NULL
+  AND default_version <> installed_version;
+```
+
+```text
+pg_stat_statements | 1.12 | 1.9
+```
+
+Run the generated script as a superuser with `psql -f update_extensions.sql`, or run `ALTER EXTENSION pg_stat_statements UPDATE;` in each database.
+
+**The public schema.** PostgreSQL 15 stopped letting every user create tables in the `public` schema of new databases. An upgraded cluster keeps its old permissions, and that includes `template1`. So even databases you create after the upgrade inherit the permissive 14-era settings. We confirmed this on the upgraded cluster: an ordinary role could create a table in `public`, both in an old database and in a database created after the upgrade. If you want the 15+ behaviour, run this in every database, including `template1`:
+
+```sql
+REVOKE CREATE ON SCHEMA public FROM PUBLIC;
+ALTER SCHEMA public OWNER TO pg_database_owner;
+```
+
+Check first that no application relies on creating objects in `public` with a role that does not own the database.
+
+**MD5 passwords.** PostgreSQL 18 deprecates MD5 password authentication. Upgraded roles keep their MD5 hashes and still log in, but setting a new MD5 password now warns:
+
+```text
+WARNING:  setting an MD5-encrypted password
+DETAIL:  MD5 password support is deprecated and will be removed in a future release of PostgreSQL.
+```
+
+Find the roles that still use MD5 with `SELECT rolname FROM pg_authid WHERE rolpassword LIKE 'md5%';` and reset their passwords under `password_encryption = 'scram-sha-256'`. Our [MD5 to SCRAM migration guide](/blog/postgres-md5-to-scram-sha-256-migration) covers the client side.
+
+## Test Before You Switch
+
+Run your application's test suite against a restored copy of production on 18 before the real cutover. Pay attention to slow queries, because the planner improved a lot between 14 and 18 and a few queries can change plans. A database client helps here. [Chat2DB](https://chat2db.ai/download) can keep the 14 and 18 connections side by side, so you can run the same query on both and compare results and plans. Its AI assistant can also explain an `EXPLAIN` output you do not recognize.
+
+Two of our tools can help with the planning. The [Postgres upgrade planner](https://chat2db.ai/tools/postgres-upgrade-planner) lists the steps for your source and target versions, and the [postgresql.conf diff tool](https://chat2db.ai/tools/postgresql-conf-diff) flags settings in your old config that 18 no longer accepts.
+
+## What If You Cannot Upgrade Yet
+
+Sometimes the upgrade cannot happen before November 12: a vendor has not certified 18, or a freeze blocks changes. In that case, reduce the exposure. Install the final 14 minor release, so you at least have every fix that was made. Restrict network access in `pg_hba.conf` and at the firewall to the hosts that need it. Then put a date on the upgrade. An unsupported database only gets riskier over time, and the gap to the current version keeps growing.
+
+If you run a managed service, your provider sets its own schedule. Some providers upgrade 14 instances automatically after end of life, and some charge for extended support. Check your provider's announcements, because an automatic upgrade at a time you did not pick is worse than one you planned.

@@ -1,0 +1,276 @@
+---
+title: "Database Is Being Accessed by Other Users: Fix"
+description: "Fix Postgres ERROR: database is being accessed by other users on DROP, RENAME or CREATE DATABASE TEMPLATE: find sessions, use WITH (FORCE), and handle slots."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: November 8, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# Database Is Being Accessed by Other Users: Fix
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="November 8, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+You tried to drop a database, and PostgreSQL refused:
+
+```text
+ERROR:  database "sales_db" is being accessed by other users
+DETAIL:  There are 2 other sessions using the database.
+```
+
+The message means what it says. Other connections are open to that database, and PostgreSQL will not remove a database while someone is using it. The same check protects `ALTER DATABASE ... RENAME` and `CREATE DATABASE ... TEMPLATE`. This guide shows how to see who is connected, how to end those sessions safely, and how to use `DROP DATABASE ... WITH (FORCE)`. It also covers the two cases where even `FORCE` does not work. We ran every example on PostgreSQL 18.6, and the prepared transaction example on 15.19.
+
+## Which Commands Raise It
+
+Three commands need a database with no other sessions:
+
+```sql
+DROP DATABASE sales_db;
+```
+
+```text
+ERROR:  database "sales_db" is being accessed by other users
+DETAIL:  There is 1 other session using the database.
+```
+
+```sql
+ALTER DATABASE sales_db RENAME TO sales_old;
+```
+
+```text
+ERROR:  database "sales_db" is being accessed by other users
+DETAIL:  There is 1 other session using the database.
+```
+
+```sql
+CREATE DATABASE sales_copy TEMPLATE sales_db;
+```
+
+```text
+ERROR:  source database "sales_db" is being accessed by other users
+DETAIL:  There is 1 other session using the database.
+```
+
+The last one surprises people who use a template database for tests. Copying a database works at the file level, so PostgreSQL needs the source to be quiet while it copies.
+
+Before it gives up, PostgreSQL waits up to five seconds for the other sessions to leave. Autovacuum workers in that database are asked to exit during that wait. That is why a short-lived connection, such as a monitoring check, sometimes lets the command succeed and sometimes does not. The command is not flaky. The other session either left in time or it did not.
+
+## CREATE DATABASE Fails Because of template1
+
+A plain `CREATE DATABASE` copies `template1`. If anyone is connected to `template1`, the copy fails, and the message names `template1` rather than the database you are creating:
+
+```sql
+CREATE DATABASE newdb;
+```
+
+```text
+ERROR:  source database "template1" is being accessed by other users
+DETAIL:  There is 1 other session using the database.
+```
+
+This is confusing the first time, because you never touched `template1`. Usually a GUI client or a monitoring tool has connected to it, or an administrator left a `psql` session open there after changing it. Find the session with the query in Step 1, using `datname = 'template1'`. If you only need an empty database, copy `template0` instead. Nobody can connect to `template0`, so it is never busy:
+
+```sql
+CREATE DATABASE newdb TEMPLATE template0;
+```
+
+```text
+CREATE DATABASE
+```
+
+`template0` gives you a clean database without any objects someone added to `template1`. If your setup relies on extensions or settings installed in `template1`, wait for the session to end instead.
+
+## A Related Error: Dropping the Database You Are In
+
+If the session that runs `DROP DATABASE` is itself connected to that database, you get a different message:
+
+```text
+ERROR:  cannot drop the currently open database
+```
+
+Connect to another database first, usually `postgres`:
+
+```bash
+psql -d postgres -c "DROP DATABASE sales_db;"
+```
+
+In a GUI client, switch the active database in the connection before running the statement.
+
+## Step 1: See Who Is Connected
+
+`pg_stat_activity` lists every session. Filter it on the database name:
+
+```sql
+SELECT pid, usename, application_name, client_addr, state, backend_start
+FROM pg_stat_activity
+WHERE datname = 'sales_db';
+```
+
+```text
+  pid  | usename  | application_name | client_addr | state  |  backend_start
+-------+----------+------------------+-------------+--------+-----------------
+ 37581 | app_user | psql             |             | active | 2026-11-08 ...
+```
+
+Read the result before you end anything. `application_name` and `client_addr` usually tell you what the sessions are: an application pool, a BI tool, a colleague's open client, a migration job. If it is your own application, stop it or point it elsewhere first. Otherwise the pool opens new connections as fast as you close them.
+
+To see the whole picture at once, group the sessions by database and type:
+
+```sql
+SELECT datname, backend_type, count(*)
+FROM pg_stat_activity
+GROUP BY 1, 2
+ORDER BY 1, 2;
+```
+
+Rows with `backend_type = 'client backend'` are real connections. Background processes such as the checkpointer and WAL writer have an empty `datname` and never block a drop. Autovacuum workers and logical replication workers do show a database name. The server ends autovacuum workers for you during the drop. Replication workers need the steps in the slot section below.
+
+## Step 2: Stop New Connections
+
+On a busy database, ending sessions is a race, because new ones arrive constantly. Block new connections first. Either switch the database off for connections:
+
+```sql
+ALTER DATABASE sales_db ALLOW_CONNECTIONS false;
+```
+
+A new connection then fails with:
+
+```text
+FATAL:  database "sales_db" is not currently accepting connections
+```
+
+Or remove the connect privilege from ordinary roles:
+
+```sql
+REVOKE CONNECT ON DATABASE sales_db FROM PUBLIC;
+```
+
+```text
+FATAL:  permission denied for database "sales_db"
+DETAIL:  User does not have CONNECT privilege.
+```
+
+The `REVOKE` only affects roles that relied on the default `PUBLIC` grant. Superusers and roles with an explicit `GRANT CONNECT` still get in. `ALLOW_CONNECTIONS false` blocks everyone, including superusers. Remember to undo either change if you are renaming rather than dropping.
+
+## Step 3: End the Sessions
+
+Terminate every other backend connected to the database:
+
+```sql
+SELECT pg_terminate_backend(pid)
+FROM pg_stat_activity
+WHERE datname = 'sales_db'
+  AND pid <> pg_backend_pid();
+```
+
+```text
+ pg_terminate_backend
+----------------------
+ t
+```
+
+`pg_terminate_backend` ends the session and rolls back its open transaction. You need to be a superuser, a member of `pg_signal_backend`, or the same role as the session you end. Superuser sessions can only be ended by a superuser. After this, the original command works:
+
+```sql
+CREATE DATABASE sales_copy TEMPLATE sales_db;
+```
+
+```text
+CREATE DATABASE
+```
+
+## The Shortcut: DROP DATABASE WITH (FORCE)
+
+Since PostgreSQL 13, `DROP DATABASE` can end the sessions itself:
+
+```sql
+DROP DATABASE sales_db WITH (FORCE);
+```
+
+```text
+DROP DATABASE
+```
+
+The command-line tool has the same option:
+
+```bash
+dropdb --force sales_db
+```
+
+`FORCE` terminates the other sessions and then drops the database in one step. Use it when you are sure the database should go, for example a test database recreated by a CI job. It needs the same rights as `pg_terminate_backend` for the sessions it ends. There is no `FORCE` for `RENAME` or `CREATE DATABASE ... TEMPLATE`, so for those use the three steps above.
+
+## When FORCE Is Not Enough: Prepared Transactions
+
+A prepared transaction belongs to the database where it was prepared, even though no session holds it. It blocks the drop, and `FORCE` cannot terminate it, because there is no backend to terminate:
+
+```sql
+DROP DATABASE pdb;
+```
+
+```text
+ERROR:  database "pdb" is being accessed by other users
+DETAIL:  There is 1 prepared transaction using the database.
+```
+
+```sql
+DROP DATABASE pdb WITH (FORCE);
+```
+
+```text
+ERROR:  database "pdb" is being used by prepared transactions
+DETAIL:  There is 1 prepared transaction using the database.
+```
+
+Find it in `pg_prepared_xacts`:
+
+```sql
+SELECT gid, prepared, owner, database FROM pg_prepared_xacts;
+```
+
+```text
+ gid |           prepared            |  owner   | database
+-----+-------------------------------+----------+----------
+ tx1 | 2026-11-08 16:32:01.570272-08 | postgres | pdb
+```
+
+A forgotten prepared transaction usually comes from a crashed transaction manager or a failed two-phase commit. Before you discard it, find out which system created it. Then connect to that database and run `ROLLBACK PREPARED 'tx1';` (or `COMMIT PREPARED` if the work should be kept). After that, the plain `DROP DATABASE` succeeded in our test. Prepared transactions are only possible when `max_prepared_transactions` is above zero, which is not the default.
+
+## When FORCE Is Not Enough: Active Replication Slots
+
+A logical replication slot also belongs to a database. If a consumer is connected to it, the drop fails with its own message, with or without `FORCE`:
+
+```text
+ERROR:  database "sdb" is used by an active logical replication slot
+DETAIL:  There is 1 active slot.
+```
+
+Stop the consumer first, such as a Debezium connector, a subscriber or `pg_recvlogical`. Once the slot is inactive, `DROP DATABASE` removes the database and drops its inactive logical slots too. In our test the slot was gone from `pg_replication_slots` afterwards. If a subscriber elsewhere still expects that slot, it will fail when it reconnects, so clean up the subscription on that side as well. Our [replication slots guide](/blog/postgres-replication-slots-guide) explains how to inspect and drop slots.
+
+## Why It Keeps Happening in Test Suites
+
+In CI and local test runs, the "other users" are often your own test process. A test framework opens a connection pool to the test database, a teardown step tries to drop the database, and the pool is still holding connections. The drop then fails, or worse, it succeeds on one run and fails on the next, depending on how fast the pool closes.
+
+Close the pool before the drop: call the pool's shutdown or dispose method in your teardown, and only then run `DROP DATABASE`. If you cannot control the pool, use `WITH (FORCE)` in the teardown, since the database is disposable anyway. For suites that recreate the database many times, copying from a template database is fast, but remember that the template must also have no open sessions, including from the test process itself.
+
+## A Safe Script for Recreating a Database
+
+For test environments that rebuild a database often, this sequence handles the common cases:
+
+```sql
+-- run while connected to the postgres database
+ALTER DATABASE app_test ALLOW_CONNECTIONS false;
+SELECT pg_terminate_backend(pid)
+FROM pg_stat_activity
+WHERE datname = 'app_test' AND pid <> pg_backend_pid();
+DROP DATABASE IF EXISTS app_test;
+CREATE DATABASE app_test TEMPLATE app_template;
+```
+
+On PostgreSQL 13 and newer you can replace the first three statements with `DROP DATABASE IF EXISTS app_test WITH (FORCE);`. The `TEMPLATE` copy still needs `app_template` to have no sessions, so do not leave a client connected to it.
+
+If you often move between databases this way, a client such as [Chat2DB](https://chat2db.ai/download) makes it easy to see which databases have open sessions and to switch the active database before you drop one. Be careful with GUI clients in general, though: many keep a background connection open to every database you browsed, and those connections are often the "other users" in this error.
+
+For related errors, see [cannot run inside a transaction block](/blog/postgres-cannot-run-inside-a-transaction-block), which you get when you wrap `DROP DATABASE` in a transaction, and [role cannot be dropped because some objects depend on it](/blog/postgres-drop-role-dependent-objects) for cleaning up the roles that owned the database.

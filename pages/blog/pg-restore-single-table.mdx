@@ -1,0 +1,260 @@
+---
+title: "pg_restore a Single Table: -t vs -L"
+description: "Restore one table from a pg_dump archive. Why pg_restore -t skips the schema, keys and indexes, and how a -L list file restores the whole table safely."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: November 8, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# pg_restore a Single Table: -t vs -L
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="November 8, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+Someone ran a bad `UPDATE` on one table, and last night's backup has the right data. You do not want to restore the whole database, just that one table. `pg_restore` can do it, but the obvious option, `-t`, leaves out more than most people expect.
+
+This guide shows what `pg_restore -t` restores and what it skips, then walks through the approach that brings back a complete table: a list file with `-L`. It also covers restoring data into an existing table and checking a dump without restoring it. We ran every command against a custom-format dump made by `pg_dump` 18.6. The dump contains a table `sales.orders` with an identity column, an enum type, a primary key, an index, a trigger and a row security policy.
+
+## You Need an Archive, Not a Plain SQL Dump
+
+Selective restore only works with archive formats: custom (`-Fc`), directory (`-Fd`) or tar (`-Ft`). A plain SQL file made with `pg_dump -Fp` or `pg_dumpall` has no table of contents, so `pg_restore` refuses it:
+
+```text
+pg_restore: error: input file appears to be a text format dump. Please use psql.
+```
+
+With a plain file, your options are to load it into a scratch database and copy the table across, or to cut the table's statements out of the file by hand. That is one more reason to take backups with `pg_dump -Fc`.
+
+## Step 1: Look Inside the Archive
+
+`pg_restore -l` prints the table of contents without restoring anything:
+
+```bash
+pg_restore -l shop.dump
+```
+
+These are the entries that belong to `sales.orders`:
+
+```text
+7; 2615 16386 SCHEMA - sales postgres
+897; 1247 16469 TYPE sales status postgres
+222; 1259 16474 TABLE sales orders postgres
+3048; 0 0 COMMENT sales TABLE orders postgres
+3049; 0 0 ACL sales TABLE orders postgres
+221; 1259 16473 SEQUENCE sales orders_id_seq postgres
+3034; 0 16474 TABLE DATA sales orders postgres
+3051; 0 0 SEQUENCE SET sales orders_id_seq postgres
+2875; 2606 16483 CONSTRAINT sales orders orders_pkey postgres
+2873; 1259 16484 INDEX sales orders_created_idx postgres
+2879; 2620 16526 TRIGGER sales orders t postgres
+3029; 0 16474 ROW SECURITY sales orders postgres
+3030; 3256 16525 POLICY sales orders p postgres
+```
+
+A table in a dump is not one item. It is a dozen separate entries: the table definition, its data, the sequence behind the identity column, the current sequence value, the primary key, each index, each trigger and policy, plus the schema and types it depends on. What you get back depends on which of these entries you select.
+
+If `pg_restore` on your machine cannot read the file, our [pg_dump File Inspector](https://chat2db.ai/tools/pg-dump-file-inspector) shows the same listing in the browser. It runs locally and does not upload the file.
+
+## Step 2: What -t Restores
+
+The documentation describes `-t` as "restore definition and/or data of only the named table". In practice that is literal. We restored into an empty database:
+
+```bash
+createdb t1
+pg_restore -d t1 -t orders shop.dump
+```
+
+```text
+pg_restore: error: could not execute query: ERROR:  schema "sales" does not exist
+LINE 1: CREATE TABLE sales.orders (
+...
+pg_restore: warning: errors ignored on restore: 5
+```
+
+Nothing was created. `-t` selected the table, its data, its comment and its grant, but not the schema the table lives in, and not the enum type its column uses. The same happened with `-n sales -t orders`, because combining the two narrows the selection further instead of widening it.
+
+With a table in `public`, which always exists, `-t` does create the table, but look at the result:
+
+```bash
+pg_restore -d t2 -t big shop.dump
+psql -d t2 -c '\d big'
+```
+
+```text
+                Table "public.big"
+ Column |  Type   | Collation | Nullable | Default
+--------+---------+-----------+----------+---------
+ id     | integer |           | not null |
+ b      | bytea   |           |          |
+```
+
+The data is there, but the primary key is missing, and so are any indexes, triggers and foreign keys. Those are separate entries in the archive, and `-t` does not pull them in. A table restored this way accepts duplicate keys, and queries that relied on its indexes run slowly.
+
+Two more behaviours of `-t` cause silent mistakes:
+
+- **No wildcards.** Unlike `pg_dump -t`, `pg_restore -t` matches exact names only. `-t 'ord*'` restored nothing, and `pg_restore` exited with status 0.
+- **No error for a missing name.** `pg_restore -d t4 -t nosuchtable shop.dump` also exited with status 0 and did nothing. Check the result. Do not rely on the exit code.
+
+`-t` does match views, materialized views and foreign tables as well as tables, and you can repeat it to select several objects.
+
+## Step 3: Restore the Whole Table With a List File
+
+The reliable way is to write the entries you want into a file and pass it with `-L`. Start from the full listing and keep the lines for your table:
+
+```bash
+pg_restore -l shop.dump > full.txt
+grep -E ' sales (orders|orders_id_seq|orders_pkey|orders_created_idx)( |$)|SCHEMA - sales|TYPE sales status| sales orders ' full.txt > list.txt
+```
+
+Review `list.txt` by eye before using it. A grep that is too loose can pick up other tables whose names contain the same word. You can also copy `full.txt` and put a semicolon at the start of every line you do not want. `pg_restore` treats those lines as comments. For our table, the list was:
+
+```text
+7; 2615 16386 SCHEMA - sales postgres
+897; 1247 16469 TYPE sales status postgres
+222; 1259 16474 TABLE sales orders postgres
+221; 1259 16473 SEQUENCE sales orders_id_seq postgres
+3034; 0 16474 TABLE DATA sales orders postgres
+3051; 0 0 SEQUENCE SET sales orders_id_seq postgres
+2875; 2606 16483 CONSTRAINT sales orders orders_pkey postgres
+2873; 1259 16484 INDEX sales orders_created_idx postgres
+2879; 2620 16526 TRIGGER sales orders t postgres
+3029; 0 16474 ROW SECURITY sales orders postgres
+3030; 3256 16525 POLICY sales orders p postgres
+```
+
+Then restore with it:
+
+```bash
+pg_restore -d t3 -L list.txt shop.dump
+```
+
+This time the table came back complete:
+
+```text
+                                   Table "sales.orders"
+ Column  |           Type           | Collation | Nullable |           Default
+---------+--------------------------+-----------+----------+------------------------------
+ id      | bigint                   |           | not null | generated always as identity
+ st      | sales.status             |           |          | 'new'::sales.status
+ note    | text                     |           |          |
+ created | timestamp with time zone |           |          | now()
+Indexes:
+    "orders_pkey" PRIMARY KEY, btree (id)
+    "orders_created_idx" btree (created)
+Policies:
+    POLICY "p"
+      USING (true)
+Triggers:
+    t BEFORE UPDATE ON sales.orders FOR EACH ROW EXECUTE FUNCTION suppress_redundant_updates_trigger()
+```
+
+The row count and the sequence position matched the source:
+
+```sql
+SELECT count(*), max(id), (SELECT last_value FROM sales.orders_id_seq)
+FROM sales.orders;
+```
+
+```text
+ count | max  | last_value
+-------+------+------------
+  5000 | 5000 |       5000
+```
+
+`pg_restore` applies the list in its own dependency order, not the order of lines in the file, so you do not have to sort anything. Leave out the `SCHEMA` and `TYPE` lines if they already exist in the target. If you keep them, they fail with "already exists" errors, which are harmless in a normal run.
+
+## Watch Out for Foreign Keys
+
+Foreign key constraints are listed under the table that holds them, so a list file for a child table picks up its `FK CONSTRAINT` line too:
+
+```text
+230; 1259 16517 TABLE public child postgres
+3040; 0 16517 TABLE DATA public child postgres
+2878; 2606 16520 FK CONSTRAINT public child child_id_fkey postgres
+```
+
+If the referenced table does not exist in the target, that one entry fails and the rest of the restore goes through:
+
+```text
+pg_restore: error: could not execute query: ERROR:  relation "public.big" does not exist
+Command was: ALTER TABLE ONLY public.child
+    ADD CONSTRAINT child_id_fkey FOREIGN KEY (id) REFERENCES public.big(id);
+```
+
+Either include the referenced table in the list, or leave the `FK CONSTRAINT` line out and add the constraint by hand once the parent data is in place. When the parent table already exists in the target with different data, adding the constraint may fail on rows that have no match. That is a sign that the child rows you restored do not fit the current parent data.
+
+## Parallel Restore of One Large Table
+
+A list file works with parallel restore too. With a directory-format dump, `pg_restore -j` loads data and builds indexes in several sessions:
+
+```bash
+pg_restore -d t5 -j 4 -L list.txt shop_dir/
+```
+
+Our restore from the directory dump brought back all 5,000 rows with the same list. Build the list from the same archive you restore from (`pg_restore -l shop_dir/`), because the numbers at the start of each line are dump IDs, and they belong to one particular dump. With a single table, the gain from `-j` comes mostly from building several indexes at once, so it helps most for tables with many indexes.
+
+## Restore Into a Scratch Database First
+
+When the table still exists in production and you want to repair rows rather than replace the table, restore it into a separate database first:
+
+```bash
+createdb repair
+pg_restore -d repair -L list.txt shop.dump
+```
+
+Then compare the old and current rows and copy back only what you need. Inside one cluster you cannot query across databases directly, so either use `postgres_fdw` or `dblink`, or export the rows from `repair` with `COPY` and load them into production. A client that can open both databases side by side, such as [Chat2DB](https://chat2db.ai/download), makes the comparison much faster. You can run the same `SELECT` against both and look at the differences before you write the fix.
+
+## Load Only the Data Into an Existing Table
+
+If the table structure is fine and you only need the rows back, use `--data-only`:
+
+```bash
+psql -d t3 -c 'TRUNCATE sales.orders'
+pg_restore -d t3 --data-only -n sales -t orders shop.dump
+```
+
+The 5,000 rows came back. Run it again without truncating, and the primary key stops it:
+
+```text
+pg_restore: error: COPY failed for table "orders": ERROR:  duplicate key value violates unique constraint "orders_pkey"
+DETAIL:  Key (id)=(1) already exists.
+```
+
+The whole `COPY` for that table fails, so no partial data is loaded. Empty the table first, or restore into a scratch database and merge from there. Also keep in mind that triggers on the target table fire during a data-only restore. Add `--disable-triggers` if they should not, which needs superuser rights.
+
+## Preview the SQL Before Running It
+
+To see exactly what a restore would do, write it to a file instead of a database:
+
+```bash
+pg_restore -f - --schema-only -n sales -t orders shop.dump
+```
+
+```sql
+CREATE TABLE sales.orders (
+    id bigint NOT NULL,
+    st sales.status DEFAULT 'new'::sales.status,
+    note text,
+    created timestamp with time zone DEFAULT now()
+);
+ALTER TABLE sales.orders OWNER TO postgres;
+COMMENT ON TABLE sales.orders IS 'orders';
+GRANT SELECT ON TABLE sales.orders TO app;
+```
+
+The preview confirms what we saw above: no primary key, no index, no identity sequence. This is a cheap check to run before any selective restore, and it also works with `-L list.txt`.
+
+## Quick Reference
+
+| Goal | Command |
+|---|---|
+| See what is in the dump | `pg_restore -l shop.dump` |
+| Table definition and data only | `pg_restore -d db -n sales -t orders shop.dump` |
+| Complete table with keys and indexes | `pg_restore -d db -L list.txt shop.dump` |
+| Rows only, into an existing empty table | `pg_restore -d db --data-only -n sales -t orders shop.dump` |
+| Preview without restoring | `pg_restore -f - -L list.txt shop.dump` |
+
+For the full set of options, see our [pg_dump and pg_restore guide](/blog/pg-dump-pg-restore-backup-guide). The [pg_restore command generator](https://chat2db.ai/tools/pg-restore-command-generator) builds the command line for these cases. If `pg_restore` cannot open your file at all, check our guide to the [unsupported version in file header](/blog/pg-restore-unsupported-version-in-file-header) error.

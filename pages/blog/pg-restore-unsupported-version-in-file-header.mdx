@@ -1,0 +1,169 @@
+---
+title: "pg_restore: Unsupported Version in File Header"
+description: "Fix pg_restore: error: unsupported version (1.16) in file header. Learn which pg_dump wrote the file, which pg_restore can read it, and three ways to restore."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: November 8, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# pg_restore: Unsupported Version in File Header
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="November 8, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+You got a dump file from a colleague, a backup service or a CI job, ran `pg_restore`, and it stopped before doing anything:
+
+```text
+pg_restore: error: unsupported version (1.16) in file header
+```
+
+The number in brackets changes, and you may see 1.14, 1.15 or 1.16, but the cause is always the same. The file was written by a newer `pg_dump` than the `pg_restore` you are running. Nothing is wrong with the file, and nothing is wrong with the server you want to restore into. This error is only about the client program that reads the file.
+
+This guide explains what the number means, how to find out which version wrote the file, and three ways to get the data restored. We reproduced every message below with PostgreSQL 14.24, 15.19 and 18.6.
+
+## What the Version Number Means
+
+A custom-format (`-Fc`), tar-format (`-Ft`) or directory-format (`-Fd`) dump starts with a small header. The first five bytes are the text `PGDMP`, and the next three bytes are the archive format version. That version is separate from the PostgreSQL version. It changes only when a new release of `pg_dump` adds something to the file layout, for example a new compression method or a new field in the table of contents.
+
+Each `pg_restore` release knows every archive version up to the one its own `pg_dump` writes, and refuses anything newer. We checked the highest version each release accepts in the PostgreSQL source code (`K_VERS_MAX` in `pg_backup_archiver.h`):
+
+| pg_dump / pg_restore release | Archive version it writes | Newest archive it can read |
+|---|---|---|
+| 14 | 1.14 | 1.14 |
+| 15 | 1.14 | 1.14 |
+| 16 | 1.15 | 1.15 |
+| 17 | 1.16 | 1.16 |
+| 18 | 1.16 | 1.16 |
+| 19 (release candidate) | 1.16 | 1.16 |
+
+So the error tells you roughly how old your `pg_restore` is compared with the file:
+
+- **1.15** means the dump came from `pg_dump` 16, and your `pg_restore` is 15 or older.
+- **1.16** means the dump came from `pg_dump` 17 or newer, and your `pg_restore` is 16 or older.
+
+Here is the real output when `pg_restore` 15 meets a dump made by `pg_dump` 18:
+
+```bash
+pg_restore --version
+```
+
+```text
+pg_restore (PostgreSQL) 15.19
+```
+
+```bash
+pg_restore -l shop.dump
+```
+
+```text
+pg_restore: error: unsupported version (1.16) in file header
+```
+
+`pg_restore` 14 prints exactly the same line. Note that 17, 18 and 19 all write 1.16, so a dump from `pg_dump` 18 can be read by `pg_restore` 17. The format did not change between those releases.
+
+## Why the Server Version Does Not Matter Here
+
+People often fix this error by upgrading the wrong thing. The error happens before `pg_restore` connects to any server. It reads the file header, sees a version it does not know, and exits. Upgrading the target database server does not help if the client binary on your PATH is still old.
+
+This is common on machines with several PostgreSQL versions installed. On Debian and Ubuntu, `pg_restore` is a wrapper that picks a version based on the cluster it thinks you mean. On macOS with Homebrew, an old `postgresql@14` can sit first on the PATH. In Docker, the client inside the container matches that container's image, not the server you connect to. Always check which binary actually runs:
+
+```bash
+which pg_restore
+pg_restore --version
+```
+
+## Find Out Which Version Wrote the File
+
+If you have a newer `pg_restore` somewhere, `pg_restore -l` prints the header in plain text. The first lines name both versions:
+
+```text
+;     Dump Version: 1.16-0
+;     Format: CUSTOM
+;     Dumped from database version: 18.6
+;     Dumped by pg_dump version: 18.6
+```
+
+"Dumped by pg_dump version" is the one that matters for this error. "Dumped from database version" is the server the data came from, which matters later for compatibility.
+
+If you only have the old client, read the bytes yourself. The version sits at offsets 5, 6 and 7:
+
+```bash
+head -c 8 shop.dump | xxd
+```
+
+```text
+00000000: 5047 444d 5001 1000                      PGDMP...
+```
+
+`01 10 00` is 1.16.0 (0x10 is 16). A directory-format dump keeps the same header in its `toc.dat` file, so run the command on that file instead.
+
+You can also open the file in our [pg_dump File Inspector](https://chat2db.ai/tools/pg-dump-file-inspector). It reads the header and table of contents in your browser without uploading the file, then shows the archive version, both PostgreSQL versions, the compression method, and which `pg_restore` releases can read it.
+
+## Fix 1: Use a Newer pg_restore Against the Old Server
+
+This is the cleanest fix. `pg_restore` 17 or 18 can connect to an older server and restore into it, and the archive format limit then no longer applies. On Debian or Ubuntu with the PGDG repository:
+
+```bash
+sudo apt install postgresql-client-18
+/usr/lib/postgresql/18/bin/pg_restore -h db.internal -U app -d shop shop.dump
+```
+
+On macOS with Homebrew, `brew install postgresql@18` and call the binary by its full path. If you cannot install anything on the machine, run the client from a container and mount the file:
+
+```bash
+docker run --rm -v "$PWD":/dump postgres:18 \
+  pg_restore -h db.internal -U app -d shop /dump/shop.dump
+```
+
+We restored a `pg_dump` 18 archive into a PostgreSQL 15 server this way. All 5,000 rows of the test table arrived, but `pg_restore` reported one error on the way:
+
+```text
+pg_restore: error: could not execute query: ERROR:  unrecognized configuration parameter "transaction_timeout"
+Command was: SET transaction_timeout = 0;
+pg_restore: warning: errors ignored on restore: 1
+```
+
+Dumps written by `pg_dump` 17 and newer set `transaction_timeout`, which servers older than 17 do not have. In a normal run, `pg_restore` logs the error and continues, so the data still arrives. With `--exit-on-error` or `--single-transaction` it stops instead. Our article on the [transaction_timeout restore error](/blog/postgres-unrecognized-parameter-transaction-timeout) shows how to handle that case.
+
+## Fix 2: Convert the Archive to SQL First
+
+If the restore has to run with an old client, for example from a locked-down application server, convert the archive to a plain SQL script on any machine that has a new `pg_restore`. Then run the script with whatever `psql` is available:
+
+```bash
+pg_restore -f shop.sql shop.dump
+psql -h db.internal -U app -d shop -v ON_ERROR_STOP=1 -f shop.sql
+```
+
+`-f` writes the SQL that `pg_restore` would have sent to a server, so no connection is needed for the first step. The script is larger than the archive and loses parallel restore (`-j`), but any `psql` can run it. You can also edit it before running, which is handy when you need to drop an unsupported setting.
+
+## Fix 3: Make the Dump With a Compatible Format
+
+If you control the side that makes the dump, you might think of running an older `pg_dump` so the file comes out in an older format. That does not work against a newer server:
+
+```text
+pg_dump: error: aborting because of server version mismatch
+pg_dump: detail: server version: 18.6; pg_dump version: 15.19
+```
+
+`pg_dump` refuses to dump a server newer than itself, because it cannot know about catalog changes made later. See our guide to the [pg_dump server version mismatch](/blog/pg-dump-server-version-mismatch) for that error. The practical choice is to produce a plain SQL dump (`pg_dump -Fp`), which has no archive version at all, or to install a newer client on the restoring side as in Fix 1.
+
+## Other Header Errors That Look Similar
+
+A few other messages come from the same header check and are easy to confuse with this one:
+
+- `input file appears to be a text format dump. Please use psql.` The file is a plain SQL dump. Restore it with `psql -f`, not `pg_restore`.
+- `input file does not appear to be a valid archive` (versions up to 17) or `input file does not appear to be a valid tar archive` (18). The file is not a pg_dump archive at all. Often it is compressed a second time, for example `shop.dump.gz`, so decompress it first.
+- `input file is too short (read 0, expected 5)`. The file is empty, usually because the dump failed. Check the `pg_dump` log and take a new dump.
+
+The [pg_dump File Inspector](https://chat2db.ai/tools/pg-dump-file-inspector) recognizes all of these cases and tells you which one you have.
+
+## Avoid the Error Next Time
+
+Keep the client version on the restoring side at least as new as the client that makes the dumps. In practice that means installing the newest `postgresql-client` package on backup and restore hosts, even if the servers they talk to are older. Newer clients work with older servers, back to 9.2 for `pg_dump` 18, so there is little downside.
+
+Also record which `pg_dump` version produced each backup. A backup you cannot restore at 3 a.m. because the restore host has the wrong client is a bad surprise during an incident. Test restores regularly with the exact tools you would use in an emergency.
+
+When you need to look inside a restored database quickly, a client such as [Chat2DB](https://chat2db.ai/download) lets you browse the restored schemas, compare row counts with the source and run checks without remembering every catalog query. For the full backup workflow, see our [pg_dump and pg_restore guide](/blog/pg-dump-pg-restore-backup-guide).

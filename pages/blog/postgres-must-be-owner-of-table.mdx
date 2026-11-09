@@ -1,0 +1,288 @@
+---
+title: "Postgres Must Be Owner of Table: Fix"
+description: "Fix ERROR: must be owner of table in PostgreSQL: which commands need ownership, and how to fix it with role membership, SET ROLE, MAINTAIN or a new owner."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: November 8, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# Postgres Must Be Owner of Table: Fix
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="November 8, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+Your role can read and write a table, but the moment you try to change it, PostgreSQL stops you:
+
+```sql
+ALTER TABLE orders ADD COLUMN created timestamptz;
+```
+
+```text
+ERROR:  must be owner of table orders
+```
+
+Privileges such as `SELECT`, `INSERT`, `UPDATE` and `DELETE` control what you can do with the rows. Changing the table itself is reserved for its owner. No `GRANT` on the table gives you that right. This guide lists which commands need ownership, then shows four fixes, from the most targeted to the broadest. We ran every example on PostgreSQL 18.6 and 15.19, because the behaviour changed in 16 and 17.
+
+## Which Commands Need Ownership
+
+We set up a table owned by `owner_role`, and gave a second role, `dev`, full data privileges:
+
+```sql
+CREATE ROLE owner_role LOGIN;
+CREATE ROLE dev LOGIN;
+CREATE TABLE orders (id int PRIMARY KEY, note text);
+ALTER TABLE orders OWNER TO owner_role;
+GRANT SELECT, INSERT, UPDATE, DELETE ON orders TO dev;
+```
+
+Logged in as `dev`, each of these failed with `must be owner of table orders` on both 15 and 18:
+
+```sql
+ALTER TABLE orders ADD COLUMN created timestamptz;
+CREATE INDEX ON orders (note);
+DROP TABLE orders;
+COMMENT ON TABLE orders IS 'customer orders';
+```
+
+Other commands are controlled by privileges rather than ownership, so they fail with a different message:
+
+```sql
+TRUNCATE orders;
+```
+
+```text
+ERROR:  permission denied for table orders
+```
+
+`TRUNCATE` has its own privilege. `GRANT TRUNCATE ON orders TO dev;` fixes that one without giving away ownership.
+
+Maintenance commands changed recently. On PostgreSQL 15, `REFRESH MATERIALIZED VIEW` required ownership, and `VACUUM` skipped the table with a warning:
+
+```text
+ERROR:  must be owner of materialized view mv
+WARNING:  skipping "orders" --- only table or database owner can vacuum it
+```
+
+On 18, the same commands report a missing privilege instead, because PostgreSQL 17 added the `MAINTAIN` privilege:
+
+```text
+ERROR:  permission denied for materialized view mv
+WARNING:  permission denied to vacuum "orders", skipping it
+```
+
+That difference matters for the fix, as shown below.
+
+## Views, Sequences and Functions Work the Same Way
+
+The rule is not limited to tables. Every object has an owner, and changing or dropping it needs ownership. With a view, a sequence and a function owned by `owner_role`, the `dev` role got these errors on 18:
+
+```sql
+DROP VIEW public.v_orders;
+ALTER SEQUENCE public.invoice_seq RESTART WITH 100;
+```
+
+```text
+ERROR:  must be owner of view v_orders
+ERROR:  must be owner of sequence invoice_seq
+```
+
+`CREATE OR REPLACE` counts as a change to the existing object. It first needs `CREATE` on the schema. Without it, `dev` got `permission denied for schema public`. After we granted `CREATE` on the schema, the ownership check still stopped it:
+
+```text
+ERROR:  must be owner of view v_orders
+ERROR:  must be owner of function f_total
+```
+
+So a migration that redefines a view or function must run as its owner, just like an `ALTER TABLE`. Using sequences is different. `nextval` and `setval` need the `USAGE` or `UPDATE` privilege, not ownership, and fail with `permission denied for sequence` when it is missing.
+
+## Fix 1: Grant MAINTAIN for Maintenance Work (17 and Newer)
+
+If the role only needs to run `VACUUM`, `ANALYZE`, `REINDEX`, `CLUSTER`, `REFRESH MATERIALIZED VIEW` or `LOCK TABLE`, grant `MAINTAIN` instead of ownership:
+
+```sql
+GRANT MAINTAIN ON orders, mv TO dev;
+```
+
+On 18, `dev` could then refresh the materialized view:
+
+```sql
+REFRESH MATERIALIZED VIEW mv;
+```
+
+```text
+REFRESH MATERIALIZED VIEW
+```
+
+On 15 the same `GRANT` fails with `unrecognized privilege type "maintain"`. On older versions, the only options are the fixes below. The predefined role `pg_maintain` gives the same right on every table in the cluster, which suits a maintenance job account better than per-table grants.
+
+## Fix 2: Make the Role a Member of the Owner
+
+Ownership checks accept members of the owning role. The cleanest design is to have tables owned by a group role that no one logs in as, with the people and services that change the schema as members:
+
+```sql
+GRANT owner_role TO dev;
+```
+
+After that, `dev` could run the `ALTER TABLE` on both 15 and 18:
+
+```text
+ALTER TABLE
+```
+
+PostgreSQL 16 changed how membership works, and this is where many people get stuck on newer versions. A membership grant now has separate `INHERIT` and `SET` options. Ownership checks follow `INHERIT`. If the membership was granted without it, the member has to switch roles explicitly:
+
+```sql
+GRANT owner_role TO dev WITH INHERIT FALSE, SET TRUE;
+```
+
+```sql
+-- as dev
+ALTER TABLE orders ADD COLUMN c2 int;
+```
+
+```text
+ERROR:  must be owner of table orders
+```
+
+```sql
+SET ROLE owner_role;
+ALTER TABLE orders ADD COLUMN c2 int;
+```
+
+```text
+ALTER TABLE
+```
+
+Check the options of an existing membership in `pg_auth_members` (the `inherit_option` and `set_option` columns exist from 16 onwards):
+
+```sql
+SELECT roleid::regrole AS role, member::regrole AS member,
+       inherit_option, set_option
+FROM pg_auth_members
+WHERE member = 'dev'::regrole;
+```
+
+```text
+    role    | member | inherit_option | set_option
+------------+--------+----------------+------------
+ owner_role | dev    | t              | t
+```
+
+The default for `INHERIT` comes from the member role's own `INHERIT` attribute. A role created with `NOINHERIT` gets memberships without inheritance, so it always needs `SET ROLE`. That is a deliberate way to make schema changes an explicit step in migration scripts.
+
+## Fix 3: Change the Owner
+
+If the wrong role owns the table, for example because a migration ran under a personal account, transfer it:
+
+```sql
+ALTER TABLE orders OWNER TO app_owner;
+```
+
+A superuser can do this freely. A non-superuser has to own the table and also be allowed to become the new owner. Since 16, the error for the second part reads:
+
+```text
+ERROR:  must be able to SET ROLE "team"
+```
+
+On 15 and older it reads `must be member of role "team"`. Grant the membership, with `SET` on 16 and newer, or have a superuser run the `ALTER`.
+
+To move everything a role owns in the current database in one go, use `REASSIGN OWNED`:
+
+```sql
+REASSIGN OWNED BY owner_role TO app_owner;
+```
+
+It affects the current database only, so run it in each database. This is also the standard first step when you want to drop a role, as described in our guide to [dropping a role with dependent objects](/blog/postgres-drop-role-dependent-objects).
+
+## Fix 4: Run the Change as the Owner
+
+For one-off changes, connect as the owner, or as a superuser, and run the statement there. Migration tools usually work best with a dedicated owner role. Give your migration tool, such as Flyway or Liquibase, the owner's credentials, and give the application a role with only data privileges. That way, only migrations can change the schema, which is the point of the ownership rule.
+
+## Make Migrations Create Tables as the Owner
+
+The most common source of this error is mixed ownership. One migration ran as `alice`, the next as a CI account, and now each table belongs to whoever created it. Every later `ALTER TABLE` fails for everyone else. You can prevent this by making the migration login switch to the owner role automatically at the start of every session:
+
+```sql
+CREATE ROLE migrator LOGIN;
+GRANT owner_role TO migrator;
+ALTER ROLE migrator SET role = 'owner_role';
+```
+
+A new session as `migrator` then runs as `owner_role`:
+
+```sql
+SELECT current_user, session_user;
+```
+
+```text
+ current_user | session_user
+--------------+--------------
+ owner_role   | migrator
+```
+
+A table created in that session belongs to `owner_role`, not to `migrator`:
+
+```sql
+CREATE TABLE public.mig_t (i int);
+SELECT tablename, tableowner FROM pg_tables WHERE tablename = 'mig_t';
+```
+
+```text
+ tablename | tableowner
+-----------+------------
+ mig_t     | owner_role
+```
+
+`owner_role` needs `CREATE` on the schema for this to work. Because `session_user` still shows the real login, audit logs keep track of who ran the migration. On 16 and newer, the membership needs the `SET` option, which is the default for a plain `GRANT`.
+
+## The Restore Variant: ALTER ... OWNER TO Fails
+
+The same rule appears when a non-superuser restores a dump made elsewhere. We restored a dump from a 14 server into an 18 database owned by a plain role, `restorer`:
+
+```text
+pg_restore: error: could not execute query: ERROR:  must be able to SET ROLE "postgres"
+Command was: ALTER SCHEMA public OWNER TO postgres;
+
+pg_restore: error: could not execute query: ERROR:  must be able to SET ROLE "postgres"
+Command was: ALTER TABLE public.t OWNER TO postgres;
+```
+
+The dump tries to give every object back to its original owner, and `restorer` is not allowed to act as `postgres`. If you want the restoring role to own everything, skip the ownership and privilege commands:
+
+```bash
+pg_restore -d dst --no-owner --no-acl shop.dump
+```
+
+That run finished with no errors. Use `--no-acl` only if you plan to set privileges yourself afterwards. Without it, `GRANT` statements may fail for roles that do not exist on the target.
+
+## Schemas Have Owners Too
+
+A close relative of this error appears when you create a table in a schema you do not own:
+
+```sql
+CREATE TABLE public.t2 (i int);
+```
+
+```text
+ERROR:  permission denied for schema public
+```
+
+Since PostgreSQL 15, the `public` schema of a new database is owned by `pg_database_owner` and ordinary roles cannot create objects in it. Grant `CREATE` on the schema, or better, give the application its own schema. Note that databases upgraded from 14 or older keep their old, more open `public` schema permissions.
+
+## Find Out Who Owns What
+
+Before you change anything, check the current owners. This query lists tables and their owners in one schema:
+
+```sql
+SELECT tablename, tableowner
+FROM pg_tables
+WHERE schemaname = 'public'
+ORDER BY 1;
+```
+
+In psql, `\dt+` and `\dn+` show owners for tables and schemas. In [Chat2DB](https://chat2db.ai/download), the table properties panel shows the owner and grants next to the column list, which is handy when you are deciding between granting a membership and moving ownership. If you write grants often, our [Postgres GRANT generator](https://chat2db.ai/tools/postgres-grant-generator) builds the statements for common role setups.
+
+For the related privilege error on sequences, see [permission denied for sequence](/blog/postgres-permission-denied-for-sequence).
