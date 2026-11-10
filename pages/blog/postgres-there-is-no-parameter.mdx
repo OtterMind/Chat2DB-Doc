@@ -1,0 +1,275 @@
+---
+title: "Postgres Error: There Is No Parameter $1 (Fix)"
+description: "Fix PostgreSQL ERROR: there is no parameter $1 (42P02) in psql, PL/pgSQL EXECUTE, SQL functions and node-postgres, plus the related bind and 42P18 errors."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: November 9, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# Postgres Error: There Is No Parameter $1 (Fix)
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="November 9, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+You copy a query from application code into psql, press Enter, and get this:
+
+```text
+ERROR:  there is no parameter $1
+LINE 1: SELECT * FROM pg_class WHERE relname = $1;
+                                               ^
+```
+
+`$1`, `$2` and so on are positional parameters. They are placeholders that a client fills in separately from the SQL text, and they only exist when the query is sent through a path that supplies them: a prepared statement, the extended query protocol of a driver, a function body, or `EXECUTE ... USING` in PL/pgSQL. When the same text arrives as a plain query with no parameters attached, PostgreSQL has nothing to substitute and stops with SQLSTATE `42P02` (undefined parameter).
+
+This article covers the places where the error shows up and the right fix for each. Every example was run on PostgreSQL 18.6, with psql 18 and node-postgres 8. The PL/pgSQL and function cases behave the same on PostgreSQL 15.19.
+
+## Why Parameters Are Not Text Substitution
+
+It helps to know what a driver actually does with `$1`. In the extended query protocol, the client sends the SQL text with its placeholders in one message (Parse), and the values in a separate message (Bind). The server parses and plans the statement before it ever sees the values, and then executes it with them. The values are never pasted into the SQL text, which is why parameters protect against SQL injection: a value like `'; DROP TABLE users; --` is just a string that gets compared with a column, not code.
+
+That design has two consequences for this error. First, a placeholder can only stand for a value, never for a table name, column name or keyword, so `SELECT * FROM $1` cannot work even with parameters attached. Second, when the SQL text is sent through the simple query protocol, which is what psql does by default and what drivers do when no values are given, there is no Bind message at all. The server finds `$1` in the text, has no value for it, and reports `there is no parameter $1`. Every fix below is a way of either providing that Bind step or removing the placeholder.
+
+## In psql: Running a Query Copied from Code
+
+The quickest way to reproduce the error is to type a parameterized query directly:
+
+```sql
+SELECT $1;
+```
+
+```text
+ERROR:  there is no parameter $1
+LINE 1: SELECT $1;
+               ^
+```
+
+psql sends this as a simple query, which cannot carry parameter values. You have four options, depending on what you are trying to do.
+
+### Option 1: Replace the Placeholder with a Literal
+
+For a one-off check, substitute the value by hand. Keep the quoting and the type that the application would use:
+
+```sql
+SELECT relname, relkind FROM pg_class WHERE relname = 'pg_class';
+```
+
+This is fine for debugging, but it does not test the same plan the application gets, because a literal lets the planner see the value while a parameter may use a generic plan.
+
+### Option 2: Use PREPARE and EXECUTE
+
+To run the statement exactly as a driver would, prepare it with parameter types and execute it with values:
+
+```sql
+PREPARE find_rel(text) AS
+  SELECT relname, relkind FROM pg_class WHERE relname = $1;
+
+EXECUTE find_rel('pg_class');
+```
+
+```text
+ relname  | relkind
+----------+---------
+ pg_class | r
+(1 row)
+```
+
+`DEALLOCATE find_rel;` removes it when you are done. Prepared statements live for the session, so a second `PREPARE` with the same name fails until you deallocate the first one.
+
+### Option 3: Use \bind in psql 16 and Newer
+
+psql 16 added `\bind`, which sends the query through the extended protocol with the values you give it. This is the closest thing to what a driver does:
+
+```sql
+SELECT relname FROM pg_class WHERE relname = $1 \bind 'pg_class' \g
+```
+
+```text
+ relname
+----------
+ pg_class
+(1 row)
+```
+
+The number of values must match the number of placeholders. Too few or too many produces a protocol error rather than the "no parameter" message:
+
+```sql
+SELECT $1::int + $2::int \bind 1 \g
+```
+
+```text
+ERROR:  bind message supplies 1 parameters, but prepared statement "" requires 2
+```
+
+On psql 15 and older, `\bind` does not exist and the line is treated as part of the next query, which leads to confusing syntax errors. Check `psql --version` first.
+
+### Option 4: Use psql Variables
+
+If you want named, reusable values in a script, psql variables with `:'name'` interpolation are often more convenient than `$n`:
+
+```sql
+\set rel 'pg_class'
+SELECT relkind FROM pg_class WHERE relname = :'rel';
+```
+
+```text
+ relkind
+---------
+ r
+(1 row)
+```
+
+psql substitutes the variable on the client before sending the query. `:'rel'` quotes it as a string literal and `:"rel"` as an identifier. This is text substitution, not a server-side parameter, so it is meant for scripts you control, not for user input.
+
+## In PL/pgSQL: EXECUTE Without USING
+
+Dynamic SQL inside a function or `DO` block is the second most common source. The `$1` inside the string refers to a parameter of the dynamic statement, not to the function's own first argument:
+
+```sql
+DO $$
+DECLARE n int;
+BEGIN
+  EXECUTE 'SELECT count(*) FROM pg_class WHERE relkind = $1' INTO n;
+  RAISE NOTICE '%', n;
+END $$;
+```
+
+```text
+ERROR:  there is no parameter $1
+LINE 1: SELECT count(*) FROM pg_class WHERE relkind = $1
+                                                      ^
+QUERY:  SELECT count(*) FROM pg_class WHERE relkind = $1
+CONTEXT:  PL/pgSQL function inline_code_block line 4 at EXECUTE
+```
+
+The `QUERY` and `CONTEXT` lines tell you the statement came from `EXECUTE`. Supply the value with `USING`:
+
+```sql
+DO $$
+DECLARE n int;
+BEGIN
+  EXECUTE 'SELECT count(*) FROM pg_class WHERE relkind = $1' INTO n USING 'r';
+  RAISE NOTICE 'tables: %', n;
+END $$;
+```
+
+```text
+NOTICE:  tables: 68
+```
+
+The count depends on your database. Each `$n` in the string maps to the n-th expression after `USING`, so `USING a, b` fills `$1` with `a` and `$2` with `b`. If you need to build identifiers such as table names, use `format()` with `%I` for the identifier and keep values in `USING`:
+
+```sql
+CREATE FUNCTION count_kind(p_kind "char") RETURNS bigint
+LANGUAGE plpgsql AS $$
+DECLARE n bigint;
+BEGIN
+  EXECUTE format('SELECT count(*) FROM %I WHERE relkind = $1', 'pg_class')
+    INTO n USING p_kind;
+  RETURN n;
+END $$;
+
+SELECT count_kind('r') > 0 AS ok;
+```
+
+```text
+ ok
+----
+ t
+(1 row)
+```
+
+`$n` placeholders in plain PL/pgSQL statements (outside `EXECUTE`) also fail, for example `PERFORM $1;` in a `DO` block. A `DO` block takes no arguments at all, so there is nothing for `$1` to refer to. Use a declared variable instead.
+
+## In SQL Functions: A Placeholder Beyond the Argument List
+
+In a `LANGUAGE sql` function, `$1`, `$2`... refer to the function's arguments. Referring to an argument that does not exist fails when the function is created:
+
+```sql
+CREATE FUNCTION add_two(int) RETURNS int
+LANGUAGE sql AS 'SELECT $2 + 1';
+```
+
+```text
+ERROR:  there is no parameter $2
+LINE 2: LANGUAGE sql AS 'SELECT $2 + 1';
+                                ^
+```
+
+Either add the missing argument to the signature or fix the number. Named arguments are easier to read and avoid the problem entirely, because the body refers to `x` instead of a position:
+
+```sql
+CREATE FUNCTION add_one(x int) RETURNS int
+LANGUAGE sql AS 'SELECT x + 1';
+
+SELECT add_one(41);
+```
+
+```text
+ add_one
+---------
+      42
+(1 row)
+```
+
+## In Drivers: Parameters Not Passed
+
+Drivers send a query with parameters only when you give them values. With node-postgres, calling `query` with SQL that contains `$1` but no values array, or with an empty array, sends a simple query, and the server reports the familiar error:
+
+```js
+await client.query('SELECT $1::text AS v');      // ERROR 42P02: there is no parameter $1
+await client.query('SELECT $1::text AS v', []);  // ERROR 42P02: there is no parameter $1
+await client.query('SELECT $1::text AS v', ['ok']); // [{ v: 'ok' }]
+```
+
+We ran these three calls with node-postgres 8 against PostgreSQL 18.6 and got exactly those results. If you pass some values but not enough, you get a different message, because now the extended protocol is used and the server counts the values:
+
+```js
+await client.query('SELECT $1::int + $2::int AS v', [1]);
+// ERROR 08P01: bind message supplies 1 parameters, but prepared statement "" requires 2
+```
+
+Common causes in application code:
+
+- **A values array built conditionally.** An optional filter adds `AND status = $2` to the SQL but the code path forgets to push the value.
+- **SQL logged and re-run elsewhere.** Query logs and APM tools often show the SQL with `$1` placeholders. Running that text in a console reproduces the error, not the bug.
+- **Mixing placeholder styles.** Some libraries use `?` or `:name` and translate them to `$n`. Passing `$1` to such a library, or `?` to node-postgres, leaves placeholders unfilled.
+- **Placeholders inside string literals.** `'$1'` in quotes is just text and is never replaced. Concatenate on the SQL side instead, for example `'%' || $1 || '%'` for a `LIKE` pattern.
+
+The last point is easy to verify:
+
+```js
+await client.query("SELECT '$1' AS v, $1::text AS w", ['x']);
+// [{ v: '$1', w: 'x' }]
+```
+
+## A Related Error: Could Not Determine Data Type of Parameter
+
+Once parameters are attached, PostgreSQL still needs to know their type. Most of the time it infers it from context, such as the column it is compared with. When there is no context, you get SQLSTATE `42P18`:
+
+```sql
+PREPARE p1 AS SELECT $1 IS NULL;
+```
+
+```text
+ERROR:  could not determine data type of parameter $1
+```
+
+Cast the placeholder (`$1::text IS NULL`) or declare the type in `PREPARE p1(text) AS ...`. Drivers hit the same problem with expressions like `$1 IS NULL OR col = $1`; a cast on the first use solves it.
+
+## Quick Reference
+
+| Where | Cause | Fix |
+|---|---|---|
+| psql | Query with `$n` sent as plain SQL | Literal value, `PREPARE`/`EXECUTE`, `\bind` (psql 16+), or psql variables |
+| PL/pgSQL `EXECUTE` | Dynamic SQL uses `$n` without `USING` | Add `USING value1, value2` |
+| `DO` block | `$n` used outside `EXECUTE` | Use declared variables |
+| SQL function | `$n` higher than the number of arguments | Fix the signature or use named arguments |
+| Driver | Values array missing or empty | Pass one value per placeholder |
+| Any | `'$1'` inside quotes | Move the placeholder out of the literal |
+
+## Testing Parameterized Queries Comfortably
+
+Debugging parameterized SQL is easier in a client that understands placeholders. In [Chat2DB](https://chat2db.ai/download) you can paste a query copied from your application or logs, fill in the parameter values, and run it against the same database, which avoids hand-editing literals into the SQL and getting the quoting wrong. For more on the protocol-level message, see [bind message supplies parameters, but prepared statement requires](/blog/postgres-bind-message-supplies-parameters).

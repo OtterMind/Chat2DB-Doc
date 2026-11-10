@@ -1,0 +1,196 @@
+---
+title: "Postgres log_line_prefix: Settings and Examples"
+description: "Configure PostgreSQL log_line_prefix: every % escape explained, %q for background processes, padding, pgBadger-ready values, and a regex to parse the log lines."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: November 9, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# Postgres log_line_prefix: Settings and Examples
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="November 9, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+When something goes wrong in PostgreSQL, the server log is usually the first place to look, and `log_line_prefix` decides how useful it is. The default prints a timestamp and a process ID:
+
+```text
+2026-11-09 16:40:02.511 UTC [48213] ERROR:  relation "ordes" does not exist at character 15
+```
+
+That tells you when and which process, but not which user, database or application sent the query. A better prefix answers those questions on every line:
+
+```text
+2026-11-09 16:40:02.511 UTC [48213] [2] [user=app_user db=shop app=billing api client=10.0.0.7(52814)] [42P01] ERROR:  relation "ordes" does not exist at character 15
+```
+
+This guide explains every escape you can use, the `%q` trick for background processes, padding, values that work with pgBadger, and how to parse the result. We tested every prefix below on PostgreSQL 14.24, 15.19 and 18.6 by writing real log lines and parsing them back.
+
+## Viewing and Changing the Setting
+
+```sql
+SHOW log_line_prefix;
+```
+
+```text
+ log_line_prefix
+-----------------
+ %m [%p]
+(1 row)
+```
+
+The value is `'%m [%p] '`, with a trailing space that psql does not make visible. It has been the default since PostgreSQL 10.
+
+`log_line_prefix` can be changed without a restart. Set it in `postgresql.conf`, or from SQL as a superuser:
+
+```sql
+ALTER SYSTEM SET log_line_prefix = '%m [%p] [%l] %q[user=%u db=%d app=%a client=%r] [%e] ';
+SELECT pg_reload_conf();
+```
+
+New lines use the new prefix as soon as the reload is processed. `ALTER SYSTEM` writes the value to `postgresql.auto.conf`, which overrides `postgresql.conf`. If you also edit `postgresql.conf` and nothing changes, that is why. `ALTER SYSTEM RESET log_line_prefix` removes the override.
+
+## The Escapes
+
+Every `%` followed by a letter is replaced when a line is written. Anything else is copied literally.
+
+| Escape | Prints | Example | Notes |
+|---|---|---|---|
+| `%m` | Timestamp with milliseconds | `2026-11-09 16:40:01.237 UTC` | Default |
+| `%t` | Timestamp without milliseconds | `2026-11-09 16:40:01 UTC` | |
+| `%n` | Unix epoch with milliseconds | `1794242401.237` | Handy for machine parsing |
+| `%p` | Process ID | `48213` | Default |
+| `%c` | Session ID | `672fbe61.bc55` | Hex start time and hex PID, unique per session |
+| `%l` | Line number within the session | `3` | Starts at 1 for each process |
+| `%s` | Process start time | `2026-11-09 16:39:58 UTC` | |
+| `%u` | User name | `app_user` | Session only |
+| `%d` | Database name | `shop` | Session only |
+| `%a` | Application name | `billing api` | Session only |
+| `%r` | Client host and port | `10.0.0.7(52814)` or `[local]` | Session only |
+| `%h` | Client host | `10.0.0.7` or `[local]` | Session only |
+| `%L` | Local server address | `10.0.0.5` | PostgreSQL 18+ |
+| `%b` | Backend type | `client backend`, `checkpointer` | |
+| `%i` | Command tag | `SELECT`, `idle` | Session only |
+| `%e` | SQLSTATE | `00000`, `42P01` | `00000` for non-errors |
+| `%v` | Virtual transaction ID | `4/17` | |
+| `%x` | Transaction ID | `0` | 0 until a write assigns an XID |
+| `%P` | Parallel leader PID | | Empty unless the process is a parallel worker; 14+ |
+| `%Q` | Query ID | `-5843171098457121403` | 0 unless `compute_query_id` is on; 14+ |
+| `%q` | Nothing | | Stops here for non-session processes |
+| `%%` | A literal `%` | | |
+
+An escape PostgreSQL does not know, such as `%z`, prints nothing and raises no error. The same happens with `%L` on PostgreSQL 17 and older, which we checked in the source of each version, so a prefix copied from newer documentation can silently lose fields on an older server.
+
+"Session only" escapes are empty for processes that do not serve a client, such as the checkpointer, autovacuum launcher and WAL writer. A few behaviors we saw in the test logs are worth knowing:
+
+- **`%a` is `[unknown]` on connection lines.** The connection lines (`connection received`, `connection authorized` and, where it is logged, `connection authenticated`) are written before the client's `application_name` takes effect, so they show `[unknown]` even when the application sets a name. The `connection authorized` message itself includes `application_name=...` in its text.
+- **An empty application name is also `[unknown]`.** A client that explicitly sets `application_name` to an empty string logs as `[unknown]`, not as a blank.
+- **`%u` and `%d` are `[unknown]` on the very first line** of a connection, `connection received`, because the startup packet has not been processed yet.
+
+## %q: Clean Lines for Background Processes
+
+Without `%q`, background processes produce lines with empty session fields:
+
+```text
+2026-11-09 16:45:00.004 UTC [48001] user=,db=,app=,client= LOG:  checkpoint starting: time
+```
+
+`%q` tells non-session processes to stop printing the prefix at that point. Put the timestamp and PID before it and session fields after it:
+
+```text
+log_line_prefix = '%m [%p] %q[user=%u db=%d app=%a client=%r] '
+```
+
+A client session then logs:
+
+```text
+2026-11-09 16:40:02.511 UTC [48213] [user=app_user db=shop app=billing api client=10.0.0.7(52814)] ERROR:  ...
+```
+
+and the checkpointer logs:
+
+```text
+2026-11-09 16:45:00.004 UTC [48001] LOG:  checkpoint starting: time
+```
+
+Everything after `%q`, including literal text such as brackets and a trailing SQLSTATE, is skipped for background processes. If you want `%e` or `%b` on every line, place them before `%q`.
+
+## Padding
+
+A number between `%` and the letter pads the value to that width. Positive numbers right-align and negative numbers left-align, which keeps log columns readable:
+
+```text
+log_line_prefix = '%m %-8p %5l [%-20b] %q%r %i: '
+```
+
+Values longer than the width are not cut. Session fields that are empty for background processes are replaced by spaces of the same width, so padded columns stay aligned. Padding makes regex parsing slightly harder, because the field is followed or preceded by spaces, so trim captured values.
+
+## Prefixes for Common Goals
+
+**General purpose, readable:**
+
+```text
+'%m [%p] [%l] %q[user=%u db=%d app=%a client=%r] [%e] '
+```
+
+**pgBadger.** pgBadger needs a time escape (`%t`, `%m` or `%n`) and a process escape (`%p` or `%c`). Its documentation recommends this value for stderr logs:
+
+```text
+'%t [%p]: user=%u,db=%d,app=%a,client=%h '
+```
+
+Any other prefix works too, as long as you pass the exact same string to pgBadger with `--prefix`.
+
+**syslog or journald.** The system logger adds its own timestamp and the process ID, so leave them out:
+
+```text
+'user=%u,db=%d,app=%a,client=%h '
+```
+
+**Debugging transactions and queries:**
+
+```text
+'%m [%p] [%b] %q[%u@%d] [xid=%x vxid=%v] [qid=%Q] '
+```
+
+`%Q` matches the `queryid` column in `pg_stat_statements`, so you can connect a logged slow statement to its aggregate statistics. Turn on `compute_query_id` (or load `pg_stat_statements`, which enables it automatically) or the value stays 0.
+
+Whatever you choose, end the prefix with a space. Otherwise it runs straight into `LOG:` or `ERROR:`.
+
+## Parsing Log Lines
+
+A consistent prefix makes the log easy to parse with a regular expression. For the general-purpose prefix above, this pattern (JavaScript or PCRE syntax) splits a line into fields:
+
+```text
+^(?<time_ms>\d{4}-\d\d-\d\d \d\d:\d\d:\d\d\.\d{3} \S+) \[(?<pid>\d+)\] \[(?<line>\d+)\] (?:\[user=(?<user>.*?) db=(?<db>.*?) app=(?<app>.*?) client=(?<client>.*?)\] \[(?<sqlstate>[0-9A-Z]{5})\] )?(?<level>DEBUG[1-5]|INFO|NOTICE|WARNING|ERROR|LOG|FATAL|PANIC|DETAIL|HINT|QUERY|CONTEXT|LOCATION|STATEMENT):  (?<message>.*)$
+```
+
+The part after `%q` is an optional group, so the same pattern matches lines from background processes. Lines that start with a tab or spaces are continuation lines of a multi-line statement and belong to the previous entry. The level names are English only; with a different `lc_messages`, they are translated.
+
+Writing such a pattern by hand is error-prone, especially with padding and lazy matches around names that contain spaces. Our free [PostgreSQL log_line_prefix Builder](https://chat2db.ai/tools/postgres-log-line-prefix-builder) explains each escape in a prefix, warns about escapes your version ignores, shows a sample line for a client and for a background process, and generates this regex (plus a Python version) from your prefix. Paste real log lines to check the result. In our tests it parsed 656 log lines written by PostgreSQL 14, 15 and 18 with eight different prefixes, without a single mismatch.
+
+## Related Logging Settings
+
+`log_line_prefix` only formats lines. These settings decide which lines exist:
+
+- `log_min_duration_statement = '500ms'` logs statements slower than the threshold, with their duration.
+- `log_connections = on` and `log_disconnections = on` record sessions, which pgBadger uses for connection reports.
+- `log_lock_waits = on` logs waits longer than `deadlock_timeout`.
+- `log_checkpoints = on` (the default since PostgreSQL 15) and `log_autovacuum_min_duration` show background work.
+- `log_destination = 'jsonlog'` (PostgreSQL 15+) writes structured JSON with all of these fields as keys, which avoids prefix parsing altogether. `log_line_prefix` does not apply to `jsonlog` or `csvlog`.
+
+For capturing execution plans of slow statements, see the [auto_explain guide](/blog/postgres-auto-explain-guide), and for finding the expensive queries in aggregate, the [pg_stat_statements guide](/blog/postgres-pg-stat-statements-guide).
+
+## Reading Logs Next to Your Database
+
+Once the log tells you which user, database and application ran a failing statement, the next step is usually to run that statement yourself. [Chat2DB](https://chat2db.ai/download) lets you open the same database, paste the statement from the log, and ask the AI assistant to explain the error or the plan.
+
+## Summary
+
+- The default `log_line_prefix` is `'%m [%p] '`. Add `%u`, `%d`, `%a` and `%r` or `%h` to know who ran each statement.
+- Put `%q` before session fields so background lines stay clean.
+- Unknown escapes, and `%L` before PostgreSQL 18, print nothing without warning.
+- For pgBadger, include a time escape and `%p` or `%c`, and pass the same prefix to `--prefix`.
+- Change it with `ALTER SYSTEM SET log_line_prefix = ...` and `SELECT pg_reload_conf();`; no restart is needed.

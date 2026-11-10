@@ -1,0 +1,329 @@
+---
+title: "Cannot Insert a Non-DEFAULT Value Into Column"
+description: "Fix PostgreSQL cannot insert a non-DEFAULT value into column for GENERATED ALWAYS identity and generated columns: OVERRIDING SYSTEM VALUE, COPY, sequences."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: November 9, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# Cannot Insert a Non-DEFAULT Value Into Column
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="November 9, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+You try to copy rows with their original IDs into a new table and PostgreSQL refuses:
+
+```text
+ERROR:  cannot insert a non-DEFAULT value into column "id"
+DETAIL:  Column "id" is an identity column defined as GENERATED ALWAYS.
+HINT:  Use OVERRIDING SYSTEM VALUE to override.
+```
+
+The SQLSTATE is `428C9` (generated always). The message appears for two different kinds of columns, and the `DETAIL` line tells you which one you hit:
+
+- **Identity columns defined as `GENERATED ALWAYS AS IDENTITY`.** PostgreSQL assigns the value from a sequence and does not accept one from you, unless you explicitly override it.
+- **Generated columns (`GENERATED ALWAYS AS (expression)`).** The value is always computed from other columns, and there is no override at all.
+
+This article covers both, including `UPDATE`, `COPY`, `pg_dump` and the sequence cleanup you need after loading explicit IDs. All examples were run on PostgreSQL 18.6, and the messages are the same on 14.24.
+
+## The Example Table
+
+```sql
+CREATE TABLE invoices (
+  id       bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  customer text NOT NULL,
+  net      numeric(10,2) NOT NULL,
+  tax_rate numeric(4,3) NOT NULL DEFAULT 0.200,
+  gross    numeric(10,2) GENERATED ALWAYS AS (round(net * (1 + tax_rate), 2)) STORED
+);
+```
+
+`id` is an identity column that only PostgreSQL may fill. `gross` is a stored generated column computed from `net` and `tax_rate`.
+
+## Case 1: Identity Column GENERATED ALWAYS
+
+Supplying an ID fails:
+
+```sql
+INSERT INTO invoices (id, customer, net) VALUES (100, 'Acme', 50);
+```
+
+```text
+ERROR:  cannot insert a non-DEFAULT value into column "id"
+DETAIL:  Column "id" is an identity column defined as GENERATED ALWAYS.
+HINT:  Use OVERRIDING SYSTEM VALUE to override.
+```
+
+The usual fix is to stop sending the column. Leave it out of the column list, or write `DEFAULT` in its place, and read the new value back with `RETURNING`:
+
+```sql
+INSERT INTO invoices (customer, net) VALUES ('Globex', 80) RETURNING *;
+```
+
+```text
+ id | customer |  net  | tax_rate | gross
+----+----------+-------+----------+-------
+  1 | Globex   | 80.00 |    0.200 | 96.00
+(1 row)
+```
+
+```sql
+INSERT INTO invoices (id, customer, net) VALUES (DEFAULT, 'Initech', 10) RETURNING id;
+```
+
+```text
+ id
+----
+  2
+(1 row)
+```
+
+ORMs and frameworks run into this error when the model sends `id = 0` or `id = null` for new rows. Configure the field as database-generated (for example `@GeneratedValue(strategy = IDENTITY)` in JPA, or the equivalent setting in your ORM) so that it is omitted from the `INSERT`.
+
+### When You Really Need to Keep the IDs
+
+Migrations and data repairs sometimes must preserve existing IDs, because other tables reference them. That is what `OVERRIDING SYSTEM VALUE` is for:
+
+```sql
+INSERT INTO invoices (id, customer, net)
+OVERRIDING SYSTEM VALUE
+VALUES (100, 'Acme', 50);
+```
+
+```text
+INSERT 0 1
+```
+
+The clause goes between the column list and `VALUES` or `SELECT`. It works the same way for `INSERT ... SELECT`, which is how you copy a table with its keys:
+
+```sql
+CREATE TABLE invoices_old (id bigint, customer text, net numeric(10,2), tax_rate numeric(4,3));
+INSERT INTO invoices_old VALUES (10, 'Old Co', 10, 0.2), (11, 'Old Co', 20, 0.2);
+
+INSERT INTO invoices (id, customer, net, tax_rate)
+OVERRIDING SYSTEM VALUE
+SELECT id, customer, net, tax_rate FROM invoices_old;
+```
+
+```text
+INSERT 0 2
+```
+
+Without the clause, `INSERT INTO invoices SELECT * FROM invoices_old` fails with the same `428C9` error.
+
+### Reset the Sequence After Loading IDs
+
+Overriding the value does not move the identity sequence. The next generated ID still comes from where the sequence was, which can collide with the IDs you just loaded. Here the sequence is at 2, and we loaded 10, 11 and 100:
+
+```sql
+INSERT INTO invoices (customer, net) VALUES ('Next', 1) RETURNING id;
+```
+
+```text
+ id
+----
+  3
+(1 row)
+```
+
+That one happens to be free, but the sequence will reach 10 after seven more inserts and fail with a duplicate key error. Move the sequence past the highest ID right after the load:
+
+```sql
+SELECT setval(pg_get_serial_sequence('invoices', 'id'), (SELECT max(id) FROM invoices));
+```
+
+```text
+ setval
+--------
+    100
+(1 row)
+```
+
+```sql
+INSERT INTO invoices (customer, net) VALUES ('Next', 1) RETURNING id;
+```
+
+```text
+ id
+-----
+ 101
+(1 row)
+```
+
+`pg_get_serial_sequence` works for identity columns as well as `serial` columns. `ALTER TABLE invoices ALTER COLUMN id RESTART WITH 101` is an alternative when you know the number. For a deeper look, see [how to reset a Postgres sequence](/blog/postgres-reset-sequence).
+
+### Updating an Identity Column
+
+`UPDATE` has its own version of the error:
+
+```sql
+UPDATE invoices SET id = 5000 WHERE customer = 'Globex';
+```
+
+```text
+ERROR:  column "id" can only be updated to DEFAULT
+DETAIL:  Column "id" is an identity column defined as GENERATED ALWAYS.
+```
+
+`SET id = DEFAULT` is allowed, but it takes the next value from the sequence, which is rarely what you want for a primary key. If you must renumber rows, temporarily switch the column to `BY DEFAULT`, run the update, and switch back (see below).
+
+## Case 2: Generated Columns
+
+A generated column is computed from the row. Supplying a value fails, and the `DETAIL` is different:
+
+```sql
+INSERT INTO invoices (customer, net, gross) VALUES ('Acme', 50, 60);
+```
+
+```text
+ERROR:  cannot insert a non-DEFAULT value into column "gross"
+DETAIL:  Column "gross" is a generated column.
+```
+
+There is no `HINT`, because there is no override. `OVERRIDING SYSTEM VALUE` applies only to identity columns:
+
+```sql
+INSERT INTO invoices (customer, net, gross)
+OVERRIDING SYSTEM VALUE
+VALUES ('Umbrella', 10, 99);
+```
+
+```text
+ERROR:  cannot insert a non-DEFAULT value into column "gross"
+DETAIL:  Column "gross" is a generated column.
+```
+
+The fix is to remove the column from the insert, or write `DEFAULT`:
+
+```sql
+INSERT INTO invoices (customer, net, gross) VALUES ('Initech', 10, DEFAULT) RETURNING gross;
+```
+
+```text
+ gross
+-------
+ 12.00
+(1 row)
+```
+
+`UPDATE ... SET gross = ...` fails with `column "gross" can only be updated to DEFAULT` and the same `DETAIL`. Update the source columns instead, and `gross` follows.
+
+The most common trigger is `INSERT INTO target SELECT * FROM source`, where the source has a plain `gross` column and the target computes it. List the columns and leave the generated one out. If the stored values differ from what the expression produces, that is a sign the source data was computed differently, and it is worth checking before you load.
+
+PostgreSQL 18 added virtual generated columns, and `GENERATED ALWAYS AS (...)` without `STORED` now creates a virtual one by default. They behave the same way for this error. On PostgreSQL 17 and older, the `STORED` keyword is required.
+
+## COPY Behaves Differently
+
+`COPY` does not check identity columns the way `INSERT` does. Loading an explicit ID into a `GENERATED ALWAYS` identity column with `COPY` succeeds without any override clause:
+
+```sql
+COPY invoices (id, customer, net) FROM stdin;
+9001	Copy Co	5
+\.
+```
+
+```text
+COPY 1
+```
+
+That is convenient for bulk loads, and it also means the sequence is again left behind, so run the `setval` step after a `COPY` too.
+
+Generated columns, on the other hand, cannot appear in a `COPY` column list at all:
+
+```sql
+COPY invoices (customer, net, gross) FROM stdin;
+Copy Co	5	6
+\.
+```
+
+```text
+ERROR:  column "gross" is a generated column
+DETAIL:  Generated columns cannot be used in COPY.
+```
+
+Leave the column out of the list and drop that field from the file, or load the file into a staging table and insert from there.
+
+## What pg_dump Does
+
+You rarely see this error when restoring a `pg_dump` backup, because pg_dump handles both cases. In its default `COPY` format it leaves generated columns out of the column list. With `--inserts` or `--column-inserts`, it writes `OVERRIDING SYSTEM VALUE` for tables with identity columns and `DEFAULT` for generated columns. From a pg_dump 18 run against the table above:
+
+```text
+INSERT INTO public.invoices OVERRIDING SYSTEM VALUE VALUES (100, 'Acme', 50.00, 0.200, DEFAULT);
+```
+
+If you build your own export scripts, copy that pattern.
+
+## Switching Between ALWAYS and BY DEFAULT
+
+`GENERATED BY DEFAULT AS IDENTITY` accepts explicit values without any clause and generates one only when you leave the column out. You can switch an existing column in place:
+
+```sql
+ALTER TABLE invoices ALTER COLUMN id SET GENERATED BY DEFAULT;
+
+INSERT INTO invoices (id, customer, net) VALUES (7777, 'ByDefault', 1) RETURNING id;
+```
+
+```text
+  id
+------
+ 7777
+(1 row)
+```
+
+Switch back the same way:
+
+```sql
+ALTER TABLE invoices ALTER COLUMN id SET GENERATED ALWAYS;
+```
+
+`ALWAYS` is the safer default for application tables, because it stops code from inventing IDs by accident. `BY DEFAULT` is handy for tables that are routinely loaded with external keys. For a full comparison of `serial`, `ALWAYS` and `BY DEFAULT`, see [SERIAL vs IDENTITY columns](/blog/postgres-serial-vs-identity-column).
+
+With `BY DEFAULT`, there is also the reverse clause, `OVERRIDING USER VALUE`, which ignores the value you supplied and uses the sequence. It is useful when a `SELECT *` copy includes IDs you do not want to keep.
+
+## A Checklist for Bulk Migrations
+
+Copying tables between databases is where identity columns cause the most trouble, because several steps must line up. A checklist that has worked well:
+
+1. **Create the target tables first**, with the identity definitions you want to keep (`ALWAYS` or `BY DEFAULT`).
+2. **Load the data with its keys.** Use `OVERRIDING SYSTEM VALUE` for `INSERT ... SELECT`, or `COPY`, which accepts identity values directly. Leave generated columns out of both.
+3. **Load child tables after parent tables**, or defer the foreign key checks, so that references resolve.
+4. **Reset every identity sequence** to the maximum loaded value with `setval(pg_get_serial_sequence(...), max(id))`. Do this for every table, not just the large ones, because a single stale sequence causes duplicate key errors on the first insert.
+5. **Insert one test row per table** in a transaction you roll back, to prove that new IDs are generated above the loaded range.
+
+If you use `pg_dump` and `pg_restore` instead, steps 2 and 4 are handled for you: the dump contains `setval` calls for each sequence, and its data section either uses `COPY` or adds `OVERRIDING SYSTEM VALUE`.
+
+## Checking Which Columns Are Generated
+
+`\d table` in psql shows `generated always as identity` or `generated always as (...)` in the Default column. In SQL, `pg_attribute` has the flags:
+
+```sql
+SELECT attname, attidentity, attgenerated
+FROM pg_attribute
+WHERE attrelid = 'invoices'::regclass AND attnum > 0 AND NOT attisdropped
+ORDER BY attnum;
+```
+
+```text
+ attname  | attidentity | attgenerated
+----------+-------------+--------------
+ id       | a           |
+ customer |             |
+ net      |             |
+ tax_rate |             |
+ gross    |             | s
+(5 rows)
+```
+
+`attidentity` is `a` for `ALWAYS` and `d` for `BY DEFAULT`. `attgenerated` is `s` for stored and, on PostgreSQL 18, `v` for virtual. A SQL client that shows these flags in the table designer saves the lookup; in [Chat2DB](https://chat2db.ai/download) the column list shows identity and generated expressions next to each column, so you can see what to leave out before you write the insert.
+
+## Summary
+
+| Message | Column kind | Fix |
+|---|---|---|
+| `cannot insert a non-DEFAULT value` + "identity column defined as GENERATED ALWAYS" | Identity, `ALWAYS` | Omit the column or use `DEFAULT`; to keep IDs, add `OVERRIDING SYSTEM VALUE` and reset the sequence |
+| `cannot insert a non-DEFAULT value` + "is a generated column" | Generated column | Omit the column or use `DEFAULT`; there is no override |
+| `can only be updated to DEFAULT` | Either | Update source columns, or switch the identity to `BY DEFAULT` temporarily |
+| `Generated columns cannot be used in COPY` | Generated column | Leave it out of the `COPY` column list |

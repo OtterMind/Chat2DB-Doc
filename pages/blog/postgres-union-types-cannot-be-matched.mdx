@@ -1,0 +1,318 @@
+---
+title: "UNION Types Cannot Be Matched in Postgres: Fix"
+description: "Fix PostgreSQL UNION types integer and text cannot be matched, plus the CASE, COALESCE, ARRAY and VALUES versions, with the type rules that decide each branch."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: November 9, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# UNION Types Cannot Be Matched in Postgres: Fix
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="November 9, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+You combine two queries with `UNION` and PostgreSQL rejects the result before running anything:
+
+```text
+ERROR:  UNION types integer and text cannot be matched
+LINE 1: SELECT id FROM orders UNION SELECT order_ref FROM refunds;
+                                           ^
+```
+
+Every column of a `UNION` result has a single data type. PostgreSQL looks at the matching column in each branch and tries to find one type that all of them can be converted to without an explicit cast. When the branches are from different type categories, such as numbers and strings, there is no such type, and you get SQLSTATE `42804` (datatype mismatch).
+
+The same check runs for every construct that merges values into one column: `CASE`, `COALESCE`, `ARRAY[...]`, `VALUES`, `GREATEST`, `LEAST`, `INTERSECT` and `EXCEPT`. The message names the construct, which is the first clue about where to look. This article explains the rules and the fixes, with examples run on PostgreSQL 18.6 and 14.24, where all messages below are identical.
+
+## The Example Tables
+
+```sql
+CREATE TABLE orders (
+  id          int,
+  customer_id int,
+  amount      numeric(10,2),
+  status      text,
+  created_at  timestamptz
+);
+
+CREATE TABLE refunds (
+  id         bigint,
+  order_ref  text,
+  amount     numeric(12,4),
+  reason     varchar(50),
+  created_on date
+);
+
+INSERT INTO orders  VALUES (1, 10, 25.00, 'paid', '2026-11-01 10:00+00');
+INSERT INTO refunds VALUES (7, '1', 5.0000, 'damaged', '2026-11-02');
+```
+
+`refunds.order_ref` holds the order ID as text, a common design in tables fed from external systems.
+
+## Reading the Message
+
+```sql
+SELECT id, created_at FROM orders
+UNION ALL
+SELECT id, order_ref FROM refunds;
+```
+
+```text
+ERROR:  UNION types timestamp with time zone and text cannot be matched
+LINE 3: SELECT id, order_ref FROM refunds;
+                   ^
+```
+
+The two types in the message are the type found so far for that output column, then the type of the branch that does not fit. The caret points at the first expression that could not be matched, here `order_ref`. In this query the columns are simply in the wrong order: the second column of the first branch is a timestamp, and the second column of the second branch is the order reference. Lining up the select lists fixes it.
+
+When the order is right and the types still differ, you need a cast. Decide which type the result column should have, then cast the branch that disagrees:
+
+```sql
+SELECT id, status FROM orders
+UNION ALL
+SELECT order_ref::int, reason FROM refunds;
+```
+
+```text
+ id | status
+----+---------
+  1 | paid
+  1 | damaged
+(2 rows)
+```
+
+Casting text to `int` fails at run time if any `order_ref` is not a number. If that can happen, cast the other way, so that the column is text in both branches:
+
+```sql
+SELECT id::text AS id, status AS label FROM orders
+UNION ALL
+SELECT order_ref, reason FROM refunds
+ORDER BY 1;
+```
+
+## What PostgreSQL Can Match Automatically
+
+The rules (documented as "UNION, CASE, and Related Constructs" in the PostgreSQL manual) boil down to this: all branches must belong to the same type category, and within that category PostgreSQL picks the type that the others can be implicitly converted to. Some practical consequences:
+
+- **Integers of different sizes match.** `int` and `bigint` resolve to `bigint`:
+
+```sql
+SELECT pg_typeof(x)
+FROM (SELECT id AS x FROM orders UNION ALL SELECT id FROM refunds) s;
+```
+
+```text
+ pg_typeof
+-----------
+ bigint
+ bigint
+(2 rows)
+```
+
+- **Numerics with different precision match.** `numeric(10,2)` and `numeric(12,4)` resolve to plain `numeric`.
+- **`text` and `varchar` match**, and resolve to `text`.
+- **`date` and `timestamptz` match**, because a date can be implicitly converted to a timestamp. The result is `timestamptz`, and the dates become midnight in the session time zone:
+
+```sql
+SELECT id, created_at FROM orders
+UNION ALL
+SELECT id, created_on FROM refunds;
+```
+
+```text
+ id |       created_at
+----+------------------------
+  1 | 2026-11-01 02:00:00-08
+  7 | 2026-11-02 00:00:00-08
+(2 rows)
+```
+
+If you want dates, cast the timestamp branch with `created_at::date` instead.
+
+- **Numbers and strings never match.** There is no implicit conversion between the numeric and string categories, so `integer` and `text` always fail.
+
+## Choosing the Target Type
+
+When two branches really hold different kinds of data, the cast you choose decides what the result means, so it is worth a moment of thought:
+
+- **Prefer the type the consumer expects.** If the result feeds a report or an API that treats the column as a number, cast the text branch to a number and handle bad values first. If it is a display label, cast numbers and dates to text.
+- **Cast to the wider type within a category.** Mixing `numeric(10,2)` and `numeric(12,4)` needs no cast, but if you add one, use the wider precision so that no values are rounded.
+- **Be explicit about time zones.** Casting `timestamptz` to `date` uses the session time zone, so the same query can return different dates for different users. Use `(created_at AT TIME ZONE 'UTC')::date` when the day boundary matters.
+- **Format text on purpose.** `amount::text` gives `25.00`, while `to_char(amount, 'FM999G990D00')` gives a formatted string. Choose the form the reader needs rather than relying on the default output.
+
+Casting in only one branch is usually enough, because the other branches already have the target type. Keep the casts in the branch whose data is "foreign" to the result, which also documents where the conversion happens.
+
+## Untyped Literals and NULL
+
+String literals in quotes and bare `NULL` start out with no type (PostgreSQL calls it `unknown`). They take their type from the other branches, which leads to two surprises.
+
+The first is that a literal is converted to the other branch's type, and that conversion can fail with a different error:
+
+```sql
+SELECT 1 UNION SELECT 'a';
+```
+
+```text
+ERROR:  invalid input syntax for type integer: "a"
+```
+
+Here PostgreSQL decided the column is `integer` and tried to read `'a'` as an integer. With an explicitly typed value, you get the matching error instead:
+
+```sql
+SELECT 1 UNION SELECT 'a'::text;
+```
+
+```text
+ERROR:  UNION types integer and text cannot be matched
+```
+
+The second surprise involves several `NULL` branches. PostgreSQL resolves a chain of `UNION`s two branches at a time, from left to right. Two untyped branches resolve to `text` among themselves, and then `text` cannot be matched with `integer`:
+
+```sql
+SELECT NULL UNION ALL SELECT NULL UNION ALL SELECT 1;
+```
+
+```text
+ERROR:  UNION types text and integer cannot be matched
+LINE 1: SELECT NULL UNION ALL SELECT NULL UNION ALL SELECT 1;
+                                                           ^
+```
+
+A single `NULL` branch is fine, because it simply takes the type of the other branch. The fix for the chain is to type the first `NULL`:
+
+```sql
+SELECT NULL::int UNION ALL SELECT NULL UNION ALL SELECT 1;
+```
+
+This pattern shows up in generated SQL that pads missing columns with `NULL`, for example when building a report from several tables that do not all have every column. Give each padding `NULL` the type of the real column, such as `NULL::numeric AS amount`.
+
+## The Same Error in CASE, COALESCE, ARRAY and VALUES
+
+The message changes its first word to match the construct.
+
+### CASE
+
+```sql
+SELECT CASE WHEN true THEN id ELSE status END FROM orders;
+```
+
+```text
+ERROR:  CASE types text and integer cannot be matched
+```
+
+All `THEN` and `ELSE` results must share a type. A quoted literal in one branch is converted to the type of the others, so mixing a number with a word fails at run time instead:
+
+```sql
+SELECT CASE WHEN amount > 10 THEN amount ELSE 'small' END FROM orders;
+```
+
+```text
+ERROR:  invalid input syntax for type numeric: "small"
+```
+
+If the result is meant to be a label, convert the number to text:
+
+```sql
+SELECT CASE WHEN amount > 10 THEN amount::text ELSE 'small' END AS size FROM orders;
+```
+
+```text
+ size
+-------
+ 25.00
+(1 row)
+```
+
+### COALESCE
+
+`COALESCE(amount, 'n/a')` is a classic for reports. It fails because `'n/a'` cannot become a numeric:
+
+```sql
+SELECT COALESCE(amount, 'n/a') FROM orders;
+```
+
+```text
+ERROR:  invalid input syntax for type numeric: "n/a"
+```
+
+Write `COALESCE(amount::text, 'n/a')`. The same applies to dates and timestamps: `COALESCE(created_at, '')` fails because an empty string is not a valid timestamp. Use `NULL` and let the client display it, or convert to text first.
+
+### ARRAY, GREATEST and Set Operations
+
+```sql
+SELECT ARRAY[1, 'x'::text];
+```
+
+```text
+ERROR:  ARRAY types integer and text cannot be matched
+```
+
+```sql
+SELECT GREATEST(1, 'a'::text);
+```
+
+```text
+ERROR:  GREATEST types integer and text cannot be matched
+```
+
+```sql
+SELECT id FROM orders INTERSECT SELECT order_ref FROM refunds;
+```
+
+```text
+ERROR:  INTERSECT types integer and text cannot be matched
+```
+
+### VALUES
+
+In a multi-row `VALUES` list, each column is resolved across all rows. Mixed rows usually fail on the literal conversion:
+
+```sql
+SELECT * FROM (VALUES (1, 'a'), ('b', 2)) AS v(x, y);
+```
+
+```text
+ERROR:  invalid input syntax for type integer: "b"
+```
+
+## A Different Error: Wrong Number of Columns
+
+If one branch has more columns than the other, the error is about the count, not the types:
+
+```sql
+SELECT id, amount FROM orders
+UNION ALL
+SELECT id, amount, reason FROM refunds;
+```
+
+```text
+ERROR:  each UNION query must have the same number of columns
+```
+
+Add a placeholder column (with a type) to the shorter branch, for example `NULL::varchar AS reason`.
+
+## A Note on json and UNION
+
+`UNION` (without `ALL`) removes duplicates, which requires comparing values. The `json` type has no equality operator, so a `UNION` of `json` columns fails with `could not identify an equality operator for type json`. Use `UNION ALL` if duplicates are acceptable, or switch to `jsonb`, which can be compared.
+
+## Finding the Mismatched Column Quickly
+
+In a long query with many columns, the caret in the `LINE` output is the fastest pointer. If the query is generated and you only have the message, compare the types branch by branch:
+
+1. Run each branch separately with `LIMIT 0` in a client that shows column types, or wrap it as `SELECT pg_typeof(col) FROM (...) s LIMIT 1` for the suspicious column.
+2. Line up the columns by position, not by name. `UNION` matches columns by position, and the names in the result always come from the first branch.
+3. Decide on a target type for each mismatched position and cast in the branch that disagrees.
+
+A visual client helps with step 1. In [Chat2DB](https://chat2db.ai/download), running each branch shows the result column types side by side, and the AI assistant can add the missing casts to a long `UNION` query for you. You can also use the browser version at [app.chat2db.ai](https://app.chat2db.ai/).
+
+## Summary
+
+- `<CONSTRUCT> types A and B cannot be matched` means the branches of a `UNION`, `CASE`, `COALESCE`, `ARRAY`, `VALUES`, `GREATEST` or set operation have types from different categories.
+- Check the column order first; then cast the disagreeing branch to the type the result column should have.
+- Integers, numerics, strings and date/time types match within their own category. Numbers and strings never match implicitly.
+- Untyped literals take the other branch's type and may fail with `invalid input syntax` instead. Several `NULL` branches resolve to `text` first, so type the first one.
+- Names come from the first branch, and matching is by position.
+
+For a related message that appears on `INSERT` and `UPDATE`, see [column is of type integer but expression is of type text](/blog/postgres-column-is-of-type-but-expression-is-of-type), and for the difference between the set operators, see [UNION, INTERSECT and EXCEPT in PostgreSQL](/blog/postgres-union-intersect-except).

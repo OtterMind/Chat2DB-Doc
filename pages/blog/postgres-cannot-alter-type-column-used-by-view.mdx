@@ -1,0 +1,295 @@
+---
+title: "Cannot Alter Type of a Column Used by a View"
+description: "Fix cannot alter type of a column used by a view or rule in PostgreSQL: find dependent views, save their DDL, then drop, alter and recreate in one transaction."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: November 9, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# Cannot Alter Type of a Column Used by a View
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="November 9, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+A migration that widens a column fails with:
+
+```text
+ERROR:  cannot alter type of a column used by a view or rule
+DETAIL:  rule _RETURN on view paid_orders depends on column "amount"
+```
+
+PostgreSQL stores a view as a parsed query tree, not as SQL text, and that tree records the exact type of every column it reads. Changing the column's type would leave the view pointing at data it no longer understands, so `ALTER TABLE ... ALTER COLUMN ... TYPE` refuses while any view (or materialized view) uses the column. The SQLSTATE is `0A000` (feature not supported). There is no `CASCADE` option that rebuilds the views for you. You have to drop the dependent views, change the column, and recreate them.
+
+This article shows how to find every dependent view, including views built on other views, how to rebuild them safely in one transaction, and the related messages for policies, functions, triggers and generated columns. We ran the examples on PostgreSQL 18.6 and 14.24; all messages are the same on both.
+
+## Reproducing the Error
+
+```sql
+CREATE TABLE orders (
+  id          int PRIMARY KEY,
+  customer_id int,
+  amount      numeric(8,2),
+  status      varchar(20),
+  note        varchar(50)
+);
+INSERT INTO orders VALUES (1, 10, 99.50, 'paid', 'first');
+
+CREATE VIEW paid_orders AS
+  SELECT id, customer_id, amount FROM orders WHERE status = 'paid';
+
+CREATE VIEW big_customers AS
+  SELECT customer_id, sum(amount) AS total FROM paid_orders GROUP BY customer_id;
+
+CREATE MATERIALIZED VIEW daily_totals AS
+  SELECT status, sum(amount) AS total FROM orders GROUP BY status;
+```
+
+Now try to widen `amount`:
+
+```sql
+ALTER TABLE orders ALTER COLUMN amount TYPE numeric(12,2);
+```
+
+```text
+ERROR:  cannot alter type of a column used by a view or rule
+DETAIL:  rule _RETURN on view paid_orders depends on column "amount"
+```
+
+`_RETURN` is the internal name of the rule that implements every view, so the `DETAIL` is really saying "view `paid_orders` uses `amount`". It only names the first dependency PostgreSQL found. Here, `daily_totals` depends on the column too, and `big_customers` depends on `paid_orders`.
+
+A few things that surprise people:
+
+- **Even a harmless widening is blocked.** `varchar(20)` to `text` or `varchar(20)` to `varchar(40)` fails the same way if a view reads the column. The check is on any type change, not on whether the change is safe.
+- **It does not matter how the view uses the column.** `status` only appears in the `WHERE` clause of `paid_orders`, and it is still blocked:
+
+```sql
+ALTER TABLE orders ALTER COLUMN status TYPE text;
+```
+
+```text
+ERROR:  cannot alter type of a column used by a view or rule
+DETAIL:  rule _RETURN on view paid_orders depends on column "status"
+```
+
+- **Columns that no view reads can be changed freely:**
+
+```sql
+ALTER TABLE orders ALTER COLUMN note TYPE varchar(200);
+```
+
+```text
+ALTER TABLE
+```
+
+## Step 1: Find Every Dependent View
+
+Views depend on columns through `pg_depend` and `pg_rewrite`. This query lists the views and materialized views that use one specific column:
+
+```sql
+SELECT DISTINCT v.oid::regclass AS view_name, v.relkind
+FROM pg_depend d
+JOIN pg_rewrite r   ON r.oid = d.objid
+JOIN pg_class v     ON v.oid = r.ev_class
+JOIN pg_attribute a ON a.attrelid = d.refobjid AND a.attnum = d.refobjsubid
+WHERE d.refobjid = 'orders'::regclass
+  AND a.attname = 'amount'
+  AND v.oid <> d.refobjid
+ORDER BY 1;
+```
+
+```text
+  view_name   | relkind
+--------------+---------
+ paid_orders  | v
+ daily_totals | m
+(2 rows)
+```
+
+`relkind` `v` is a view and `m` a materialized view. This only finds direct dependents. `big_customers` reads `paid_orders`, not `orders`, so it is missing, but you will still have to drop it, because `paid_orders` cannot be dropped while `big_customers` depends on it. A recursive query follows the chain and reports how deep each view sits:
+
+```sql
+WITH RECURSIVE deps AS (
+  SELECT DISTINCT r.ev_class AS view_oid, 1 AS level
+  FROM pg_depend d
+  JOIN pg_rewrite r ON r.oid = d.objid
+  WHERE d.classid = 'pg_rewrite'::regclass
+    AND d.refobjid = 'orders'::regclass
+    AND r.ev_class <> d.refobjid
+  UNION
+  SELECT DISTINCT r.ev_class, deps.level + 1
+  FROM deps
+  JOIN pg_depend d  ON d.refobjid = deps.view_oid AND d.classid = 'pg_rewrite'::regclass
+  JOIN pg_rewrite r ON r.oid = d.objid
+  WHERE r.ev_class <> deps.view_oid
+)
+SELECT view_oid::regclass AS view_name, max(level) AS depth
+FROM deps
+GROUP BY view_oid
+ORDER BY 2, 1;
+```
+
+```text
+   view_name   | depth
+---------------+-------
+ paid_orders   |     1
+ daily_totals  |     1
+ big_customers |     2
+(3 rows)
+```
+
+This version lists every view that depends on the table, not just on one column, which is the safe set to rebuild. Sorting a `regclass` sorts by OID, which here is creation order. Drop them from the deepest level up, and recreate them from the shallowest level down.
+
+## Step 2: Save the View Definitions
+
+Before dropping anything, save each definition. `pg_get_viewdef` returns the SQL that PostgreSQL would use to recreate the view:
+
+```sql
+SELECT pg_get_viewdef('paid_orders'::regclass, true);
+```
+
+```text
+            pg_get_viewdef
+--------------------------------------
+  SELECT id,                         +
+     customer_id,                    +
+     amount                          +
+    FROM orders                      +
+   WHERE status::text = 'paid'::text;
+(1 row)
+```
+
+The output is normalized, with explicit casts and qualified names, so it may not look like what you originally wrote. It is equivalent. Also save everything that is attached to the views and would be lost when they are dropped:
+
+- **Privileges**: `\dp paid_orders` or `pg_class.relacl`. Dropping a view drops its grants.
+- **Comments**: `obj_description('paid_orders'::regclass)`.
+- **View options**: `security_barrier`, `security_invoker` (15+) and `check_option`, visible in `pg_class.reloptions`.
+- **Indexes on materialized views**, which are dropped with the materialized view.
+- **Triggers on views** (`INSTEAD OF` triggers).
+
+A schema-only dump of the affected views captures all of this at once: `pg_dump --schema-only -t paid_orders -t big_customers -t daily_totals dbname`. The `-t` option includes views and materialized views, and the output contains the `CREATE VIEW`, `GRANT`, `COMMENT` and index statements.
+
+## Step 3: Drop, Alter and Recreate in One Transaction
+
+DDL is transactional in PostgreSQL, so you can do everything in one transaction. Other sessions never see the views missing, and if any step fails, the whole change rolls back.
+
+```sql
+BEGIN;
+
+DROP VIEW big_customers;
+DROP VIEW paid_orders;
+DROP MATERIALIZED VIEW daily_totals;
+
+ALTER TABLE orders ALTER COLUMN amount TYPE numeric(12,2);
+
+CREATE VIEW paid_orders AS
+  SELECT id, customer_id, amount FROM orders WHERE status = 'paid';
+CREATE VIEW big_customers AS
+  SELECT customer_id, sum(amount) AS total FROM paid_orders GROUP BY customer_id;
+CREATE MATERIALIZED VIEW daily_totals AS
+  SELECT status, sum(amount) AS total FROM orders GROUP BY status;
+
+COMMIT;
+```
+
+After the commit, the view reports the new type:
+
+```sql
+\d paid_orders
+```
+
+```text
+                  View "public.paid_orders"
+   Column    |     Type      | Collation | Nullable | Default
+-------------+---------------+-----------+----------+---------
+ id          | integer       |           |          |
+ customer_id | integer       |           |          |
+ amount      | numeric(12,2) |           |          |
+```
+
+Then reapply the grants, comments and indexes you saved. Two cautions for production:
+
+- `ALTER COLUMN TYPE` usually rewrites the whole table under an `ACCESS EXCLUSIVE` lock, so the transaction blocks readers and writers of `orders` for the duration of the rewrite. Some changes skip the rewrite, such as increasing a `varchar` limit or changing `varchar` to `text`. Plan accordingly, and set a `lock_timeout` so the migration fails fast instead of queueing behind long queries. The [lock_timeout guide](/blog/postgres-lock-timeout-guide) shows how.
+- `CREATE MATERIALIZED VIEW` runs the query and stores the result, which can take a while on large tables. If that is too slow inside the lock, create it `WITH NO DATA` in the transaction and run `REFRESH MATERIALIZED VIEW` afterwards.
+
+## Why CREATE OR REPLACE VIEW Does Not Help
+
+`CREATE OR REPLACE VIEW` can add columns to the end of a view, but it cannot change the type of an existing view column:
+
+```sql
+CREATE OR REPLACE VIEW paid_orders AS
+  SELECT id, customer_id, amount::numeric(14,2) AS amount
+  FROM orders WHERE status = 'paid';
+```
+
+```text
+ERROR:  cannot change data type of view column "amount" from numeric(12,2) to numeric(14,2)
+```
+
+So there is no way to adjust the views in place before or after the table change. Drop and recreate is the only route.
+
+## Other Objects That Block a Type Change
+
+Views are the most common blocker, but the same check covers other dependents, each with its own message. We tested each one on a separate table, because a view on the table would otherwise be reported first.
+
+**Row-level security policies:**
+
+```text
+ERROR:  cannot alter type of a column used in a policy definition
+DETAIL:  policy p_cust on table t2 depends on column "customer_id"
+```
+
+Save the policy with `pg_policies`, drop it, alter the column, recreate the policy.
+
+**SQL-standard function bodies** (`BEGIN ATOMIC`, PostgreSQL 14 and newer):
+
+```text
+ERROR:  cannot alter type of a column used by a function or procedure
+DETAIL:  function t2_status(integer) depends on column "status"
+```
+
+Functions written with a quoted body (`AS 'SELECT ...'` or `AS $$ ... $$`) are stored as text and do not record column dependencies, so they never block the change. They may still fail later at run time if their declared return type no longer matches, so review them too.
+
+**Generated columns** that use the column in their expression:
+
+```text
+ERROR:  cannot alter type of a column used by a generated column
+DETAIL:  Column "amount" is used by generated column "cents".
+```
+
+**Trigger `WHEN` conditions:**
+
+```text
+ERROR:  cannot alter type of a column used in a trigger definition
+DETAIL:  trigger t_note on table orders depends on column "note"
+```
+
+The remedy is the same pattern each time: record the definition, drop the object, change the column, recreate the object, all in one transaction.
+
+## Rehearse the Migration on a Copy
+
+Because the drop and recreate happens inside one transaction, a mistake in a recreated view rolls everything back, which is safe but can still cost you a maintenance window. Rehearse first:
+
+- **Restore a recent schema-only dump** into a scratch database and run the full script there. Errors in view definitions, missing grants and wrong dependency order all show up without touching production.
+- **Compare the view definitions** before and after with `pg_get_viewdef`. They should differ only in the types you intended to change.
+- **Compare privileges** with `\dp` on the views before and after. A dropped view silently loses its grants, and applications usually notice only when a query fails with a permission error.
+- **Time the table rewrite** on a copy with realistic data size. If it takes longer than your lock budget, consider adding a new column, backfilling it in batches, and swapping the views over to it, instead of changing the type in place.
+
+Running the rehearsal also gives you the exact list of views to mention in the change request, which reviewers tend to ask for.
+
+## Tools Can Generate the Script
+
+Doing this by hand is tedious when a column feeds a dozen views. Some migration tools generate the drop and recreate steps from the dependency graph. If yours does not, a SQL client helps with the bookkeeping. In [Chat2DB](https://chat2db.ai/download) you can open each dependent view's DDL from the object tree, and ask the AI assistant to assemble the `BEGIN ... COMMIT` script from the dependency query results, which you then review before running it.
+
+## Summary
+
+- `cannot alter type of a column used by a view or rule` means at least one view or materialized view reads the column. The `DETAIL` names only the first one.
+- Any type change is blocked, even widening `varchar`.
+- Find all dependents with `pg_depend` and `pg_rewrite`, recursively, because views on views must be dropped too.
+- Save definitions with `pg_get_viewdef` or `pg_dump --schema-only -t`, including grants, comments and materialized view indexes.
+- Drop from the deepest view up, alter the column, recreate from the base up, in one transaction.
+- Policies, `BEGIN ATOMIC` functions, generated columns and trigger conditions block the change with similar messages and the same fix.
+
+For the column change itself, including `USING` clauses and table rewrites, see [how to change a column type in PostgreSQL](/blog/postgres-alter-column-type).

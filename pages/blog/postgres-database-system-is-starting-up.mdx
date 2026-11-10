@@ -1,0 +1,186 @@
+---
+title: "Postgres: The Database System Is Starting Up"
+description: "What FATAL: the database system is starting up, shutting down, in recovery mode or not yet accepting connections means in PostgreSQL, and how to fix each case."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: November 9, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# Postgres: The Database System Is Starting Up
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="November 9, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+Your application or psql tries to connect and gets one of these instead of a session:
+
+```text
+FATAL:  the database system is starting up
+FATAL:  the database system is shutting down
+FATAL:  the database system is in recovery mode
+FATAL:  the database system is not yet accepting connections
+DETAIL:  Consistent recovery state has not been yet reached.
+FATAL:  the database system is not accepting connections
+DETAIL:  Hot standby mode is disabled.
+```
+
+All of them share SQLSTATE `57P03` (cannot connect now). The server process is running and listening, but it is in a state where it cannot run queries yet, or any more. Unlike "connection refused", nothing is broken in the network path, and unlike an authentication error, your credentials have not been checked. The postmaster rejects the connection immediately, based only on what the server is doing at that moment.
+
+Each message maps to a specific state, and the fix depends on which one you see. This guide explains each state, shows how we reproduced it, and lists what to do. We tested everything on PostgreSQL 18.6 and 14.24, and checked the message texts in the source of both versions.
+
+## How PostgreSQL Decides
+
+When a connection arrives, the postmaster checks its own state before it even starts authentication. Simplified from `canAcceptConnections()` in the PostgreSQL source:
+
+| Server state | Message |
+|---|---|
+| A shutdown has been requested | the database system is shutting down |
+| Starting up, before recovery has signaled the postmaster | the database system is starting up |
+| Replaying WAL, `hot_standby = off` | the database system is not accepting connections / Hot standby mode is disabled. |
+| Replaying WAL, not yet consistent | the database system is not yet accepting connections / Consistent recovery state has not been yet reached. |
+| Resetting after a server process crashed | the database system is in recovery mode |
+
+PostgreSQL 18 adds one more variant for standbys that are consistent but cannot yet build a snapshot: "Recovery snapshot is not yet ready for hot standby", with a hint about write transactions with many subtransactions on the primary.
+
+The check runs before authentication, which is also why `pg_isready` can report these states without a password.
+
+## "The Database System Is Starting Up"
+
+This appears in the short window between starting the server and the point where it can accept queries. We reproduced it by stopping a PostgreSQL 14 server with `pg_ctl stop -m immediate` after a large update, then starting it again and connecting in a loop while it replayed about 600 MB of WAL:
+
+```text
+FATAL:  the database system is starting up
+```
+
+The server log shows what it is doing in the meantime. This excerpt is from our PostgreSQL 18 run of the same test, where about 780 MB of WAL was replayed:
+
+```text
+LOG:  database system was interrupted; last known up at 2026-11-09 16:23:33 PST
+LOG:  redo starts at 0/20000A0
+LOG:  redo done at 0/315B3D18 system usage: CPU: user: 1.46 s, system: 0.30 s, elapsed: 1.88 s
+LOG:  database system is ready to accept connections
+```
+
+On PostgreSQL 15 and newer, the same crash recovery is reported differently. The startup process now tells the postmaster as soon as redo begins, so most of the window shows the "not yet accepting connections" message instead. We ran the identical test on 15.19 and 18.6:
+
+```text
+FATAL:  the database system is not yet accepting connections
+DETAIL:  Consistent recovery state has not been yet reached.
+```
+
+So on a modern server, "starting up" usually means the very first moments, and a long crash recovery shows as "not yet accepting connections".
+
+**What to do:** usually nothing but wait. Check the server log for `redo starts`, `redo done` and `ready to accept connections`. If startup takes long, the cause is the amount of WAL to replay since the last checkpoint. A large `max_wal_size` with a long `checkpoint_timeout` means more WAL after a crash and a longer recovery. That trade-off is covered in the [checkpoint tuning guide](/blog/postgres-checkpoint-tuning-guide).
+
+If the server never gets out of this state, look further up in the log for a `FATAL` or `PANIC` from the startup process: a missing WAL file, a full disk, or a corrupt page. The client message stays the same while the server keeps failing and restarting.
+
+## "The Database System Is Shutting Down"
+
+The server has been asked to stop, and it refuses new connections while it finishes. We reproduced it with a smart shutdown while a session was open:
+
+```bash
+psql -c "select pg_sleep(6)" &
+pg_ctl -D $PGDATA stop -m smart -W
+psql -c "select 1"
+```
+
+```text
+psql: error: connection to server on socket "/tmp/.s.PGSQL.5432" failed: FATAL:  the database system is shutting down
+```
+
+A smart shutdown waits for every existing session to end on its own, which can take forever if a connection pool keeps connections open. Meanwhile, every new connection gets this error. The default mode, `fast`, disconnects sessions and stops quickly, so the window is short.
+
+**What to do:**
+
+- If you started a smart shutdown by accident, finish it with `pg_ctl stop -m fast`. It is not possible to cancel a shutdown once it has been requested.
+- If you see this during deployments, check the order of steps: the application should stop sending traffic before the database stops, and wait until the database is back before it reconnects.
+- With systemd or Kubernetes, look at the stop timeout. If the service manager kills PostgreSQL after a fixed time, the next start includes crash recovery and you get the startup messages above.
+
+## "The Database System Is in Recovery Mode"
+
+This one is more serious. It means a PostgreSQL server process crashed, and the postmaster is resetting everything. When any backend dies unexpectedly, the postmaster cannot trust shared memory any more, so it terminates every other session, reinitializes, and runs crash recovery. We reproduced it by killing one backend with `kill -9`:
+
+```text
+LOG:  client backend (PID 29007) was terminated by signal 9: Killed: 9
+LOG:  terminating any other active server processes
+LOG:  all server processes terminated; reinitializing
+```
+
+During that reset, new connections get:
+
+```text
+FATAL:  the database system is in recovery mode
+```
+
+All other sessions were disconnected, so applications typically see a burst of errors such as "server closed the connection unexpectedly" followed by this message.
+
+**What to do:**
+
+1. Find the first crash line in the server log: `terminated by signal 9`, `terminated by signal 11`, `was terminated by exception`, or `exited with exit code`. That line names the process type and PID.
+2. **Signal 9 on Linux** is usually the kernel out-of-memory killer. Check `dmesg` or `journalctl -k` for `Out of memory: Killed process`. Reduce `work_mem` times parallel workers times connections, add memory, or limit connections with a pooler. Setting `vm.overcommit_memory = 2` on dedicated database hosts makes PostgreSQL get an "out of memory" error instead of being killed.
+3. **Signal 11 (segmentation fault)** points at a bug, very often in an extension. Note the query from the log line right after the crash (`Failed process was running: ...`), check extension versions, and update.
+4. If the crashes repeat, the server spends most of its time in recovery and the application sees this message constantly. Fix the cause; do not just add retries.
+
+Setting `restart_after_crash = off` makes the postmaster exit instead of reinitializing, which suits setups where a cluster manager should decide whether to restart or fail over.
+
+## "Not Yet Accepting Connections" on a Standby
+
+On a replica, this message means the standby is replaying WAL but has not yet reached a consistent state, so read-only queries are not safe yet. We reproduced it with a standby restored from a base backup whose `restore_command` fetched each WAL segment slowly:
+
+```text
+FATAL:  the database system is starting up
+FATAL:  the database system is not yet accepting connections
+DETAIL:  Consistent recovery state has not been yet reached.
+```
+
+The first message appeared while the standby was still starting, and the second after redo began. Once the log shows:
+
+```text
+LOG:  consistent recovery state reached at 0/7A000120
+LOG:  database system is ready to accept read-only connections
+```
+
+queries work. A standby built from a fresh base backup must replay at least up to the end of the backup before it is consistent. If WAL arrives slowly from the archive, that can take a long time.
+
+**What to do:**
+
+- Follow the progress in the standby's log, or with `pg_controldata` on the data directory (the "Minimum recovery ending location").
+- If it never becomes consistent, check that `restore_command` actually finds the files (the log shows each restored segment), and that `primary_conninfo` connects.
+- On PostgreSQL 18, if the detail says "Recovery snapshot is not yet ready for hot standby", the standby is waiting for a clean snapshot from the primary. Long-running write transactions with more than 64 subtransactions on the primary delay it. Let them finish.
+
+## "Not Accepting Connections: Hot Standby Mode Is Disabled"
+
+The server is a standby (or is doing archive recovery), and `hot_standby` is `off`, so it will never accept queries while in recovery:
+
+```text
+FATAL:  the database system is not accepting connections
+DETAIL:  Hot standby mode is disabled.
+```
+
+We reproduced it by starting a `pg_basebackup -R` copy with `hot_standby = off` in `postgresql.auto.conf`. The default for `hot_standby` has been `on` since PostgreSQL 10, so this is usually an explicit setting, often left over from a restore procedure.
+
+**What to do:** if you want to read from the standby, set `hot_standby = on` and restart it. If the server is supposed to be a primary, it should not be in recovery at all. Check for a stray `standby.signal` or `recovery.signal` file in the data directory, for example after restoring from a backup tool, and promote the server with `pg_ctl promote` or `SELECT pg_promote();` if a promotion was intended.
+
+## Making Applications Resilient
+
+All of these states are temporary in a healthy system, so clients should treat `57P03` as retryable:
+
+- **Retry with backoff on connect.** Most connection pools can retry the initial connection. Retry on `57P03` and on connection refused, with a delay that grows to a few seconds, and give up after a sensible total time.
+- **Use `pg_isready` in scripts and health checks.** It returns exit code 1 ("rejecting connections") for these states, 0 when the server accepts connections, and 2 when there is no response. Wait for 0 before running migrations after a restart.
+- **Separate readiness from liveness in Kubernetes.** A server in crash recovery is alive but not ready. Killing it because a readiness check fails restarts recovery from the beginning.
+
+When you are diagnosing a server that keeps bouncing between these states, a client that shows the server log and activity next to your queries saves time. [Chat2DB](https://chat2db.ai/download) keeps your connection settings and lets you reconnect with one click once the server is ready, and you can try it in the browser at [app.chat2db.ai](https://app.chat2db.ai/).
+
+## Summary
+
+| Message | What the server is doing | Action |
+|---|---|---|
+| starting up | First moments of startup; on 14 and older, also crash recovery | Wait; check the log for redo progress |
+| shutting down | A shutdown was requested; smart mode waits for sessions | Use `-m fast`; fix deployment order |
+| in recovery mode | A server process crashed and all sessions were reset | Find the crash cause (OOM killer, extension bug) |
+| not yet accepting connections | Replaying WAL, not yet consistent (crash recovery on 15+, or standby) | Wait; check `restore_command` and replication |
+| not accepting connections, hot standby disabled | In recovery with `hot_standby = off` | Turn it on, or remove the stray signal file |
+
+For other connection failures, see [connection refused](/blog/postgres-connection-refused-fix) and [sorry, too many clients already](/blog/postgres-too-many-clients-already-fix).

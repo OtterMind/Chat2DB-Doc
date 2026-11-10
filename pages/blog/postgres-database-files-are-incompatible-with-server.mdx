@@ -1,0 +1,186 @@
+---
+title: "Database Files Are Incompatible With Server"
+description: "Fix PostgreSQL FATAL: database files are incompatible with server after a Homebrew, apt or Docker upgrade, with pg_upgrade and dump/restore steps for 14 to 18."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: November 9, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# Database Files Are Incompatible With Server
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="November 9, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+After a package upgrade or a new Docker image, PostgreSQL refuses to start:
+
+```text
+FATAL:  database files are incompatible with server
+DETAIL:  The data directory was initialized by PostgreSQL version 14, which is not compatible with this version 18.6.
+```
+
+Your data is fine. The message means that the server binary you started belongs to a different major version than the one that created the data directory. PostgreSQL's on-disk format changes between major versions (14, 15, 16, 17, 18...), so a server only opens data directories of its own major version. Minor updates such as 18.5 to 18.6 never cause this error.
+
+With PostgreSQL 14 reaching end of life on November 12, 2026, many teams are upgrading right now, and this message is what you see when the binaries move ahead of the data. This article explains how to read the message, how to get the database running again immediately, and how to do the actual upgrade with `pg_upgrade` or dump and restore, including the Docker case. All commands were run with PostgreSQL 14.24 and 18.6 built from source.
+
+## Reading the Message
+
+The `DETAIL` names both versions: the one in the data directory (from its `PG_VERSION` file) and the one of the running binary. We reproduced both directions:
+
+```bash
+initdb -D /tmp/inc14            # with the PostgreSQL 14 binaries
+/usr/local/pgsql-18/bin/postgres -D /tmp/inc14
+```
+
+```text
+FATAL:  database files are incompatible with server
+DETAIL:  The data directory was initialized by PostgreSQL version 14, which is not compatible with this version 18.6.
+```
+
+And an older binary on a newer directory:
+
+```text
+FATAL:  database files are incompatible with server
+DETAIL:  The data directory was initialized by PostgreSQL version 18, which is not compatible with this version 14.24.
+```
+
+The second case happens when a package downgrade, a wrong `PATH` or an older Docker tag picks up data that has already been upgraded. Never try to force it: the old server cannot read the new format.
+
+You can check the data directory's version without starting anything:
+
+```bash
+cat /tmp/inc14/PG_VERSION
+```
+
+```text
+14
+```
+
+Two related variants exist. If the major version is the same but the internal catalog version differs, which happens between beta or release candidate builds and the final release, the detail reads "The database cluster was initialized with CATALOG_VERSION_NO ..., but the server was compiled with CATALOG_VERSION_NO ...". The PG_CONTROL_VERSION variant appears if the control file itself has a different layout. The fix is the same as for a major version change.
+
+`pg_ctl` reports the problem less clearly. When we started the 14 directory with the 18 `pg_ctl`, it printed:
+
+```text
+pg_ctl: control file appears to be corrupt
+```
+
+The server log written by `pg_ctl -l` contains the real `FATAL` line. If you see "control file appears to be corrupt" right after an upgrade, check versions before you suspect corruption.
+
+## Step 1: Get the Old Version Running Again
+
+The quickest way back to a working database is to start it with the binaries of the version that created it. Nothing has been changed on disk by the failed start.
+
+- **Homebrew (macOS):** formulas are versioned. `brew services stop postgresql@18`, then `brew install postgresql@14` if needed and `brew services start postgresql@14`. Make sure your shell `PATH` points at the 14 binaries for `psql` and `pg_dump` against this server.
+- **Debian and Ubuntu (PGDG packages):** each major version is its own package (`postgresql-14`, `postgresql-18`) and its own cluster. `pg_lsclusters` lists clusters with their versions. The data of the 14 cluster lives in `/var/lib/postgresql/14/main` and is started with `pg_ctlcluster 14 main start`.
+- **RHEL, Rocky, Alma (PGDG packages):** binaries live in `/usr/pgsql-14/bin` and `/usr/pgsql-18/bin`. Start the old service unit, `postgresql-14`.
+- **Docker:** go back to the old image tag (for example `postgres:14`) with the same volume. See the Docker section below.
+
+Once it is running, take a backup before you try anything else: `pg_dumpall` for a logical copy, or a file system copy of the data directory while the server is stopped.
+
+## Step 2: Choose an Upgrade Method
+
+There are two standard ways to move the data to the new major version.
+
+| Method | Downtime | Needs | Best for |
+|---|---|---|---|
+| `pg_upgrade` | Minutes, mostly independent of data size with `--link` | Old and new binaries on the same host | Most production upgrades |
+| `pg_dumpall` / `pg_dump` + restore | Proportional to data size | Only the new server, plus a dump from the old one | Small databases, moving hosts, changing settings like encoding or locale |
+
+Logical replication from the old to the new version is a third option for near-zero downtime, at the cost of more setup.
+
+### Upgrading with pg_upgrade
+
+`pg_upgrade` needs both sets of binaries and an empty data directory initialized by the new version. One detail matters for upgrades to 18: `initdb` in PostgreSQL 18 enables data checksums by default, and `pg_upgrade` requires both clusters to match. A 14 cluster usually has checksums off, so initialize the new one without them (or enable checksums on the old cluster first with `pg_checksums`):
+
+```bash
+/usr/local/pgsql-18/bin/initdb -D /tmp/up18 -U postgres --no-data-checksums
+
+cd /tmp/upgrade-work
+/usr/local/pgsql-18/bin/pg_upgrade \
+  -b /usr/local/pgsql-14/bin -B /usr/local/pgsql-18/bin \
+  -d /tmp/inc14 -D /tmp/up18 -U postgres --check
+```
+
+```text
+Checking for presence of required libraries                   ok
+Checking database user is the install user                    ok
+Checking for prepared transactions                            ok
+Checking for new cluster tablespace directories               ok
+
+*Clusters are compatible*
+```
+
+`--check` changes nothing. Fix whatever it reports, such as missing extensions in the new installation, then run the same command without `--check`, with both servers stopped:
+
+```text
+Upgrade Complete
+----------------
+Some statistics are not transferred by pg_upgrade.
+Once you start the new server, consider running these two commands:
+    /usr/local/pgsql-18/bin/vacuumdb -U postgres --all --analyze-in-stages --missing-stats-only
+    /usr/local/pgsql-18/bin/vacuumdb -U postgres --all --analyze-only
+```
+
+`pg_upgrade` writes its logs to the current directory, which is why we ran it from a scratch directory. Copy `postgresql.conf` and `pg_hba.conf` settings to the new cluster before starting it, because the new data directory has fresh default files. Add `--link` (hard links) or, on PostgreSQL 18, `--swap` to avoid copying the data files. With those modes, the old cluster must not be started again after the new one has run.
+
+The [PostgreSQL 14 end-of-life upgrade guide](/blog/postgres-14-end-of-life-upgrade) walks through a full 14 to 18 upgrade, including checksums, extension versions and post-upgrade checks, and the [pg_upgrade guide](/blog/postgres-pg-upgrade-guide) covers the options in more depth.
+
+### Upgrading with Dump and Restore
+
+With the old server running and the new one running on another port, a pipe copies everything, including roles:
+
+```bash
+pg_dumpall -h old-host -p 5432 -U postgres | psql -h new-host -p 5433 -U postgres -d postgres
+```
+
+Use the `pg_dumpall` and `psql` from the new version. Newer `pg_dump` can read older servers, but older `pg_dump` cannot produce dumps for features it does not know, and it refuses to dump a newer server. Expect one harmless error during the restore: `role "postgres" already exists`. For large databases, dump each database with `pg_dump -Fd -j 4` and restore with `pg_restore -j 4` to use several cores.
+
+## Docker: Why the Container Stops After Changing the Tag
+
+Docker users meet this error most often, because changing `image: postgres:14` to `postgres:latest` or `postgres:18` swaps the binaries while the volume keeps the old data. The official image does not run `pg_upgrade` for you.
+
+With images up to 17, the volume is mounted at `/var/lib/postgresql/data`, and starting a newer image on an older volume fails with the "database files are incompatible with server" message.
+
+PostgreSQL 18 images changed the layout. Per the image documentation, `PGDATA` is now version-specific, `/var/lib/postgresql/18/docker`, and the declared volume moved to `/var/lib/postgresql`. The 18 image's entrypoint looks for old data in the previous location and stops with its own error instead of silently creating an empty database. From the entrypoint script in the docker-library repository:
+
+```text
+Error: in 18+, these Docker images are configured to store database data in a
+       format which is compatible with "pg_ctlcluster" (specifically, using
+       major-version-specific directory names).
+       ...
+       Counter to that, there appears to be PostgreSQL data in:
+         /var/lib/postgresql/data
+       This is usually the result of upgrading the Docker image without
+       upgrading the underlying database using "pg_upgrade" (which requires both
+       versions).
+```
+
+So depending on the tag and how the volume is mounted, a Docker upgrade gives you either the PostgreSQL message or this one. The cause and the fix are the same.
+
+A safe Docker upgrade with dump and restore:
+
+1. Pin the old tag again (`postgres:14`) and start the old container with its volume.
+2. Dump everything: `docker exec old-pg pg_dumpall -U postgres > all.sql`.
+3. Start a new `postgres:18` container with a new, empty volume mounted at `/var/lib/postgresql`.
+4. Restore: `docker exec -i new-pg psql -U postgres -d postgres < all.sql`.
+5. Point the application at the new container, and keep the old volume until you have verified the data.
+
+For `pg_upgrade` inside Docker you need a container that has both versions' binaries and both data directories mounted. The single mount at `/var/lib/postgresql` in 18+ images is designed for that, because the old and new data directories can then sit on the same file system, which `pg_upgrade --link` requires. Whatever you do, never point a newer image at the old volume and delete "the broken files" to make the container start. An empty database would start, and the old data would be gone.
+
+## Preventing It Next Time
+
+- **Pin major versions.** Use `postgres:18` rather than `postgres:latest` in Compose files, and versioned packages such as `postgresql@18` in Homebrew. Upgrade on purpose, not as a side effect of `docker pull` or `brew upgrade`.
+- **Check before restarting after package updates.** `pg_lsclusters` on Debian and Ubuntu, or `cat $PGDATA/PG_VERSION` anywhere, shows the data version. `postgres --version` shows the binary version.
+- **Test the upgrade on a copy.** Restore last night's backup on a spare machine, run `pg_upgrade --check` or a full dump and restore, and time it.
+
+After an upgrade, a quick look at the new server confirms that schemas, row counts and extensions came across. [Chat2DB](https://chat2db.ai/download) can hold connections to the old and new servers side by side, so you can compare tables and run the same checks against both before you switch the application over.
+
+## Summary
+
+- "Database files are incompatible with server" means the binary's major version differs from the data directory's `PG_VERSION`. The data is intact.
+- Start the data with its original version's binaries first, and take a backup.
+- Upgrade with `pg_upgrade` (both binaries, matching checksum settings, `--check` first) or with `pg_dumpall` and restore using the new version's tools.
+- Docker images do not upgrade data. On 18+, the image uses `/var/lib/postgresql/18/docker` and reports old data in `/var/lib/postgresql/data` with its own error.
+- Pin major versions so the next upgrade is planned.

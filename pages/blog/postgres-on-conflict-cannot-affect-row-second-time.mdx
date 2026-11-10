@@ -1,0 +1,305 @@
+---
+title: "ON CONFLICT Cannot Affect Row a Second Time: Fix"
+description: "Fix PostgreSQL ON CONFLICT DO UPDATE command cannot affect row a second time: find duplicate keys in the batch and dedupe them with DISTINCT ON or GROUP BY."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: November 9, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# ON CONFLICT Cannot Affect Row a Second Time: Fix
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="November 9, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+An upsert that worked for months suddenly fails on one batch:
+
+```text
+ERROR:  ON CONFLICT DO UPDATE command cannot affect row a second time
+HINT:  Ensure that no rows proposed for insertion within the same command have duplicate constrained values.
+```
+
+The SQLSTATE is `21000` (cardinality violation). Nothing is wrong with the table, the unique index or the `ON CONFLICT` clause. The problem is the data you sent in: two or more of the rows in this one statement have the same value in the conflict key. PostgreSQL refuses to guess which of them should win, so it rejects the whole statement.
+
+This guide shows how to reproduce the error, how to find the duplicate keys, and four ways to fix it depending on which row should win. Every example below was run on PostgreSQL 18.6, and the error text is the same on 14.24.
+
+## Reproducing the Error
+
+Start with a small product table keyed by SKU:
+
+```sql
+CREATE TABLE products (
+  sku        text PRIMARY KEY,
+  name       text,
+  price      numeric,
+  updated_at timestamptz DEFAULT now()
+);
+
+INSERT INTO products VALUES ('A-1', 'Mug', 8.00);
+```
+
+Now send a batch that contains `A-1` twice:
+
+```sql
+INSERT INTO products (sku, name, price)
+VALUES ('A-1', 'Mug', 9.50),
+       ('B-2', 'Plate', 12.00),
+       ('A-1', 'Mug XL', 11.00)
+ON CONFLICT (sku) DO UPDATE
+SET name = EXCLUDED.name, price = EXCLUDED.price;
+```
+
+```text
+ERROR:  ON CONFLICT DO UPDATE command cannot affect row a second time
+HINT:  Ensure that no rows proposed for insertion within the same command have duplicate constrained values.
+```
+
+The statement is atomic, so `B-2` is not inserted either. Nothing changes.
+
+The row does not even need to exist beforehand. A batch with two new rows for the same key fails in exactly the same way:
+
+```sql
+INSERT INTO products (sku, name, price)
+VALUES ('C-3', 'Bowl', 5), ('C-3', 'Bowl', 5)
+ON CONFLICT (sku) DO UPDATE SET price = EXCLUDED.price;
+```
+
+```text
+ERROR:  ON CONFLICT DO UPDATE command cannot affect row a second time
+```
+
+Even identical duplicates are rejected. PostgreSQL does not compare the rest of the row to see whether the second update would be harmless.
+
+## Why PostgreSQL Refuses
+
+`INSERT ... ON CONFLICT DO UPDATE` processes the proposed rows one at a time. The first `A-1` row conflicts with the existing row, so PostgreSQL updates it. When the third proposed row arrives, it conflicts with the row that this same command has just updated. Updating it again would make the result depend on the order in which rows happen to be processed, and that order is not something SQL guarantees. A `VALUES` list, a `SELECT` from a staging table or a function result can come back in a different order next time, and the "winning" price would change silently.
+
+So the rule is simple: within one statement, each target row may be updated at most once. That is also why the message says "a second time" rather than "duplicate key". The unique index is working exactly as designed.
+
+`DO NOTHING` behaves differently. Since nothing is updated, there is no ambiguity about the final value, and duplicates are tolerated:
+
+```sql
+INSERT INTO products (sku, name, price)
+VALUES ('D-4', 'Cup', 3), ('D-4', 'Cup big', 4)
+ON CONFLICT (sku) DO NOTHING;
+```
+
+```text
+INSERT 0 1
+```
+
+The first `D-4` row is inserted and the second is skipped. If skipping is what you want, `DO NOTHING` is a valid fix. Be aware that which duplicate survives still depends on processing order, which is exactly what `DO UPDATE` refuses to leave to chance.
+
+## Step 1: Find the Duplicate Keys
+
+When the rows come from a staging table, a `GROUP BY ... HAVING` query shows the offending keys. Here is a staging table with a classic problem: the same SKU was exported twice with different prices.
+
+```sql
+CREATE TABLE staging (sku text, name text, price numeric, loaded_at timestamptz);
+
+INSERT INTO staging VALUES
+  ('A-1', 'Mug',    9.50,  '2026-11-01'),
+  ('A-1', 'Mug XL', 11.00, '2026-11-03'),
+  ('B-2', 'Plate',  12,    '2026-11-02');
+
+SELECT sku, count(*)
+FROM staging
+GROUP BY sku
+HAVING count(*) > 1;
+```
+
+```text
+ sku | count
+-----+-------
+ A-1 |     2
+(1 row)
+```
+
+For a composite key, group by every column of the key, in the same form as the unique index. If the conflict target is `(warehouse_id, sku)`, the check is `GROUP BY warehouse_id, sku`.
+
+When the rows come from application code, the duplicates are usually caused by one of these:
+
+- **Retries that append instead of replace.** A failed batch is retried, and the retry is added to a buffer that still holds the first attempt.
+- **Merged sources.** Two feeds are concatenated and both contain the same record.
+- **Event streams.** Several change events for the same entity arrive in one micro-batch.
+- **Joins that multiply rows.** `INSERT ... SELECT` with a join to a table that has several matching rows per key.
+
+The last one is easy to miss, because the source tables look clean on their own. Run the `SELECT` part of the statement by itself and group it by the conflict key to see whether the join fans out.
+
+## Step 2: Decide Which Row Should Win
+
+Every fix below answers the same question in a different way: when the batch contains several rows for one key, which one should be written? Pick the rule first, then the SQL follows.
+
+### Fix 1: Keep the Latest Row with DISTINCT ON
+
+If the newest record should win, `DISTINCT ON` keeps the first row per key according to `ORDER BY`. Sort the timestamp descending so that the newest row comes first:
+
+```sql
+INSERT INTO products (sku, name, price)
+SELECT DISTINCT ON (sku) sku, name, price
+FROM staging
+ORDER BY sku, loaded_at DESC
+ON CONFLICT (sku) DO UPDATE
+SET name = EXCLUDED.name, price = EXCLUDED.price;
+```
+
+```text
+INSERT 0 2
+```
+
+```sql
+SELECT sku, name, price FROM products ORDER BY sku;
+```
+
+```text
+ sku |  name  | price
+-----+--------+-------
+ A-1 | Mug XL | 11.00
+ B-2 | Plate  |    12
+ D-4 | Cup    |     3
+(3 rows)
+```
+
+`A-1` now carries the values from the November 3 export. The `ORDER BY` must start with the `DISTINCT ON` columns, and you should add enough columns after them to make the choice deterministic. If two rows can share the same `loaded_at`, add another tiebreaker such as an ID.
+
+### Fix 2: Combine the Rows with GROUP BY
+
+Sometimes the duplicates are not competing versions but parts of a total. Stock movements are the typical case: two rows for the same warehouse and SKU should be added together, not choose one.
+
+```sql
+CREATE TABLE inv (wh int, sku text, qty int, PRIMARY KEY (wh, sku));
+
+INSERT INTO inv VALUES (1, 'A', 1), (1, 'A', 2)
+ON CONFLICT (wh, sku) DO UPDATE SET qty = inv.qty + EXCLUDED.qty;
+```
+
+```text
+ERROR:  ON CONFLICT DO UPDATE command cannot affect row a second time
+```
+
+Aggregate first, then upsert the totals:
+
+```sql
+INSERT INTO inv
+SELECT wh, sku, sum(qty)
+FROM (VALUES (1, 'A', 1), (1, 'A', 2)) AS v(wh, sku, qty)
+GROUP BY wh, sku
+ON CONFLICT (wh, sku) DO UPDATE SET qty = inv.qty + EXCLUDED.qty;
+
+SELECT * FROM inv;
+```
+
+```text
+ wh | sku | qty
+----+-----+-----
+  1 | A   |   3
+(1 row)
+```
+
+Choose the aggregate that matches the meaning of each column: `sum` for quantities, `max` for "last seen" timestamps, `bool_or` for flags, and so on.
+
+### Fix 3: Keep the Last Element of a JSON Array
+
+APIs often send a JSON array, and the rule is "the later element wins". `WITH ORDINALITY` numbers the elements, so you can use `DISTINCT ON` with the position:
+
+```sql
+INSERT INTO products (sku, name, price)
+SELECT DISTINCT ON (x->>'sku') x->>'sku', x->>'name', (x->>'price')::numeric
+FROM jsonb_array_elements(
+  '[{"sku":"F-6","name":"Fork","price":2},
+    {"sku":"F-6","name":"Fork v2","price":3}]'
+) WITH ORDINALITY AS t(x, n)
+ORDER BY x->>'sku', n DESC
+ON CONFLICT (sku) DO UPDATE
+SET name = EXCLUDED.name, price = EXCLUDED.price
+RETURNING sku, name, price;
+```
+
+```text
+ sku |  name   | price
+-----+---------+-------
+ F-6 | Fork v2 |     3
+(1 row)
+```
+
+The same approach works for `unnest(...) WITH ORDINALITY` when the driver sends parallel arrays.
+
+### Fix 4: Deduplicate in the Application
+
+If the batch is built in application code, deduplicating there keeps the SQL simple. Use a map keyed by the conflict columns and let later entries overwrite earlier ones, then send the map's values. This also reduces the amount of data sent to the server. The important detail is to build the key exactly as the database compares it: if the unique index is on `lower(email)`, the map key must be the lowercased email too, or two rows that differ only in case will still collide on the server.
+
+## Normalized Keys Need Normalized Deduplication
+
+That last point deserves a closer look. Suppose the uniqueness rule is case-insensitive:
+
+```sql
+CREATE TABLE users (email text);
+CREATE UNIQUE INDEX users_email_lower ON users (lower(email));
+
+INSERT INTO users (email)
+VALUES ('Ana@Example.com'), ('ana@example.com')
+ON CONFLICT (lower(email)) DO UPDATE SET email = EXCLUDED.email;
+```
+
+```text
+ERROR:  ON CONFLICT DO UPDATE command cannot affect row a second time
+```
+
+The two strings are different, so a `DISTINCT ON (email)` would keep both and still fail. Deduplicate on the same expression the index uses:
+
+```sql
+INSERT INTO users (email)
+SELECT DISTINCT ON (lower(email)) email
+FROM (VALUES ('Ana@Example.com', 1), ('ana@example.com', 2)) AS v(email, n)
+ORDER BY lower(email), n DESC
+ON CONFLICT (lower(email)) DO UPDATE SET email = EXCLUDED.email;
+```
+
+```text
+INSERT 0 1
+```
+
+The same applies to `btrim`, date truncation or any other expression index used as a conflict target.
+
+## MERGE Has the Same Rule
+
+`MERGE`, available since PostgreSQL 15, enforces the same rule with its own message:
+
+```sql
+MERGE INTO products p
+USING staging s ON p.sku = s.sku
+WHEN MATCHED THEN UPDATE SET price = s.price
+WHEN NOT MATCHED THEN INSERT (sku, name, price) VALUES (s.sku, s.name, s.price);
+```
+
+```text
+ERROR:  MERGE command cannot affect row a second time
+HINT:  Ensure that not more than one source row matches any one target row.
+```
+
+So switching from `ON CONFLICT` to `MERGE` does not avoid the problem. The fixes are the same: deduplicate the source with `DISTINCT ON` or `GROUP BY` in a subquery or CTE before it reaches the `USING` clause.
+
+## What About Splitting the Batch?
+
+Running each row as its own statement makes the error disappear, because each statement then updates a row only once. It also makes the result depend on the order in which your code sends the rows, and it turns one round trip into many. If the order is meaningful (events applied in sequence), that may be acceptable, but say so explicitly in the code. In most cases, deduplicating with a clear rule is both faster and easier to reason about.
+
+## Checking Your Upserts Before Production
+
+Two habits prevent most of these failures:
+
+1. **Test with duplicates on purpose.** Unit tests for an upsert path should include a batch with a repeated key, and a repeated key that differs only in case or whitespace if the index normalizes it.
+2. **Inspect real batches.** When the error appears in production, log the conflict keys of the failing batch and run the `GROUP BY ... HAVING count(*) > 1` check against them.
+
+A SQL client makes the second step faster. In [Chat2DB](https://chat2db.ai/download) you can load the failing batch into a staging table, run the duplicate check, and ask the AI assistant to rewrite the upsert with `DISTINCT ON` against your actual columns.
+
+## Summary
+
+- `ON CONFLICT DO UPDATE command cannot affect row a second time` means the same statement proposed two or more rows with the same conflict key.
+- It happens whether or not the row already exists, and even when the duplicates are identical.
+- `DO NOTHING` tolerates duplicates. `DO UPDATE` and `MERGE` do not.
+- Find the keys with `GROUP BY <conflict columns> HAVING count(*) > 1`, and check joins that multiply rows.
+- Fix it by choosing a winner with `DISTINCT ON ... ORDER BY`, combining rows with `GROUP BY`, or deduplicating in the application, always on the same expression the unique index uses.
+
+For related upsert problems, see [no unique or exclusion constraint matching the ON CONFLICT specification](/blog/postgres-no-unique-constraint-on-conflict) and the [ON CONFLICT DO UPDATE guide](/blog/postgres-on-conflict-do-update-guide).
