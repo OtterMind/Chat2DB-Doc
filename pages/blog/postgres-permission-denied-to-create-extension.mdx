@@ -1,0 +1,201 @@
+---
+title: "Postgres: Permission Denied to Create Extension"
+description: "Fix PostgreSQL permission denied to create extension: trusted vs untrusted extensions, the CREATE privilege on the database, and what to do on managed services."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: November 10, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# Postgres: Permission Denied to Create Extension
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="November 10, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+Your migration or setup script runs `CREATE EXTENSION`, and PostgreSQL stops it with one of two hints:
+
+```text
+ERROR:  permission denied to create extension "pg_stat_statements"
+HINT:  Must be superuser to create this extension.
+```
+
+```text
+ERROR:  permission denied to create extension "pg_trgm"
+HINT:  Must have CREATE privilege on current database to create this extension.
+```
+
+Both have SQLSTATE `42501` (insufficient privilege). The hint tells you which of two rules you hit, and the fix is different for each. This guide explains trusted and untrusted extensions, shows the exact behavior we measured on PostgreSQL 18.6 and 14.24, and covers what to do when you do not have a superuser account, as on most managed database services.
+
+If the error is instead `could not open extension control file`, the extension is not installed on the server at all. That is a packaging problem, not a permissions problem.
+
+## Trusted and Untrusted Extensions
+
+Creating an extension runs its install script, which can create functions written in C, register hooks, or read files. Code like that can bypass every permission check in the database, so by default only superusers may create extensions.
+
+Since PostgreSQL 13, an extension's control file can mark it as `trusted`. A trusted extension may be created by any role that has the `CREATE` privilege on the current database. Its install script then runs with superuser rights, but the resulting objects are owned by the role that ran `CREATE EXTENSION`. The extension authors are vouching that the script cannot be abused to escalate privileges.
+
+You can check each available extension in `pg_available_extension_versions`:
+
+```sql
+SELECT name, superuser, trusted
+FROM pg_available_extension_versions v
+WHERE version = (SELECT default_version FROM pg_available_extensions a WHERE a.name = v.name)
+  AND name IN ('pg_trgm', 'pg_stat_statements', 'amcheck',
+               'pg_buffercache', 'pgstattuple', 'plpgsql')
+ORDER BY 1;
+```
+
+```text
+        name        | superuser | trusted
+--------------------+-----------+---------
+ amcheck            | t         | f
+ pg_buffercache     | t         | f
+ pg_stat_statements | t         | f
+ pg_trgm            | t         | t
+ pgstattuple        | t         | f
+ plpgsql            | t         | t
+```
+
+`superuser = t` with `trusted = t` means "needs superuser, unless trusted rules apply". Among the contrib modules, trusted ones include `pg_trgm`, `hstore`, `citext`, `pgcrypto`, `uuid-ossp`, `fuzzystrmatch`, `unaccent`, `btree_gin`, `btree_gist`, `intarray`, `ltree`, `cube`, `isn`, `lo`, `seg`, `tablefunc`, `tcn` and `tsm_system_rows`. Monitoring and maintenance modules such as `pg_stat_statements`, `pg_buffercache`, `pgstattuple`, `amcheck` and `postgres_fdw` are not trusted. Third-party extensions decide for themselves. Check `trusted` on your server rather than relying on a list.
+
+## Case 1: "Must Be Superuser to Create This Extension"
+
+The extension is not trusted, and your role is not a superuser. We reproduced it with a normal login role:
+
+```sql
+CREATE ROLE app_owner LOGIN;
+CREATE DATABASE appdb OWNER postgres;
+\c appdb
+SET ROLE app_owner;
+CREATE EXTENSION pg_stat_statements;
+```
+
+```text
+ERROR:  42501: permission denied to create extension "pg_stat_statements"
+HINT:  Must be superuser to create this extension.
+```
+
+Granting `CREATE` on the database does not help for these. Even the database owner gets the same error:
+
+```text
+postgres=# \c owned2
+postgres=# SET ROLE db_owner2;      -- owner of database owned2
+postgres=> CREATE EXTENSION pg_buffercache;
+ERROR:  permission denied to create extension "pg_buffercache"
+HINT:  Must be superuser to create this extension.
+```
+
+### Fix: Have a Superuser Create It Once
+
+On a self-managed server, connect as a superuser (usually `postgres`) and create the extension in the right database:
+
+```sql
+\c appdb postgres
+CREATE EXTENSION IF NOT EXISTS pg_stat_statements;
+```
+
+Extensions are per database, so repeat this in every database that needs it. If you want new databases to have it automatically, create it in `template1`, which `CREATE DATABASE` copies by default.
+
+Then let the application role use it without making it a superuser. For `pg_stat_statements`, grant the predefined role that allows reading all statistics:
+
+```sql
+GRANT pg_read_all_stats TO app_owner;
+```
+
+Keep `CREATE EXTENSION IF NOT EXISTS` in your migrations. Once the superuser has created the extension, the migration's `IF NOT EXISTS` turns into a no-op and no longer fails for the unprivileged role. Without `IF NOT EXISTS`, it fails with `extension "..." already exists`.
+
+Some extensions also need server configuration before they work. `pg_stat_statements` must be in `shared_preload_libraries`, which requires a restart. Creating the extension without that succeeds, but querying the view then fails with `pg_stat_statements must be loaded via "shared_preload_libraries"` (PostgreSQL 14 prints the setting name without quotes).
+
+## Case 2: "Must Have CREATE Privilege on Current Database"
+
+The extension is trusted, but your role lacks `CREATE` on the database:
+
+```sql
+SET ROLE app_owner;
+CREATE EXTENSION pg_trgm;
+```
+
+```text
+ERROR:  42501: permission denied to create extension "pg_trgm"
+HINT:  Must have CREATE privilege on current database to create this extension.
+```
+
+### Fix: Grant CREATE on the Database, or Use the Owner
+
+```sql
+RESET ROLE;
+GRANT CREATE ON DATABASE appdb TO app_owner;
+
+SET ROLE app_owner;
+CREATE EXTENSION pg_trgm;
+```
+
+```text
+CREATE EXTENSION
+```
+
+The database owner has `CREATE` implicitly, so creating databases with `OWNER app_owner` avoids the grant altogether. In our test, the owner of database `owned2` created `pg_trgm` without any extra grant.
+
+Note that `CREATE` on a database also allows creating schemas in it. If that is more than you want to give an application role, have a superuser or the database owner create the trusted extensions instead.
+
+A few things we observed about trusted extensions that are worth knowing:
+
+- **The creating role owns the extension.** `pg_extension.extowner` showed `app_owner`, so that role can later drop or update it. A role that does not own an extension cannot drop it: `DROP EXTENSION amcheck` as `app_owner`, for an extension the superuser had created, failed with `must be owner of extension amcheck`.
+- **Schema privileges were not the obstacle.** On PostgreSQL 18, `app_owner` had no `CREATE` privilege on the `public` schema (the default since PostgreSQL 15), yet `CREATE EXTENSION pg_trgm` installed the extension into `public`. It also succeeded with `SCHEMA ext_s`, a schema where `app_owner` had no privileges. The install script runs with superuser rights. Do not count on schema permissions to stop users from installing trusted extensions. The database `CREATE` privilege is the control.
+
+## Managed Services
+
+On hosted PostgreSQL you usually do not get a real superuser, so case 1 looks impossible at first. Providers solve it in their own ways:
+
+- **Amazon RDS and Aurora** give the master user the `rds_superuser` role, which can create the extensions the provider supports, including untrusted ones such as `pg_stat_statements`.
+- **Azure Database for PostgreSQL (flexible server)** requires extensions to be listed in the `azure.extensions` server parameter before anyone can create them. Without that you get an error even as the admin user.
+- **Google Cloud SQL** has a `cloudsqlsuperuser` role for the default user, with a list of supported extensions.
+- **Supabase, Neon and similar platforms** pre-install many extensions or let you enable them from the dashboard.
+
+Rules and supported lists change, so check the provider's documentation for your exact service and version. In all cases, an extension that is not in the provider's supported list cannot be installed, whatever your privileges, because its files are not on the server.
+
+## Migrations and ORMs
+
+Frameworks such as Rails, Django, Prisma and Flyway often run migrations as the application role, and the extension migration is the first one to fail. Options, from best to worst:
+
+1. Create the extensions out of band as a superuser (or provider admin) when you provision the database, and keep `CREATE EXTENSION IF NOT EXISTS` in the migration so it becomes a no-op.
+2. Run migrations as a dedicated migration role that owns the database (enough for trusted extensions) or has `rds_superuser`-style privileges, and run the application as a less privileged role.
+3. Never make the application role a superuser just to get past this error. A superuser application account turns any SQL injection into full control of the server, including reading files and running programs.
+
+Before running migrations against a new environment, check what the migration role can do. Both checks below returned false for a freshly created role in our test:
+
+```sql
+SELECT rolsuper,
+       has_database_privilege('mig', current_database(), 'CREATE') AS can_create
+FROM pg_roles
+WHERE rolname = 'mig';
+```
+
+```text
+ rolsuper | can_create
+----------+------------
+ f        | f
+```
+
+With `rolsuper = f` and `can_create = f`, the role can create neither trusted nor untrusted extensions. With `can_create = t`, it can create trusted ones. Combine this with the `trusted` column from the earlier query to predict exactly which `CREATE EXTENSION` statements in your migrations will fail, before you run them.
+
+To see which extensions a database already has, and their versions:
+
+```sql
+SELECT extname, extversion, extowner::regrole, extnamespace::regnamespace
+FROM pg_extension
+ORDER BY 1;
+```
+
+In psql, `\dx` shows the same list. Chat2DB shows installed extensions in its database tree too, which is handy when you manage many databases and want to check that each one has what the application expects. You can [download Chat2DB](https://chat2db.ai/download) or use it in the browser at [app.chat2db.ai](https://app.chat2db.ai/).
+
+## Summary
+
+| Hint | Meaning | Fix |
+|---|---|---|
+| Must be superuser to create this extension. | The extension is not trusted | A superuser (or the provider's admin role) creates it once per database; grant predefined roles for usage |
+| Must have CREATE privilege on current database to create this extension. | The extension is trusted, and your role lacks database `CREATE` | `GRANT CREATE ON DATABASE ...`, or create it as the database owner |
+
+`permission denied to create extension` always comes with a hint that tells you which rule you hit. Check `trusted` in `pg_available_extension_versions`. Untrusted extensions need a superuser or your provider's equivalent. Trusted ones need only the database `CREATE` privilege. Create extensions at provisioning time and keep `IF NOT EXISTS` in your migrations.

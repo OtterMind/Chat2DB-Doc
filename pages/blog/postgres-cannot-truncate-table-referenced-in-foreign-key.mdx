@@ -1,0 +1,239 @@
+---
+title: "Postgres Cannot Truncate Table Referenced in FK"
+description: "Fix PostgreSQL cannot truncate a table referenced in a foreign key constraint: truncate tables together, use CASCADE safely, or DELETE. Tested on PG 14 and 18."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: November 10, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# Postgres Cannot Truncate Table Referenced in FK
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="November 10, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+You want to empty a table quickly, so you run `TRUNCATE`, and PostgreSQL refuses:
+
+```text
+ERROR:  cannot truncate a table referenced in a foreign key constraint
+DETAIL:  Table "orders" references "customers".
+HINT:  Truncate table "orders" at the same time, or use TRUNCATE ... CASCADE.
+```
+
+The SQLSTATE is `0A000` (feature not supported). It shows up most often in test suites that reset the database between tests, in ETL jobs that reload a staging table, and in scripts that clear a lookup table before refilling it. This guide explains why the check exists, then walks through each fix and what it costs. All examples were run on PostgreSQL 18.6 and 14.24, which behave identically here.
+
+## Why PostgreSQL Refuses
+
+`DELETE` removes rows one at a time, so it can check foreign keys row by row. A row in `customers` that is still referenced by `orders` either blocks the delete or cascades to the child, depending on the foreign key's `ON DELETE` action.
+
+`TRUNCATE` works differently. It throws away the table's data files and creates new, empty ones. That is why it is instant on a table of any size and why it gives the disk space back immediately. It never looks at individual rows, so it cannot fire foreign key checks or `ON DELETE` actions. If PostgreSQL allowed it, `orders` would be left pointing at customers that no longer exist.
+
+So the rule is simple. You can truncate a table only if every table that references it through a foreign key is truncated in the same command.
+
+The check is purely structural. It does not care whether the child table is empty. In our test we deleted every row from `orders` first, and `TRUNCATE customers` still failed with the same error. Disabling triggers does not help either:
+
+```sql
+BEGIN;
+ALTER TABLE orders DISABLE TRIGGER ALL;
+TRUNCATE customers;   -- ERROR: cannot truncate a table referenced in a foreign key constraint
+ROLLBACK;
+
+BEGIN;
+SET LOCAL session_replication_role = replica;
+TRUNCATE customers;   -- same error
+ROLLBACK;
+```
+
+Both tricks turn off foreign key enforcement for `DELETE` and `INSERT`, but they do not affect the `TRUNCATE` check.
+
+## The Example Schema
+
+```sql
+CREATE TABLE customers (
+  id   bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  name text NOT NULL
+);
+CREATE TABLE orders (
+  id          bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  customer_id bigint NOT NULL REFERENCES customers (id),
+  total       numeric
+);
+CREATE TABLE order_items (
+  id       bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  order_id bigint REFERENCES orders (id) ON DELETE CASCADE,
+  sku      text
+);
+```
+
+`customers` is referenced by `orders`, and `orders` is referenced by `order_items`.
+
+## Fix 1: Truncate the Related Tables Together
+
+List every table in one statement:
+
+```sql
+TRUNCATE customers, orders, order_items;
+```
+
+This is the precise fix. You decide exactly which tables are emptied, and nothing else is touched. The error tells you one missing table at a time, so you may need a few attempts. Truncating `customers` and `orders` together still failed in our test, this time because of the next level down:
+
+```text
+ERROR:  cannot truncate a table referenced in a foreign key constraint
+DETAIL:  Table "order_items" references "orders".
+HINT:  Truncate table "order_items" at the same time, or use TRUNCATE ... CASCADE.
+```
+
+Instead of guessing, list the whole chain of referencing tables with a recursive query:
+
+```sql
+WITH RECURSIVE refs AS (
+  SELECT conrelid, 1 AS depth
+  FROM pg_constraint
+  WHERE contype = 'f'
+    AND confrelid = 'customers'::regclass
+    AND conrelid <> confrelid
+  UNION
+  SELECT c.conrelid, r.depth + 1
+  FROM pg_constraint c
+  JOIN refs r ON c.confrelid = r.conrelid
+  WHERE c.contype = 'f' AND c.conrelid <> c.confrelid
+)
+SELECT conrelid::regclass AS referencing_table, min(depth) AS depth
+FROM refs
+GROUP BY 1
+ORDER BY 2;
+```
+
+```text
+ referencing_table | depth
+-------------------+-------
+ orders            |     1
+ order_items       |     2
+```
+
+Every table in that result must be truncated together with `customers`. If one of them holds data you want to keep, `TRUNCATE` is the wrong tool and you need Fix 3.
+
+Self-references are not a problem. A table whose foreign key points to itself, such as an `employees.manager_id` column referencing `employees.id`, truncates fine on its own, because the referencing table and the referenced table are the same and both are emptied.
+
+## Fix 2: TRUNCATE ... CASCADE
+
+`CASCADE` tells PostgreSQL to find the referencing tables itself and truncate them as well:
+
+```sql
+TRUNCATE customers CASCADE;
+```
+
+```text
+NOTICE:  truncate cascades to table "orders"
+NOTICE:  truncate cascades to table "order_items"
+TRUNCATE TABLE
+```
+
+Read those notices carefully. `TRUNCATE ... CASCADE` empties **all rows** of every referencing table, recursively. It does not mean "delete the orders that belong to the customers I removed", because you are removing all customers. If a log table or a long-lived history table has a foreign key to the table you are clearing, it is emptied too. That might be a table you forgot existed, or one added later by someone else.
+
+That is why many teams ban bare `CASCADE` in production scripts. If you use it, run it inside a transaction first, read the notices, and roll back if the list surprises you:
+
+```sql
+BEGIN;
+TRUNCATE customers CASCADE;
+-- read the NOTICE lines, then:
+ROLLBACK;   -- or COMMIT if the list is what you expected
+```
+
+`TRUNCATE` is transactional in PostgreSQL, so `ROLLBACK` restores everything. `CASCADE` is a reasonable choice for wiping a test database, where emptying everything is exactly the goal.
+
+## Fix 3: Use DELETE When You Need Row-Level Rules
+
+If you only want to remove some rows, or the child tables must keep their data, use `DELETE`. It follows the foreign key rules:
+
+```sql
+DELETE FROM customers;
+```
+
+```text
+ERROR:  update or delete on table "customers" violates foreign key constraint "orders_customer_id_fkey" on table "orders"
+DETAIL:  Key (id)=(1) is still referenced from table "orders".
+```
+
+That error is correct behavior: those customers have orders. Either delete the orders first, or define the foreign key with `ON DELETE CASCADE` or `ON DELETE SET NULL` if that matches your data model. `DELETE` is much slower than `TRUNCATE` on large tables. It writes WAL for every row, it leaves dead tuples for VACUUM, and it does not return disk space to the operating system. On a 2-million-row table in our lab, `DELETE FROM big` took 3.0 seconds, while `TRUNCATE big` finished in under a second. After deleting half of the rows, the table still used 269 MB on disk, the same as before. After the truncate, it used 0 bytes.
+
+If you have to use `DELETE` for a large cleanup, do it in batches so each transaction stays short and autovacuum can keep up:
+
+```sql
+DELETE FROM order_items
+WHERE id IN (SELECT id FROM order_items WHERE order_id < 100000 LIMIT 10000);
+-- repeat until it reports DELETE 0, then VACUUM (ANALYZE) order_items;
+```
+
+## Resetting Identity Columns and Sequences
+
+`TRUNCATE` keeps sequences where they were by default. After emptying the tables in our test, the next customer got id 4, continuing from the three rows we had inserted. Add `RESTART IDENTITY` to reset identity columns and owned sequences of every truncated table:
+
+```sql
+TRUNCATE customers, orders, order_items RESTART IDENTITY;
+INSERT INTO customers (name) VALUES ('x') RETURNING id;
+--  id
+-- ----
+--   1
+```
+
+With `CASCADE`, `RESTART IDENTITY` also applies to the tables that were truncated by the cascade.
+
+## Partitioned Tables
+
+The check applies to partitions as well. When `pc` is a partitioned table referenced by `pr`, truncating either the parent or a single partition fails:
+
+```text
+ERROR:  cannot truncate a table referenced in a foreign key constraint
+DETAIL:  Table "pr" references "pc1".
+HINT:  Truncate table "pr" at the same time, or use TRUNCATE ... CASCADE.
+```
+
+Here `pc1` is a partition of `pc`. To retire old partitions of a referenced table, detach them first with `ALTER TABLE ... DETACH PARTITION`. That step checks the foreign key too, and fails while rows in the referencing table still point into the partition, which is the protection you want:
+
+```text
+ERROR:  removing partition "pc1" violates foreign key constraint "pr_x_fkey_1"
+DETAIL:  Key (x)=(1) is still referenced from table "pr".
+```
+
+(PostgreSQL 14 names the internal constraint `pr_x_fkey1`, without the second underscore.)
+
+## A Safe Pattern for Test Suites
+
+Test frameworks that reset data between tests often run into this error. A robust approach is to truncate every application table in one statement, generated from the catalog:
+
+```sql
+SELECT 'TRUNCATE ' || string_agg(format('%I.%I', schemaname, tablename), ', ')
+       || ' RESTART IDENTITY;'
+FROM pg_tables
+WHERE schemaname = 'public'
+  AND tablename NOT IN ('schema_migrations');
+```
+
+Run the generated statement. Because every table is listed, no foreign key can block it, and you do not need `CASCADE`. Keep migration bookkeeping tables out of the list, as shown.
+
+## Locks and Other Side Effects
+
+`TRUNCATE` takes an `ACCESS EXCLUSIVE` lock on every table it empties, including tables reached through `CASCADE`. While it waits for that lock, even plain `SELECT` statements on those tables queue behind it. On a busy system, set `lock_timeout` first so the command fails fast instead of piling up connections:
+
+```sql
+SET lock_timeout = '3s';
+TRUNCATE staging_orders, staging_order_items;
+```
+
+Other effects to keep in mind: `TRUNCATE` fires `TRUNCATE` triggers but not `DELETE` triggers. It is replicated by logical replication (PostgreSQL 11 and later), unless the publication excludes truncate. It is not MVCC-safe for transactions that started earlier, so a long-running repeatable read transaction will see the table as empty after the truncate commits.
+
+When you are cleaning up data across several related tables, it helps to see the foreign keys before running anything destructive. [Chat2DB](https://chat2db.ai/download) shows table relationships in its schema view, so you can check which tables reference the one you are about to empty. You can also open it in the browser at [app.chat2db.ai](https://app.chat2db.ai/).
+
+## Summary
+
+| You want to | Use |
+|---|---|
+| Empty a table and all tables that reference it, on purpose | `TRUNCATE parent, child, grandchild` |
+| Empty a table and let PostgreSQL find the children | `TRUNCATE parent CASCADE` (in a transaction, read the notices first) |
+| Remove rows while keeping referencing data intact | `DELETE` with appropriate `ON DELETE` rules |
+| Reset ids after emptying | add `RESTART IDENTITY` |
+
+`cannot truncate a table referenced in a foreign key constraint` is PostgreSQL protecting referential integrity, because `TRUNCATE` cannot check rows. Disabling triggers or setting `session_replication_role` does not bypass it, and an empty child table does not count. Truncate the whole family together, use `CASCADE` knowingly, or fall back to `DELETE`.

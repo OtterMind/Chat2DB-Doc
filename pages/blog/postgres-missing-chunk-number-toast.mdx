@@ -1,0 +1,227 @@
+---
+title: "Postgres: Missing Chunk Number 0 for Toast Value"
+description: "What ERROR: missing chunk number 0 for toast value means in PostgreSQL, how to find the damaged rows with amcheck or a PL/pgSQL loop, and how to repair them."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: November 10, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# Postgres: Missing Chunk Number 0 for Toast Value
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="November 10, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+A query, a `pg_dump` run, or a `VACUUM FULL` fails with:
+
+```text
+ERROR:  missing chunk number 0 for toast value 16402 in pg_toast_16384
+```
+
+This is a data corruption error. Its SQLSTATE is `XX001` (data corrupted). PostgreSQL found a row whose column points to a value stored out of line in the table's TOAST table, went to fetch that value, and the pieces are not there. It is not caused by your SQL, and running the query again will not help. This guide explains what TOAST is, shows the error reproduced on PostgreSQL 18.6 and 14.24, and walks through finding the damaged rows, saving everything else, and making the table healthy again.
+
+## What TOAST Is and Why Chunks Go Missing
+
+A PostgreSQL heap page is 8 kB, and a single row has to fit in one page. Values that are larger than about 2 kB (text, bytea, jsonb, large arrays) are first compressed. If the value is still too big, it is moved out of line into a separate table called the TOAST table. Every table with a toastable column has one, named `pg_toast.pg_toast_<oid of the table>`.
+
+Out-of-line values are split into chunks of just under 2 kB. Each chunk is a row in the TOAST table with three columns: `chunk_id` (the "toast value" number in the error), `chunk_seq` (0, 1, 2, ...), and `chunk_data`. The main table row keeps only an 18-byte pointer holding the `chunk_id` and the size. When you read the column, PostgreSQL looks up all chunks for that `chunk_id` through the TOAST table's index, checks that the sequence numbers are complete, and glues them back together.
+
+"Missing chunk number 0" means the index lookup returned nothing at all for that value. Other variants exist, such as "unexpected chunk number 3 (expected 2)" or "missing chunk number 2", and they point to the same kind of damage when only some chunks are gone.
+
+The usual causes:
+
+- Storage problems: a bad disk block, a lost write after a power failure on storage that ignores flush requests, or a broken file copy.
+- A damaged TOAST index. The chunks are still in the TOAST table, but the index no longer finds them.
+- Restoring a file-level backup that was taken incorrectly, for example copying the data directory without `pg_backup_start()` or a snapshot.
+- Bugs. These are rare, but they have happened, so keep up with minor releases.
+
+## Reproducing the Error
+
+We built a small table with values large enough to be stored out of line. `SET STORAGE EXTERNAL` turns off compression so the values really go to TOAST:
+
+```sql
+CREATE TABLE docs (id int PRIMARY KEY, title text, body text);
+ALTER TABLE docs ALTER COLUMN body SET STORAGE EXTERNAL;
+INSERT INTO docs
+SELECT g, 'doc ' || g, repeat(md5(g::text), 200)   -- 6,400 bytes each
+FROM generate_series(1, 50) g;
+CHECKPOINT;
+
+SELECT reltoastrelid::regclass FROM pg_class WHERE relname = 'docs';
+--  pg_toast.pg_toast_16384
+SELECT pg_relation_filepath(reltoastrelid) FROM pg_class WHERE relname = 'docs';
+--  base/5/16388
+```
+
+With the server stopped, we overwrote five 8 kB blocks of the TOAST file with zeros, which simulates storage that lost those writes. After a restart:
+
+```text
+postgres=# SELECT id, md5(body) FROM docs ORDER BY id;
+ERROR:  missing chunk number 0 for toast value 16402 in pg_toast_16384
+
+postgres=# \set VERBOSITY verbose
+postgres=# SELECT md5(body) FROM docs WHERE id = 11;
+ERROR:  XX001: missing chunk number 0 for toast value 16402 in pg_toast_16384
+LOCATION:  heap_fetch_toast_slice, heaptoast.c:786
+```
+
+A few details are worth knowing before you start investigating:
+
+- `SELECT count(*) FROM docs` still returned 50. Queries that do not read the damaged column work fine, which is why this corruption can stay hidden for months until a backup or a report touches it.
+- Zeroed pages do not trigger a checksum failure, even with data checksums enabled (they were on in our PostgreSQL 18 cluster). An all-zero page is treated as a valid empty page. Checksums catch flipped bits, not every kind of lost data.
+- `pg_dump` fails as soon as it reaches the table, so your logical backups stop working:
+
+```text
+pg_dump: error: Dumping the contents of table "docs" failed: PQgetResult() failed.
+pg_dump: detail: Error message from server: ERROR:  missing chunk number 0 for toast value 16402 in pg_toast_16384
+pg_dump: detail: Command was: COPY public.docs (id, title, body) TO stdout;
+```
+
+PostgreSQL 14.24 printed the same message text with the same SQLSTATE.
+
+## Step 1: Protect What You Have
+
+Before changing anything, take a copy of the data directory (or a storage snapshot) while the server is stopped. Every repair below deletes or overwrites data, and you may want to try a different approach later. Also check the server log and the operating system log for I/O errors. If the disk is failing, fix the hardware or move to a replica first. Repairing rows on a disk that keeps losing writes only buys a few hours.
+
+If you have a healthy standby or a recent backup, compare. A physical standby replays the same WAL, so it usually has the same logical content, but the corruption may not have reached it if the cause was a local disk problem on the primary. Querying the damaged rows on the standby is a quick test.
+
+## Step 2: Try REINDEX on the TOAST Table
+
+If the chunks are still in the TOAST table and only the index is broken, rebuilding the index fixes the error without losing data. It is cheap, so try it first:
+
+```sql
+REINDEX TABLE pg_toast.pg_toast_16384;
+-- or rebuild every index of the table, including its TOAST index:
+REINDEX TABLE docs;
+```
+
+In our reproduction this did not help, because the chunk rows themselves were destroyed. Run the failing query again after the reindex. If the error is still there, the data is gone from this copy of the database.
+
+## Step 3: Find Every Damaged Row
+
+### With amcheck
+
+PostgreSQL 14 and later ship `verify_heapam()` in the `amcheck` extension, and it can follow TOAST pointers:
+
+```sql
+CREATE EXTENSION IF NOT EXISTS amcheck;
+
+SELECT blkno, offnum, attnum, msg
+FROM verify_heapam('docs', check_toast => true);
+```
+
+```text
+ blkno | offnum | attnum |                    msg
+-------+--------+--------+--------------------------------------------
+     0 |     11 |      2 | toast value 16402 not found in toast table
+     0 |     12 |      2 | toast value 16403 not found in toast table
+     0 |     13 |      2 | toast value 16404 not found in toast table
+...
+(5 rows)
+```
+
+`blkno` and `offnum` form the row's `ctid`, so `(0,11)` is block 0, line pointer 11. `attnum` is the column number (counted from 0 here, so 2 is `body`). The command-line wrapper `pg_amcheck` does the same check across many tables or whole databases:
+
+```bash
+pg_amcheck -d mydb -t docs --heapallindexed
+```
+
+```text
+heap table "postgres.public.docs", block 0, offset 11, attribute 2:
+    toast value 16402 not found in toast table
+```
+
+### With a PL/pgSQL Loop
+
+On older versions, or when you want the primary key values directly, read the column row by row and catch the error. `md5(body)` forces PostgreSQL to fetch and assemble the whole value:
+
+```sql
+CREATE TEMP TABLE damaged (id int);
+
+DO $$
+DECLARE r record;
+BEGIN
+  FOR r IN SELECT id FROM docs LOOP
+    BEGIN
+      PERFORM md5(body) FROM docs WHERE id = r.id;
+    EXCEPTION WHEN OTHERS THEN
+      INSERT INTO damaged VALUES (r.id);
+      RAISE NOTICE 'id % is damaged: %', r.id, SQLERRM;
+    END;
+  END LOOP;
+END $$;
+```
+
+```text
+NOTICE:  id 11 is damaged: missing chunk number 0 for toast value 16402 in pg_toast_16384
+NOTICE:  id 12 is damaged: missing chunk number 0 for toast value 16403 in pg_toast_16384
+...
+```
+
+Each `BEGIN ... EXCEPTION` block uses a subtransaction, so on a table with millions of rows run it in batches by key range. Repeat the `PERFORM` for every toastable column (text, bytea, jsonb and so on), because each column has its own pointers.
+
+On PostgreSQL 17 and later, `pg_column_toast_chunk_id(body)` returns the `chunk_id` of an out-of-line value without reading it, so you can map the number in the error message straight to a row:
+
+```sql
+SELECT id FROM docs WHERE pg_column_toast_chunk_id(body) = 16402;
+```
+
+That function does not exist in 14, which returned an empty result in our test script.
+
+## Step 4: Repair the Rows
+
+You have three options for each damaged row. Pick based on whether the value can be recovered from somewhere else.
+
+**Restore the value from a backup or the source system.** If the data came from another system, or you have an older dump, update just those rows:
+
+```sql
+UPDATE docs SET body = <value from backup> WHERE id = 11;
+```
+
+**Clear the damaged column.** If losing the value is acceptable, or you will refill it later, set it to NULL. The row keeps its key and other columns:
+
+```sql
+UPDATE docs SET body = NULL WHERE id IN (SELECT id FROM damaged);
+```
+
+```text
+UPDATE 5
+```
+
+The `UPDATE` works because PostgreSQL does not need to read the old out-of-line value to replace it. If the column is `NOT NULL`, write a placeholder instead, or drop the constraint temporarily.
+
+**Delete the row.** When the whole row is worthless without that value, `DELETE FROM docs WHERE id IN (...)`. If other tables reference it through foreign keys, deal with those first.
+
+After the repair, check again:
+
+```sql
+SELECT count(*) FROM verify_heapam('docs', check_toast => true);
+--  0
+```
+
+In our lab the count went from 5 to 0, the full-table read succeeded (45 values remaining, 5 NULL), and `pg_dump -t docs` completed with exit code 0. Take a fresh logical backup now, because it is the first good one since the damage happened.
+
+## What Not to Do
+
+- Do not run `VACUUM FULL` or `CLUSTER` hoping it rebuilds things. Both read every value and fail on the same error.
+- Do not set `zero_damaged_pages` for this problem. It deals with pages whose headers or checksums are invalid. A zeroed TOAST page is already "valid", so the setting changes nothing.
+- Do not delete files from the data directory by hand. The catalog will still reference them, and you will turn one damaged table into an unstartable cluster.
+- Do not ignore it because only a few rows are affected. Corruption from failing storage tends to spread. Find the cause.
+
+## Preventing It
+
+Most of the work is outside PostgreSQL:
+
+- Use storage that honors `fsync`, and keep `fsync = on` and `full_page_writes = on`.
+- Enable data checksums. They are the default for new clusters from PostgreSQL 18 (`initdb --data-checksums` on earlier versions, or `pg_checksums --enable` on a stopped cluster). As our test showed, they do not catch zeroed pages, but they do catch the far more common bit flips and torn pages.
+- Run `pg_amcheck` regularly, for example weekly on a replica, with `--heapallindexed`. It catches problems while your backups are still good.
+- Test restores. A backup you have never restored is a hope, not a backup.
+- Stay on a current minor release so known bugs that can cause corruption are fixed.
+
+When you need to look at the affected rows, compare them with a backup copy, or write the repair `UPDATE` statements, a client that shows both databases side by side helps. [Chat2DB](https://chat2db.ai/download) can connect to the damaged primary and to a restored copy at the same time, so you can check the values row by row before you change anything.
+
+## Summary
+
+`missing chunk number 0 for toast value N in pg_toast_M` means the out-of-line pieces of a large column value are gone, either from the TOAST table itself or from its index. Back up the data directory first and check the storage. Then try `REINDEX` on the TOAST table, and if that does not help, locate the damaged rows with `verify_heapam(..., check_toast => true)`, `pg_amcheck`, or a PL/pgSQL loop. Restore those values from a backup, or set them to NULL or delete the rows. Verify with amcheck, take a new backup, and schedule regular amcheck runs so the next problem is found early.

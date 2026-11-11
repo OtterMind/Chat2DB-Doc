@@ -1,0 +1,199 @@
+---
+title: "Postgres Server Closed Connection Unexpectedly"
+description: "What psql server closed the connection unexpectedly means: terminated backends, crashes, idle timeouts, shutdowns and network drops, with fixes for each."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: November 10, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# Postgres Server Closed Connection Unexpectedly
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="November 10, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+This is one of the most common messages from psql and from any client built on libpq (Python psycopg, Ruby pg, PHP pgsql and many others):
+
+```text
+server closed the connection unexpectedly
+	This probably means the server terminated abnormally
+	before or while processing the request.
+```
+
+It is a client-side message. libpq prints it whenever the socket is closed while the client expects a reply, whatever the reason. The server may have crashed, but far more often somebody or something ended the session deliberately: an administrator, a timeout setting, a shutdown, a proxy or a firewall. The real cause is almost always in one of two places: the line printed just before it, or the PostgreSQL server log.
+
+This guide shows what each cause looks like from the client and in the server log. We reproduced each scenario on PostgreSQL 18.6 with psql 18.
+
+## First: Read the Line Above It
+
+When the server ends a session on purpose, it sends a final `FATAL` or `WARNING` message before closing the socket. psql prints it right above the generic text. The table below lists the variants we produced, in order of how often they show up in practice:
+
+| Line before "server closed the connection unexpectedly" | Cause |
+|---|---|
+| FATAL: terminating connection due to administrator command | `pg_terminate_backend()`, or a fast shutdown of the server |
+| FATAL: terminating connection due to idle-in-transaction timeout | `idle_in_transaction_session_timeout` |
+| FATAL: terminating connection due to idle-session timeout | `idle_session_timeout` (PostgreSQL 14+) |
+| WARNING: terminating connection because of crash of another server process | Another backend crashed, and the server is restarting |
+| (nothing) | Your own backend crashed, or the network connection was cut |
+
+If there is nothing above it, go to the server log.
+
+## Cause 1: The Session Was Terminated
+
+An administrator, a monitoring script or a connection pooler called `pg_terminate_backend()`. We started a long query and terminated it from another session:
+
+```sql
+-- session 1
+SELECT pg_sleep(20);
+
+-- session 2
+SELECT pg_terminate_backend(pid)
+FROM pg_stat_activity
+WHERE query LIKE 'SELECT pg_sleep(20)%' AND pid <> pg_backend_pid();
+```
+
+Session 1 printed:
+
+```text
+FATAL:  terminating connection due to administrator command
+server closed the connection unexpectedly
+	This probably means the server terminated abnormally
+	before or while processing the request.
+connection to server was lost
+```
+
+The server log also records it:
+
+```text
+FATAL:  terminating connection due to administrator command
+```
+
+Find out who did it. In many teams, a cron job kills long-running or idle sessions, and nobody remembers it exists. With `log_line_prefix` including the application name and user (`%a`, `%u`) and `log_statement = 'ddl'` or `pg_stat_statements` enabled, you can usually find the caller. The `pg_terminate_backend` call itself is only logged if statement logging catches it.
+
+Fast shutdowns (`pg_ctl stop -m fast`, or `systemctl stop postgresql`) produce exactly the same client message, so also check the log for `received fast shutdown request` around that time.
+
+## Cause 2: An Idle Timeout
+
+Two settings close sessions that are idle for too long:
+
+```sql
+SET idle_in_transaction_session_timeout = '1s';
+BEGIN;
+SELECT 1;
+-- wait 3 seconds
+SELECT 2;
+```
+
+```text
+FATAL:  terminating connection due to idle-in-transaction timeout
+server closed the connection unexpectedly
+	This probably means the server terminated abnormally
+	before or while processing the request.
+connection to server was lost
+```
+
+With `idle_session_timeout` (PostgreSQL 14 and later), the session is closed even outside a transaction:
+
+```text
+FATAL:  terminating connection due to idle-session timeout
+```
+
+These settings may come from `postgresql.conf`, `ALTER ROLE ... SET`, `ALTER DATABASE ... SET`, or the connection string. Check where:
+
+```sql
+SELECT name, setting, source
+FROM pg_settings
+WHERE name IN ('idle_in_transaction_session_timeout', 'idle_session_timeout',
+               'statement_timeout', 'transaction_timeout');
+```
+
+```sql
+SELECT r.rolname, d.datname, s.setconfig
+FROM pg_db_role_setting s
+LEFT JOIN pg_roles r ON r.oid = s.setrole
+LEFT JOIN pg_database d ON d.oid = s.setdatabase;
+```
+
+For the idle-in-transaction case, the fix is in the application: do not leave transactions open while waiting for user input or slow external calls. For the idle-session case with a connection pool, set the pool's maximum idle time below the server timeout so the pool closes connections first. Otherwise it hands out connections that the server has already closed. Note that `statement_timeout` and `transaction_timeout` cancel the query or end the transaction, they do not normally produce this message: you get `canceling statement due to statement timeout` instead.
+
+## Cause 3: A Backend Crashed
+
+If a server process dies abnormally, for example killed by the Linux OOM killer, by a segmentation fault in an extension, or by someone running `kill -9`, the postmaster cannot trust shared memory anymore. It terminates every other session, replays WAL from the last checkpoint, and starts accepting connections again. We simulated it with `kill -9` on one backend while two sessions were running queries.
+
+The session whose process was killed got only the generic message, with nothing above it:
+
+```text
+server closed the connection unexpectedly
+	This probably means the server terminated abnormally
+	before or while processing the request.
+connection to server was lost
+```
+
+Every other session got a warning first:
+
+```text
+WARNING:  terminating connection because of crash of another server process
+DETAIL:  The postmaster has commanded this server process to roll back the current transaction and exit, because another server process exited abnormally and possibly corrupted shared memory.
+HINT:  In a moment you should be able to reconnect to the database and repeat your command.
+server closed the connection unexpectedly
+```
+
+The server log tells the whole story:
+
+```text
+LOG:  client backend (PID 82297) was terminated by signal 9: Killed: 9
+LOG:  terminating any other active server processes
+LOG:  all server processes terminated; reinitializing
+LOG:  database system was not properly shut down; automatic recovery in progress
+LOG:  database system is ready to accept connections
+```
+
+What to look for:
+
+- **`terminated by signal 9: Killed`** on Linux usually means the OOM killer. Check `dmesg` or `journalctl -k` for `Out of memory: Killed process`. Reduce memory use (`work_mem` times the number of concurrent sort and hash operations, `max_connections`, `shared_buffers`), or follow the PostgreSQL documentation on Linux memory overcommit (`vm.overcommit_memory = 2`) so that allocations fail with a normal error instead.
+- **`terminated by signal 11: Segmentation fault`** points to a bug, often in an extension. The log line after it usually shows the query that was running (`Failed process was running: ...`). Update the extension and PostgreSQL to the latest minor release, and report reproducible crashes.
+- **`terminated by signal 6: Aborted`** is often an assertion or a failed `abort()` in an extension or library.
+
+During the restart, new connections are refused with `FATAL: the database system is in recovery mode`, which we cover in [The Database System Is Starting Up](/blog/postgres-database-system-is-starting-up).
+
+## Cause 4: The Network Dropped the Connection
+
+If the server log shows nothing at the time of the error, the connection was probably cut between client and server. Typical culprits are a cloud load balancer or NAT gateway that drops idle TCP connections (often after a few minutes), a firewall that times out idle flows, a VPN reconnecting, or a laptop going to sleep. With SSL, the same situation is often reported as `SSL SYSCALL error: EOF detected` or `SSL connection has been closed unexpectedly`.
+
+The server only notices later, when it next tries to read or write. You may then see `could not receive data from client: Connection reset by peer` or `unexpected EOF on client connection` in its log, which confirms the network theory.
+
+Fixes:
+
+- **TCP keepalives** keep idle connections from looking idle to middleboxes, and detect dead peers. Set them on the client in the connection string: `keepalives=1 keepalives_idle=60 keepalives_interval=10 keepalives_count=5`. On the server, the matching settings are `tcp_keepalives_idle`, `tcp_keepalives_interval` and `tcp_keepalives_count`. They show `0` (use the OS default) and only apply to TCP connections, not to Unix sockets.
+- **Pool settings**: configure your connection pool to validate connections before use and to retire them before the network's idle timeout.
+- **`client_connection_check_interval`** (PostgreSQL 14+) makes the server check periodically, during long queries, whether the client is still there, so it can cancel work nobody will read.
+
+## Reconnecting
+
+In interactive mode, psql tries to reconnect right away:
+
+```text
+postgres=# select 2 as after_kill;
+FATAL:  terminating connection due to administrator command
+server closed the connection unexpectedly
+	This probably means the server terminated abnormally
+	before or while processing the request.
+The connection to the server was lost. Attempting reset: Succeeded.
+```
+
+The statement that hit the closed connection is **not** run again. You have to repeat it, and any open transaction was rolled back on the server. Applications should do the same deliberately: catch the connection error, reconnect, and retry only operations that are safe to repeat (idempotent), or the whole transaction. In non-interactive mode (`psql -f` or `-c`), psql reports `connection to server was lost` and exits with status 2.
+
+GUI clients usually reconnect on the next query as well. In [Chat2DB](https://chat2db.ai/download), a dropped connection is re-established when you run the next statement, and you can keep a second tab open on `pg_stat_activity` to see whether your session is still listed. That is a quick way to tell a server-side termination from a network drop. You can also try it in the browser at [app.chat2db.ai](https://app.chat2db.ai/).
+
+## Summary
+
+`server closed the connection unexpectedly` only tells you that the socket closed. Look at the line printed just before it and at the server log:
+
+- `terminating connection due to administrator command`: `pg_terminate_backend()` or a fast shutdown.
+- `idle-in-transaction timeout` or `idle-session timeout`: a timeout setting. Find it in `pg_settings` and `pg_db_role_setting`.
+- `terminating connection because of crash of another server process`: a backend crashed. Check the log for the signal and the OOM killer.
+- Nothing at all on either side: the network or a middlebox dropped the connection. Use TCP keepalives and pool validation.
+
+Then make your application reconnect and retry safely, because connections will always be lost occasionally.

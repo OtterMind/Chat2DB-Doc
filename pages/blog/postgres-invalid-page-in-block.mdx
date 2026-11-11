@@ -1,0 +1,198 @@
+---
+title: "Postgres ERROR: Invalid Page in Block (XX001)"
+description: "Fix PostgreSQL ERROR: invalid page in block and page verification failed: checksums, pg_checksums, amcheck, zero_damaged_pages and safe data salvage."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: November 10, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# Postgres ERROR: Invalid Page in Block (XX001)
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="November 10, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+When PostgreSQL reads an 8 kB page from disk and the page fails its sanity checks, the query stops with one of these:
+
+```text
+WARNING:  page verification failed, calculated checksum 48213 but expected 16728
+ERROR:  invalid page in block 3 of relation base/13343/16384
+```
+
+or, on PostgreSQL 18 with its new asynchronous I/O, a summary for several bad blocks read together:
+
+```text
+ERROR:  2 invalid pages among blocks 3..6 of relation "base/5/16384"
+DETAIL:  Block 3 held the first invalid page.
+HINT:  See server log for the other 1 invalid block(s).
+```
+
+The SQLSTATE is `XX001` (data corrupted). The page on disk is not what PostgreSQL wrote there. This guide shows how to find out which table and which rows are affected, what `zero_damaged_pages` and `ignore_checksum_failure` really do, and how to rescue the readable data. Every command and output below comes from tests on PostgreSQL 18.6 and 14.24 in which we deliberately damaged table files.
+
+## What PostgreSQL Checks When It Reads a Page
+
+Every table and index is stored as a set of 8 kB pages. When a page comes into shared buffers, PostgreSQL verifies two things:
+
+1. **The page header is plausible.** Fields such as `pd_lower`, `pd_upper` and `pd_special` must be in order and within the page. A page full of zeros is accepted as a new, empty page.
+2. **The checksum matches**, if data checksums are enabled. The checksum is computed over the whole page when it is written, and recomputed on read.
+
+If either check fails, you get "invalid page in block N". With checksums, PostgreSQL first logs "page verification failed, calculated checksum X but expected Y".
+
+Without checksums, PostgreSQL can only see damage to the header. Garbage in the middle of a page goes undetected and shows up later as strange errors from the code that reads the rows. In our PostgreSQL 14 test without checksums, 64 bytes of garbage in the tuple area of block 3 produced this, and no "invalid page" error at all:
+
+```text
+ERROR:  XX000: invalid compression method id 2
+LOCATION:  toast_decompress_datum, detoast.c:489
+```
+
+Other symptoms of the same kind of hidden damage include `invalid memory alloc request size 18446744073709551604` and `could not access status of transaction`. They are worth checking for corruption too.
+
+## Step 1: Identify the Relation
+
+The error names a file path, not a table. `base/5/16384` means database OID 5, relfilenode 16384. Map it:
+
+```sql
+-- Which database is OID 5?
+SELECT datname FROM pg_database WHERE oid = 5;
+
+-- Connect to that database, then:
+SELECT pg_filenode_relation(0, 16384)::regclass;
+--  accounts
+```
+
+The `0` means the default tablespace. For a relation in another tablespace, the path looks like `pg_tblspc/<tablespace oid>/...`, and you pass that OID instead. If the relation is an index, you are in luck: an index can be rebuilt from the table with `REINDEX`, and no data is lost.
+
+Next, check the scale of the problem. With the server stopped, `pg_checksums --check` reads every page of the cluster:
+
+```text
+$ pg_checksums --check -D /var/lib/postgresql/18/main
+pg_checksums: error: checksum verification failed in file "/var/lib/postgresql/18/main/base/5/16384", block 3: calculated checksum F83D but block contains C054
+pg_checksums: error: checksum verification failed in file "/var/lib/postgresql/18/main/base/5/16384", block 5: calculated checksum 8817 but block contains 742A
+Checksum operation completed
+Files scanned:   955
+Blocks scanned:  2840
+Bad checksums:  2
+Data checksum version: 1
+```
+
+Each failure line gives the file and the block number. On a cluster without checksums it stops with `data checksums are not enabled in cluster`, and you have to rely on amcheck while the server is running:
+
+```sql
+CREATE EXTENSION IF NOT EXISTS amcheck;
+SELECT blkno, offnum, msg FROM verify_heapam('accounts') LIMIT 20;
+SELECT bt_index_check('accounts_pkey', true);
+```
+
+Be aware that amcheck reads pages through the same buffer manager. When it hits a page that fails verification, it stops with the same `invalid page in block` error instead of listing it. In our test `verify_heapam('accounts')` did exactly that. Use it to find damage that the checksum cannot see, and use `pg_checksums` or the error messages to find the pages that fail the checks.
+
+## Step 2: Stop the Bleeding
+
+Before any repair:
+
+- **Copy the data directory or snapshot the volume** with the server stopped. Every repair below discards data.
+- **Check the hardware.** Look at `dmesg`, SMART data, the RAID controller and the cloud provider's volume status. If the disk is failing, move to a standby or new storage first.
+- **Check your standby.** A physical replica has its own copy of each page. If the damage came from the primary's disk and not from WAL, the same rows are probably fine on the standby. Promoting it, or copying the table from it, may lose nothing.
+
+If you have a backup with WAL archiving, point-in-time recovery to just before now is often the cleanest fix, especially for a large table.
+
+## Step 3: What zero_damaged_pages Really Does
+
+`zero_damaged_pages` is a superuser setting that tells PostgreSQL to replace a page that fails verification with an empty page in memory, log a warning and carry on:
+
+```text
+postgres=# SET zero_damaged_pages = on;
+postgres=# SELECT count(*) FROM accounts;
+WARNING:  invalid page in block 3 of relation "base/5/16384"; zeroing out page
+WARNING:  invalid page in block 5 of relation "base/5/16384"; zeroing out page
+ count
+-------
+  1686
+(1 row)
+```
+
+The table had 2,000 rows. The rows on the two damaged pages are gone from the result. Two things surprised us when we tested it:
+
+- **The zeroing was not written to disk.** After a restart, `SELECT count(*) FROM accounts` failed again with the original error. Even `VACUUM` with `zero_damaged_pages = on` printed `WARNING: zeroing out 2 invalid pages among blocks 3..6` and still left the pages bad on disk; `pg_checksums` reported 2 bad checksums afterwards. This was PostgreSQL 18.6, and 14.24 behaved the same for the plain `SELECT` test. Do not count on the setting to "fix" the table.
+- **Indexes still point to the missing rows.** The primary key index has entries for the rows that were on the zeroed pages. Queries through the index read the heap page again and fail, and any unique constraint can still reject new rows with those keys.
+
+So treat `zero_damaged_pages` as a way to read past the damage and copy the rest out, not as a repair.
+
+## Step 4: Salvage the Readable Rows
+
+Copy the good rows into a new table inside a transaction that has the setting on, then swap the tables:
+
+```sql
+BEGIN;
+SET LOCAL zero_damaged_pages = on;
+CREATE TABLE accounts_new (LIKE accounts INCLUDING ALL);
+INSERT INTO accounts_new SELECT * FROM accounts;
+COMMIT;
+```
+
+```text
+INSERT 0 1686
+```
+
+```sql
+BEGIN;
+ALTER TABLE accounts RENAME TO accounts_damaged;
+ALTER TABLE accounts_new RENAME TO accounts;
+COMMIT;
+```
+
+`LIKE ... INCLUDING ALL` copies column defaults, CHECK constraints, indexes and identity settings. It does not copy foreign keys that point to or from the table, grants, triggers or policies, and views still reference the old table (they follow the table OID, not the name). Recreate those explicitly and check `\d+ accounts_damaged` before you drop it. In our lab the new table survived a restart with all 1,686 rows.
+
+To work out which keys were lost, compare against a known range or a backup:
+
+```sql
+SELECT g AS missing_id
+FROM generate_series(1, 2000) g
+WHERE NOT EXISTS (SELECT 1 FROM accounts WHERE id = g);
+```
+
+A `pg_dump` with the setting passed through `PGOPTIONS` is another way to get a logical copy of everything that is still readable:
+
+```bash
+PGOPTIONS='-c zero_damaged_pages=on' pg_dump -t accounts mydb > accounts_salvage.sql
+```
+
+In our lab this finished with exit code 0 and 1,686 rows in the file. Restore the missing rows from a backup or from the source system if you can.
+
+## Step 5: ignore_checksum_failure Is More Dangerous
+
+`ignore_checksum_failure = on` makes PostgreSQL accept a page whose checksum is wrong and use it as if it were fine:
+
+```text
+postgres=# SET ignore_checksum_failure = on;
+postgres=# SELECT count(*) FROM accounts;
+WARNING:  ignoring checksum failure in block 3 of relation "base/5/16384"
+```
+
+The page now sits in shared buffers with whatever garbage it contains, and every other session uses it too, with no warning. In our test the next query that read the damaged rows failed with:
+
+```text
+ERROR:  invalid memory alloc request size 18446744073709551604
+```
+
+That is PostgreSQL trying to read a length field that was overwritten. Garbage that reaches the page can also be written back to disk with a fresh, valid checksum if the page is modified, after which no tool will ever flag it again. Use this setting only on a copy of the cluster, to look at a page, never on production.
+
+## Version Notes
+
+- **PostgreSQL 18** enables data checksums by default in `initdb`, uses asynchronous I/O, and can report several bad blocks from one read as "N invalid pages among blocks X..Y". The server log has one line per block.
+- **PostgreSQL 14 to 17** report one block per error, with relation paths shown without quotes (`base/13343/16384`). Checksums are off unless the cluster was created with `--data-checksums` or converted with `pg_checksums --enable`.
+- In all versions, the setting `data_checksums` (`SHOW data_checksums;`) tells you whether checksums are on.
+
+## Preventing the Next One
+
+- Enable checksums on older clusters. `pg_checksums --enable` needs the server stopped and rewrites every page, so plan the downtime, or enable them on a new replica and fail over.
+- Use storage that honors flushes, and keep `fsync` and `full_page_writes` on. Torn pages after a crash are a classic source of this error when `full_page_writes` is off.
+- Run `pg_amcheck --heapallindexed` regularly, on a replica if load is a concern, and check the server log for `page verification failed` warnings.
+- Keep a tested backup with WAL archiving, so you can use point-in-time recovery when the damaged table is large.
+
+When you rebuild a table like this, it helps to compare row counts and key ranges between the salvaged table, a restored backup and the standby before you swap anything. [Chat2DB](https://chat2db.ai/download) can hold connections to all three at once, and its web version at [app.chat2db.ai](https://app.chat2db.ai/) works when you are on a machine without your usual tools.
+
+## Summary
+
+`invalid page in block N of relation X` means a page failed its header check or its checksum when PostgreSQL read it. Map the file to a table with `pg_filenode_relation`, measure the damage with `pg_checksums --check` and amcheck, and copy the data directory before changing anything. If the relation is an index, `REINDEX` it. For a table, prefer a healthy standby or point-in-time recovery. Otherwise, copy the readable rows out with `zero_damaged_pages = on` in a single transaction and swap the tables, because in our tests the setting by itself never fixed the pages on disk. Leave `ignore_checksum_failure` for forensic work on a copy.

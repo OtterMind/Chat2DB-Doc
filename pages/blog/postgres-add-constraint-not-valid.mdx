@@ -1,0 +1,230 @@
+---
+title: "Postgres NOT VALID and VALIDATE CONSTRAINT Guide"
+description: "Add foreign keys, CHECK, NOT NULL and UNIQUE constraints to big PostgreSQL tables without blocking: NOT VALID, VALIDATE CONSTRAINT and lock_timeout."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: November 10, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# Postgres NOT VALID and VALIDATE CONSTRAINT Guide
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="November 10, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+Adding a constraint to a large table is one of the most common ways to cause an outage with a single line of SQL. `ALTER TABLE orders ADD CONSTRAINT ... CHECK (...)` has to check every existing row, and while it does, it holds a lock that blocks other queries. On a table with hundreds of millions of rows that can take many minutes.
+
+PostgreSQL has a two-step alternative: add the constraint as `NOT VALID`, which only changes the catalog, and then run `VALIDATE CONSTRAINT`, which checks the old rows under a much weaker lock. This guide explains both steps, the lock each one takes (measured with `pg_locks` on PostgreSQL 18.6 and 14.24), how to handle `NOT NULL`, `UNIQUE` and primary keys, and why `lock_timeout` matters even for the fast step.
+
+## The Problem Is the Lock, Not Only the Scan
+
+A plain `ADD CONSTRAINT ... CHECK` takes an `ACCESS EXCLUSIVE` lock. That lock conflicts with everything, including plain `SELECT`. It is held for the whole scan of the table.
+
+There is a second, less obvious problem. Before the `ALTER` can even start, it has to wait for every transaction that already holds any lock on the table. While it waits in the lock queue, every new query on the table queues behind it, because lock requests are granted in order. We reproduced this with three sessions on a 3-million-row table:
+
+- Session A: `BEGIN; SELECT count(*) FROM orders WHERE id < 10;`, then left the transaction open.
+- Session B: `ALTER TABLE orders ADD CONSTRAINT orders_amount_check CHECK (amount >= 0);`
+- Session C: `SELECT count(*) FROM orders WHERE id = 5;`
+
+```sql
+SELECT pid, state, wait_event_type, pg_blocking_pids(pid) AS blocked_by, left(query, 60)
+FROM pg_stat_activity
+WHERE datname = current_database() AND pid <> pg_backend_pid();
+```
+
+```text
+  pid  |        state        | wait_event_type | blocked_by |                    query
+-------+---------------------+-----------------+------------+---------------------------------------------
+ 82480 | idle in transaction | Client          | {}         | select count(*) from orders where id < 10;
+ 82484 | active              | Lock            | {82480}    | alter table orders add constraint orders_amo
+ 82489 | active              | Lock            | {82484}    | select count(*) from orders where id = 5
+```
+
+Session C, a single-row lookup by primary key, waited 6 seconds: first for A to finish, then for B to scan the table. In production, C is every request your application sends to that table.
+
+## Step 1: ADD CONSTRAINT ... NOT VALID
+
+`NOT VALID` tells PostgreSQL to record the constraint without checking existing rows:
+
+```sql
+ALTER TABLE orders
+  ADD CONSTRAINT orders_amount_check CHECK (amount >= 0) NOT VALID;
+```
+
+On our 3-million-row table this took 2.3 ms, against 94 ms for the plain version. On a table with a billion rows the difference is minutes. From the moment it commits, the constraint applies to new and updated rows. This is from our test table `child`:
+
+```text
+ERROR:  new row for relation "child" violates check constraint "child_qty_chk"
+DETAIL:  Failing row contains (4, 1, d, -1).
+```
+
+The old rows are simply not checked yet, and `pg_constraint.convalidated` is false. `\d orders` shows the constraint with `NOT VALID` after it.
+
+`NOT VALID` works for `CHECK` and `FOREIGN KEY` constraints, and on PostgreSQL 18 also for `NOT NULL`. It does not exist for `UNIQUE`, `PRIMARY KEY` or `EXCLUDE`, which are enforced by indexes. They are covered below.
+
+## Step 2: VALIDATE CONSTRAINT
+
+```sql
+ALTER TABLE orders VALIDATE CONSTRAINT orders_amount_check;
+```
+
+This scans the table and checks every row, but with a `SHARE UPDATE EXCLUSIVE` lock. That lock allows `SELECT`, `INSERT`, `UPDATE` and `DELETE` to continue. It conflicts only with other schema changes, `VACUUM` (including autovacuum), `ANALYZE` and index builds on the same table. If an old row violates the constraint, validation fails, nothing changes, and the constraint stays `NOT VALID`:
+
+```text
+ERROR:  check constraint "child_qty_chk" of relation "child" is violated by some row
+```
+
+Find and fix those rows, then run `VALIDATE` again:
+
+```sql
+SELECT * FROM orders WHERE NOT (amount >= 0) LIMIT 100;
+```
+
+A `CHECK` passes when its expression is true **or NULL**, so `NOT (amount >= 0)` finds exactly the rows that would fail. Rows with a NULL `amount` are not violations.
+
+## Measured Locks
+
+We ran each statement inside a transaction and read `pg_locks` before committing. PostgreSQL 14.24 and 18.6 gave the same result:
+
+| Statement | Table being altered | Referenced table |
+|---|---|---|
+| `ADD FOREIGN KEY ... NOT VALID` | SHARE ROW EXCLUSIVE | SHARE ROW EXCLUSIVE |
+| `VALIDATE CONSTRAINT` (foreign key) | SHARE UPDATE EXCLUSIVE | ROW SHARE |
+| `ADD FOREIGN KEY` (one step) | SHARE ROW EXCLUSIVE, held during the scan | SHARE ROW EXCLUSIVE |
+| `ADD CHECK ... NOT VALID` | ACCESS EXCLUSIVE, no scan | n/a |
+| `VALIDATE CONSTRAINT` (check) | SHARE UPDATE EXCLUSIVE | n/a |
+| `ADD CHECK` (one step) | ACCESS EXCLUSIVE, held during the scan | n/a |
+| `ALTER COLUMN ... SET NOT NULL` | ACCESS EXCLUSIVE, scan unless proven | n/a |
+| `ADD CONSTRAINT ... UNIQUE USING INDEX` | ACCESS EXCLUSIVE, no scan | n/a |
+
+SHARE ROW EXCLUSIVE blocks writes but not reads. ACCESS EXCLUSIVE blocks everything. The point of the two-step approach is that the strong locks are held only for a catalog update lasting milliseconds, and the long scan runs under a lock that lets the application keep working.
+
+## Always Set lock_timeout
+
+Step 1 is fast once it has the lock, but it still has to get the lock, and the queueing problem from the first section applies to it too. Set a lock timeout so the statement gives up instead of stalling your application:
+
+```sql
+SET lock_timeout = '3s';
+ALTER TABLE orders
+  ADD CONSTRAINT orders_amount_check CHECK (amount >= 0) NOT VALID;
+```
+
+With session A holding its transaction open, this failed after 2 seconds (we used `2s` in the test) instead of blocking everyone:
+
+```text
+ERROR:  canceling statement due to lock timeout
+```
+
+Nothing changed, so you can retry a few seconds later. Deployment tools that apply migrations often have a retry option for exactly this. It also helps to cap `statement_timeout` for step 1. Leave it uncapped (or generous) for the validation step, which needs time but does not block anybody.
+
+## Foreign Keys
+
+```sql
+SET lock_timeout = '3s';
+
+-- Optional but recommended: index the referencing column, without blocking writes
+CREATE INDEX CONCURRENTLY IF NOT EXISTS orders_customer_id_idx ON orders (customer_id);
+
+ALTER TABLE orders ADD CONSTRAINT orders_customer_fk
+  FOREIGN KEY (customer_id) REFERENCES customers (id) NOT VALID;
+
+ALTER TABLE orders VALIDATE CONSTRAINT orders_customer_fk;
+```
+
+The index is not required by the constraint, but without it every `DELETE` or key `UPDATE` on `customers` has to scan `orders` to check for references. Find violating rows before validating:
+
+```sql
+SELECT o.*
+FROM orders o
+WHERE o.customer_id IS NOT NULL
+  AND NOT EXISTS (SELECT 1 FROM customers c WHERE c.id = o.customer_id)
+LIMIT 100;
+```
+
+**Partitioned tables:** PostgreSQL 17 and older reject `NOT VALID` foreign keys on a partitioned table:
+
+```text
+ERROR:  cannot add NOT VALID foreign key on partitioned table "pt" referencing relation "parent"
+DETAIL:  This feature is not yet supported on partitioned tables.
+```
+
+The workaround is to add and validate the foreign key on each partition, then add it on the parent. The parent adopts the existing, validated partition constraints instead of checking the rows again. We confirmed this on 14 and 18 with `pg_stat_user_tables.seq_scan`: the counter on the partitions did not move when the parent constraint was added, while a control run without the partition constraints scanned both partitions. PostgreSQL 18 accepts `NOT VALID` on the partitioned table directly.
+
+## NOT NULL
+
+`ALTER COLUMN ... SET NOT NULL` scans the table under ACCESS EXCLUSIVE. On PostgreSQL 12 to 17, you can let a validated CHECK constraint prove there are no NULLs, and PostgreSQL then skips the scan:
+
+```sql
+ALTER TABLE orders ADD CONSTRAINT orders_email_not_null
+  CHECK (email IS NOT NULL) NOT VALID;
+ALTER TABLE orders VALIDATE CONSTRAINT orders_email_not_null;
+
+SET client_min_messages = debug1;
+ALTER TABLE orders ALTER COLUMN email SET NOT NULL;
+```
+
+```text
+DEBUG:  existing constraints on column "orders.email" are sufficient to prove that it does not contain nulls
+```
+
+Without the check constraint, the same statement logs `DEBUG: verifying table "orders"`, which is the full scan. Afterwards drop the helper constraint, because the column's NOT NULL now does the job:
+
+```sql
+ALTER TABLE orders DROP CONSTRAINT orders_email_not_null;
+```
+
+PostgreSQL 18 stores NOT NULL as a real constraint in `pg_constraint` and supports `NOT VALID` for it directly:
+
+```sql
+ALTER TABLE orders ADD CONSTRAINT orders_email_nn NOT NULL email NOT VALID;  -- ACCESS EXCLUSIVE, no scan
+ALTER TABLE orders VALIDATE CONSTRAINT orders_email_nn;                      -- SHARE UPDATE EXCLUSIVE
+```
+
+In our test, validation failed with `column "email" of relation "c" contains null values` while NULLs remained, and new NULLs were rejected immediately after the first step.
+
+## UNIQUE and PRIMARY KEY
+
+These constraints need a unique index. Build it without blocking writes, then attach it as a constraint:
+
+```sql
+CREATE UNIQUE INDEX CONCURRENTLY customers_email_key ON customers (email);
+ALTER TABLE customers ADD CONSTRAINT customers_email_key UNIQUE USING INDEX customers_email_key;
+```
+
+`CREATE INDEX CONCURRENTLY` cannot run inside a transaction block. If it fails because of duplicates or a timeout, it leaves an INVALID index behind, which you must drop before retrying:
+
+```text
+ERROR:  could not create unique index "customers_email_key"
+DETAIL:  Key (email)=(c1@x) is duplicated.
+```
+
+For a primary key, the key columns must be NOT NULL. If they are not, `ADD PRIMARY KEY USING INDEX` sets NOT NULL itself, and we saw it log `verifying table` as it scanned under ACCESS EXCLUSIVE. Run the NOT NULL steps above first, and the final step becomes instant.
+
+On partitioned tables, `ADD CONSTRAINT ... USING INDEX` is not supported. Adding `UNIQUE` on the parent built new indexes on every partition under ACCESS EXCLUSIVE in our test, even though matching unique indexes already existed on the partitions. The low-lock alternative is a partitioned unique **index** built with `CREATE UNIQUE INDEX ... ON ONLY parent`, plus `CREATE UNIQUE INDEX CONCURRENTLY` on each partition and `ALTER INDEX ... ATTACH PARTITION`. It enforces uniqueness and can be referenced by foreign keys, but it is not a constraint in `pg_constraint`.
+
+## Generate the Script Instead of Writing It
+
+Keeping all these rules in your head during a migration is error-prone. Our free [Postgres Safe Constraint Migration Generator](https://chat2db.ai/tools/postgres-safe-constraint-migration-generator) writes the step-by-step script for foreign keys, CHECK, NOT NULL, UNIQUE and primary keys, for your PostgreSQL version and for partitioned tables. It labels each step with the lock it takes and adds the pre-check queries and a rollback. We ran its output for each operation against PostgreSQL 14 and 18.
+
+You can then run the steps one at a time in [Chat2DB](https://chat2db.ai/download), with a second tab watching `pg_stat_activity` for blocked sessions while the migration runs.
+
+## Verify the Result
+
+```sql
+SELECT conname, contype, convalidated, pg_get_constraintdef(oid)
+FROM pg_constraint
+WHERE conrelid = 'orders'::regclass
+ORDER BY conname;
+```
+
+Every constraint should show `convalidated = t`. A constraint left `NOT VALID` still protects new rows, but the planner ignores a `NOT VALID` CHECK constraint for constraint exclusion, and pg_dump writes it out as `NOT VALID`, so the unchecked state survives a restore. Also check for invalid indexes left by failed concurrent builds:
+
+```sql
+SELECT indexrelid::regclass FROM pg_index WHERE NOT indisvalid;
+```
+
+## Summary
+
+Split every constraint change on a large table into a fast catalog step and a slow validation step. Use `NOT VALID` plus `VALIDATE CONSTRAINT` for CHECK and foreign keys. For NOT NULL, use a validated CHECK on PostgreSQL 12 to 17, or `NOT NULL ... NOT VALID` on 18. For UNIQUE and primary keys, use `CREATE UNIQUE INDEX CONCURRENTLY` plus `USING INDEX`. Set `lock_timeout` before every step that takes a strong lock, because a fast statement stuck behind a long transaction can still block your entire application.

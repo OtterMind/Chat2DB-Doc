@@ -1,0 +1,265 @@
+---
+title: "Postgres Materialized View Has Not Been Populated"
+description: "Fix PostgreSQL materialized view has not been populated (55000): WITH NO DATA, failed refresh after pg_restore, search_path in PG 17+, CONCURRENTLY errors."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: November 10, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# Postgres Materialized View Has Not Been Populated
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="November 10, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+A query against a materialized view fails with:
+
+```text
+ERROR:  materialized view "region_totals" has not been populated
+HINT:  Use the REFRESH MATERIALIZED VIEW command.
+```
+
+The SQLSTATE is `55000` (object not in prerequisite state). The materialized view exists, but it holds no data at all, not even an empty result. PostgreSQL refuses to answer instead of silently returning zero rows. The hint is correct, but it does not tell you why the view is unpopulated or why the refresh might fail again. This guide covers the three common causes, including a surprising one after `pg_restore` and on PostgreSQL 17 and later. All output comes from PostgreSQL 18.6 and 14.24.
+
+## What "Populated" Means
+
+A materialized view stores the result of its query in a real table-like storage file. PostgreSQL tracks whether that storage holds a valid result in `pg_class.relispopulated`, which is also shown in `pg_matviews.ispopulated`:
+
+```sql
+SELECT schemaname, matviewname, ispopulated
+FROM pg_matviews
+ORDER BY 1, 2;
+```
+
+```text
+ schemaname |  matviewname  | ispopulated
+------------+---------------+-------------
+ public     | region_totals | f
+```
+
+When `ispopulated` is false, any query that reads the materialized view fails, directly or through another view. Note that `EXPLAIN` still works and shows a sequential scan, so a plan alone will not warn you.
+
+## Cause 1: Created or Refreshed WITH NO DATA
+
+```sql
+CREATE MATERIALIZED VIEW region_totals AS
+SELECT region, sum(amount) AS total, count(*) AS n
+FROM sales
+GROUP BY region
+WITH NO DATA;
+
+SELECT * FROM region_totals;
+```
+
+```text
+ERROR:  55000: materialized view "region_totals" has not been populated
+HINT:  Use the REFRESH MATERIALIZED VIEW command.
+LOCATION:  ExecOpenScanRelation, execUtils.c:760
+```
+
+`WITH NO DATA` is useful in deployment scripts: the view is created instantly, and you fill it later at a convenient time. `REFRESH MATERIALIZED VIEW ... WITH NO DATA` does the same to an existing view. It throws the data away and frees the space, and it leaves the view unpopulated.
+
+The fix is a plain refresh:
+
+```sql
+REFRESH MATERIALIZED VIEW region_totals;
+SELECT * FROM region_totals ORDER BY region;
+```
+
+```text
+ region | total  |  n
+--------+--------+------
+ apac   | 165000 | 3333
+ eu     | 165033 | 3333
+ us     | 164967 | 3334
+```
+
+### CONCURRENTLY Does Not Work on an Unpopulated View
+
+Many refresh jobs use `CONCURRENTLY`, so readers are not blocked during the refresh. On an unpopulated view it fails:
+
+```sql
+REFRESH MATERIALIZED VIEW CONCURRENTLY region_totals;
+```
+
+```text
+ERROR:  CONCURRENTLY cannot be used when the materialized view is not populated
+```
+
+A concurrent refresh computes the new result and applies only the differences to the existing data, so it needs existing data to compare against. Run one plain `REFRESH` first, then the concurrent ones work. A plain refresh takes an `ACCESS EXCLUSIVE` lock that blocks readers until it finishes. That rarely matters here, since nobody can read the view yet anyway.
+
+`CONCURRENTLY` also needs a unique index on the materialized view. Without one you get this error, even when the view is populated:
+
+```text
+ERROR:  cannot refresh materialized view "public.by_day" concurrently
+HINT:  Create a unique index with no WHERE clause on one or more columns of the materialized view.
+```
+
+```sql
+CREATE UNIQUE INDEX ON region_totals (region);
+```
+
+A robust refresh job handles both cases:
+
+```sql
+DO $$
+BEGIN
+  IF (SELECT ispopulated FROM pg_matviews
+      WHERE schemaname = 'public' AND matviewname = 'region_totals') THEN
+    EXECUTE 'REFRESH MATERIALIZED VIEW CONCURRENTLY public.region_totals';
+  ELSE
+    EXECUTE 'REFRESH MATERIALIZED VIEW public.region_totals';
+  END IF;
+END $$;
+```
+
+Unlike `CREATE INDEX CONCURRENTLY`, a concurrent refresh is allowed inside a transaction block and inside a `DO` block. We ran this block on PostgreSQL 14 and 18 without problems.
+
+### Plain or Concurrent Refresh?
+
+Once a view is populated, both kinds of refresh are possible, and they lock differently. We ran each inside a transaction and checked `pg_locks` on PostgreSQL 18:
+
+| Refresh | Strongest lock on the view | Effect on readers |
+|---|---|---|
+| `REFRESH MATERIALIZED VIEW` | ACCESS EXCLUSIVE | `SELECT` on the view waits until the refresh commits |
+| `REFRESH MATERIALIZED VIEW CONCURRENTLY` | EXCLUSIVE | `SELECT` keeps working and sees the old data until the commit |
+
+A plain refresh rebuilds the view into new storage and swaps it in. That is usually faster and leaves no dead rows behind, but every query that touches the view has to wait. A concurrent refresh computes the new result, compares it with the stored rows using the unique index, and applies inserts, updates and deletes. It is slower, especially when most rows change, and it leaves dead tuples that autovacuum has to clean up, but readers are never blocked.
+
+For a dashboard that is read all day, use `CONCURRENTLY` after the first population. For a nightly batch view that nobody reads during the refresh, the plain refresh is simpler and cheaper. Neither kind allows two refreshes of the same view at the same time. A second refresh waits for the first, so schedule jobs so they do not overlap.
+
+## Cause 2: A Refresh Failed During pg_restore
+
+`pg_dump` does not dump the rows of a materialized view. It dumps the view definition, and then a `REFRESH MATERIALIZED VIEW` step that runs near the end of the restore. If that refresh fails, `pg_restore` logs the error, continues with the rest of the restore, and leaves the view unpopulated. Unless you read the restore output carefully, you only find out when the application first queries the view.
+
+We reproduced a typical case on PostgreSQL 14. A materialized view calls a SQL function that refers to a table without a schema name:
+
+```sql
+CREATE TABLE rates (code text PRIMARY KEY, rate numeric);
+CREATE TABLE sales (id int, code text, amount numeric);
+
+CREATE FUNCTION to_usd(c text, a numeric) RETURNS numeric
+LANGUAGE sql STABLE
+AS $$ SELECT a * rate FROM rates WHERE code = c $$;
+
+CREATE MATERIALIZED VIEW usd_totals AS
+SELECT code, sum(to_usd(code, amount)) AS usd
+FROM sales GROUP BY code;
+```
+
+Creating it works, because the session's `search_path` includes `public`. Then we dumped and restored the database:
+
+```text
+$ pg_dump -Fc -f mv.dump mvsrc
+$ pg_restore -d mvdst mv.dump
+pg_restore: while PROCESSING TOC:
+pg_restore: from TOC entry 2910; 0 18440 MATERIALIZED VIEW DATA usd_totals postgres
+pg_restore: error: could not execute query: ERROR:  relation "rates" does not exist
+LINE 1:  select a * rate from rates where code = c
+                              ^
+QUERY:   select a * rate from rates where code = c
+CONTEXT:  SQL function "to_usd" during inlining
+Command was: REFRESH MATERIALIZED VIEW public.usd_totals;
+
+pg_restore: warning: errors ignored on restore: 1
+```
+
+`pg_restore` exited with status 1, and the restored view was unpopulated:
+
+```text
+ matviewname | ispopulated
+-------------+-------------
+ empty_mv    | f
+ usd_totals  | f
+```
+
+Dump scripts set an empty `search_path` for safety, so the unqualified `rates` inside the function cannot be found. The same happens with functions used in indexes, defaults and check constraints.
+
+The fix is to make the function independent of the caller's `search_path`, then refresh:
+
+```sql
+ALTER FUNCTION public.to_usd(text, numeric) SET search_path = public;
+REFRESH MATERIALIZED VIEW public.usd_totals;
+```
+
+Schema-qualifying the table inside the function body (`FROM public.rates`) works too, and is what we recommend for new code.
+
+Notice `empty_mv` in the list above. It was created `WITH NO DATA` in the source, and it is restored unpopulated as well. `pg_dump` preserves that state, so a view that was never refreshed in production will not be refreshed by a restore either.
+
+After any restore, check for unpopulated views and generate the refresh statements:
+
+```sql
+SELECT format('REFRESH MATERIALIZED VIEW %I.%I;', schemaname, matviewname)
+FROM pg_matviews
+WHERE NOT ispopulated;
+```
+
+Run the output in dependency order. If one view reads from another, refresh the inner view first, or the outer refresh fails with the same "has not been populated" error. This query lists materialized views that read from other materialized views:
+
+```sql
+SELECT DISTINCT d.refobjid::regclass AS depends_on,
+                r.ev_class::regclass AS matview
+FROM pg_depend d
+JOIN pg_rewrite r ON r.oid = d.objid
+JOIN pg_class c   ON c.oid = d.refobjid
+WHERE c.relkind = 'm'
+  AND r.ev_class <> d.refobjid;
+```
+
+```text
+ depends_on | matview
+------------+---------
+ m1         | m2
+```
+
+Here `m2` is built from `m1`, so refresh `m1` first. In a deep chain, repeat the query on its own output, or refresh in the order the views were created, which `pg_dump` also uses.
+
+## Cause 3: PostgreSQL 17 and Later Refresh With a Safe search_path
+
+Starting with PostgreSQL 17, maintenance commands such as `REFRESH MATERIALIZED VIEW`, `CREATE MATERIALIZED VIEW`, `VACUUM`, `ANALYZE`, `CLUSTER` and `REINDEX` run with `search_path` set to `pg_catalog, pg_temp`, no matter what the session uses. This closes a class of security problems, but it breaks materialized views that depend on functions with unqualified names.
+
+On PostgreSQL 18.6, the same `CREATE MATERIALIZED VIEW usd_totals` failed right away:
+
+```text
+ERROR:  relation "rates" does not exist
+LINE 1:  select a * rate from rates where code = c
+                              ^
+QUERY:   select a * rate from rates where code = c
+CONTEXT:  SQL function "to_usd" during inlining
+```
+
+When we restored the PostgreSQL 14 dump into PostgreSQL 18, the refresh failed during the restore, as before. A plain `REFRESH MATERIALIZED VIEW usd_totals` typed in a normal session also failed, even though `rates` was visible to that session. This catches people out after a major upgrade. With `pg_upgrade`, the stored data survives and the views stay populated, but the first scheduled refresh fails. With a dump and restore, the refresh step fails during the restore, and the views come back unpopulated.
+
+The fix is the same as for cause 2: `ALTER FUNCTION ... SET search_path = ...`, or schema-qualified names in the function body. After that change, the refresh succeeded on PostgreSQL 18 and `ispopulated` became true.
+
+## Permission to Refresh
+
+Refreshing needs more than `SELECT` on the view. On PostgreSQL 14, a role that is not the owner gets:
+
+```text
+ERROR:  must be owner of materialized view region_totals
+```
+
+PostgreSQL 17 added the `MAINTAIN` privilege, and on 18.6 the same attempt fails with `permission denied for materialized view region_totals`. You can then grant just that right instead of transferring ownership:
+
+```sql
+GRANT MAINTAIN ON region_totals TO reporter;
+```
+
+In our test, `reporter` could refresh the view after this grant. On 16 and older, run the refresh as the owner, or give the job a role that is a member of the owning role.
+
+## A Checklist for Refresh Jobs
+
+- Check `ispopulated` before using `CONCURRENTLY`, or run a plain refresh the first time.
+- Give every materialized view you refresh concurrently a unique index without a `WHERE` clause.
+- Make functions used by materialized views independent of `search_path`, especially before upgrading to PostgreSQL 17 or later.
+- After each restore or upgrade, run the `NOT ispopulated` query above and alert if it returns rows.
+- Log refresh failures. A refresh that fails keeps the old data (or stays unpopulated) without anyone noticing.
+
+Monitoring many materialized views is easier when you can see their state at a glance. In [Chat2DB](https://chat2db.ai/download) you can save the `pg_matviews` query and run it against each environment after a deployment. You can also use it in the browser at [app.chat2db.ai](https://app.chat2db.ai/).
+
+## Summary
+
+`materialized view "x" has not been populated` means the view has no stored result. Common reasons are that it was created or refreshed `WITH NO DATA`, that the refresh step of a `pg_restore` failed, or, on PostgreSQL 17 and later, that refreshes now run with a restricted `search_path` that breaks unqualified names in functions. Run a plain `REFRESH MATERIALIZED VIEW` first, because `CONCURRENTLY` needs existing data and a unique index. Then fix the function `search_path` if the refresh itself fails.

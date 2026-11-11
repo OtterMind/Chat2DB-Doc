@@ -1,0 +1,191 @@
+---
+title: "Postgres: Invalid Memory Alloc Request Size Fix"
+description: "Why PostgreSQL raises invalid memory alloc request size and string buffer exceeds maximum allowed length: 1 GB limits, huge rows, pg_dump, corruption."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: November 10, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# Postgres: Invalid Memory Alloc Request Size Fix
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="November 10, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+This error looks like the server ran out of memory, but it usually has nothing to do with how much RAM you have:
+
+```text
+ERROR:  invalid memory alloc request size 1200000004
+```
+
+PostgreSQL refuses to allocate a single chunk of memory larger than 1 GB (1,073,741,823 bytes) through its normal allocator. When some operation asks for more, you get this error with the requested size in bytes. The SQLSTATE is `XX000` (internal error). There is a second, very different reason for the same message: a huge, nonsensical size such as `18446744073709551604` almost always means corrupted data.
+
+This guide shows both situations and the related "string buffer exceeds maximum allowed length" error, with output from PostgreSQL 18.6 and 14.24, and explains how to work around each one.
+
+## The 1 GB Limits in PostgreSQL
+
+Several limits come from the same design decision. A variable-length value (text, bytea, jsonb, arrays) stores its length in a 30-bit field, so no single value can exceed 1 GB, and the general-purpose allocator rejects any request above that size. Related limits:
+
+| Limit | Value | Error you see |
+|---|---|---|
+| Single allocation (`MaxAllocSize`) | 1 GB minus 1 byte | invalid memory alloc request size N |
+| One text, bytea or other varlena value | 1 GB | requested length too large, invalid memory alloc request size N |
+| Internal string buffer (output of COPY, row text, aggregates) | 1 GB minus 1 byte | string buffer exceeds maximum allowed length (1073741823 bytes) |
+| jsonb array or object | 268,435,455 bytes | total size of jsonb array elements exceeds the maximum of 268435455 bytes |
+| Array elements | 134,217,727 | array size exceeds the maximum allowed (134217727) |
+
+Some functions check the limit themselves and raise a clearer error with SQLSTATE `54000` (program limit exceeded). Others hit the allocator and report the raw size.
+
+## Reproducing the Size Errors
+
+Concatenating two 600 MB strings asks for a 1.2 GB result:
+
+```sql
+SELECT length(repeat('x', 600000000) || repeat('y', 600000000));
+```
+
+```text
+ERROR:  XX000: invalid memory alloc request size 1200000004
+LOCATION:  MemoryContextSizeFailure, mcxt.c:1180
+```
+
+Functions that build a value of a known length check first:
+
+```sql
+SELECT length(repeat('x', 1100000000));
+-- ERROR:  54000: requested length too large
+
+SELECT length(lpad('x', 1100000000, 'y'));
+-- ERROR:  54000: requested length too large
+
+SELECT cardinality(array_fill(1, ARRAY[200000000]));
+-- ERROR:  54000: array size exceeds the maximum allowed (134217727)
+
+SELECT pg_column_size(jsonb_agg(repeat('z', 1000000))) FROM generate_series(1, 300);
+-- ERROR:  54000: total size of jsonb array elements exceeds the maximum of 268435455 bytes
+```
+
+All of these behaved the same on PostgreSQL 14 and 18.
+
+### A Row That Is Too Wide to Insert in One Go
+
+This one surprised us. Inserting one row with two 600 MB text values failed:
+
+```sql
+CREATE TABLE blobs (id int, a text, b text);
+INSERT INTO blobs VALUES (1, repeat('x', 600000000), repeat('y', 600000000));
+```
+
+```text
+ERROR:  XX000: invalid memory alloc request size 1200000060
+```
+
+Each value is fine on its own, but PostgreSQL first builds the complete row in memory and only then moves large values out of line into TOAST. The row would be 1.2 GB. Inserting the first value and then updating the second worked, because each step builds a row of about 600 MB:
+
+```sql
+INSERT INTO blobs VALUES (1, repeat('x', 600000000), NULL);
+UPDATE blobs SET b = repeat('y', 600000000);
+```
+
+The table now holds a row with 1.2 GB of data, which leads to the next problem.
+
+## When You Cannot Read or Dump the Data Anymore
+
+Anything that turns the whole row into one string fails. That includes `COPY`, `row_to_json`, and `string_agg` over the two values. On PostgreSQL 18.6:
+
+```text
+postgres=# COPY blobs TO '/dev/null';
+ERROR:  54000: string buffer exceeds maximum allowed length (1073741823 bytes)
+DETAIL:  Cannot enlarge string buffer containing 600000003 bytes by 600000000 more bytes.
+```
+
+PostgreSQL 14.24 reports the same condition as an "out of memory" error, which sends many people off checking RAM and `work_mem` for no reason:
+
+```text
+ERROR:  54000: out of memory
+DETAIL:  Cannot enlarge string buffer containing 600000003 bytes by 600000000 more bytes.
+```
+
+The `DETAIL` line is the giveaway. The two sizes add up to more than 1 GB. Real memory exhaustion looks different, with `Failed on request of size ...` in the detail and a memory context dump in the server log.
+
+The serious consequence is that `pg_dump` cannot back up the table:
+
+```text
+pg_dump: error: Dumping the contents of table "blobs" failed: PQgetResult() failed.
+pg_dump: detail: Error message from server: ERROR:  string buffer exceeds maximum allowed length (1073741823 bytes)
+DETAIL:  Cannot enlarge string buffer containing 600000003 bytes by 600000000 more bytes.
+pg_dump: detail: Command was: COPY public.blobs (id, a, b) TO stdout;
+```
+
+`pg_dump --inserts` fails the same way while fetching the row. Physical backups (`pg_basebackup`, pgBackRest, snapshots) are not affected, because they copy files, not rows.
+
+### Workarounds for Very Wide Rows
+
+- **Dump the table without that data, then export it separately.** Use `pg_dump --exclude-table-data=blobs`, and copy the columns one at a time. `COPY (SELECT a FROM blobs) TO ...` worked in our test, because each output line stays under 1 GB.
+- **Split the value.** Store large documents in chunks (for example one row per 100 MB piece, with a sequence number), or keep them outside the database in object storage and store only the key.
+- **Use large objects** (`lo_import`, `lo_export`) for files that must live in PostgreSQL. A large object can be up to 4 TB and is read in pages, never as one value. `pg_dump` handles large objects separately.
+- **Compress before storing.** Many large text values compress well. TOAST compresses automatically, but the limit applies to the uncompressed size.
+
+Find the widest rows before they cause trouble:
+
+```sql
+SELECT id,
+       pg_column_size(a) AS stored_a,
+       octet_length(a)   AS raw_a,
+       octet_length(b)   AS raw_b
+FROM blobs
+ORDER BY coalesce(octet_length(a), 0) + coalesce(octet_length(b), 0) DESC
+LIMIT 10;
+```
+
+`pg_column_size` shows the stored, possibly compressed size, and `octet_length` the real size. In our example `a` took 6.8 MB on disk for 600 MB of data, because a repeated character compresses extremely well. Keep the raw size in mind, because that is what has to fit in memory.
+
+## Aggregates That Grow Past 1 GB
+
+`string_agg`, `array_agg`, `jsonb_agg` and `json_agg` build one value from many rows. A report that worked for years can start failing once the data grows:
+
+```text
+ERROR:  string buffer exceeds maximum allowed length (1073741823 bytes)
+DETAIL:  Cannot enlarge string buffer containing 600000002 bytes by 600000000 more bytes.
+```
+
+Aggregating a whole table into one value is rarely what the application really needs. Fixes:
+
+- Aggregate per group (`GROUP BY customer_id`), not for the whole table.
+- Page through the data with `LIMIT` and keyset pagination, or stream rows with a cursor and build the document on the client.
+- For exports, use `COPY ... TO STDOUT` row by row instead of building one big JSON array in SQL.
+
+## Huge Nonsense Sizes Mean Corruption
+
+If the size in the message is absurd, such as `18446744073709551604` (close to 2^64) or several billion bytes for a column that holds short strings, the request did not come from your data. PostgreSQL read a length field from a damaged row, and the garbage decoded as an enormous number.
+
+We produced exactly this by writing 64 bytes of garbage into a table page and forcing PostgreSQL to read it with `ignore_checksum_failure = on`:
+
+```text
+ERROR:  invalid memory alloc request size 18446744073709551604
+```
+
+Treat this as data corruption:
+
+1. Find the table and the rows. Run the failing query with a narrower `WHERE`, or use amcheck: `SELECT * FROM verify_heapam('table_name')`, or `pg_amcheck` from the shell.
+2. Copy the data directory before changing anything, and check the storage for errors.
+3. Restore the damaged rows from a backup or a standby, or remove them, as described in our guides on [invalid page in block](/blog/postgres-invalid-page-in-block) and [missing chunk number for toast value](/blog/postgres-missing-chunk-number-toast).
+
+Increasing `work_mem` or adding RAM will not help with either kind of this error. The limit is fixed in the code, and garbage lengths are not a memory problem.
+
+## Quick Diagnosis
+
+| Message | What it really means | Where to look |
+|---|---|---|
+| invalid memory alloc request size 1200000004 | One value or row would exceed 1 GB | The query building a large value, or a wide INSERT |
+| string buffer exceeds maximum allowed length / out of memory with "Cannot enlarge string buffer" | Text output (COPY, row_to_json, aggregate) would exceed 1 GB | Wide rows, whole-table aggregates |
+| requested length too large, array size exceeds..., total size of jsonb... | A function's own size check | The function arguments |
+| invalid memory alloc request size 18446744073709551604 | Corrupted length field | amcheck, storage, backups |
+
+When you are chasing which rows or values are too big, it helps to sort by `octet_length` and look at the top rows across environments. [Chat2DB](https://chat2db.ai/download) can run that query and show the sizes in a sortable grid, without fetching the large values themselves.
+
+## Summary
+
+`invalid memory alloc request size` is PostgreSQL's 1 GB allocation limit, not a shortage of RAM. It appears when a single value, a whole row, or an aggregate result would exceed 1 GB. Related messages are `string buffer exceeds maximum allowed length`, which PostgreSQL 14 reports as `out of memory`. Rows near that size can be stored but not dumped with `pg_dump`, so split large data, use large objects, or keep files outside the database. If the size in the message is astronomically large, you are looking at corruption: locate it with amcheck and restore from a backup.

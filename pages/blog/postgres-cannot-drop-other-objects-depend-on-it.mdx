@@ -1,0 +1,296 @@
+---
+title: "Postgres Cannot Drop: Other Objects Depend on It"
+description: "Fix PostgreSQL cannot drop table, column, type or function because other objects depend on it (2BP01): list dependents with pg_depend and use CASCADE safely."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: November 10, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# Postgres Cannot Drop: Other Objects Depend on It
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="November 10, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+You try to drop a table, a column, a type or a function, and PostgreSQL refuses:
+
+```text
+ERROR:  cannot drop table customers because other objects depend on it
+DETAIL:  constraint orders_customer_id_fkey on table orders depends on table customers
+view customer_emails depends on table customers
+view vip depends on view customer_emails
+HINT:  Use DROP ... CASCADE to drop the dependent objects too.
+```
+
+The SQLSTATE is `2BP01` (dependent objects still exist). PostgreSQL records which database objects depend on which in the `pg_depend` catalog. A plain `DROP` (which means `DROP ... RESTRICT`) fails if anything else would be left pointing at nothing. The error is a safety net. The `DETAIL` lists exactly what would break, and the `HINT` offers `CASCADE`, which you should not use blindly.
+
+This guide shows the error for the most common object types, how to list dependencies before you drop anything, what `CASCADE` really removes, and how to change a table without losing your views. Everything below was run on PostgreSQL 18.6 and 14.24, with identical messages.
+
+## The Example Schema
+
+```sql
+CREATE TABLE customers (id int PRIMARY KEY, name text, email text);
+CREATE TABLE orders (
+  id int PRIMARY KEY,
+  customer_id int REFERENCES customers (id),
+  total numeric
+);
+CREATE VIEW customer_emails AS SELECT id, email FROM customers;
+CREATE VIEW vip AS SELECT * FROM customer_emails WHERE id < 10;
+
+CREATE TYPE mood AS ENUM ('ok', 'sad');
+CREATE TABLE diary (id int, m mood);
+
+CREATE FUNCTION default_total() RETURNS numeric LANGUAGE sql AS 'SELECT 0';
+ALTER TABLE orders ALTER COLUMN total SET DEFAULT default_total();
+
+CREATE SEQUENCE invoice_seq;
+CREATE TABLE invoices (id int DEFAULT nextval('invoice_seq'));
+
+CREATE SCHEMA reporting;
+CREATE TABLE reporting.t (x int);
+```
+
+## What the Error Looks Like for Each Object Type
+
+**A column used by a view:**
+
+```sql
+ALTER TABLE customers DROP COLUMN email;
+```
+
+```text
+ERROR:  cannot drop column email of table customers because other objects depend on it
+DETAIL:  view customer_emails depends on column email of table customers
+view vip depends on view customer_emails
+HINT:  Use DROP ... CASCADE to drop the dependent objects too.
+```
+
+Views depend on the specific columns they use. Dropping a column that no view uses works fine.
+
+**A type used by a column:**
+
+```text
+ERROR:  cannot drop type mood because other objects depend on it
+DETAIL:  column m of table diary depends on type mood
+```
+
+**A function used in a column default** (it also applies to functions used in indexes, triggers, check constraints and views):
+
+```text
+ERROR:  cannot drop function default_total() because other objects depend on it
+DETAIL:  default value for column total of table orders depends on function default_total()
+```
+
+**A sequence used in a default:**
+
+```text
+ERROR:  cannot drop sequence invoice_seq because other objects depend on it
+DETAIL:  default value for column id of table invoices depends on sequence invoice_seq
+```
+
+**A schema that is not empty:**
+
+```text
+ERROR:  cannot drop schema reporting because other objects depend on it
+DETAIL:  table reporting.t depends on schema reporting
+```
+
+Roles produce a related but different error, `role "app_reader" cannot be dropped because some objects depend on it`, followed by details such as `privileges for table customers`. Roles are shared across databases and are handled with `REASSIGN OWNED` and `DROP OWNED`. We cover that in [Postgres Drop Role: Fix Dependent Objects](/blog/postgres-drop-role-dependent-objects).
+
+## List the Dependencies Before You Decide
+
+The `DETAIL` is truncated when there are many dependents. Query `pg_depend` directly to see everything that depends on an object:
+
+```sql
+SELECT DISTINCT
+       classid::regclass AS catalog,
+       pg_describe_object(classid, objid, objsubid) AS dependent_object
+FROM pg_depend
+WHERE refobjid = 'customers'::regclass
+  AND deptype = 'n'
+ORDER BY 2;
+```
+
+```text
+    catalog    |                  dependent_object
+---------------+----------------------------------------------------
+ pg_constraint | constraint orders_customer_id_fkey on table orders
+ pg_rewrite    | rule _RETURN on view customer_emails
+```
+
+Views show up as their `_RETURN` rule in `pg_rewrite`. `deptype = 'n'` (normal) is the kind of dependency that blocks a plain `DROP`. Automatic (`a`) and internal (`i`) dependencies, such as a table's own indexes or its row type, are dropped along with the object and never cause this error.
+
+Views on views form a chain. This recursive query finds every view that depends on the table, directly or indirectly:
+
+```sql
+WITH RECURSIVE deps AS (
+  SELECT DISTINCT r.ev_class::regclass AS view_name, 1 AS depth
+  FROM pg_rewrite r
+  JOIN pg_depend d ON d.objid = r.oid
+  WHERE d.refobjid = 'customers'::regclass
+    AND r.ev_class <> 'customers'::regclass
+  UNION
+  SELECT DISTINCT r.ev_class::regclass, deps.depth + 1
+  FROM deps
+  JOIN pg_depend d ON d.refobjid = deps.view_name
+  JOIN pg_rewrite r ON r.oid = d.objid
+  WHERE r.ev_class <> deps.view_name
+)
+SELECT view_name, min(depth) AS depth
+FROM deps
+GROUP BY 1
+ORDER BY 2;
+```
+
+```text
+    view_name    | depth
+-----------------+-------
+ customer_emails |     1
+ vip             |     2
+```
+
+Materialized views appear in this list too, since they are built the same way.
+
+To check a single column before dropping it, join `pg_depend` to `pg_attribute`. Column dependencies are recorded with the column number in `refobjsubid`:
+
+```sql
+SELECT DISTINCT pg_describe_object(d.classid, d.objid, d.objsubid) AS dependent_object
+FROM pg_depend d
+JOIN pg_attribute a ON a.attrelid = d.refobjid AND a.attnum = d.refobjsubid
+WHERE d.refobjid = 'c2'::regclass
+  AND a.attname = 'email'
+  AND d.deptype = 'n';
+```
+
+```text
+    dependent_object
+-------------------------
+ rule _RETURN on view v2
+```
+
+An empty result means no view, constraint or default uses the column, and `ALTER TABLE ... DROP COLUMN` will succeed.
+
+## What pg_depend Does Not Know About
+
+The dependency tracking has an important gap: PostgreSQL does not parse the body of PL/pgSQL functions (or functions in other procedural languages) to record which tables they use. We created two functions that read the same table:
+
+```sql
+CREATE TABLE prices (id int, p numeric);
+
+CREATE FUNCTION f_plpgsql() RETURNS numeric LANGUAGE plpgsql
+AS $$ BEGIN RETURN (SELECT sum(p) FROM prices); END $$;
+
+CREATE FUNCTION f_atomic() RETURNS numeric LANGUAGE sql
+BEGIN ATOMIC
+  SELECT sum(p) FROM prices;
+END;
+```
+
+Dropping the table mentioned only one of them:
+
+```text
+ERROR:  cannot drop table prices because other objects depend on it
+DETAIL:  function f_atomic() depends on table prices
+HINT:  Use DROP ... CASCADE to drop the dependent objects too.
+```
+
+The SQL-standard function body (`BEGIN ATOMIC`, available since PostgreSQL 14) is parsed when the function is created, so PostgreSQL records the dependency. The PL/pgSQL function is invisible to `pg_depend`. After `DROP TABLE prices CASCADE`, which dropped only `f_atomic()`, the PL/pgSQL function failed the next time it ran:
+
+```text
+ERROR:  relation "prices" does not exist
+LINE 1: (select sum(p) from prices)
+                            ^
+CONTEXT:  PL/pgSQL function f_plpgsql() line 1 at RETURN
+```
+
+The same applies to SQL functions written with a quoted string body (`AS $$ ... $$`), dynamic SQL built with `EXECUTE`, and queries in your application code. Before dropping or renaming a table, search function sources as well:
+
+```sql
+SELECT p.oid::regprocedure AS function_name
+FROM pg_proc p
+WHERE p.prokind IN ('f', 'p')
+  AND p.prosrc ILIKE '%prices%';
+```
+
+A plain text search can return false positives, but it catches the cases `pg_depend` misses. For new code, prefer `BEGIN ATOMIC` bodies for SQL functions, so PostgreSQL can protect them.
+
+## What CASCADE Really Drops
+
+`CASCADE` drops the object and everything that depends on it, recursively. Test it inside a transaction and read the notice before committing:
+
+```sql
+BEGIN;
+DROP TABLE customers CASCADE;
+```
+
+```text
+NOTICE:  drop cascades to 3 other objects
+DETAIL:  drop cascades to constraint orders_customer_id_fkey on table orders
+drop cascades to view customer_emails
+drop cascades to view vip
+DROP TABLE
+```
+
+```sql
+ROLLBACK;
+```
+
+Look closely at what was removed for `orders`. Only the **foreign key constraint** was dropped. The `orders` table and its rows stayed, but without the constraint, nothing stops orders from pointing at customer ids that no longer exist. The two views, on the other hand, were dropped completely, including `vip`, which only depended on the table indirectly.
+
+Some other cascades are just as easy to miss:
+
+- `DROP FUNCTION default_total() CASCADE` printed `drop cascades to default value for column total of table orders`. The column survives, but new rows get NULL instead of the default.
+- `DROP TYPE mood CASCADE` drops the **column** `diary.m`, and its data with it.
+- `DROP SCHEMA reporting CASCADE` drops every table in the schema.
+
+The rule of thumb: run `CASCADE` only inside a transaction, read every line of the `NOTICE`, and commit only if the list contains exactly what you expected. PostgreSQL DDL is transactional, so `ROLLBACK` undoes all of it.
+
+## Changing a Table Without Losing Its Views
+
+The most common reason for this error is a schema change, not a real drop: rebuilding a table, changing a column, or replacing a function. Some alternatives avoid the problem:
+
+**Recreate the dependent views yourself.** Save the definitions first, drop them, make the change, and recreate them in dependency order, all in one transaction:
+
+```sql
+SELECT format('CREATE OR REPLACE VIEW %s AS %s',
+              'customer_emails'::regclass,
+              pg_get_viewdef('customer_emails'::regclass, true));
+```
+
+Also save grants and comments on the views, because recreating a view loses them. `pg_dump --schema-only -t customer_emails -t vip` captures definitions, grants and comments in one file.
+
+**Use `CREATE OR REPLACE` where it is allowed.** `CREATE OR REPLACE VIEW` can change a view's query and add columns at the end without touching views that depend on it. It cannot drop or rename columns, or change their types. `CREATE OR REPLACE FUNCTION` keeps every object that depends on the function, as long as the argument types and return type stay the same.
+
+**Rename instead of drop.** `ALTER TABLE ... RENAME` and `ALTER TABLE ... RENAME COLUMN` do not break views. Views store references by OID and column number, not by name, and they follow the rename automatically.
+
+**Remove the sequence ownership trap.** For `invoice_seq`, linking the sequence to its column turns the dependency around:
+
+```sql
+ALTER SEQUENCE invoice_seq OWNED BY invoices.id;
+DROP TABLE invoices;   -- now drops the sequence too
+```
+
+After this, dropping the table drops the sequence automatically, which is usually what you want for a per-table id sequence. Identity columns (`GENERATED ... AS IDENTITY`) handle this for you.
+
+## Choosing Between RESTRICT and CASCADE in Scripts
+
+`RESTRICT` is the default, and it is the right default for scripts that run unattended. If a dependent object appears that the script author did not expect, the script stops with this error and nothing is lost. A script with `CASCADE` keeps running and silently removes whatever was added since it was written. That might be a reporting view another team created last week, or the foreign key that kept your data consistent.
+
+Reserve `CASCADE` for objects you own completely, such as temporary schemas in test environments, staging tables created by the same job, or a schema that you are deliberately removing with everything in it. Everywhere else, list the dependent objects explicitly in the script, drop them first, and recreate them afterwards. The script is longer, but every object it removes is named in it, which is what a reviewer needs to see.
+
+## Migration Tools
+
+Rails, Django, Alembic, Flyway and similar tools generate plain `DROP` statements, and the migration fails with this error as soon as somebody adds a view, a reporting function or a foreign key that the migration author did not know about. Good practice:
+
+- Keep views and functions in the migrations too, so the migration history knows about them and can drop and recreate them.
+- Never add `CASCADE` to make a failing migration pass. Read the `DETAIL`, decide which dependent objects should be recreated, and write that into the migration.
+- Run new migrations against a production-like schema first, not just an empty development database.
+
+Before dropping anything in a shared database, it helps to look at the dependencies visually. In [Chat2DB](https://chat2db.ai/download) you can browse a table's views, foreign keys and indexes, and run the `pg_depend` queries above, to see what a `DROP` would affect.
+
+## Summary
+
+`cannot drop X because other objects depend on it` means a plain `DROP` would leave views, constraints, defaults or columns pointing at nothing. List the dependents with `pg_depend` or the recursive view query. Then either remove or change them yourself, or use `CASCADE` inside a transaction after reading its `NOTICE`. Remember that `CASCADE` removes foreign key constraints (not the referencing tables), whole views, defaults, and even columns when you drop a type. When the goal is to change a table rather than delete it, save and recreate the dependent views, use `CREATE OR REPLACE`, or rename instead of dropping.

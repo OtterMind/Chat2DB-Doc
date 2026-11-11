@@ -1,0 +1,239 @@
+---
+title: "Postgres Partition Constraint Violated by Some Row"
+description: "Fix PostgreSQL partition constraint is violated by some row and updated partition constraint for default partition would be violated, plus how to skip the scan."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: November 10, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# Postgres Partition Constraint Violated by Some Row
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="November 10, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+Two closely related errors appear when you add partitions to a partitioned table in PostgreSQL:
+
+```text
+ERROR:  partition constraint of relation "events_2027" is violated by some row
+```
+
+```text
+ERROR:  updated partition constraint for default partition "events_default" would be violated by some row
+```
+
+Both have SQLSTATE `23514` (check violation). The first comes from `ALTER TABLE ... ATTACH PARTITION` when the table you attach contains rows outside the bounds you gave it. The second comes from `CREATE TABLE ... PARTITION OF` or `ATTACH PARTITION` when the **default** partition already holds rows that belong in the new range. This guide reproduces both on PostgreSQL 18.6 and 14.24, shows how to find the offending rows, and shows how to attach partitions without long scans and heavy locks.
+
+## Background: Partition Constraints
+
+Each partition of a range or list partitioned table has an implicit constraint derived from its bounds. A partition created `FOR VALUES FROM ('2027-01-01') TO ('2028-01-01')` behaves as if it had `CHECK (created_at >= '2027-01-01' AND created_at < '2028-01-01')`, plus `created_at IS NOT NULL` for range partitioning. Rows inserted through the parent are routed to the right partition, so normally nothing can violate these constraints.
+
+Two operations can break that guarantee, and PostgreSQL checks both:
+
+1. **Attaching an existing table.** The table was filled independently, so PostgreSQL scans it to prove every row fits the new bounds.
+2. **Adding a partition when a default partition exists.** The default partition holds every row that matched no other partition. Once a new partition covers a range, rows in that range may no longer stay in the default, so PostgreSQL scans the default partition to make sure there are none.
+
+## The Example
+
+```sql
+CREATE TABLE events (
+  id         bigint,
+  created_at date NOT NULL,
+  payload    text
+) PARTITION BY RANGE (created_at);
+
+CREATE TABLE events_2025 PARTITION OF events
+  FOR VALUES FROM ('2025-01-01') TO ('2026-01-01');
+CREATE TABLE events_default PARTITION OF events DEFAULT;
+
+INSERT INTO events VALUES
+  (1, '2025-03-01', 'a'),
+  (2, '2026-02-10', 'b'),   -- no 2026 partition yet: goes to default
+  (3, '2026-11-05', 'c');   -- same
+```
+
+## Error 1: The Default Partition Has Rows for the New Range
+
+Now somebody creates the 2026 partition:
+
+```sql
+CREATE TABLE events_2026 PARTITION OF events
+  FOR VALUES FROM ('2026-01-01') TO ('2027-01-01');
+```
+
+```text
+ERROR:  23514: updated partition constraint for default partition "events_default" would be violated by some row
+SCHEMA NAME:  public
+TABLE NAME:  events_default
+LOCATION:  check_default_partition_contents, partbounds.c:3389
+```
+
+Rows 2 and 3 are in the default partition, and the new partition would claim their range. PostgreSQL does not move rows between partitions during DDL, so it refuses.
+
+This is common in systems where a job creates next month's partition in advance, but the job failed or ran late. Rows for the new month landed in the default partition in the meantime.
+
+### Fix: Move the Rows, Then Attach
+
+Create the new partition as a standalone table, move the rows out of the default partition, and attach it, all in one transaction:
+
+```sql
+BEGIN;
+
+CREATE TABLE events_2026 (LIKE events INCLUDING ALL);
+
+INSERT INTO events_2026
+SELECT * FROM events_default
+WHERE created_at >= '2026-01-01' AND created_at < '2027-01-01';
+
+DELETE FROM events_default
+WHERE created_at >= '2026-01-01' AND created_at < '2027-01-01';
+
+ALTER TABLE events ATTACH PARTITION events_2026
+  FOR VALUES FROM ('2026-01-01') TO ('2027-01-01');
+
+COMMIT;
+```
+
+```sql
+SELECT tableoid::regclass AS partition, * FROM events ORDER BY id;
+```
+
+```text
+  partition  | id | created_at | payload
+-------------+----+------------+---------
+ events_2025 |  1 | 2025-03-01 | a
+ events_2026 |  2 | 2026-02-10 | b
+ events_2026 |  3 | 2026-11-05 | c
+```
+
+Other sessions keep seeing the moved rows in the default partition until the commit, and in the new partition afterwards. No reader ever sees them missing or duplicated. The `DELETE` and `ATTACH` take locks on the default partition, so writes that would go there wait until the commit. Do this in a quiet period if the default partition is large.
+
+An alternative is to detach the default partition, create the new partition, and re-insert the default rows through the parent so they are routed correctly. That works, but while the default partition is detached, inserts of rows that match no partition fail with `no partition of relation "events" found for row`.
+
+## Error 2: The Attached Table Has Rows Outside Its Bounds
+
+A different team loads 2027 data into a standalone table and then attaches it:
+
+```sql
+CREATE TABLE events_2027 (LIKE events INCLUDING ALL);
+INSERT INTO events_2027 VALUES (10, '2027-05-01', 'x'), (11, '2028-01-02', 'y');
+
+ALTER TABLE events ATTACH PARTITION events_2027
+  FOR VALUES FROM ('2027-01-01') TO ('2028-01-01');
+```
+
+```text
+ERROR:  partition constraint of relation "events_2027" is violated by some row
+```
+
+Row 11 is dated 2028. Find such rows with the bounds written as a `WHERE` clause, negated:
+
+```sql
+SELECT *
+FROM events_2027
+WHERE NOT (created_at >= '2027-01-01' AND created_at < '2028-01-01');
+```
+
+```text
+ id | created_at | payload
+----+------------+---------
+ 11 | 2028-01-02 | y
+```
+
+If the partition key column were nullable, also check `created_at IS NULL`. `NOT (...)` returns NULL for NULL keys, so those rows would not show up here, yet a range partition cannot hold them. For list partitions, use `WHERE region NOT IN ('us')` (and check for NULL too, unless NULL is part of the list).
+
+To get the exact bounds of existing partitions, ask the catalog:
+
+```sql
+SELECT c.oid::regclass AS partition,
+       pg_get_expr(c.relpartbound, c.oid) AS bounds
+FROM pg_inherits i
+JOIN pg_class c ON c.oid = i.inhrelid
+WHERE i.inhparent = 'events'::regclass
+ORDER BY 1;
+```
+
+```text
+   partition    |                      bounds
+----------------+--------------------------------------------------
+ events_2025    | FOR VALUES FROM ('2025-01-01') TO ('2026-01-01')
+ events_default | DEFAULT
+ events_2026    | FOR VALUES FROM ('2026-01-01') TO ('2027-01-01')
+```
+
+Range bounds are inclusive at `FROM` and exclusive at `TO`. A row dated exactly `2028-01-01` does not fit a partition `TO ('2028-01-01')`, which is a frequent cause of this error when people expect the upper bound to be inclusive.
+
+Fix the stray rows by deleting them, correcting them, or moving them to the right partition (insert through the parent, then delete from the staging table), and run the `ATTACH` again.
+
+## Attaching Without a Long Scan
+
+`ATTACH PARTITION` scans the new table to validate its rows, and if a default partition exists, it scans that too. Our lock measurements on both versions:
+
+| Statement | Lock on parent | Lock on attached table | Lock on default partition |
+|---|---|---|---|
+| `ALTER TABLE ... ATTACH PARTITION` | SHARE UPDATE EXCLUSIVE | ACCESS EXCLUSIVE | ACCESS EXCLUSIVE |
+| `CREATE TABLE ... PARTITION OF` | ACCESS EXCLUSIVE | ACCESS EXCLUSIVE | ACCESS EXCLUSIVE |
+
+`ATTACH` takes only `SHARE UPDATE EXCLUSIVE` on the parent (PostgreSQL 12 and later), so queries on other partitions keep running. That is why it is the preferred way to add partitions to a busy table. `CREATE TABLE ... PARTITION OF` blocks the whole parent briefly. But the ACCESS EXCLUSIVE locks on the attached table and on the default partition are held for the whole scan.
+
+You can skip both scans with CHECK constraints that prove the rows already fit:
+
+```sql
+-- 1. A CHECK on the new table that matches its bounds exactly
+ALTER TABLE events_2026 ADD CONSTRAINT events_2026_bounds
+  CHECK (created_at >= '2026-01-01' AND created_at < '2027-01-01');
+
+-- 2. A CHECK on the default partition that excludes the new range
+ALTER TABLE events_default ADD CONSTRAINT events_default_not_2026
+  CHECK (created_at < '2026-01-01' OR created_at >= '2027-01-01');
+
+SET client_min_messages = debug1;
+ALTER TABLE events ATTACH PARTITION events_2026
+  FOR VALUES FROM ('2026-01-01') TO ('2027-01-01');
+```
+
+```text
+DEBUG:  partition constraint for table "events_2026" is implied by existing constraints
+DEBUG:  updated partition constraint for default partition "events_default" is implied by existing constraints
+ALTER TABLE
+```
+
+Without the second constraint, the debug output instead shows `verifying table "events_default"`, which means a full scan of the default partition under ACCESS EXCLUSIVE.
+
+Adding the CHECK constraints scans the tables too, but you can do that without blocking by adding them as `NOT VALID` and running `VALIDATE CONSTRAINT` separately, which holds only SHARE UPDATE EXCLUSIVE. PostgreSQL only uses a **validated** constraint to skip the attach scan. After the attach, drop the CHECK on the new partition because it duplicates the partition constraint. The one on the default partition must be adjusted each time you add a range, so many teams prefer to keep the default partition empty and alert when rows show up in it.
+
+The [Postgres Safe Constraint Migration Generator](https://chat2db.ai/tools/postgres-safe-constraint-migration-generator) writes the `NOT VALID` plus `VALIDATE` steps for you, with the lock level of each step.
+
+## Detaching Partitions When a Default Exists
+
+The default partition also affects the reverse operation. PostgreSQL 14 added `DETACH PARTITION ... CONCURRENTLY`, which detaches a partition while queries continue on the parent. It refuses to run while a default partition exists:
+
+```sql
+ALTER TABLE ev DETACH PARTITION ev25 CONCURRENTLY;
+```
+
+```text
+ERROR:  cannot detach partitions concurrently when a default partition exists
+```
+
+After we dropped the default partition, the same statement succeeded on both PostgreSQL 14 and 18. A plain `DETACH PARTITION` still works with a default partition, but takes an ACCESS EXCLUSIVE lock on the parent. Retention jobs that drop old partitions are one more reason some teams avoid default partitions altogether. `DETACH ... CONCURRENTLY` also cannot run inside a transaction block.
+
+## Preventing the Problem
+
+- **Create partitions ahead of time**, for example with pg_partman or a scheduled job that creates the next few periods, and monitor that the job succeeds.
+- **Alert on rows in the default partition.** A simple `SELECT count(*) FROM events_default` in your monitoring catches a missing partition early, while the move is still small.
+- **Decide whether you want a default partition at all.** Without one, an insert with no matching partition fails immediately with `no partition of relation ... found for row`. That is noisy, but it never silently piles up rows that block future partitions.
+- **Validate staging tables before attaching.** Run the bounds check query as part of the load job.
+
+When you are moving rows between partitions, it helps to compare row counts per partition before and after the transaction. In [Chat2DB](https://chat2db.ai/download) you can run the `tableoid::regclass` query and the bounds query side by side and keep the results open while you work.
+
+## Summary
+
+| Error | Cause | Fix |
+|---|---|---|
+| `partition constraint of relation "x" is violated by some row` | The table being attached has rows outside the bounds | Find them with `WHERE NOT (bounds)`, plus an `IS NULL` check if needed, then fix or move them |
+| `updated partition constraint for default partition "d" would be violated by some row` | The default partition holds rows for the new range | Move the rows into the new table and attach it in one transaction |
+
+Both errors are PostgreSQL refusing to leave rows in the wrong partition. Remember that `TO` bounds are exclusive. To avoid long scans under ACCESS EXCLUSIVE locks, add validated CHECK constraints that imply the bounds before you attach.
