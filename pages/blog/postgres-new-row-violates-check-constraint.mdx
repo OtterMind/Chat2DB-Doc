@@ -1,0 +1,212 @@
+---
+title: "Postgres: New Row Violates Check Constraint"
+description: "Fix new row for relation violates check constraint (SQLSTATE 23514) in PostgreSQL: read the failing row, find bad data, and add constraints with NOT VALID."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: November 11, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# Postgres: New Row Violates Check Constraint
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="November 11, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+A `CHECK` constraint is a rule that every row must satisfy, such as "balance is never negative" or "discount is not larger than price". When an `INSERT`, `UPDATE`, `COPY` or upsert would store a row that breaks the rule, PostgreSQL rejects the whole statement:
+
+```text
+ERROR:  new row for relation "accounts" violates check constraint "accounts_balance_check"
+DETAIL:  Failing row contains (1, -5, a@b).
+```
+
+The SQLSTATE is `23514`, `check_violation`. The constraint is working as intended, so the fix is almost always in the data or the statement, not in the constraint. This guide shows how to read the error, find the rule and the bad values, handle bulk loads and upserts, and add new constraints to tables that already contain bad rows. Every example was run on PostgreSQL 18.6 and 14.24 with identical results.
+
+## Reading the Error
+
+Take this table:
+
+```sql
+CREATE TABLE accounts (
+  id int PRIMARY KEY,
+  balance numeric CHECK (balance >= 0),
+  email text CONSTRAINT email_has_at CHECK (email LIKE '%@%')
+);
+```
+
+Each part of the error points somewhere:
+
+- **The relation** (`accounts`) is the table being written. With partitioned tables, this can be a partition name.
+- **The constraint name** identifies the rule. A constraint written inline without a name gets an automatic name of the form `table_column_check`, here `accounts_balance_check`. The named one keeps its name, `email_has_at`.
+- **DETAIL: Failing row contains (...)** shows the full new row in column order, after defaults, triggers and the `UPDATE` expression have been applied.
+
+The last point matters for updates. This statement:
+
+```sql
+INSERT INTO accounts VALUES (3, 5, 'ok@x');
+UPDATE accounts SET balance = balance - 10 WHERE id = 3;
+```
+
+fails with `Failing row contains (3, -5, ok@x)`. The `-5` is not a value you typed. It is the result of `5 - 10`. The detail line always shows the row as it would have been stored.
+
+With `\set VERBOSITY verbose` in psql, or by reading the error fields in your driver, you also get the schema, table and constraint as separate fields. Use those fields instead of parsing the message text when your application needs to map a violation to a user-facing message.
+
+## Find the Rule Behind the Name
+
+The constraint definition is in `pg_constraint`:
+
+```sql
+SELECT conname, convalidated, pg_get_constraintdef(oid)
+FROM pg_constraint
+WHERE conrelid = 'accounts'::regclass AND contype = 'c';
+```
+
+```text
+        conname         | convalidated |       pg_get_constraintdef
+------------------------+--------------+-----------------------------------
+ accounts_balance_check | t            | CHECK ((balance >= (0)::numeric))
+ email_has_at           | t            | CHECK ((email ~~ '%@%'::text))
+```
+
+psql's `\d accounts` prints the same list under "Check constraints". Note how PostgreSQL rewrites `LIKE` as the `~~` operator in the stored definition. That is the same expression, just in its internal form.
+
+## NULL Passes a Check Constraint
+
+A `CHECK` fails only when its expression is **false**. When the expression is `NULL`, the row is accepted:
+
+```sql
+CREATE TABLE acc2 (id int, balance numeric CHECK (balance >= 0));
+INSERT INTO acc2 VALUES (1, NULL);   -- INSERT 0 1
+```
+
+`NULL >= 0` is `NULL`, not false, so the row goes in. If the column must have a value, add `NOT NULL` as well. The constraint `CHECK (balance >= 0)` alone does not reject missing balances.
+
+## Fixing the Statement
+
+Most violations come from one of these sources:
+
+- **Arithmetic in updates.** Moving money, adjusting stock or applying discounts can push a value past the limit. Guard the update so it only touches rows that stay valid, and check the row count: `UPDATE accounts SET balance = balance - 10 WHERE id = 3 AND balance >= 10;` returns `UPDATE 0` when funds are insufficient, which the application can turn into a clear message.
+- **Validation that lives only in the application.** A form or API that accepts any string will eventually send `nobody` to the `email_has_at` column. Validate early, but keep the constraint as the final guard.
+- **Defaults and triggers.** A default value or a `BEFORE` trigger can produce a value the check rejects. The failing row in the detail line includes their effect, so compare it with what the application sent.
+- **Unit or format changes.** A constraint such as `CHECK (rate BETWEEN 0 AND 1)` rejects a client that sends percentages (`15`) instead of fractions (`0.15`).
+
+## Bulk Loads: COPY and Multi-Row INSERT
+
+A single bad row aborts a whole `COPY` or multi-row `INSERT`. `COPY` at least tells you where it stopped:
+
+```text
+ERROR:  new row for relation "acc2" violates check constraint "acc2_balance_check"
+DETAIL:  Failing row contains (3, -1).
+CONTEXT:  COPY acc2, line 1: "3	-1"
+```
+
+For large files, load into a staging table without constraints first, then move only the valid rows and report the rest:
+
+```sql
+CREATE TEMP TABLE acc2_stage (LIKE acc2 INCLUDING DEFAULTS);
+COPY acc2_stage FROM STDIN;           -- or \copy from a file
+
+INSERT INTO acc2 SELECT * FROM acc2_stage WHERE balance >= 0 OR balance IS NULL;
+SELECT * FROM acc2_stage WHERE NOT (balance >= 0);   -- rows to fix
+```
+
+`LIKE ... INCLUDING DEFAULTS` copies the columns, defaults and `NOT NULL` constraints, but not the check constraints (those need `INCLUDING CONSTRAINTS`), so the stage accepts rows the real table would reject. Our [COPY command generator](https://chat2db.ai/tools/postgres-copy-command-generator) can write the `COPY` and `\copy` lines for the staging step.
+
+## Upserts
+
+`INSERT ... ON CONFLICT` checks constraints twice, and the order surprises people. Start with this table:
+
+```sql
+CREATE TABLE products (
+  id int PRIMARY KEY,
+  price numeric,
+  discount numeric,
+  CONSTRAINT discount_le_price CHECK (discount <= price)
+);
+INSERT INTO products VALUES (1, 10, 2), (2, 5, 2);
+```
+
+First, the row you propose to insert is checked **before** PostgreSQL looks for a conflict. A proposed row that breaks the rule fails even when it would have hit the conflict path, and even with `DO NOTHING`:
+
+```sql
+INSERT INTO products VALUES (2, 5, 9) ON CONFLICT (id) DO NOTHING;
+-- ERROR:  new row for relation "products" violates check constraint "discount_le_price"
+-- DETAIL:  Failing row contains (2, 5, 9).
+```
+
+So clamping the value in the `DO UPDATE SET` clause cannot rescue an invalid proposed row. We tried `SET discount = LEAST(excluded.discount, products.price)` with the same `(2, 5, 9)` row and got the same error. Fix the values before they reach the `VALUES` list.
+
+Second, when the conflict path runs, the updated row is checked too. Here the proposed row is valid, but the update sets an invalid discount:
+
+```sql
+INSERT INTO products VALUES (2, 5, 1)
+ON CONFLICT (id) DO UPDATE SET discount = 9;
+-- ERROR:  new row for relation "products" violates check constraint "discount_le_price"
+-- DETAIL:  Failing row contains (2, 5, 9).
+```
+
+The detail line looks identical in both cases, so compare it with the proposed row to see which path failed. In the second case, an expression in `SET` can keep the result valid: `SET discount = LEAST(excluded.discount + 3, products.price)` with a proposed discount of 4 stored 5, the product's price, instead of failing.
+
+## Domain Constraints Give a Different Message
+
+Checks can also live on a domain, a reusable type with rules attached. Violations of a domain check produce a different message with the same SQLSTATE and no failing-row detail:
+
+```sql
+CREATE DOMAIN pos_int AS int CHECK (VALUE > 0);
+SELECT (-1)::pos_int;
+-- ERROR:  value for domain pos_int violates check constraint "pos_int_check"
+```
+
+If you search your schema for a constraint name from such an error and find nothing on the table, look at the column types. Our [domain types guide](/blog/postgres-domain-types-guide) explains when domains are a good fit.
+
+## Adding a Check to a Table That Already Has Bad Rows
+
+`ALTER TABLE ... ADD CONSTRAINT ... CHECK` scans the table and fails if any existing row breaks the rule, with a message in a different form:
+
+```text
+ERROR:  check constraint "bal_lt" of relation "accounts" is violated by some row
+```
+
+This message does not show the row. Find the offenders with the negated expression. `NOT (expr)` is false or `NULL` exactly for the rows the check accepts, so it returns precisely the rows the constraint rejects:
+
+```sql
+SELECT * FROM products WHERE NOT (discount <= price);
+```
+
+On a busy table, adding the constraint in two steps is safer. Suppose `products` had been created without the constraint and product 2 already has a discount of 8 and a price of 5:
+
+```sql
+-- 1. Enforce the rule for new rows only. Fast, no table scan.
+ALTER TABLE products ADD CONSTRAINT discount_le_price CHECK (discount <= price) NOT VALID;
+
+-- 2. Fix the existing rows.
+UPDATE products SET discount = price WHERE NOT (discount <= price);
+
+-- 3. Check the old rows. Allows normal reads and writes during the scan.
+ALTER TABLE products VALIDATE CONSTRAINT discount_le_price;
+```
+
+In our test, the `NOT VALID` constraint immediately rejected a new bad row, `(4, 3, 9)`. `VALIDATE` failed with the "violated by some row" message while row 2 was still wrong, and succeeded after the fix, after which `convalidated` was `t`. Product 3, with a `NULL` discount, passed throughout. The lock levels and the full procedure are in our guide to [NOT VALID constraints](/blog/postgres-add-constraint-not-valid), and the [safe constraint migration generator](https://chat2db.ai/tools/postgres-safe-constraint-migration-generator) writes the three steps for you.
+
+## Check Constraints Cannot Be Deferred
+
+Unlike foreign keys and unique constraints, a check cannot wait until commit. Adding `DEFERRABLE` fails at once:
+
+```text
+ERROR:  CHECK constraints cannot be marked DEFERRABLE
+```
+
+Written inline after a column check, the same clause produced `misplaced DEFERRABLE clause`. Every row must satisfy the rule at the end of each statement. If a multi-step change needs an intermediate state, perform it in a single `UPDATE`, or relax the constraint (for example by allowing `NULL` during the change) and tighten it again with `NOT VALID` and `VALIDATE`.
+
+## Related Errors With the Same Code
+
+SQLSTATE 23514 is also used for partition bounds. Inserting a row that fits no partition gives `no partition of relation found for row`, and attaching a partition with out-of-range rows gives `partition constraint is violated by some row`. Those have their own guides: [no partition found for row](/blog/postgres-no-partition-of-relation-found-for-row) and [partition constraint violated](/blog/postgres-partition-constraint-violated-by-some-row). A check that needs to look at other rows or tables cannot be written as a `CHECK` at all; see [cannot use subquery in check constraint](/blog/postgres-cannot-use-subquery-in-check-constraint).
+
+## Inspecting Constraints in a GUI
+
+When a schema has dozens of constraints, it is faster to see them next to the columns. In [Chat2DB](https://chat2db.ai/download) the table designer lists check constraints with their expressions, so you can match a constraint name from an error to its rule, and run the `NOT (expr)` query in the SQL editor right away.
+
+## Summary
+
+`new row for relation ... violates check constraint` means the row PostgreSQL was about to store, as shown in the `DETAIL` line, made the constraint expression false. Look up the expression in `pg_constraint`, compare it with the failing row, and fix the statement or the data. Remember that `NULL` passes a check, and add `NOT NULL` when a value is required. Load bulk data through a staging table, and remember that upserts check both the proposed row and the updated row. Add new rules with `NOT VALID`, clean up the rows that `NOT (expr)` finds, then run `VALIDATE CONSTRAINT`.

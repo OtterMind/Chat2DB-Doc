@@ -1,0 +1,206 @@
+---
+title: "Postgres: New Row Violates Row-Level Security"
+description: "Fix new row violates row-level security policy for table in PostgreSQL: missing INSERT policies, WITH CHECK, RETURNING, upserts and unset tenant settings."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: November 11, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# Postgres: New Row Violates Row-Level Security
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="November 11, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+You enabled row-level security (RLS), granted `INSERT` on the table, and the application still cannot write:
+
+```text
+ERROR:  new row violates row-level security policy for table "notes"
+```
+
+The SQLSTATE is `42501`, the same code as `permission denied`, but the cause is different. The role has the table privilege, and the row it tried to write did not pass the policy's `WITH CHECK` test, or there was no policy that allows the write at all. This guide reproduces every common cause on PostgreSQL 18.6 and 14.24 (both behaved identically) and shows how to fix each one.
+
+## Setting Up the Example
+
+A typical multi-tenant table, where the application sets the tenant ID for each session:
+
+```sql
+CREATE ROLE app_user LOGIN;
+CREATE TABLE notes (
+  id serial PRIMARY KEY,
+  tenant_id int NOT NULL,
+  body text
+);
+GRANT SELECT, INSERT, UPDATE, DELETE ON notes TO app_user;
+GRANT USAGE ON SEQUENCE notes_id_seq TO app_user;
+
+ALTER TABLE notes ENABLE ROW LEVEL SECURITY;
+CREATE POLICY tenant_isolation ON notes
+  USING (tenant_id = current_setting('app.tenant_id')::int);
+```
+
+A policy written with only `USING` applies to all commands, and for writes PostgreSQL reuses the `USING` expression as the `WITH CHECK` expression. Now act as the application:
+
+```sql
+SET ROLE app_user;
+SET app.tenant_id = '1';
+
+INSERT INTO notes (tenant_id, body) VALUES (1, 'mine');    -- INSERT 0 1
+INSERT INTO notes (tenant_id, body) VALUES (2, 'theirs');
+-- ERROR:  new row violates row-level security policy for table "notes"
+
+UPDATE notes SET tenant_id = 2 WHERE id = 1;
+-- ERROR:  new row violates row-level security policy for table "notes"
+```
+
+Both errors are RLS doing its job. Tenant 1 may not create a row for tenant 2, and may not move its own row to tenant 2. The `UPDATE` case is worth noting: the existing row passed `USING`, so it was visible and could be targeted, but the new version of the row failed the check.
+
+## How PostgreSQL Checks Writes
+
+Every policy has up to two expressions:
+
+- `USING` decides which **existing** rows a command can see or target (`SELECT`, `UPDATE`, `DELETE`).
+- `WITH CHECK` decides which **new** rows a command may write (`INSERT`, and the new version of a row in `UPDATE`).
+
+If no permissive policy applies to a command, nothing is allowed. That default deny is behind most of the surprising cases below. To see what a table's policies contain, read them from the catalog:
+
+```sql
+SELECT polname, polcmd, polpermissive,
+       pg_get_expr(polqual, polrelid)      AS using_expr,
+       pg_get_expr(polwithcheck, polrelid) AS check_expr
+FROM pg_policy
+WHERE polrelid = 'notes'::regclass;
+```
+
+`polcmd` is `r` for SELECT, `a` for INSERT, `w` for UPDATE, `d` for DELETE and `*` for ALL. psql's `\d notes` also lists the policies under the table.
+
+## Cause 1: There Is No Policy for INSERT
+
+A common pattern is to start with a read policy and forget the write side:
+
+```sql
+CREATE POLICY read_own ON notes FOR SELECT
+  USING (tenant_id = current_setting('app.tenant_id')::int);
+
+SET ROLE app_user;
+INSERT INTO notes (tenant_id, body) VALUES (1, 'x');
+-- ERROR:  new row violates row-level security policy for table "notes"
+```
+
+The row is for the right tenant, but no policy covers `INSERT`, so the default deny applies. The message does not say "no policy", which makes this case confusing. Add an explicit write policy:
+
+```sql
+CREATE POLICY write_own ON notes FOR INSERT
+  WITH CHECK (tenant_id = current_setting('app.tenant_id')::int);
+```
+
+## Cause 2: The Tenant Setting Is Missing or Empty
+
+Policies that read a session setting fail in different ways depending on how the setting is missing. In a fresh session where `app.tenant_id` was never set, `current_setting('app.tenant_id', true)` returns `NULL`. The comparison becomes `NULL`, which is not true, so the insert fails with the RLS error. That is safe, but the message hides the real problem: the application forgot to set the tenant.
+
+Things get worse after a `RESET` or a connection pool that resets sessions. Once a custom setting has existed in a session, resetting it leaves an **empty string**, not `NULL`. With the cast inside the policy, the insert then failed with a different error:
+
+```text
+ERROR:  invalid input syntax for type integer: ""
+```
+
+Make the policy robust to both states with `NULLIF`:
+
+```sql
+CREATE POLICY tenant_isolation ON notes
+  USING (tenant_id = NULLIF(current_setting('app.tenant_id', true), '')::int);
+```
+
+With that policy, both the never-set and the reset cases fail cleanly with the RLS error. The fix on the application side is to set the tenant at the start of every transaction. With a connection pooler in transaction mode, use `SET LOCAL` (or `set_config('app.tenant_id', '1', true)`) inside the transaction, so the value cannot leak to the next client:
+
+```sql
+BEGIN;
+SET LOCAL ROLE app_user;
+SET LOCAL app.tenant_id = '1';
+INSERT INTO notes (tenant_id, body) VALUES (1, 'local ok');   -- INSERT 0 1
+COMMIT;
+```
+
+Our article on [session settings and set_config](/blog/postgres-session-settings-and-set-config) explains how custom settings behave in more detail.
+
+## Cause 3: INSERT ... RETURNING Needs a SELECT Policy
+
+This one surprises many teams, because the same insert works without `RETURNING`:
+
+```sql
+CREATE POLICY ins_any ON notes FOR INSERT WITH CHECK (true);
+
+SET ROLE app_user;
+INSERT INTO notes (tenant_id, body) VALUES (3, 'y');                  -- INSERT 0 1
+INSERT INTO notes (tenant_id, body) VALUES (3, 'y') RETURNING id;
+-- ERROR:  new row violates row-level security policy for table "notes"
+```
+
+When a write returns the row, PostgreSQL also requires the new row to pass the table's `SELECT` policies, because returning it is a form of reading it. With no `SELECT` policy, or one the new row does not satisfy, the statement fails. ORMs add `RETURNING` to almost every insert to fetch generated keys, so this cause is very common in application code. Add a `SELECT` policy that covers the rows the role is allowed to create.
+
+## Cause 4: Upserts Check More Policies
+
+`INSERT ... ON CONFLICT DO UPDATE` can take the update path, and then the `UPDATE` policies apply as well. With only `INSERT` and `SELECT` policies in place:
+
+```sql
+INSERT INTO notes (id, tenant_id, body) VALUES (1, 1, 'z')
+ON CONFLICT (id) DO UPDATE SET body = excluded.body;
+```
+
+```text
+ERROR:  new row violates row-level security policy (USING expression) for table "notes"
+```
+
+The `(USING expression)` part tells you that PostgreSQL checked the existing row against the `UPDATE` policy's `USING` clause and there was no `UPDATE` policy to satisfy. If your application upserts, it needs policies for `INSERT`, `UPDATE` and `SELECT`. A single `FOR ALL` policy with both clauses covers them:
+
+```sql
+CREATE POLICY tenant_all ON notes FOR ALL
+  USING (tenant_id = NULLIF(current_setting('app.tenant_id', true), '')::int)
+  WITH CHECK (tenant_id = NULLIF(current_setting('app.tenant_id', true), '')::int);
+```
+
+## Cause 5: FORCE ROW LEVEL SECURITY on the Owner
+
+By default, the table owner bypasses RLS. Teams that test as the owner see everything working, then the real role fails. The reverse also happens: after `ALTER TABLE ... FORCE ROW LEVEL SECURITY`, the owner is subject to the policies too. We tested with a non-superuser owner:
+
+```sql
+ALTER TABLE owned FORCE ROW LEVEL SECURITY;
+SET ROLE tbl_owner;
+INSERT INTO owned VALUES (2, 2);
+-- ERROR:  new row violates row-level security policy for table "owned"
+```
+
+Superusers and roles with the `BYPASSRLS` attribute ignore RLS even with `FORCE`. Our insert as the `postgres` superuser succeeded after `FORCE`. So never test policies as a superuser. Use `SET ROLE` to the application role, as in the examples above.
+
+## COPY Into a Table With RLS
+
+Bulk loads hit a related error. A role that is subject to RLS cannot use `COPY ... FROM` on the table at all:
+
+```text
+ERROR:  COPY FROM not supported with row-level security
+HINT:  Use INSERT statements instead.
+```
+
+This is a separate message, not a policy failure. `COPY FROM` does not evaluate `WITH CHECK` expressions row by row, so PostgreSQL refuses it for any role that the policies apply to. `COPY ... TO`, on the other hand, works and returns only the rows the role may see: as `app_user` with tenant 1, our export contained only tenant 1's notes. For loads, either use multi-row `INSERT` statements (or `INSERT ... SELECT` from a staging table) as the application role, or run the `COPY` as the table owner or a `BYPASSRLS` role and validate the tenant column yourself.
+
+## Debugging Checklist
+
+When you see this error, check the following in order:
+
+1. **Which command and which path?** Plain insert, update, insert with `RETURNING`, or upsert? Each needs a different set of policies.
+2. **Is there a permissive policy for that command?** List them from `pg_policy`. No policy means deny.
+3. **What does the session see?** Run `SELECT current_user, current_setting('app.tenant_id', true);` in the same transaction as the failing statement.
+4. **Does the row pass the check by hand?** Evaluate the `WITH CHECK` expression with the row's values in a `SELECT`.
+5. **Restrictive policies.** Policies created `AS RESTRICTIVE` must all pass, in addition to at least one permissive policy.
+
+Writing policies by hand for every command is repetitive. Our free [Postgres RLS policy generator](https://chat2db.ai/tools/postgres-rls-policy-generator) produces matching `USING` and `WITH CHECK` clauses for common tenant patterns; wrap its `current_setting()` call in `NULLIF(..., '')` as shown above if your pool resets sessions. For design guidance and performance, see the [row-level security guide](/blog/postgres-row-level-security-guide) and [RLS performance tuning](/blog/postgres-rls-performance-tuning).
+
+## Testing Policies Interactively
+
+The quickest way to understand a policy problem is to replay the application's statements as the application role. In [Chat2DB](https://chat2db.ai/download) you can open a connection as `app_user`, or run `SET ROLE` in the SQL editor, set the tenant variable, and try the failing `INSERT` with and without `RETURNING`. Seeing which variant fails usually identifies the missing policy in a minute.
+
+## Summary
+
+`new row violates row-level security policy` means a write produced a row that no applicable policy allows. The usual reasons are a missing `INSERT` or `UPDATE` policy (default deny), a tenant setting that is `NULL` or an empty string, `RETURNING` requiring a `SELECT` policy, upserts needing `UPDATE` policies, and owners or superusers who bypass RLS during testing. Write `FOR ALL` policies with both `USING` and `WITH CHECK`, guard session settings with `NULLIF`, set them per transaction, and always test as the real application role. If the error is `permission denied for table` instead, the problem is grants, not policies; see [permission denied for table](/blog/postgres-permission-denied-for-table-fix).

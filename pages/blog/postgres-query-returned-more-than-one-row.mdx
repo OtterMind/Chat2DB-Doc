@@ -1,0 +1,256 @@
+---
+title: "PL/pgSQL: Query Returned More Than One Row"
+description: "Fix query returned more than one row (P0003) in PL/pgSQL: SELECT INTO STRICT, UPDATE RETURNING INTO, EXECUTE INTO, and the too_many_rows extra check."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: November 11, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# PL/pgSQL: Query Returned More Than One Row
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="November 11, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+A PL/pgSQL function that reads one value into a variable fails with:
+
+```text
+ERROR:  query returned more than one row
+HINT:  Make sure the query returns a single row, or use LIMIT 1.
+CONTEXT:  PL/pgSQL function order_total(integer) line 4 at SQL statement
+```
+
+The SQLSTATE is `P0003`, `too_many_rows`. It comes from PL/pgSQL, not from the SQL engine. The function expected exactly one row from a query whose result it stores with `INTO`, and the query produced several. This is a different error from `more than one row returned by a subquery used as an expression`, which is raised by plain SQL; that one has its [own guide](/blog/postgres-more-than-one-row-returned-by-subquery). Here we cover the PL/pgSQL statements that raise P0003, when they raise it, and how to fix the query or the logic. All examples ran on PostgreSQL 18.6 and 14.24 with the same output.
+
+## The Setup
+
+```sql
+CREATE TABLE orders (id int, customer_id int, total numeric);
+INSERT INTO orders VALUES (1, 7, 10), (2, 7, 20), (3, 8, 5);
+```
+
+Customer 7 has two orders, customer 8 has one, and customer 99 has none.
+
+## SELECT INTO STRICT
+
+```sql
+CREATE OR REPLACE FUNCTION order_total(c int) RETURNS numeric
+LANGUAGE plpgsql AS $$
+DECLARE t numeric;
+BEGIN
+  SELECT total INTO STRICT t FROM orders WHERE customer_id = c;
+  RETURN t;
+END $$;
+
+SELECT order_total(8);    -- 5
+SELECT order_total(7);    -- ERROR:  query returned more than one row
+SELECT order_total(99);   -- ERROR:  query returned no rows
+```
+
+`STRICT` means "exactly one row". Zero rows raise `P0002` (`no_data_found`) and two or more raise `P0003`. That is useful when the query is supposed to identify a single row by its key, because a second row means the data or the query is wrong, and silently picking one would hide the problem.
+
+## SELECT INTO Without STRICT Hides the Problem
+
+Drop the `STRICT` keyword and the same call succeeds:
+
+```sql
+CREATE OR REPLACE FUNCTION order_total2(c int) RETURNS numeric
+LANGUAGE plpgsql AS $$
+DECLARE t numeric;
+BEGIN
+  SELECT total INTO t FROM orders WHERE customer_id = c;
+  RETURN t;
+END $$;
+
+SELECT order_total2(7);   -- 10
+```
+
+Without `STRICT`, PL/pgSQL keeps the **first** row and discards the rest. With no `ORDER BY`, "first" is whatever row the executor happened to produce. It returned 10 here, but it could return 20 after a vacuum, a new index or a parallel plan. With zero rows, the variable is set to `NULL` and the special variable `FOUND` is false. So the absence of P0003 in old code does not mean the code is correct.
+
+## UPDATE, INSERT and DELETE With RETURNING INTO
+
+Data-changing statements are stricter. When `RETURNING ... INTO` produces more than one row, PL/pgSQL raises P0003 **even without `STRICT`**:
+
+```sql
+CREATE OR REPLACE FUNCTION bump(c int) RETURNS numeric
+LANGUAGE plpgsql AS $$
+DECLARE t numeric;
+BEGIN
+  UPDATE orders SET total = total + 1 WHERE customer_id = c RETURNING total INTO t;
+  RETURN t;
+END $$;
+
+SELECT bump(8);   -- 6
+SELECT bump(7);
+-- ERROR:  query returned more than one row
+-- CONTEXT:  PL/pgSQL function bump(integer) line 4 at SQL statement
+```
+
+Because the error aborts the transaction, the `UPDATE` of both rows is rolled back. Nothing was changed. This behaviour protects you from updating many rows while believing you updated one. The usual cause is a `WHERE` clause on a column that is not unique, here `customer_id` instead of the order `id`.
+
+## EXECUTE ... INTO
+
+Dynamic SQL follows the same rules. `EXECUTE ... INTO STRICT` raises P0003 for several rows, and plain `EXECUTE ... INTO` takes the first row:
+
+```sql
+EXECUTE 'SELECT total FROM orders WHERE customer_id = $1' INTO STRICT t USING c;
+-- for c = 7: ERROR:  query returned more than one row
+-- CONTEXT:  PL/pgSQL function dyn(integer) line 4 at EXECUTE
+```
+
+Note the `at EXECUTE` in the context line, which distinguishes it from a static statement. The dynamic version printed no `HINT` line.
+
+## Show the Parameters With print_strict_params
+
+When a function runs thousands of times, the error alone does not tell you which input caused it. Turn on `plpgsql.print_strict_params` and PL/pgSQL adds the parameter values to the error:
+
+```sql
+SET plpgsql.print_strict_params = on;
+SELECT order_total(7);
+```
+
+```text
+ERROR:  query returned more than one row
+DETAIL:  parameters: c = '7'
+HINT:  Make sure the query returns a single row, or use LIMIT 1.
+CONTEXT:  PL/pgSQL function order_total(integer) line 4 at SQL statement
+```
+
+You can set it per session, per database (`ALTER DATABASE shop SET plpgsql.print_strict_params = on`), or per function with `#print_strict_params on` at the top of the function body.
+
+## FOUND and ROW_COUNT Do Not Reveal Extra Rows
+
+A natural idea is to drop `STRICT` and check the row count afterwards. It does not work for duplicates. After a non-`STRICT` `SELECT INTO`, PL/pgSQL stops reading after the first row, so `GET DIAGNOSTICS n = ROW_COUNT` reports 1 even when the query matches several rows:
+
+```sql
+SELECT total INTO t FROM orders WHERE customer_id = c;
+GET DIAGNOSTICS n = ROW_COUNT;
+-- customer 7 (two orders): total=10 found=t row_count=1
+-- customer 99 (no orders): total=  found=f row_count=0
+```
+
+`FOUND` and `ROW_COUNT` reliably tell you about zero rows, not about too many. To detect duplicates you need `STRICT`, the `too_many_rows` extra check below, or a separate `count(*)`.
+
+The same rules apply when the target is a row or record variable instead of scalars. `SELECT * INTO STRICT r FROM orders WHERE customer_id = c`, with `r orders%ROWTYPE`, returned `3:5` for customer 8 and raised P0003 for customer 7.
+
+## Catch Silent Truncation With extra_errors
+
+To find non-`STRICT` statements that quietly take the first of several rows, PL/pgSQL has opt-in checks. Setting `plpgsql.extra_errors = 'too_many_rows'` turns the silent case into the same error:
+
+```sql
+SET plpgsql.extra_errors = 'too_many_rows';
+SELECT order_total3(7);   -- same body as order_total2
+-- ERROR:  query returned more than one row
+```
+
+And `plpgsql.extra_warnings = 'too_many_rows'` logs a warning but still returns the first row:
+
+```text
+WARNING:  query returned more than one row
+HINT:  Make sure the query returns a single row, or use LIMIT 1.
+```
+
+Enabling the warning in development and test environments is a cheap way to find hidden multi-row lookups before they cause wrong results in production.
+
+## A Related Silent Problem: Column Count Mismatches
+
+Row count is not the only thing `INTO` handles loosely. If the query returns more columns than there are target variables, the extra columns are dropped. If it returns fewer, the remaining variables become `NULL`. In this function, both statements ran without any message and the result was `a=3 b=`:
+
+```sql
+SELECT id, total INTO a FROM orders WHERE customer_id = c;   -- total is discarded
+SELECT id INTO a, b FROM orders WHERE customer_id = c;       -- b is set to NULL
+```
+
+The `strict_multi_assignment` extra check catches both cases. As a warning, it logged `number of source and target fields in assignment does not match` twice. As an error (`plpgsql.extra_errors = 'strict_multi_assignment'`), it stopped the function at line 4. A good development setting enables both checks: `SET plpgsql.extra_warnings = 'too_many_rows, strict_multi_assignment';`.
+
+## How to Fix It
+
+Pick the fix based on what the function is supposed to do.
+
+### The Query Should Return One Row: Fix the Filter
+
+If the function looks up a single entity, filter by its key. Then add a unique constraint so the database guarantees it:
+
+```sql
+SELECT total INTO STRICT t FROM orders WHERE id = p_order_id;
+ALTER TABLE orders ADD PRIMARY KEY (id);
+```
+
+If duplicates already exist, P0003 has found a data quality problem. Find the duplicates first:
+
+```sql
+SELECT customer_id, count(*) FROM orders GROUP BY customer_id HAVING count(*) > 1;
+```
+
+### You Want One Specific Row: Order and Limit
+
+If several rows are legitimate and you want one particular row, say which one. The hint's suggestion of `LIMIT 1` is only correct together with an `ORDER BY`:
+
+```sql
+SELECT total INTO t
+FROM orders
+WHERE customer_id = c
+ORDER BY id DESC
+LIMIT 1;       -- the latest order
+```
+
+### You Want an Aggregate
+
+Often the intent was a total or a count, not a single row:
+
+```sql
+SELECT coalesce(sum(total), 0) INTO t FROM orders WHERE customer_id = c;
+```
+
+An aggregate without `GROUP BY` always returns exactly one row, so it can never raise P0002 or P0003.
+
+### You Want All the Rows
+
+Loop over them, or collect them into an array:
+
+```sql
+FOR r IN SELECT id, total FROM orders WHERE customer_id = c LOOP
+  -- process r.id, r.total
+END LOOP;
+
+SELECT array_agg(total ORDER BY id) INTO totals FROM orders WHERE customer_id = c;
+```
+
+## Handling the Exceptions
+
+When zero or several rows are possible but unusual, catch the conditions by name and turn them into clear errors or defaults:
+
+```sql
+CREATE OR REPLACE FUNCTION order_total5(c int) RETURNS numeric
+LANGUAGE plpgsql AS $$
+DECLARE t numeric;
+BEGIN
+  SELECT total INTO STRICT t FROM orders WHERE customer_id = c;
+  RETURN t;
+EXCEPTION
+  WHEN too_many_rows THEN
+    RAISE EXCEPTION 'customer % has several orders', c USING ERRCODE = 'P0003';
+  WHEN no_data_found THEN
+    RETURN 0;
+END $$;
+
+SELECT order_total5(99);   -- 0
+SELECT order_total5(7);    -- ERROR:  customer 7 has several orders
+```
+
+An `EXCEPTION` block creates a subtransaction each time it is entered, which has a cost in tight loops. If the handler would only return a default, a non-`STRICT` query plus a check of `FOUND`, or an aggregate, is cheaper.
+
+## Debugging Workflow
+
+1. Read the `CONTEXT` line. It names the function and the line number within the body; `at SQL statement` or `at EXECUTE` tells you which kind of statement it was.
+2. Turn on `plpgsql.print_strict_params` to see the inputs.
+3. Run the query on its own with those inputs and look at the extra rows.
+4. Decide whether the data is wrong (add a constraint), or the query is wrong (fix the filter, order, aggregate or loop).
+
+Steps 2 and 3 are quicker in an editor that keeps the function, a test call and the inner query side by side. In [Chat2DB](https://chat2db.ai/download) you can open the function from the schema tree, run it with `SET plpgsql.print_strict_params = on` in the same session, and paste the inner query with the reported parameter to see every row it returns.
+
+## Summary
+
+`query returned more than one row` is PL/pgSQL's P0003 error. It is raised by `SELECT ... INTO STRICT` and `EXECUTE ... INTO STRICT` when the query yields several rows, and by `INSERT`, `UPDATE` and `DELETE ... RETURNING INTO` even without `STRICT`. Fix the filter and add a unique constraint when one row is expected. Use `ORDER BY ... LIMIT 1` when you want a specific row, an aggregate when you want a summary, and a loop when you want them all. Turn on `print_strict_params` to see the inputs, and use `extra_warnings = 'too_many_rows'` to find code that silently drops rows.

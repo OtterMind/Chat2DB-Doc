@@ -1,0 +1,210 @@
+---
+title: "Postgres Trigger Error: Record NEW Has No Field"
+description: "Fix record new has no field (42703) in PostgreSQL trigger functions: column typos, renamed columns, shared triggers, quoted names and statement-level triggers."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: November 11, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# Postgres Trigger Error: Record NEW Has No Field
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="November 11, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+An `UPDATE` that used to work starts failing, and the error points at a trigger:
+
+```text
+ERROR:  record "new" has no field "modified_at"
+CONTEXT:  PL/pgSQL assignment "NEW.modified_at := now()"
+PL/pgSQL function touch() line 3 at assignment
+```
+
+The SQLSTATE is `42703`, `undefined_column`, the same code as `column "x" does not exist`. Inside a trigger function, `NEW` and `OLD` are records shaped like the table the trigger fired on. Referring to a field the table does not have raises this error. This guide explains why PostgreSQL accepts such a trigger in the first place, lists the usual causes, and shows how to write triggers that survive schema changes. All examples were run on PostgreSQL 18.6 and 14.24 with identical results.
+
+## Reproducing It
+
+```sql
+CREATE TABLE docs (id int, title text, updated_at timestamptz);
+
+CREATE OR REPLACE FUNCTION touch() RETURNS trigger
+LANGUAGE plpgsql AS $$
+BEGIN
+  NEW.modified_at := now();
+  RETURN NEW;
+END $$;
+
+CREATE TRIGGER docs_touch BEFORE UPDATE ON docs
+  FOR EACH ROW EXECUTE FUNCTION touch();
+
+INSERT INTO docs VALUES (1, 'x', now());   -- works: the trigger only fires on UPDATE
+UPDATE docs SET title = 'y';
+-- ERROR:  record "new" has no field "modified_at"
+```
+
+The table has `updated_at`, the function writes `modified_at`. Both `CREATE FUNCTION` and `CREATE TRIGGER` succeeded, and the `INSERT` worked too. The error appeared only when the trigger actually ran.
+
+## Why CREATE TRIGGER Does Not Catch It
+
+A trigger function is not tied to one table. The same `touch()` function can be attached to ten tables, and `NEW` has a different shape on each. PL/pgSQL therefore cannot check field names when the function is created. It resolves `NEW.modified_at` the first time that line runs for a given table. Two consequences follow:
+
+- The error appears only for the operations and code paths that reach the bad line. A field used only inside `IF TG_OP = 'DELETE'` stays hidden until the first delete.
+- `pg_depend` does not record which columns a PL/pgSQL trigger uses. Dropping or renaming a column the trigger needs succeeds without warning, and the trigger breaks later.
+
+## Cause 1: A Typo or a Different Naming Convention
+
+The most common cause is the one above: `modified_at` versus `updated_at`, `updatedAt` versus `updated_at`, `create_time` versus `created_at`. Compare the field in the error with the real columns:
+
+```sql
+SELECT attname
+FROM pg_attribute
+WHERE attrelid = 'docs'::regclass AND attnum > 0 AND NOT attisdropped
+ORDER BY attnum;
+```
+
+Then fix the function. `CREATE OR REPLACE FUNCTION` takes effect for new calls immediately; you do not need to re-create the trigger.
+
+## Cause 2: Unquoted Mixed-Case Column Names
+
+Field names in PL/pgSQL follow the same folding rules as SQL. An unquoted name is lowered:
+
+```sql
+CREATE TABLE "CamelDocs" (id int, "UpdatedAt" timestamptz);
+
+CREATE OR REPLACE FUNCTION camel() RETURNS trigger
+LANGUAGE plpgsql AS $$
+BEGIN
+  NEW.UpdatedAt := now();
+  RETURN NEW;
+END $$;
+-- trigger created, then:
+INSERT INTO "CamelDocs" VALUES (1, NULL);
+-- ERROR:  record "new" has no field "updatedat"
+```
+
+Notice the lower-case `updatedat` in the message. That is the clue. Quote the field: `NEW."UpdatedAt" := now();` made the insert succeed. Tables created by ORMs that preserve case (some .NET and Java tools do) hit this often. Our guide on [column does not exist](/blog/postgres-column-does-not-exist-fix) covers identifier case in more depth.
+
+## Cause 3: A Column Was Renamed or Dropped
+
+A migration renames `modified_at` to `updated_at`, every query is updated, and the trigger is forgotten. Because there is no dependency, `ALTER TABLE ... RENAME COLUMN` succeeds. Before renaming or dropping a column, search function bodies for it:
+
+```sql
+SELECT p.oid::regprocedure AS function
+FROM pg_proc p
+JOIN pg_language l ON l.oid = p.prolang
+WHERE l.lanname = 'plpgsql'
+  AND p.prosrc ILIKE '%modified_at%';
+```
+
+And list which tables use each trigger function:
+
+```sql
+SELECT tgname, tgrelid::regclass AS table_name, tgfoid::regprocedure AS function
+FROM pg_trigger
+WHERE NOT tgisinternal
+ORDER BY 2, 1;
+```
+
+In our database this showed `docs_touch | docs | touch()`. Add both queries to your migration checklist.
+
+## Cause 4: One Trigger Function on Tables With Different Columns
+
+Shared trigger functions are convenient for auditing and timestamps, but they break as soon as one table lacks the field. There are two clean solutions.
+
+**Option A: one function per column layout.** Keep generic logic in the function and attach it only to tables that have the columns. This is the simplest and fastest approach.
+
+**Option B: make the function check for the column.** Convert `NEW` to `jsonb` to test for a key, and write the value back with `jsonb_populate_record`:
+
+```sql
+CREATE OR REPLACE FUNCTION generic_touch() RETURNS trigger
+LANGUAGE plpgsql AS $$
+BEGIN
+  IF to_jsonb(NEW) ? 'updated_at' THEN
+    NEW := jsonb_populate_record(NEW, jsonb_build_object('updated_at', now()));
+  END IF;
+  RETURN NEW;
+END $$;
+
+CREATE TRIGGER docs_gen  BEFORE UPDATE ON docs    FOR EACH ROW EXECUTE FUNCTION generic_touch();
+CREATE TRIGGER audit_gen BEFORE UPDATE ON t_audit FOR EACH ROW EXECUTE FUNCTION generic_touch();
+```
+
+With this version, updating `docs` set `updated_at` to the current time, and updating `t_audit`, which has no such column, worked without error. The `jsonb` round trip costs a little CPU per row, so prefer option A on hot tables. Another option is to pass the column name as a trigger argument (`EXECUTE FUNCTION touch('updated_at')`) and read it from `TG_ARGV[0]`. Note that `NEW.TG_ARGV[0]` is not valid syntax, so a dynamic column name still needs the `jsonb` approach or `hstore`.
+
+## Unblocking Production While You Fix It
+
+The error aborts every statement that fires the trigger, so a broken timestamp trigger can stop all updates to a table. If the trigger's work is not essential, for example an `updated_at` stamp, you can disable it while you deploy the corrected function:
+
+```sql
+ALTER TABLE docs DISABLE TRIGGER docs_touch;
+-- UPDATE docs ... now succeeds; pg_trigger.tgenabled shows 'D'
+ALTER TABLE docs ENABLE TRIGGER docs_touch;
+```
+
+This needs ownership of the table and takes a lock on it, and rows changed in the meantime will not have the trigger's effect. Do not disable triggers that enforce business rules or write audit records. Fixing the function with `CREATE OR REPLACE` is usually just as fast and needs no lock on the table.
+
+## OLD in INSERT Triggers and NEW in Statement Triggers
+
+Older articles warn that accessing `OLD` in an `INSERT` trigger raises `record "old" is not assigned yet`. That was true before PostgreSQL 11. On current versions `OLD` is simply `NULL` in an `INSERT` trigger, and `NEW` is `NULL` in a `DELETE` trigger. We verified this on 14 and 18:
+
+```sql
+CREATE OR REPLACE FUNCTION old_in_insert() RETURNS trigger
+LANGUAGE plpgsql AS $$
+BEGIN
+  RAISE NOTICE 'old title=%', OLD.title;
+  RETURN NEW;
+END $$;
+CREATE TRIGGER docs_old BEFORE INSERT ON docs FOR EACH ROW EXECUTE FUNCTION old_in_insert();
+INSERT INTO docs VALUES (5, 'n', now());
+-- NOTICE:  old title=<NULL>
+```
+
+The same applies to statement-level triggers (`FOR EACH STATEMENT`), where both `NEW` and `OLD` are `NULL`. Our statement trigger printed `title=<NULL>` instead of failing. That is a quiet bug rather than an error. If you need the changed rows in a statement-level trigger, declare transition tables with `REFERENCING NEW TABLE AS new_rows` and query them.
+
+Field-name checks still apply in these cases. `OLD.no_such_column` raises `record "old" has no field "no_such_column"` even when `OLD` is `NULL`. To branch on the operation, test `TG_OP` (`'INSERT'`, `'UPDATE'`, `'DELETE'`, `'TRUNCATE'`) instead of testing whether `OLD` is `NULL`:
+
+```sql
+CREATE OR REPLACE FUNCTION touch() RETURNS trigger
+LANGUAGE plpgsql AS $$
+BEGIN
+  IF TG_OP = 'UPDATE' AND NEW.title IS DISTINCT FROM OLD.title THEN
+    NEW.updated_at := now();
+  END IF;
+  RETURN NEW;
+END $$;
+```
+
+## Inspect What NEW Actually Contains
+
+When the field list is not what you expect, print the record. `to_jsonb(NEW)` shows every field name and value the trigger sees:
+
+```sql
+CREATE OR REPLACE FUNCTION dump_new() RETURNS trigger
+LANGUAGE plpgsql AS $$
+BEGIN
+  RAISE NOTICE 'NEW = %', to_jsonb(NEW);
+  RETURN NEW;
+END $$;
+-- NOTICE:  NEW = {"id": 3, "qty": 3, "price": 2, "total": 6}
+```
+
+Attach it temporarily as an `AFTER` trigger and run the failing statement. The keys are the exact column names, in their real case.
+
+## Generated Columns in BEFORE Triggers
+
+Generated columns exist in `NEW`, so they never cause the "no field" error, but they behave differently. In a `BEFORE` trigger, a stored generated column has not been computed yet. For a table with `total numeric GENERATED ALWAYS AS (price * qty) STORED`, our `BEFORE INSERT` trigger printed `NEW.total in BEFORE trigger = <NULL>`. Assigning to it there has no effect: a trigger that set `NEW.total := 99` stored the computed value 1, not 99. Read generated values in `AFTER` triggers, where the `dump_new()` output above showed `"total": 6`, and change the base columns instead of the generated one.
+
+## Preventing It
+
+- **Test every trigger operation.** A smoke test that inserts, updates and deletes one row in each table with triggers catches field errors immediately, because the lines run at least once.
+- **Keep trigger functions near their tables in migrations.** When a migration renames a column, the same file should update the function.
+- **Use a static checker.** The `plpgsql_check` extension can check a trigger function against a specific table (`plpgsql_check_function('touch()', 'docs')`) and reports unknown fields without running the code.
+- **Generate boilerplate.** Our free [trigger generator](https://chat2db.ai/tools/postgres-trigger-generator) produces timestamp and audit triggers with the correct `NEW`/`OLD` usage for each timing.
+
+Looking at the table's columns and the trigger source side by side makes the mismatch obvious. In [Chat2DB](https://chat2db.ai/download) the object tree shows a table's columns and its triggers in one place, and you can open the trigger function, correct the field name and re-run the failing statement without leaving the editor.
+
+## Summary
+
+`record "new" has no field "x"` means a trigger function referenced `NEW.x` (or `OLD.x`) on a table without that column. PL/pgSQL resolves fields at run time, so the error surfaces only when the line executes, and column renames are not blocked by any dependency. Check the column list, quote mixed-case names, search function bodies before renaming columns, and avoid sharing one trigger across tables with different columns, or make it check with `to_jsonb(NEW) ? 'col'`. Branch on `TG_OP`, and remember that `OLD` and `NEW` are `NULL` rather than errors when they do not apply.

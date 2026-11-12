@@ -1,0 +1,187 @@
+---
+title: "Postgres: Could Not Obtain Lock on Row (55P03)"
+description: "Fix ERROR: could not obtain lock on row in relation (55P03) in PostgreSQL: what NOWAIT does, how to find the blocking session, and when to use SKIP LOCKED."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: November 11, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# Postgres: Could Not Obtain Lock on Row (55P03)
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="November 11, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+A worker tries to claim a job, a checkout page tries to reserve stock, and PostgreSQL refuses straight away:
+
+```text
+ERROR:  could not obtain lock on row in relation "jobs"
+```
+
+The SQLSTATE is `55P03`, named `lock_not_available`. Unlike a deadlock or a timeout, this error is not something the server decided after waiting. It happens because the query asked PostgreSQL **not** to wait. This guide shows exactly where the error comes from, how to find the session holding the lock, and how to choose between `NOWAIT`, `SKIP LOCKED` and `lock_timeout`. All examples were run on PostgreSQL 18.6 and 14.24, and both versions produced the same messages.
+
+## Reproducing the Error
+
+Create a small job table:
+
+```sql
+CREATE TABLE jobs (id int PRIMARY KEY, status text);
+INSERT INTO jobs SELECT g, 'queued' FROM generate_series(1, 5) g;
+```
+
+In the first session, lock a row and keep the transaction open:
+
+```sql
+-- session A
+BEGIN;
+SELECT * FROM jobs WHERE id = 1 FOR UPDATE;
+```
+
+In a second session, ask for the same row with `NOWAIT`:
+
+```sql
+-- session B
+SELECT * FROM jobs WHERE id = 1 FOR UPDATE NOWAIT;
+```
+
+```text
+ERROR:  55P03: could not obtain lock on row in relation "jobs"
+LOCATION:  heap_lock_tuple, heapam.c:5235
+```
+
+Without `NOWAIT`, session B would simply wait until session A commits or rolls back. With `NOWAIT`, it gives up at once and raises 55P03. The same applies to `FOR NO KEY UPDATE NOWAIT`, `FOR SHARE NOWAIT` and `FOR KEY SHARE NOWAIT`, whenever the lock it wants conflicts with one already held.
+
+The row lock does not have to come from `SELECT ... FOR UPDATE`. An open transaction that ran `UPDATE jobs SET status = 'running' WHERE id = 1`, or a `DELETE` of that row, holds a conflicting lock too, so a `FOR UPDATE NOWAIT` from another session fails in exactly the same way.
+
+## The Same SQLSTATE, Three Different Messages
+
+55P03 is shared by several messages. Knowing which one you have tells you what to change:
+
+| Message | Cause |
+|---|---|
+| `could not obtain lock on row in relation "jobs"` | A row lock clause with `NOWAIT` hit a locked row |
+| `could not obtain lock on relation "jobs"` | `LOCK TABLE ... NOWAIT` could not get the table lock |
+| `canceling statement due to lock timeout` | The statement waited longer than `lock_timeout` |
+
+We produced all three on the same table:
+
+```sql
+LOCK TABLE jobs IN ACCESS EXCLUSIVE MODE NOWAIT;
+-- ERROR:  25P01: LOCK TABLE can only be used in transaction blocks
+
+BEGIN;
+LOCK TABLE jobs IN ACCESS EXCLUSIVE MODE NOWAIT;
+-- ERROR:  55P03: could not obtain lock on relation "jobs"
+
+SET lock_timeout = '500ms';
+SELECT * FROM jobs WHERE id = 1 FOR UPDATE;
+-- ERROR:  55P03: canceling statement due to lock timeout
+-- CONTEXT:  while locking tuple (0,1) in relation "jobs"
+```
+
+Note the first line: `LOCK TABLE` outside a transaction block is rejected with a different error before any locking happens. The `CONTEXT` line on the timeout message shows the physical row (`ctid` `(0,1)`) the session was waiting for, which is useful when the query touches many rows. For the timeout case in depth, see our [lock_timeout guide](/blog/postgres-lock-timeout-guide).
+
+## Find the Session Holding the Lock
+
+The error itself does not say who holds the row. To find out, run the blocked statement without `NOWAIT` from one session, and inspect it from another:
+
+```sql
+SELECT pid,
+       wait_event_type,
+       wait_event,
+       pg_blocking_pids(pid) AS blocked_by,
+       left(query, 60) AS query
+FROM pg_stat_activity
+WHERE wait_event_type = 'Lock';
+```
+
+In our test the waiting session showed `wait_event_type = Lock`, `wait_event = transactionid` and `blocked_by = {82627}`. A row lock wait shows up as a wait on the other **transaction ID**, not on the table, because PostgreSQL records row locks in the row itself and waiters queue on the locking transaction. Then look at the blocker:
+
+```sql
+SELECT pid, state, now() - xact_start AS xact_age, left(query, 60) AS last_query
+FROM pg_stat_activity
+WHERE pid = ANY (pg_blocking_pids(82630));
+```
+
+```text
+  pid  | state  |    xact_age     |                          last_query
+-------+--------+-----------------+--------------------------------------------------------------
+ 82627 | active | 00:00:02.170875 | BEGIN; UPDATE jobs SET status='running' WHERE id=1; SELECT p
+```
+
+The usual culprits are long transactions: a batch job that updates rows and then does slow work before committing, or a session left `idle in transaction` by an application that forgot to commit. If the blocker is stuck, `pg_cancel_backend(pid)` cancels its current statement and `pg_terminate_backend(pid)` ends the session and rolls back its transaction. Our guide on [cancelling and terminating queries](/blog/postgres-kill-query-cancel-terminate) explains the difference.
+
+## Fix 1: Handle the Error Where NOWAIT Is Intended
+
+`NOWAIT` is usually chosen on purpose, for example to show "this record is being edited" instead of freezing a user interface. In that case 55P03 is an expected result, not a bug, and the code should catch it. In application code, check the SQLSTATE rather than the message text. In PL/pgSQL, the condition name is `lock_not_available`:
+
+```sql
+DO $$
+BEGIN
+  PERFORM 1 FROM jobs WHERE id = 1 FOR UPDATE NOWAIT;
+  RAISE NOTICE 'got the lock';
+EXCEPTION WHEN lock_not_available THEN
+  RAISE NOTICE 'row 1 is busy, try later';
+END $$;
+```
+
+With another session holding row 1, this printed `row 1 is busy, try later` on both versions; without a competing lock it printed `got the lock`. In a long transaction, remember that an error aborts the whole transaction. Wrap the `NOWAIT` statement in a savepoint if the transaction should continue after a failure, or retry the whole transaction from the start.
+
+## Fix 2: Use SKIP LOCKED for Queues
+
+If several workers pull jobs from the same table, `NOWAIT` is the wrong tool. Every worker goes for the first free row, all but one fail, and they retry in a loop. `SKIP LOCKED` lets each worker take the next row nobody else holds:
+
+```sql
+WITH next_job AS (
+  SELECT id
+  FROM jobs
+  WHERE status = 'queued'
+  ORDER BY id
+  FOR UPDATE SKIP LOCKED
+  LIMIT 1
+)
+UPDATE jobs
+SET status = 'running'
+FROM next_job
+WHERE jobs.id = next_job.id
+RETURNING jobs.id;
+```
+
+While session A held row 1, `SELECT id FROM jobs ORDER BY id FOR UPDATE SKIP LOCKED LIMIT 2` returned rows 2 and 3 with no error and no waiting. `SKIP LOCKED` gives an inconsistent view of the table on purpose, so use it only for work queues and similar patterns, never for reports or totals. Our article on [SELECT FOR UPDATE SKIP LOCKED](/blog/postgres-select-for-update-skip-locked) covers queue design, indexing and retries.
+
+## Fix 3: Wait a Little Instead of Not at All
+
+Sometimes the right behaviour is "wait briefly, then give up". `NOWAIT` cannot do that, but `lock_timeout` can:
+
+```sql
+BEGIN;
+SET LOCAL lock_timeout = '2s';
+SELECT * FROM jobs WHERE id = 1 FOR UPDATE;
+-- ... work ...
+COMMIT;
+```
+
+`SET LOCAL` limits the setting to the current transaction. The timeout applies to each lock wait separately, not to the whole statement. If the lock is not granted in time, you get `canceling statement due to lock timeout`, which has the same SQLSTATE 55P03, so the same error handling covers both cases.
+
+## Fix 4: Shorten the Transactions That Hold Locks
+
+If 55P03 shows up where nobody intended contention, the real problem is how long rows stay locked. Row locks are held until the transaction ends, so:
+
+- Commit as soon as the rows are changed. Do slow work such as HTTP calls, file uploads or emails before the transaction or after the commit, not in the middle.
+- Set `idle_in_transaction_session_timeout` so a forgotten `BEGIN` cannot hold locks forever.
+- Lock rows in a consistent order (for example `ORDER BY id`) when one transaction touches several rows. This avoids [deadlocks](/blog/postgres-deadlock-detected-fix) as well.
+- Use `FOR NO KEY UPDATE` instead of `FOR UPDATE` if you will not change the key columns. It does not block foreign key checks from other sessions inserting child rows.
+
+## Which Lock Modes Conflict
+
+The row lock clauses form a hierarchy. A `FOR KEY SHARE` lock, which PostgreSQL takes internally for foreign key checks, only conflicts with `FOR UPDATE`. So `SELECT ... FOR UPDATE NOWAIT` on a parent row can fail while another transaction is inserting a child row that references it. The table-level modes have their own conflict matrix. Our free [Postgres lock conflict checker](https://chat2db.ai/tools/postgres-lock-conflict-checker) shows which statements block each other, and the [lock modes guide](/blog/postgres-lock-table-lock-modes) explains each mode.
+
+## Watching Locks in a GUI
+
+When a production incident involves lock waits, it helps to see sessions, their state and their transaction age side by side. In [Chat2DB](https://chat2db.ai/download) you can save the `pg_stat_activity` and `pg_blocking_pids` queries above as snippets and run them against any connection in a couple of clicks, then cancel or terminate the blocker from the same editor.
+
+## Summary
+
+`could not obtain lock on row in relation` is the 55P03 error that `NOWAIT` raises when the row is locked by another transaction. Decide which behaviour you actually want. Keep `NOWAIT` and catch `lock_not_available` when failing fast is the goal. Use `SKIP LOCKED` for work queues, and `lock_timeout` when a short wait is acceptable. When the error appears unexpectedly, look for the long or idle transaction that holds the row with `pg_blocking_pids()`, and shorten the transactions that hold row locks.

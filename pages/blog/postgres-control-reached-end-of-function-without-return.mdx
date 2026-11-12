@@ -1,0 +1,277 @@
+---
+title: "Control Reached End of Function Without RETURN"
+description: "Fix control reached end of function without RETURN (2F005) in PL/pgSQL: missing ELSE branches, loops, exception handlers, trigger functions and OUT parameters."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: November 11, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# Control Reached End of Function Without RETURN
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="November 11, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+A PL/pgSQL function compiles, works in your tests, and then fails in production with:
+
+```text
+ERROR:  control reached end of function without RETURN
+CONTEXT:  PL/pgSQL function grade(integer)
+```
+
+The SQLSTATE is `2F005`, `function_executed_no_return_statement`. It means execution ran off the end of the function body without hitting a `RETURN` statement, so PostgreSQL had no value to hand back. It is a runtime error, not a compile-time one. `CREATE FUNCTION` accepts the code, and the error only appears for the inputs that take the path without a `RETURN`. This guide shows the patterns that cause it and how to fix each one. We ran every example on PostgreSQL 18.6 and 14.24, which gave the same results.
+
+## A Minimal Example
+
+```sql
+CREATE OR REPLACE FUNCTION grade(score int) RETURNS text
+LANGUAGE plpgsql AS $$
+BEGIN
+  IF score >= 90 THEN
+    RETURN 'A';
+  ELSIF score >= 50 THEN
+    RETURN 'B';
+  END IF;
+END $$;
+
+SELECT grade(95);   -- A
+SELECT grade(10);   -- ERROR:  control reached end of function without RETURN
+```
+
+For a score of 10, neither branch runs, execution reaches the final `END`, and the function has nothing to return. Notice that the `CONTEXT` line names the function but not a line number. The failure happens at the very end, not at a statement.
+
+## Why PostgreSQL Does Not Catch This When You Create the Function
+
+PL/pgSQL checks syntax when you run `CREATE FUNCTION`, but it does not analyse control flow to prove that every path ends in `RETURN`. It cannot know which branches will be taken, and some paths may be unreachable in practice. So the function is accepted, and the problem only surfaces when real data takes the missing path. That is why this error often appears after a new kind of input arrives: a new status value, a negative number, or a `NULL`.
+
+`NULL` deserves special mention. `IF score >= 90` is `NULL` when `score` is `NULL`, so neither branch runs. `grade(NULL)` fails exactly like `grade(10)` unless you handle it.
+
+## Fix 1: End Every Path With RETURN
+
+The simplest fix is a final `RETURN` after the conditional logic, or an `ELSE` branch:
+
+```sql
+CREATE OR REPLACE FUNCTION grade(score int) RETURNS text
+LANGUAGE plpgsql AS $$
+BEGIN
+  IF score IS NULL THEN
+    RETURN NULL;
+  ELSIF score >= 90 THEN
+    RETURN 'A';
+  ELSIF score >= 50 THEN
+    RETURN 'B';
+  END IF;
+  RETURN 'C';
+END $$;
+```
+
+A trailing `RETURN` is more robust than relying on `ELSE`, because it also covers paths you add later. If reaching the end means a bug, say so explicitly instead of returning a made-up value:
+
+```sql
+  RAISE EXCEPTION 'grade(): unexpected score %', score;
+END $$;
+```
+
+That turns a vague 2F005 into an error that names the input.
+
+## Loops That Usually Return
+
+A loop that returns from inside its body has the same weakness. If the loop finishes without returning, control falls through to the end:
+
+```sql
+CREATE OR REPLACE FUNCTION loopret(n int) RETURNS int
+LANGUAGE plpgsql AS $$
+BEGIN
+  WHILE n > 0 LOOP
+    IF n = 3 THEN RETURN n; END IF;
+    n := n - 1;
+  END LOOP;
+END $$;
+
+SELECT loopret(5);  -- 3
+SELECT loopret(2);  -- ERROR:  control reached end of function without RETURN
+```
+
+Searching loops (find the first matching row, retry until success) should always have a `RETURN` or `RAISE` after `END LOOP` for the case where nothing was found.
+
+## Exception Handlers That Swallow the Error
+
+An `EXCEPTION` block replaces the rest of the function body when it catches an error. If the handler does not return, the function reaches the end:
+
+```sql
+CREATE OR REPLACE FUNCTION safe_ratio(n int) RETURNS int
+LANGUAGE plpgsql AS $$
+BEGIN
+  RETURN 10 / n;
+EXCEPTION
+  WHEN division_by_zero THEN
+    RAISE NOTICE 'div by zero';
+END $$;
+
+SELECT safe_ratio(0);
+-- NOTICE:  div by zero
+-- ERROR:  control reached end of function without RETURN
+```
+
+The notice shows that the handler ran. Then the function ended without a value. Add the return value to the handler:
+
+```sql
+EXCEPTION
+  WHEN division_by_zero THEN
+    RAISE NOTICE 'div by zero';
+    RETURN NULL;
+END $$;
+```
+
+## CASE Statements Fail Differently
+
+A PL/pgSQL `CASE` statement without `ELSE` does not fall through silently. It raises its own error when no branch matches:
+
+```sql
+CREATE OR REPLACE FUNCTION grade2(score int) RETURNS text
+LANGUAGE plpgsql AS $$
+BEGIN
+  CASE
+    WHEN score >= 90 THEN RETURN 'A';
+    WHEN score >= 50 THEN RETURN 'B';
+  END CASE;
+END $$;
+
+SELECT grade2(10);
+-- ERROR:  case not found
+-- HINT:  CASE statement is missing ELSE part.
+```
+
+That error (SQLSTATE `20000`) is easier to diagnose because it has a hint and a line number. If you see "case not found" instead of 2F005, the fix is the same: add an `ELSE` branch.
+
+## A Bare RETURN Is Caught Earlier
+
+The opposite mistake, a `RETURN` without a value in a function that must return one, is caught when the function is created, not at run time:
+
+```sql
+CREATE OR REPLACE FUNCTION r_noval(n int) RETURNS int
+LANGUAGE plpgsql AS $$
+BEGIN
+  IF n > 0 THEN RETURN; END IF;
+  RETURN 1;
+END $$;
+-- ERROR:  missing expression at or near ";"
+```
+
+So a function that compiles either returns a value on every `RETURN` it reaches, or reaches its end. The 2F005 error is always about the second case: a path with no `RETURN` at all.
+
+## Trigger Functions
+
+Trigger functions must return too, and they have their own version of the message:
+
+```sql
+CREATE TABLE acc2 (id int, balance numeric);
+
+CREATE OR REPLACE FUNCTION trg_noreturn() RETURNS trigger
+LANGUAGE plpgsql AS $$
+BEGIN
+  NEW.balance := 0;
+END $$;
+
+CREATE TRIGGER t1 BEFORE INSERT ON acc2
+  FOR EACH ROW EXECUTE FUNCTION trg_noreturn();
+
+INSERT INTO acc2 VALUES (4, 1);
+-- ERROR:  control reached end of trigger procedure without RETURN
+```
+
+What to return depends on the trigger:
+
+- **BEFORE ROW triggers** return `NEW` to continue with the (possibly modified) row, or `NULL` to skip this row silently. Returning `OLD` from a `BEFORE DELETE` trigger lets the delete proceed.
+- **AFTER triggers and statement-level triggers** ignore the return value, but the function must still return something. `RETURN NULL;` is the convention.
+- **INSTEAD OF triggers on views** return `NEW` (or `OLD` for deletes) to report that a row was processed, or `NULL` to report nothing.
+
+If you only want to modify the row, the missing piece is nearly always `RETURN NEW;` at the end. Our [trigger generator](https://chat2db.ai/tools/postgres-trigger-generator) writes trigger functions with the correct return for each timing.
+
+## Functions That Do Not Need RETURN
+
+Not every PL/pgSQL function needs a `RETURN` with a value. These all ran without the error:
+
+```sql
+-- RETURNS void: nothing to return
+CREATE OR REPLACE FUNCTION logit(msg text) RETURNS void
+LANGUAGE plpgsql AS $$ BEGIN RAISE NOTICE '%', msg; END $$;
+
+-- OUT parameters: the values of the OUT variables are returned
+CREATE OR REPLACE FUNCTION split_name(full_name text, OUT first text, OUT last text)
+LANGUAGE plpgsql AS $$
+BEGIN
+  first := split_part(full_name, ' ', 1);
+  last  := split_part(full_name, ' ', 2);
+END $$;
+
+-- Set-returning: RETURN NEXT / RETURN QUERY add rows; reaching END finishes the set
+CREATE OR REPLACE FUNCTION evens(n int) RETURNS SETOF int
+LANGUAGE plpgsql AS $$
+BEGIN
+  FOR i IN 1..n LOOP
+    IF i % 2 = 0 THEN RETURN NEXT i; END IF;
+  END LOOP;
+END $$;
+```
+
+`SELECT * FROM split_name('Ada Lovelace')` returned `Ada | Lovelace`, and `evens(5)` returned 2 and 4. So one way to avoid 2F005 in functions that compute several values is to declare `OUT` parameters. In a set-returning function, reaching the end is the normal way to finish; a bare `RETURN;` also ends it early.
+
+## Procedures, DO Blocks and RETURNS TABLE
+
+Procedures created with `CREATE PROCEDURE` return nothing, so `CALL p_noret(1)` ran to its end without any error. Anonymous `DO` blocks are the same. A function declared `RETURNS TABLE (...)` is a set-returning function, so reaching the end simply ends the result set: our `tab_noret(0)`, which only ran `RETURN QUERY` for positive inputs, returned zero rows instead of failing. If an empty result is a bug for some inputs, raise an exception explicitly.
+
+## Sweep the Inputs to Find Missing Paths
+
+Because the error only appears for certain inputs, a quick sweep over a range of values finds the gaps before users do. Catch SQLSTATE `2F005` for each call and collect the failures:
+
+```sql
+DO $$
+DECLARE bad int[] := '{}';
+BEGIN
+  FOR s IN -5..100 LOOP
+    BEGIN
+      PERFORM grade(s);
+    EXCEPTION WHEN SQLSTATE '2F005' THEN
+      bad := bad || s;
+    END;
+  END LOOP;
+  RAISE NOTICE 'inputs without RETURN: % values, from % to %',
+    cardinality(bad), bad[1], bad[cardinality(bad)];
+END $$;
+```
+
+For the original `grade()` this printed `inputs without RETURN: 55 values, from -5 to 49`, which shows the missing branch at a glance. Add `NULL` and the boundary values of each `IF` to such tests, and keep them in your migration test suite.
+
+## SQL Functions Behave Differently
+
+A `LANGUAGE sql` function cannot hit this error. It returns the result of its last query, and a `CASE` expression without `ELSE` simply yields `NULL`:
+
+```sql
+CREATE OR REPLACE FUNCTION grade3(score int) RETURNS text
+LANGUAGE sql AS $$
+  SELECT CASE WHEN score >= 90 THEN 'A' WHEN score >= 50 THEN 'B' END
+$$;
+
+SELECT grade3(10) IS NULL;   -- true
+```
+
+For simple mappings like this, a SQL function is shorter and can be inlined by the planner. Just be aware that it hides the missing case as a `NULL` instead of failing. Our guide to [creating functions in PostgreSQL](/blog/postgres-create-function-guide) compares the two languages.
+
+## Finding the Function That Fails
+
+The `CONTEXT` line names the function and its argument types, for example `PL/pgSQL function grade(integer)`. When it is called from a trigger or a view, there may be several context lines; the first is the innermost function. To read the current source:
+
+```sql
+SELECT pg_get_functiondef('grade(integer)'::regprocedure);
+```
+
+Then trace every path through the body, including the `ELSE`-less `IF` branches, the loop exits and each exception handler, and confirm that each one ends in `RETURN` or `RAISE`. The `plpgsql_check` extension, if you can install it, reports missing returns statically, which is useful in CI.
+
+Reviewing long function bodies is easier in an editor with syntax highlighting and a schema browser. [Chat2DB](https://chat2db.ai/download) opens a function's source from the object tree, so you can edit it, re-create it with `CREATE OR REPLACE`, and rerun the failing call in the same window.
+
+## Summary
+
+`control reached end of function without RETURN` means a PL/pgSQL function finished without returning a value on the path that ran. Add a final `RETURN` or `RAISE` after `IF` chains and loops, return a value from every exception handler, and handle `NULL` inputs explicitly. Trigger functions need `RETURN NEW` or `RETURN NULL`. Functions with `OUT` parameters, `RETURNS void` or `SETOF` do not need a value. If the error is `case not found` instead, add an `ELSE` to the `CASE` statement.

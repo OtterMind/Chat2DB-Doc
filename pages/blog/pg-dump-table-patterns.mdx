@@ -1,0 +1,200 @@
+---
+title: "pg_dump -t, -T, -n, -N: Table and Schema Patterns"
+description: "How pg_dump -t, -T, -n and -N patterns match: wildcards, case folding, quoting, search_path visibility, partitions, and fixes for no matching tables found."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: November 11, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# pg_dump -t, -T, -n, -N: Table and Schema Patterns
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="November 11, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+Dumping part of a database looks easy: name the tables with `-t`, skip some with `-T`, or limit the dump to a schema with `-n`. Then pg_dump answers with something like:
+
+```text
+pg_dump: error: no matching tables were found
+```
+
+even though the table clearly exists. The reason is that these switches do not take table names. They take **patterns**, and pg_dump turns each pattern into a regular expression with its own rules for case, quotes, dots and wildcards. This guide explains those rules with real results. We built a test database with awkward names (mixed case, dots, a dollar sign, partitions, several schemas) and ran every pattern below through pg_dump 18.6 and 14.24, which gave identical results.
+
+The test objects were:
+
+```sql
+CREATE SCHEMA sales; CREATE SCHEMA "Sales"; CREATE SCHEMA audit_2025; CREATE SCHEMA audit_2026;
+CREATE TABLE public.orders (id serial PRIMARY KEY);
+CREATE TABLE public.order_items (id int);
+CREATE TABLE public."Orders" (id int);
+CREATE TABLE public."order$log" (id int);
+CREATE TABLE public."my.table" (id int);
+CREATE TABLE public.events (id int, ts date) PARTITION BY RANGE (ts);
+CREATE TABLE public.events_2025 PARTITION OF public.events FOR VALUES FROM ('2025-01-01') TO ('2026-01-01');
+CREATE TABLE public.events_2026 PARTITION OF public.events FOR VALUES FROM ('2026-01-01') TO ('2027-01-01');
+CREATE VIEW public.v_orders AS SELECT * FROM public.orders;
+CREATE TABLE sales.orders (id int);
+CREATE TABLE sales.invoices_2025 (id int);
+CREATE TABLE sales.invoices_2026 (id int);
+CREATE TABLE sales.only_in_sales (id int);
+CREATE TABLE "Sales".report (id int);
+CREATE TABLE audit_2025.log (id int);
+CREATE TABLE audit_2026.log (id int);
+```
+
+## The Switches
+
+| Switch | Meaning |
+|---|---|
+| `-t pattern` / `--table` | Dump only tables, views, materialized views, sequences and foreign tables that match |
+| `-T pattern` / `--exclude-table` | Leave matching tables out |
+| `-n pattern` / `--schema` | Dump only matching schemas and their contents |
+| `-N pattern` / `--exclude-schema` | Leave matching schemas out |
+| `--exclude-table-data=pattern` | Keep the table definition but skip its rows |
+| `--strict-names` | Fail if any single `-t` or `-n` pattern matches nothing |
+
+Each switch can be repeated. Exclusions are applied after inclusions.
+
+## How a Pattern Becomes a Regular Expression
+
+pg_dump uses the same pattern rules as psql's `\d` commands. Running psql with `-E` shows the SQL it generates. For `\dt "Ord"*s|x*` it printed:
+
+```sql
+AND c.relname OPERATOR(pg_catalog.~) '^(Ord.*s|x.*)$' COLLATE pg_catalog.default
+AND pg_catalog.pg_table_is_visible(c.oid)
+```
+
+That one line shows most of the rules:
+
+- **Anchored.** The whole pattern is wrapped in `^(` and `)$`, so `orders` matches only `orders`, not `orders_archive`.
+- **Wildcards.** `*` becomes `.*` and `?` becomes `.` (exactly one character).
+- **Case folding.** Letters outside double quotes are lowered, just as SQL folds unquoted identifiers. Inside double quotes the case is kept.
+- **Regex characters pass through.** Outside quotes, characters such as `|`, `+`, `( )`, `[ ]` and `{ }` keep their regular expression meaning. Inside quotes every character is literal.
+- **Dollar is always literal.** `$` is valid in identifiers, so it is escaped even outside quotes.
+- **The dot splits names.** An unquoted `.` separates the schema from the table, or database, schema and table.
+- **Visibility.** With no schema part, only tables visible through the `search_path` can match.
+
+## Results for Common Patterns
+
+This table shows what each `-t` pattern dumped from the test database:
+
+| `-t` pattern | Dumped |
+|---|---|
+| `orders` | public.orders (and its sequence) |
+| `Orders` | public.orders (case folded) |
+| `'"Orders"'` | public."Orders" only |
+| `'order*'` | public."order$log", public.order_items, public.orders, public.orders_id_seq |
+| `'"order*"'` | error: no matching tables (the `*` is literal inside quotes) |
+| `'order?'` | public.orders |
+| `'orders\|order_items'` | public.order_items, public.orders |
+| `'order$log'` | public."order$log" |
+| `my.table` | error: looks for table `table` in schema `my` |
+| `'"my.table"'` | public."my.table" |
+| `'sales.*'` | all four tables in schema sales |
+| `'*.orders'` | public.orders and sales.orders |
+| `Sales.report` | error: folds to schema `sales` |
+| `'"Sales".report'` | "Sales".report |
+| `'audit_202[56].log'` | audit_2025.log, audit_2026.log |
+| `'sales.invoices_20(25\|26)'` | sales.invoices_2025, sales.invoices_2026 |
+| `only_in_sales` | error: not on the search_path |
+
+The single quotes in the table are shell quotes. Always use them. Without quotes, the shell expands `*` against file names in the current directory and removes the double quotes you typed, so `-t "Orders"` reaches pg_dump as plain `Orders`.
+
+## Why "No Matching Tables Were Found"
+
+These are the causes we see most often, in order of frequency.
+
+### Case Folding
+
+`pg_dump -t Orders` looks for `orders`. A table created with quotes as `"Orders"` needs the quotes to reach pg_dump: `-t '"Orders"'`. To match a mixed-case schema and table, quote both parts: `-t '"Sales"."Report"'`.
+
+### The Table Is Not on the search_path
+
+An unqualified pattern is checked with `pg_table_is_visible()`, which uses the connecting role's default `search_path`. That is usually `"$user", public`. `-t only_in_sales` failed because the table lives in schema `sales`, and `-t sales.only_in_sales` worked. When in doubt, qualify every pattern with its schema.
+
+The visibility rule has a second effect. `pg_catalog` is always searched, even when it is not listed in `search_path`, so an unqualified wildcard can match system catalogs. In our tests `-t '*x'` dumped `pg_catalog.pg_index` and `pg_catalog.pg_stat_progress_create_index` along with `public.ordersx`. Qualifying the pattern (`-t 'public.*x'`) avoids that.
+
+### A Dot in the Name
+
+A table named `my.table` must be quoted, or pg_dump reads the dot as the schema separator.
+
+### Several Patterns, One Typo
+
+With several `-t` switches, pg_dump only fails when none of them match anything. `pg_dump -t orders -t nosuch` dumped `orders` and said nothing about `nosuch`. That is how a renamed table silently drops out of a backup script. Add `--strict-names` to make every pattern count:
+
+```text
+pg_dump: error: no matching tables were found for pattern "nosuch"
+```
+
+`--strict-names` applies to `-t` and `-n` only. Exclusion patterns (`-T`, `-N`, `--exclude-table-data`) that match nothing are never an error.
+
+## Schema Patterns With -n and -N
+
+`-n` patterns follow the same rules but match schema names, so there is no dot to split:
+
+```bash
+pg_dump -n 'audit_*' -Fc -f audit.dump        # audit_2025 and audit_2026
+pg_dump -n sales -T 'sales.invoices_*' -Fc -f sales.dump
+pg_dump -N 'audit_*' -Fc -f no_audit.dump
+```
+
+The second command dumped `sales.only_in_sales` and `sales.orders` and skipped both invoice tables. A dot in an `-n` pattern was always rejected in our tests, even when the part before it was the current database name:
+
+```text
+pg_dump: error: cross-database references are not implemented: pat.sales
+```
+
+Two more details matter:
+
+- `-n '*'` matches every schema, including `pg_catalog` and `information_schema`, which a normal dump never includes. Use `-N` to exclude schemas instead.
+- When any `-t` switch is present, `-n` and `-N` have no effect. `pg_dump -n sales -t public.orders` dumped only `public.orders`.
+
+## Partitions and Sequences
+
+Partitioned tables do not pull their partitions in: `-t events` dumped only the parent `public.events`. You have three options:
+
+```bash
+pg_dump -t 'events*' ...                       # matches parent and partitions by name
+pg_dump --table-and-children=events ...        # PostgreSQL 16 and later
+pg_dump --exclude-table-and-children=events ...
+```
+
+`--table-and-children` worked with pg_dump 18 and was rejected as an unrecognized option by pg_dump 14.
+
+Sequences behave the other way. A sequence owned by a dumped table, such as the one behind a `serial` or identity column, is always dumped with its table. Even `-T orders_id_seq` did not remove `public.orders_id_seq` while `public.orders` was included.
+
+## Dumping Structure Without Data
+
+`--exclude-table-data` keeps a table's `CREATE TABLE` but drops its rows. It is the right tool for large log and audit tables in a development copy:
+
+```bash
+pg_dump -d shop --exclude-table-data='audit_*.log' --exclude-table-data='public.events_*' -Fc -f shop_dev.dump
+```
+
+Our test with `-t orders --exclude-table-data=orders` produced the table definition and no `COPY` block.
+
+## pg_restore Does Not Use Patterns
+
+`pg_restore -t`, `-n` and `-I` compare names exactly, without wildcards or schema qualification. In our archive, `pg_restore -t 'order*'` restored nothing, `-t sales.orders` restored nothing, and `-t orders` restored both `public.orders` and `sales.orders`, because the name is matched in every schema. Add `-n sales` to pick one schema. To restore a subset by pattern, list the archive, filter the list, and restore from it:
+
+```bash
+pg_restore -l shop.dump > all.list
+grep -E 'TABLE (DATA )?sales ' all.list > sales.list
+pg_restore -L sales.list -d shop_copy shop.dump
+```
+
+Our guide to [restoring a single table](/blog/pg-restore-single-table) covers that workflow in more detail.
+
+## Test Patterns Before the Backup Runs
+
+A wrong pattern often fails quietly by dumping less than you meant. Before you put a pattern in a cron job, you can preview its matches with psql: `\dt` and `\dv` use the same rules, so `\dt 'sales.invoices_*'` lists what `-t 'sales.invoices_*'` will select.
+
+For more complex combinations of `-t`, `-T`, `-n`, `-N` and `--exclude-table-data`, our free [pg_dump table pattern tester](https://chat2db.ai/tools/pg-dump-table-pattern-tester) shows the regex for each pattern, which of your tables it matches (including the search_path rule), the final list that would be dumped, and a correctly quoted command. Its conversion was checked against pg_dump 14 and 18 on more than two thousand generated patterns. To build the rest of the command, such as format, compression and parallel jobs, use the [pg_dump command generator](https://chat2db.ai/tools/pg-dump-command-generator).
+
+If you prefer a visual check, [Chat2DB](https://chat2db.ai/download) shows every schema and table in the connection tree, which makes it easy to confirm exact names, mixed case and partition children before you write the patterns.
+
+## Summary
+
+`pg_dump` table and schema switches take patterns, not names. Letters fold to lower case unless quoted. `*` and `?` are wildcards, and other regex characters work outside quotes. A dot separates schema and table, and unqualified patterns only see tables on the search_path, plus `pg_catalog`. Quote every pattern for the shell, qualify it with a schema, and add `--strict-names` so a typo fails loudly. Remember that partitions need `--table-and-children` or a matching pattern, and that `pg_restore` only accepts exact names. For a complete backup strategy, see the [pg_dump and pg_restore guide](/blog/pg-dump-pg-restore-backup-guide).

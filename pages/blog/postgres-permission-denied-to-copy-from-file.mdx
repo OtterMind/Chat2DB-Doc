@@ -1,0 +1,137 @@
+---
+title: "Postgres: Permission Denied to COPY From a File"
+description: "Fix permission denied to COPY from a file and must be superuser to COPY in PostgreSQL: pg_read_server_files, \\copy, COPY FROM STDIN, and file access errors."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: November 11, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# Postgres: Permission Denied to COPY From a File
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="November 11, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+You try to load a CSV with `COPY` as a normal application role and PostgreSQL refuses:
+
+```text
+ERROR:  permission denied to COPY from a file
+DETAIL:  Only roles with privileges of the "pg_read_server_files" role may COPY from a file.
+HINT:  Anyone can COPY to stdout or from stdin. psql's \copy command also works for anyone.
+```
+
+The SQLSTATE is `42501`. The error is not about the CSV file's permissions and not about the table. `COPY ... FROM '/path/file.csv'` makes the **database server process** open a file on the **server's** file system. That is a powerful capability, so PostgreSQL limits it to superusers and members of special roles. This guide explains the different versions of the message, the two kinds of fix (move the file reading to the client, or grant the server-side right), and the file errors that come next. We ran every example on PostgreSQL 18.6, 15.19 and 14.24.
+
+## The Message Depends on the Version
+
+The wording changed twice, which matters when you search logs:
+
+| Version | Message |
+|---|---|
+| 14 | `must be superuser or a member of the pg_read_server_files role to COPY from a file` |
+| 15 | `must be superuser or have privileges of the pg_read_server_files role to COPY from a file` |
+| 18 | `permission denied to COPY from a file` with a `DETAIL` naming `pg_read_server_files` |
+
+All three carry the same hint about `STDIN` and `\copy`, and the same SQLSTATE. Writing to a server file and running a program have matching messages:
+
+```text
+ERROR:  permission denied to COPY to a file
+DETAIL:  Only roles with privileges of the "pg_write_server_files" role may COPY to a file.
+
+ERROR:  permission denied to COPY to or from an external program
+DETAIL:  Only roles with privileges of the "pg_execute_server_program" role may COPY to or from an external program.
+```
+
+The first comes from `COPY table TO '/path'`, the second from `COPY ... FROM PROGRAM 'cmd'`.
+
+## Reproducing It
+
+```sql
+CREATE ROLE loader LOGIN;
+CREATE TABLE people (id int, name text);
+GRANT INSERT, SELECT ON people TO loader;
+
+SET ROLE loader;
+COPY people FROM '/srv/import/people.csv' WITH (FORMAT csv, HEADER);
+-- ERROR:  permission denied to COPY from a file
+```
+
+`loader` has `INSERT` on the table, so a normal `INSERT` works. Only the server-side file access is blocked.
+
+## Fix 1: Read the File on the Client With \copy
+
+In most cases the file is on your laptop, a CI runner or an application server, not on the database host. Then server-side `COPY` is the wrong tool anyway, because the server cannot see that file. psql's `\copy` reads the file on the client and streams it to the server as `COPY ... FROM STDIN`, which every role with `INSERT` privilege may run:
+
+```bash
+psql -h db1.example.com -U loader -d shop \
+  -c "\copy people FROM '/home/me/people.csv' WITH (FORMAT csv, HEADER)"
+```
+
+Our run printed `COPY 2` as the unprivileged `loader` role. The options are the same as for `COPY`, with one difference: `\copy` must fit on one line, because psql parses it as a meta-command. For long commands, put the options on one line or use a variable.
+
+You can also pipe a file into a plain `COPY ... FROM STDIN`, which is handy in shell scripts and containers:
+
+```bash
+cat people.csv | psql -h db1.example.com -U loader -d shop \
+  -c "COPY people FROM STDIN WITH (FORMAT csv, HEADER)"
+```
+
+Exports work the same way in reverse: `\copy people TO 'people.csv' WITH (FORMAT csv, HEADER)` or `COPY people TO STDOUT WITH (FORMAT csv, HEADER)` from any role that can `SELECT` the table.
+
+Application drivers have their own streaming APIs for `COPY FROM STDIN`, such as `copy_expert` and `cursor.copy()` in psycopg, `CopyManager` in JDBC, and `pg-copy-streams` for Node.js. Use those instead of server file paths when an application loads data.
+
+## Fix 2: Grant the Server-Side Role
+
+If the file really is on the database server, for example a nightly export dropped into an import directory, grant the predefined role to the loading role:
+
+```sql
+GRANT pg_read_server_files TO loader;     -- COPY FROM 'file'
+GRANT pg_write_server_files TO exporter;  -- COPY TO 'file'
+```
+
+After the grant, the same `COPY` as `loader` returned `COPY 2`. Think about what this grants before you do it. `pg_read_server_files` lets the role read **any** file the PostgreSQL operating system user can read. That includes the data directory, configuration files and possibly keys. `pg_execute_server_program` effectively gives shell access as the `postgres` OS user. Grant these roles only to trusted administrative roles, never to an application role that handles user input.
+
+Managed services usually do not allow these roles at all. Amazon RDS, Cloud SQL and Azure Database for PostgreSQL either withhold them or provide their own import functions, because customers have no access to the server file system. On those platforms the client-side `\copy` route is the only one.
+
+## The Next Errors: File Not Found and Permission Denied
+
+Once the role has the right, the server tries to open the path, and the operating system has the next say. These errors are also often misread:
+
+```text
+ERROR:  could not open file "/srv/import/nope.csv" for reading: No such file or directory
+HINT:  COPY FROM instructs the PostgreSQL server process to read a file. You may want a client-side facility such as psql's \copy.
+```
+
+```text
+ERROR:  could not open file "/srv/import/locked.csv" for reading: Permission denied
+```
+
+The SQLSTATE of the first is `58P01`. Common reasons:
+
+- **The file is on another machine.** The path is resolved on the database server. A path that exists on your laptop does not exist there. This is the most common cause, and the hint points at `\copy` for that reason.
+- **Relative paths.** A relative path is resolved against the server's data directory. `COPY people FROM 'people.csv'` failed with `could not open file "people.csv"` because there was no such file in the data directory (`SHOW data_directory;` prints it). Always use absolute paths with server-side `COPY`.
+- **Operating system permissions.** The server runs as the `postgres` OS user (or whichever user started it). That user needs read permission on the file and execute permission on every directory in the path. Files in a home directory with mode 700, or files owned by root with mode 600, fail with `Permission denied`. Put import files in a dedicated directory owned by, or readable to, the `postgres` user.
+- **Sandboxing.** If the systemd unit that starts PostgreSQL sets `PrivateTmp=true`, the server gets its own private `/tmp`. A file you put in `/tmp` is then invisible to the server even though `ls` shows it. Use a directory outside `/tmp`.
+- **Containers.** In Docker, the server sees the container's file system. Mount the import directory as a volume, or stream the file through `STDIN` with `docker exec -i ... psql -c "COPY ... FROM STDIN"`.
+
+## Choosing Between COPY and \copy
+
+| | Server-side `COPY 'file'` | Client-side `\copy` / `FROM STDIN` |
+|---|---|---|
+| Where the file is read | Database server | Client machine |
+| Privileges needed | Superuser or `pg_read_server_files` / `pg_write_server_files` | Only `INSERT` (or `SELECT` for export) on the table |
+| Works on managed services | Usually not | Yes |
+| Network transfer | None | The whole file goes over the connection |
+| Typical use | Admin jobs on the DB host | Everything else |
+
+For very large files on the database host itself, server-side `COPY` avoids sending the data over a network connection. For everything else, the client-side path is simpler and safer. Our guide on [data migration with psql COPY](/blog/postgresql-data-migration-with-psql-copy) covers performance options for both, and the free [Postgres COPY command generator](https://chat2db.ai/tools/postgres-copy-command-generator) writes `COPY`, `\copy` and `FROM STDIN` variants with the right CSV options.
+
+## Loading Without the Command Line
+
+If you load spreadsheets or CSV files by hand rather than from scripts, a GUI client avoids both the privilege and the file location problems, because it reads the file locally and sends the rows over the connection. [Chat2DB](https://chat2db.ai/download) has an import wizard for CSV and Excel files that maps columns to the target table and works with an ordinary role that has `INSERT` permission.
+
+## Summary
+
+`permission denied to COPY from a file` (or `must be superuser ... to COPY from a file` on older versions) means a role without `pg_read_server_files` asked the database server to read a file. If the file is on the client, which is the usual case, use `\copy` or `COPY ... FROM STDIN`. Neither needs special privileges. If the file is on the server, grant `pg_read_server_files` to a trusted role, use absolute paths, and make sure the `postgres` OS user can reach the file. For errors after the data starts flowing, such as missing columns, see [COPY missing data for column](/blog/postgres-copy-missing-data-for-column).

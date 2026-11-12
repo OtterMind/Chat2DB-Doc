@@ -1,0 +1,195 @@
+---
+title: "PostgreSQL .pgpass File: Format, Escaping, Fixes"
+description: "How the PostgreSQL .pgpass file works: line format, wildcards, escaping colons and backslashes, 0600 permissions, host matching rules, and why it gets ignored."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: November 11, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# PostgreSQL .pgpass File: Format, Escaping, Fixes
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="November 11, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+Scripts that call `psql`, `pg_dump` or `vacuumdb` need a password, and putting it on the command line or in `PGPASSWORD` leaks it into shell history and process listings. The standard answer is the password file, `~/.pgpass`. libpq, the client library behind psql, pg_dump, psycopg and many other tools, reads it whenever the server asks for a password and none was given.
+
+The file is simple, but it is also strict. One wrong colon, a trailing space, or the wrong file mode and libpq silently skips your entry. You then get the same error you were trying to avoid:
+
+```text
+psql: error: connection to server at "127.0.0.1", port 5432 failed: fe_sendauth: no password supplied
+```
+
+This guide explains the format, the matching rules and every failure we could reproduce. All examples were run with psql 18.6 against a PostgreSQL 18.6 server using `scram-sha-256` authentication, and the behaviour was the same with the 14.24 client.
+
+## The .pgpass Line Format
+
+Each line holds one entry with five fields separated by colons:
+
+```text
+hostname:port:database:username:password
+```
+
+A concrete file for two servers looks like this:
+
+```text
+# production primary
+db1.example.com:5432:shop:app:Sup3r-secret
+# any database on the reporting replica
+db2.example.com:5432:*:report:An0ther-secret
+# local development, any host, port and database
+*:*:*:dev:devpass
+```
+
+The rules are:
+
+- The first four fields can be a literal value or a single `*`, which matches anything. A `*` only works as a wildcard when it is the whole field; `db*.example.com` is compared literally and never matches a real host name.
+- Lines that start with `#` are comments. A `#` anywhere else is part of the data.
+- libpq reads the file from the top and uses the **first** line whose four fields match. Order matters: put specific entries above wildcard entries.
+- Blank lines are ignored. Windows line endings (`\r\n`) are stripped, so a file edited on Windows still works.
+
+The database field is compared with the database you connect to. If you do not name one, libpq connects to a database with the same name as the user, and that name is what it looks up. For replication connections the database field must be `replication`.
+
+## Where libpq Looks for the File
+
+On Linux and macOS the default location is `~/.pgpass`. On Windows it is `%APPDATA%\postgresql\pgpass.conf`. You can point libpq somewhere else with the `PGPASSFILE` environment variable or the `passfile` connection parameter, which is useful for service accounts and containers:
+
+```bash
+PGPASSFILE=/etc/myapp/pgpass pg_dump -h db1.example.com -U app -d shop -Fc -f shop.dump
+psql "host=db1.example.com dbname=shop user=app passfile=/etc/myapp/pgpass"
+```
+
+When libpq used a password from the file and the server still rejected it, psql tells you which file it came from. That message is the quickest way to confirm that the file was read at all:
+
+```text
+psql: error: connection to server at "127.0.0.1", port 5518 failed: FATAL:  password authentication failed for user "app"
+password retrieved from file "/home/deploy/.pgpass"
+```
+
+If you see `fe_sendauth: no password supplied` instead, no line matched or the file was ignored. If you see the "password retrieved from file" line, a line did match but its password is wrong.
+
+## Permissions: chmod 600 or the File Is Ignored
+
+On Unix systems libpq refuses to use a password file that other users could read. We created a correct file with mode 644 and connected:
+
+```text
+WARNING: password file "/home/deploy/.pgpass" has group or world access; permissions should be u=rw (0600) or less
+psql: error: connection to server at "127.0.0.1", port 5518 failed: fe_sendauth: no password supplied
+```
+
+The warning is easy to miss in a cron job, because it goes to standard error and the real error follows it. The fix is one command:
+
+```bash
+chmod 600 ~/.pgpass
+ls -l ~/.pgpass
+# -rw-------  1 deploy  staff  92 Nov 11 09:14 /home/deploy/.pgpass
+```
+
+The file must also be a regular file. A symlink to a regular file is fine, but a directory or a device is rejected. On Windows libpq does not check permissions, so protect `pgpass.conf` with the normal folder ACLs instead.
+
+## Escaping Colons and Backslashes
+
+Because the colon separates fields, a colon inside any field must be written as `\:`, and a literal backslash as `\\`. This matters most for generated passwords. Take the password `p:a\ss*1`. The correct line is:
+
+```text
+127.0.0.1:5518:shop:app:p\:a\\ss*1
+```
+
+We tested three versions of that line against a role whose password really is `p:a\ss*1`:
+
+| Line in .pgpass | Password libpq sends | Result |
+|---|---|---|
+| `...:app:p\:a\\ss*1` | `p:a\ss*1` | connects |
+| `...:app:p:a\ss*1` | `p` | password authentication failed |
+| `...:app:p\:a\\ss*1 ` (trailing space) | `p:a\ss*1 ` | password authentication failed |
+
+The second row shows a detail worth remembering: libpq stops reading the password at the first unescaped colon. Everything after it is thrown away, so the server receives a one-character password. The third row shows that trailing spaces are not trimmed. Editors that add whitespace, or a heredoc with an indented closing line, can break an otherwise correct entry.
+
+To escape a password reliably in a script, let `sed` do it:
+
+```bash
+PW='p:a\ss*1'
+ESCAPED=$(printf '%s' "$PW" | sed -e 's/\\/\\\\/g' -e 's/:/\\:/g')
+printf '%s\n' "db1.example.com:5432:shop:app:$ESCAPED" >> ~/.pgpass
+chmod 600 ~/.pgpass
+```
+
+Use `printf '%s'` rather than `echo` or a bare `printf "$PW"`. In our first attempt we passed the password as a printf format string, printf interpreted `\\` itself, and the file ended up with a single backslash. The resulting failure looked exactly like a wrong password.
+
+The same escaping applies to the host, database and user fields. A database called `a:b` is written `a\:b`. A `\*` is a literal asterisk, not a wildcard.
+
+## How the Host Field Is Matched
+
+The host field is compared as a string with the `host` connection parameter, not with a resolved IP address. That produces three surprises.
+
+### localhost and 127.0.0.1 Are Different Entries
+
+With only this line in the file:
+
+```text
+localhost:5518:*:app:p\:a\\ss*1
+```
+
+`psql -h localhost` found the password and connected, while `psql -h 127.0.0.1` failed with `no password supplied`. Both reach the same server, but libpq compares the text you typed. If your scripts use both forms, add both lines, or use `*` for the host when the rest of the line is specific enough.
+
+### Unix Socket Connections
+
+When you connect through a Unix socket, libpq looks up the entry as `localhost`, but only if the socket is in libpq's default socket directory (usually `/var/run/postgresql` on Debian and Ubuntu packages, `/tmp` on many source builds). For any other directory it looks up the directory path itself. Our lab server listened on a non-default directory, and:
+
+```bash
+psql -h /srv/pg/socket -p 5518 -U app -d shop
+```
+
+failed with a `localhost` entry but succeeded with this one:
+
+```text
+/srv/pg/socket:5518:*:app:p\:a\\ss*1
+```
+
+If you omit `-h` entirely, libpq uses its default socket directory, so `localhost` is the right host field.
+
+### hostaddr Does Not Count When host Is Set
+
+If a connection string has both `host` and `hostaddr`, the password lookup uses `host`. Only when `host` is empty does libpq fall back to the `hostaddr` value.
+
+## The Port Field Is a String Too
+
+The port is compared as text, and the default is `5432` when the connection does not specify one. A line written for `5432` will not match a connection to `6432` (a typical PgBouncer port). We confirmed that a `127.0.0.1:5432:shop:app:...` line gives `no password supplied` when connecting to port 5518. If you route through PgBouncer, add a line for the pooler port, or use `*`.
+
+## Multiple Hosts and Failover Strings
+
+libpq accepts several hosts in one connection string, for example `host=db1,db2 port=5432,5433`. It looks up a password separately for every host, so you need one `.pgpass` line per host and port pair. A single line for `db1` leaves the connection to `db2` without a password after a failover, and the problem only shows up when the primary is down.
+
+## A Debugging Checklist
+
+When a connection keeps asking for a password, work through this list in order:
+
+1. **Is the file read?** Run with `-w` (never prompt) and check whether the error says "password retrieved from file". If it does not, the file was ignored or no line matched.
+2. **Permissions.** `ls -l ~/.pgpass` must show `-rw-------`. Check for the "group or world access" warning.
+3. **Which file?** Check `echo $PGPASSFILE` and whether the connection string sets `passfile`. In containers and under sudo, `~` may not be the home directory you expect.
+4. **Exact host text.** Compare the host field with the `-h` value or the `host` parameter, character for character.
+5. **Port and database.** Remember the default port 5432 and the default database name, which equals the user name.
+6. **Order.** Look for an earlier wildcard line that matches first and carries an old password.
+7. **Escaping and whitespace.** Look for unescaped colons, single backslashes and trailing spaces in the password.
+
+Our free [.pgpass and pg_service.conf generator](https://chat2db.ai/tools/pgpass-pg-service-conf-generator) automates steps 4 to 7. Paste your file and the connection details, and it shows which line libpq picks and the exact password it would send, following the same matching code that libpq uses. It can also turn connection URIs into escaped `.pgpass` lines.
+
+## .pgpass, PGPASSWORD and Service Files
+
+`.pgpass` is not the only way to supply a password, and it helps to know how they interact:
+
+- A password given directly, with `password=` in the connection string or the `PGPASSWORD` variable, always wins. libpq only reads `.pgpass` when no password was provided.
+- `PGPASSWORD` is visible to other processes on some systems and is easy to leak into logs. The PostgreSQL documentation recommends the password file instead.
+- A service file (`~/.pg_service.conf`) groups host, port, database and other settings under a name, so you can run `psql service=shop_prod`. It can hold a password too, but keeping passwords in `.pgpass` and everything else in the service file keeps the secrets in one tightly protected file. See our [pg_service.conf guide](/blog/postgres-pg-service-conf) for the details.
+
+Also remember that the server decides whether a password is needed at all. If `pg_hba.conf` uses `trust` or `peer` for your connection, `.pgpass` is never consulted. If you are unsure which rule applies, our article on [the pg_hba.conf file](/blog/pg-hba-conf-explained) explains how the server picks a line.
+
+## Working With GUI Clients
+
+Graphical tools usually store their own passwords and do not read `.pgpass`. In [Chat2DB](https://chat2db.ai/download) you save the password with the connection profile, and the same host, port and user values you put in `.pgpass` apply. That makes it a convenient way to double-check that a password works before you write it into a file used by cron jobs.
+
+## Summary
+
+The `.pgpass` file is the safest way to give command-line PostgreSQL tools a password, as long as you respect its rules. Use one line per host and port, with `*` only for whole fields. Escape `:` and `\`, and keep trailing spaces out. Keep the file at mode 0600, and put specific entries before wildcards. When something fails, the presence or absence of the "password retrieved from file" message tells you whether to look at matching or at the password itself. For connection failures that happen before authentication, see [password authentication failed for user](/blog/postgres-password-authentication-failed-fix).

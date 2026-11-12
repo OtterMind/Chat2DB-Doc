@@ -1,0 +1,192 @@
+---
+title: "PostgreSQL pg_service.conf: Connection Services"
+description: "Use pg_service.conf to name PostgreSQL connections: file format, locations, precedence over PG* variables, and fixes for syntax error in service file."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: November 11, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# PostgreSQL pg_service.conf: Connection Services
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="November 11, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+Long connection commands are hard to type and easy to get wrong:
+
+```bash
+psql "host=db1.example.com port=5432 dbname=shop user=app sslmode=verify-full application_name=reporting"
+```
+
+The connection service file lets you give that set of parameters a name and then connect with just the name:
+
+```bash
+psql service=shop_prod
+```
+
+The file is called `pg_service.conf`, and it is read by libpq, the C client library. That means it works for psql, pg_dump, pg_restore, pgbench, vacuumdb, psycopg and any other client built on libpq, with no changes to scripts beyond the service name. This guide covers the format, where the file lives, how its values combine with environment variables, and the errors you get when libpq cannot read it. Every example was run with the psql 18.6 and 14.24 clients against a PostgreSQL 18.6 server.
+
+## The File Format
+
+A service file is a list of sections. Each section starts with the service name in square brackets, followed by `keyword=value` lines that use the same keywords as a libpq connection string:
+
+```ini
+# ~/.pg_service.conf
+[shop_prod]
+host=db1.example.com
+port=5432
+dbname=shop
+user=app
+sslmode=verify-full
+application_name=reporting
+
+[shop_ro]
+host=db2.example.com
+port=5432
+dbname=shop
+user=report
+options=-c default_transaction_read_only=on
+```
+
+With that file in place, every libpq client can use the names:
+
+```bash
+psql service=shop_prod
+PGSERVICE=shop_ro psql -c 'SHOW default_transaction_read_only'
+pg_dump "service=shop_prod" -Fc -f shop.dump
+psql "postgresql://?service=shop_prod"
+```
+
+In our test, `PGSERVICE=shop_ro` returned `on` for `default_transaction_read_only`, which shows that the `options` line was applied. The `options` keyword is a handy way to set session parameters per service, such as a read-only default for reporting users or a `statement_timeout` for batch jobs.
+
+In Python, psycopg passes the string straight to libpq, so `psycopg.connect("service=shop_prod")` works the same way. Drivers that do not use libpq, such as the JDBC driver or node-postgres, do not read this file.
+
+## Where libpq Looks for the File
+
+libpq searches two places, in this order:
+
+1. The per-user file: `~/.pg_service.conf` on Linux and macOS, `%APPDATA%\postgresql\.pg_service.conf` on Windows. The `PGSERVICEFILE` environment variable overrides this path.
+2. The system-wide file: `pg_service.conf` in the directory given by `PGSYSCONFDIR`, or in the installation's `sysconfdir` (`pg_config --sysconfdir` prints it).
+
+If the service is not defined in the per-user file, libpq moves on to the system file. We confirmed this by defining `[a]` in the `PGSERVICEFILE` file and `[b]` only in `$PGSYSCONFDIR/pg_service.conf`; `service=b` connected. A shared system file is a good way to give every user on a jump host the same service names, while each user keeps their own passwords.
+
+## Rules That Trip People Up
+
+The parser is much stricter than an INI parser. We tested each of these cases with psql, and the 14 and 18 clients behaved the same except for the keyword list.
+
+### No Spaces Around the Equals Sign
+
+```ini
+[sp]
+host = 127.0.0.1
+```
+
+fails with:
+
+```text
+psql: error: syntax error in service file "/home/deploy/.pg_service.conf", line 2
+```
+
+libpq takes everything before the first `=` as the keyword, so the keyword here is `host ` with a trailing space, which does not exist. A space **after** the equals sign is worse, because it does not fail at parse time. With `host= 127.0.0.1`, libpq keeps the leading space as part of the host name and then tries to resolve `" 127.0.0.1"`, which produced an unrelated connection error on our machine. Leading spaces on a line and trailing spaces at the end of a line are removed, so indentation is fine.
+
+### Comments Only on Their Own Line
+
+A line whose first non-blank character is `#` is a comment. A `#` later in a line is part of the value: `application_name=#notcomment` set the application name to `#notcomment`. Text after the closing bracket of a section header is ignored, so `[shop_prod] # primary` still defines `shop_prod`.
+
+### Only Real Connection Keywords
+
+Any keyword libpq does not know is a syntax error. That includes typos such as `portt=5432` and keywords that are newer than your client library. We checked a list of keywords against the 14, 15 and 18 clients: `require_auth`, `load_balance_hosts`, `sslnegotiation`, `sslcertmode`, `gssdelegation`, `min_protocol_version`, `max_protocol_version` and the `oauth_*` parameters are accepted by libpq 18 but rejected by 14 and 15 with `syntax error in service file`. If a shared file must work for old and new clients, leave the newer keywords out, or keep separate files.
+
+### No Nested Services
+
+A `service=` line inside a section is rejected:
+
+```text
+psql: error: nested service specifications not supported in service file "/home/deploy/.pg_service.conf", line 2
+```
+
+### Errors Only Count Inside the Section You Use
+
+libpq only parses the lines of the section it is looking for. A broken line in another section is ignored until someone uses that section. That is convenient, but it also means a typo can sit unnoticed in a rarely used service for months.
+
+### Duplicates: First Value Wins
+
+If a key appears twice in the same section, the first value is used. We set `dbname=shop` and then `dbname=postgres`, and `current_database()` returned `shop`. If the same section name appears twice in a file, libpq stops at the end of the first one, so the second block has no effect.
+
+### Unknown Service Names
+
+```text
+psql: error: definition of service "nope" not found
+```
+
+This means neither file contains the section. Check the spelling, the brackets, and whether `PGSERVICEFILE` points where you think it does.
+
+## Precedence: Explicit Parameters, Service, Environment
+
+A connection can get each setting from several places. libpq applies them in this order, and the first one that sets a value wins:
+
+1. Parameters in the connection string or on the command line.
+2. Values from the service file.
+3. `PG*` environment variables such as `PGDATABASE` and `PGHOST`.
+4. Built-in defaults.
+
+Two tests show the practical effect:
+
+```bash
+# an explicit parameter beats the service file
+psql "service=shop_prod dbname=postgres" -Atc 'select current_database()'
+# postgres
+
+# the service file beats the environment
+PGDATABASE=postgres psql "service=shop_prod" -Atc 'select current_database()'
+# shop
+```
+
+The second result surprises people who expect environment variables to override files. If a deployment sets `PGDATABASE` and also uses a service, the service wins, so make the service file the single source of truth.
+
+Be careful with psql's positional arguments, too. `psql -d postgres service=shop_prod` does not combine the two: psql treats the second word as the user name, and the connection went to the default socket instead of the service host. Put everything in one connection string, or use `-d "service=shop_prod dbname=postgres"`.
+
+## Passwords: Keep Them in .pgpass
+
+A service section may contain `password=`, and libpq uses it (we tested a password containing `:` and `\`, and no escaping was needed in the service file). However, the service file is usually less protected and more widely shared than the password file, and libpq does not check its permissions. The common pattern is:
+
+- `~/.pg_service.conf`: host, port, database, user, SSL and session options. Can be shared or committed to an internal repository.
+- `~/.pgpass`: one line per host, port, database and user, with the password. Mode 0600, never shared.
+
+Because the `.pgpass` lookup uses the final host, port, database and user, it works with services automatically. Our [.pgpass guide](/blog/postgres-pgpass-file) explains the matching and escaping rules.
+
+## Generating and Checking Service Files
+
+Writing these files by hand for a dozen environments is tedious, and the strict parser means small mistakes only show up when someone connects. Our free [.pgpass and pg_service.conf generator](https://chat2db.ai/tools/pgpass-pg-service-conf-generator) takes connection URIs such as `postgresql://app:secret@db1.example.com:5432/shop?sslmode=verify-full` and writes both files, with the passwords moved to `.pgpass` and correctly escaped. It also checks an existing service file for a chosen libpq version, flags spaces around `=`, unknown or too-new keywords and duplicate keys, and shows the parameters a service resolves to. The parser was compared with real psql 14 and 18 runs on hundreds of random files.
+
+## Multi-Host Services for Failover
+
+A service can list several hosts, which gives you client-side failover without changing scripts:
+
+```ini
+[shop_rw]
+host=db1.example.com,db2.example.com
+port=5432,5432
+dbname=shop
+user=app
+target_session_attrs=read-write
+connect_timeout=5
+```
+
+libpq tries the hosts in order and, with `target_session_attrs=read-write`, skips any server that is in recovery. Remember to add a `.pgpass` line for each host, because the password is looked up per host. Our [connection string guide](/blog/postgres-connection-string-guide) covers the other multi-host parameters.
+
+## Using Services in Practice
+
+A few patterns work well:
+
+- **Backups and maintenance.** Cron jobs call `pg_dump service=shop_prod` and never contain host names or credentials. Moving the database to a new host means editing one line.
+- **Per-environment names.** Use `shop_dev`, `shop_staging` and `shop_prod` consistently, and set `PGSERVICE` in each environment's shell profile so a bare `psql` connects to the right place.
+- **Read-only access.** Give analysts a service with `options=-c default_transaction_read_only=on`, so an accidental `UPDATE` fails instead of changing data.
+
+GUI clients keep their own connection list. In [Chat2DB](https://chat2db.ai/download) you can create one connection per environment with the same host, port, database and SSL settings as your service sections, and keep the command-line and GUI views of each database consistent.
+
+## Summary
+
+`pg_service.conf` turns long connection strings into short names that every libpq client understands. Write `key=value` with no spaces around the equals sign, put comments on their own lines, and use only keywords your oldest client supports. Remember that the first value wins and that service values override `PG*` variables but not explicit parameters. Keep passwords in a `.pgpass` file with mode 0600. When something goes wrong, the error message names the file and line number, and the section-only parsing explains why a broken line can stay hidden until someone uses it.
