@@ -1,0 +1,299 @@
+---
+title: "Postgres: Invalid Input Syntax for Type json"
+description: "Fix ERROR: invalid input syntax for type json in PostgreSQL: what each DETAIL message means, how to find bad rows with pg_input_is_valid, and safe jsonb casts."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: November 14, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# Postgres: Invalid Input Syntax for Type json
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="November 14, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+You cast a text column to `jsonb`, load a CSV with a JSON column, or insert a payload from an API, and PostgreSQL stops with:
+
+```text
+ERROR:  invalid input syntax for type json
+DETAIL:  Token "'" is invalid.
+CONTEXT:  JSON data, line 1: {'...
+```
+
+The message is the same for `json` and `jsonb` (both use the same parser). The SQLSTATE is `22P02` (`invalid_text_representation`). The useful information is in the `DETAIL` and `CONTEXT` lines: `DETAIL` says what the parser expected, and `CONTEXT` shows the input up to the point where it gave up. This guide lists the messages you will actually see, with the input that produced each one on PostgreSQL 18.7. It then shows how to find every bad row in a table at once and how to convert a text column to `jsonb` without losing the whole migration to one broken value. PostgreSQL 17.12 produced identical messages for every case.
+
+## The DETAIL Messages and What Causes Them
+
+PostgreSQL's JSON parser follows the JSON standard (RFC 8259) strictly. Most failures come from input that is valid JavaScript or Python but not valid JSON.
+
+### Single quotes
+
+```sql
+SELECT '{''a'': 1}'::json;
+```
+
+```text
+DETAIL:  Token "'" is invalid.
+CONTEXT:  JSON data, line 1: {'...
+```
+
+JSON strings and keys need double quotes. This usually comes from Python's `str(dict)` or `repr()` instead of `json.dumps()`. Fix the producer, not the database.
+
+### Unquoted keys
+
+```sql
+SELECT '{a: 1}'::json;
+```
+
+```text
+DETAIL:  Token "a" is invalid.
+```
+
+JavaScript object literals allow bare keys. JSON does not.
+
+### Trailing commas
+
+```sql
+SELECT '{"a": 1,}'::json;
+```
+
+```text
+DETAIL:  Expected string, but found "}".
+CONTEXT:  JSON data, line 1: {"a": 1,}
+```
+
+After a comma the parser expects another key (a string), and finds the closing brace instead. In an array the message is the same idea with a value instead of a key.
+
+### Python and JavaScript literals
+
+```sql
+SELECT '{"ok": True}'::json;   -- DETAIL:  Token "True" is invalid.
+SELECT '{"v": None}'::json;    -- DETAIL:  Token "None" is invalid.
+SELECT '{"a": NaN}'::json;     -- DETAIL:  Token "NaN" is invalid.
+```
+
+JSON only has `true`, `false` and `null`, in lower case. `NaN` and `Infinity` are not JSON at all. Python's `json.dumps()` writes `NaN` by default, so pass `allow_nan=False` and handle those values explicitly.
+
+### Leading zeros
+
+```sql
+SELECT '{"a": 01}'::json;
+```
+
+```text
+DETAIL:  Token "01" is invalid.
+```
+
+Numbers like ZIP codes or IDs with leading zeros must be strings in JSON: `{"zip": "01234"}`.
+
+### Missing colon
+
+```sql
+SELECT '{"a" 1}'::json;
+```
+
+```text
+DETAIL:  Expected ":", but found "1".
+```
+
+### Empty or truncated input
+
+```sql
+SELECT ''::json;
+SELECT '[1, 2'::json;
+```
+
+```text
+DETAIL:  The input string ended unexpectedly.
+```
+
+An empty string is not valid JSON, and neither is a document cut off partway, for example by a `varchar(255)` column somewhere upstream or a log line limit. The CONTEXT line shows how far the parser got. If an empty value means "no data", store `NULL` instead (see the conversion section below).
+
+### Two documents in one value
+
+```sql
+SELECT '{"a": 1} {"b": 2}'::json;
+```
+
+```text
+DETAIL:  Expected end of input, but found "{".
+```
+
+Newline-delimited JSON (one object per line) has to be split into rows before casting. Each line is valid on its own, but the whole file is not one JSON document.
+
+### Raw control characters
+
+```sql
+SELECT '{"a": "line
+break"}'::json;
+```
+
+```text
+DETAIL:  Character with value 0x0a must be escaped.
+```
+
+A literal newline or tab inside a JSON string must be written as `\n` or `\t`. This usually means someone built the JSON with string concatenation instead of a JSON library.
+
+### Invalid escapes
+
+```sql
+SELECT '{"a": "\x41"}'::json;
+```
+
+```text
+DETAIL:  Escape sequence "\x" is invalid.
+```
+
+JSON knows `\"`, `\\`, `\/`, `\b`, `\f`, `\n`, `\r`, `\t` and `\uXXXX`, nothing else. A Windows path such as `"C:\temp"` breaks for the same reason, because `\t` is fine but `\d`, `\x` and similar are not. Escape backslashes as `\\`.
+
+### Lone Unicode surrogates
+
+```sql
+SELECT '{"a": "\ud83d"}'::jsonb;
+```
+
+```text
+DETAIL:  Unicode low surrogate must follow a high surrogate.
+```
+
+`\ud83d` is the first half of an emoji encoded as a UTF-16 surrogate pair. Some truncation code cut the string between the two halves.
+
+## The \u0000 Special Case: json vs jsonb
+
+One escape behaves differently in the two types:
+
+```sql
+SELECT '{"a": "\u0000"}'::json;    -- works: {"a": "\u0000"}
+SELECT '{"a": "\u0000"}'::jsonb;
+```
+
+```text
+ERROR:  unsupported Unicode escape sequence
+DETAIL:  \u0000 cannot be converted to text.
+CONTEXT:  JSON data, line 1: {"a": "\u0000...
+```
+
+This has its own SQLSTATE, `22P05` (`untranslatable_character`), not 22P02. PostgreSQL `text` cannot contain a NUL byte, and `jsonb` stores strings as text. `json` keeps the original text, so it accepts the escape, but extracting the value fails later with the same error (`'{"a": "\u0000"}'::json ->> 'a'`). If you see this, strip NULs before loading (`replace(payload, '\u0000', '')` on the text) or fix the producer. Our [json vs jsonb comparison](/blog/postgres-json-vs-jsonb) covers the other differences between the types.
+
+## Finding Every Bad Row at Once
+
+A cast fails on the first bad row and tells you nothing about the others:
+
+```sql
+CREATE TABLE raw_events (id int, payload text);
+INSERT INTO raw_events VALUES
+  (1, '{"user": 1}'), (2, '{''user'': 2}'), (3, ''),
+  (4, '{"user": 4,}'), (5, NULL), (6, '{"user": "\u0000"}');
+
+SELECT id, payload::jsonb FROM raw_events;
+-- ERROR:  invalid input syntax for type json
+-- DETAIL:  Token "'" is invalid.
+```
+
+PostgreSQL 16 added `pg_input_is_valid()`, which tests a value against any type's input function without raising an error:
+
+```sql
+SELECT id, payload
+FROM raw_events
+WHERE NOT pg_input_is_valid(payload, 'jsonb');
+```
+
+```text
+ id |      payload
+----+--------------------
+  2 | {'user': 2}
+  3 |
+  4 | {"user": 4,}
+  6 | {"user": "\u0000"}
+```
+
+`NULL` (row 5) is not reported, because a NULL is a valid value of any type. To see *why* each row fails, use `pg_input_error_info()`:
+
+```sql
+SELECT r.id, e.message, e.detail, e.sql_error_code
+FROM raw_events r,
+     LATERAL pg_input_error_info(r.payload, 'jsonb') e
+WHERE e.message IS NOT NULL;
+```
+
+```text
+ id |               message               |                detail                | sql_error_code
+----+-------------------------------------+--------------------------------------+----------------
+  2 | invalid input syntax for type json  | Token "'" is invalid.                | 22P02
+  3 | invalid input syntax for type json  | The input string ended unexpectedly. | 22P02
+  4 | invalid input syntax for type json  | Expected string, but found "}".      | 22P02
+  6 | unsupported Unicode escape sequence | \u0000 cannot be converted to text.  | 22P05
+```
+
+That is a complete error report in one query. On PostgreSQL 15 and older, write a small PL/pgSQL function that tries the cast in a `BEGIN ... EXCEPTION WHEN others` block and returns false on failure.
+
+### The IS JSON predicate
+
+PostgreSQL 16 also added the SQL-standard `IS JSON` predicate, which can additionally check the top-level shape:
+
+```sql
+SELECT id, payload IS JSON AS is_json, payload IS JSON OBJECT AS is_object
+FROM raw_events;
+```
+
+Rows 2, 3 and 4 were `false`, row 5 `NULL`, and rows 1 and **6** `true`. `IS JSON` checks JSON syntax, and `\u0000` is valid JSON syntax, so it passes even though a `jsonb` cast fails. When the target column is `jsonb`, `pg_input_is_valid(payload, 'jsonb')` is the accurate test.
+
+## Converting a Text Column to jsonb
+
+A plain conversion aborts on the first bad value:
+
+```sql
+ALTER TABLE raw_events ALTER COLUMN payload TYPE jsonb USING payload::jsonb;
+-- ERROR:  invalid input syntax for type json
+```
+
+Decide what should happen to bad rows first. To turn them into `NULL`:
+
+```sql
+ALTER TABLE raw_events
+  ALTER COLUMN payload TYPE jsonb
+  USING CASE WHEN pg_input_is_valid(payload, 'jsonb') THEN payload::jsonb END;
+```
+
+This succeeded on our table, leaving row 1 as `{"user": 1}` and the invalid rows as NULL. Copy the bad rows to a side table before the conversion if you need to fix them later. `ALTER COLUMN TYPE` rewrites the table under an exclusive lock, so for big tables add a new `jsonb` column and backfill it in batches instead. Our [ALTER COLUMN TYPE guide](/blog/postgres-alter-column-type) shows that pattern.
+
+## COPY and CSV Loads
+
+With `COPY`, the error names the line and the column:
+
+```text
+ERROR:  invalid input syntax for type json
+DETAIL:  Token "'" is invalid.
+CONTEXT:  JSON data, line 1: {'...
+COPY j, line 2, column doc: "{'a': 2}"
+```
+
+Load such files into a staging table with a `text` column first, validate with `pg_input_is_valid()`, then insert the good rows into the real table. On PostgreSQL 17 and newer, `COPY ... WITH (ON_ERROR ignore)` can also skip rows whose values fail type input. Loading a four-line file with two bad JSON values that way reported `NOTICE:  2 rows were skipped due to data type incompatibility` and `COPY 2` on both 17.12 and 18.7. Check that notice before trusting the result. The general case of this error for other types (integers, dates, booleans) is covered in our [invalid input syntax guide](/blog/postgres-invalid-input-syntax-for-type-fix).
+
+## Validate at the Door
+
+Many of these errors show up late because the JSON was stored in a `text` column and only cast when someone queried it. If the column is `jsonb` from the start, the same input fails at `INSERT` time, inside the request that sent it, with the `DETAIL` message right there in the application log. That is far easier to fix than a report that fails weeks later on row 4 million. If a staging table must accept anything, keep the raw `text` column, and in the step that copies rows into the typed table, filter with `pg_input_is_valid(payload, 'jsonb')`. Rows that fail go to a reject table together with their `pg_input_error_info()` detail. That way you have a record of every bad payload and the reason it was rejected.
+
+## Build JSON in SQL, Not by Concatenation
+
+When the JSON is built in SQL, use the JSON functions. They handle quoting and escaping for you:
+
+```sql
+SELECT to_json('it''s'::text), json_build_object('k', 'v''s');
+```
+
+```text
+ to_json | json_build_object
+---------+-------------------
+ "it's"  | {"k" : "v's"}
+```
+
+`jsonb_build_object`, `json_agg`, `to_jsonb(row)` and `row_to_json` cover nearly every case where people reach for `'{"' || key || '": "' || value || '"}'`, which breaks as soon as a value contains a quote, a backslash or a newline. More functions are covered in the [jsonb operators and functions guide](/blog/postgres-jsonb-operators-and-functions).
+
+When you are cleaning up a batch of failed rows, it helps to see the raw value, the `pg_input_error_info()` detail and the fixed value side by side. In [Chat2DB](https://chat2db.ai/download) you can run the validation query, edit the offending payloads in the result grid, and re-run the check before converting the column.
+
+## Summary
+
+`invalid input syntax for type json` (22P02) means the text is not valid JSON, and the `DETAIL` line says exactly why. The usual causes are single quotes, bare keys, trailing commas, `True`/`None`/`NaN`, leading zeros, empty strings, raw newlines, bad escapes and truncated documents. `\u0000` is the exception: it is valid `json` but fails as `jsonb` with 22P05. Find every bad row with `pg_input_is_valid()` and `pg_input_error_info()` (PostgreSQL 16+), convert columns with a `CASE` in the `USING` clause, and build JSON with the JSON functions instead of string concatenation.

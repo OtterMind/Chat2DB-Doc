@@ -1,0 +1,196 @@
+---
+title: "Postgres amcheck: Check B-tree and GIN Indexes"
+description: "Use amcheck and pg_amcheck to detect PostgreSQL index and heap corruption: bt_index_check, heapallindexed, gin_index_check in 18, verify_heapam and fixes."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: November 14, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# Postgres amcheck: Check B-tree and GIN Indexes
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="November 14, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+Index corruption in PostgreSQL rarely announces itself. A query that should find 100 rows finds 99, a unique index lets a duplicate in, or an index scan suddenly fails with an error about a page. The November 2026 update releases (18.7, 17.12, 16.16, 15.20, 14.25) fixed several bugs of this kind, in GIN, `pg_trgm` GiST and `bpchar` B-tree indexes, which is why many teams are asking right now whether their indexes are healthy.
+
+`amcheck` is the contrib extension built for that question. It checks B-tree indexes against their own invariants and against the table. Since PostgreSQL 14 it also checks tables, and since 18 GIN indexes. `pg_amcheck` is the command-line tool that runs those checks across a whole database. This guide shows each function on a real PostgreSQL 18.7 cluster. We first checked healthy indexes, then overwrote bytes in index and table files on purpose, and recorded exactly what each check reported.
+
+## Installing amcheck
+
+`amcheck` ships with PostgreSQL in the contrib package. Install it in each database you want to check:
+
+```sql
+CREATE EXTENSION amcheck;
+SELECT extversion FROM pg_extension WHERE extname = 'amcheck';  -- 1.5 on PostgreSQL 18
+```
+
+The functions only read. They take an `AccessShareLock` (the same as a `SELECT`) for `bt_index_check` and `gin_index_check`, and a `ShareLock` on the table for `bt_index_parent_check`, which blocks writes while it runs. By default only superusers can execute them. Grant `EXECUTE` on the functions to a monitoring role if needed.
+
+Our test table:
+
+```sql
+CREATE TABLE orders (id bigint PRIMARY KEY, customer text, tags text[], doc jsonb);
+INSERT INTO orders
+SELECT g, 'customer ' || (g % 500), ARRAY['t' || (g % 7), 't' || (g % 11)], jsonb_build_object('n', g % 100)
+FROM generate_series(1, 50000) g;
+CREATE INDEX orders_customer ON orders (customer);
+CREATE INDEX orders_tags ON orders USING gin (tags);
+CREATE INDEX orders_doc ON orders USING gin (doc jsonb_path_ops);
+```
+
+## bt_index_check: The Everyday B-tree Check
+
+```sql
+SELECT bt_index_check('orders_pkey');
+SELECT bt_index_check('orders_customer', heapallindexed => true);
+```
+
+On a healthy index both return a single empty row (the function returns `void`). With no options it checks that keys on every page are in order and that pages agree with their siblings. `heapallindexed => true` adds the most useful check: it scans the table and confirms that every row that should be in the index really is. That catches the "query misses rows" kind of corruption. It costs a full table scan, so expect it to take about as long as a `count(*)`.
+
+PostgreSQL 17 added a third option, `checkunique => true`, which verifies that a unique index does not contain more than one visible entry for the same key.
+
+### bt_index_parent_check: Deeper, but Blocks Writes
+
+```sql
+SELECT bt_index_parent_check('orders_customer', heapallindexed => true, rootdescend => true);
+```
+
+This also checks the links between parent and child pages. `rootdescend` re-finds every leaf tuple by searching from the root, which is the most thorough test there is. The price is the `ShareLock`: inserts, updates and deletes on the table wait until it finishes. Run it during a maintenance window or on a restored copy.
+
+## gin_index_check: New in PostgreSQL 18
+
+```sql
+SELECT gin_index_check('orders_tags');
+SELECT gin_index_check('orders_doc');
+```
+
+Both returned empty rows on our healthy indexes. According to the PostgreSQL 18 documentation, the function tests that parent and child tuples in the GIN index are consistent and that the page graph respects balanced-tree invariants. It does **not** compare entries with the table the way `heapallindexed` does for B-trees, so it can confirm that the tree is well formed, but not that every entry points at the right row. For the GIN bug fixed in 18.7, where VACUUM could leave entries "pointing at unrelated table rows", a clean `gin_index_check` is not proof. Rebuilding remains the safe fix, as our [18.7 reindex guide](/blog/postgres-18-7-update-reindex) explains.
+
+Two practical details: on PostgreSQL 17 and older the function does not exist (`ERROR: function gin_index_check(unknown) does not exist`), and passing the wrong index type is rejected with a clear message:
+
+```text
+ERROR:  expected "gin" index as targets for verification
+DETAIL:  Relation "orders_customer_trgm" is a gist index.
+```
+
+There is no GiST or BRIN checker in amcheck yet.
+
+## Checking Every Index in a Database
+
+You can call the functions from a catalog query to check all B-tree and GIN indexes in one statement:
+
+```sql
+SELECT c.relname, am.amname,
+       CASE am.amname
+         WHEN 'btree' THEN bt_index_check(c.oid, true)::text
+         WHEN 'gin'   THEN gin_index_check(c.oid)::text
+       END AS result
+FROM pg_index i
+JOIN pg_class c ON c.oid = i.indexrelid
+JOIN pg_am am ON am.oid = c.relam
+JOIN pg_namespace n ON n.oid = c.relnamespace
+WHERE am.amname IN ('btree', 'gin')
+  AND n.nspname = 'public'
+  AND i.indisvalid
+  AND c.relpersistence <> 't'
+ORDER BY 1;
+```
+
+The filters matter. Invalid indexes (left over from a failed `CREATE INDEX CONCURRENTLY`) and other sessions' temporary tables cannot be checked. The catch is that the first error aborts the whole statement. For a full sweep, use `pg_amcheck`.
+
+## pg_amcheck: The Command-Line Sweep
+
+`pg_amcheck` (PostgreSQL 14 and newer) connects to one or more databases and runs `verify_heapam` on tables and `bt_index_check` on B-tree indexes. It keeps going after an error and reports every problem it finds:
+
+```bash
+pg_amcheck -d mydb --heapallindexed --progress
+```
+
+On our healthy cluster it checked 275 relations (1,581 pages) and exited with status 0. Useful options from `pg_amcheck --help`:
+
+- `-j NUM`: run that many checks in parallel.
+- `-t`, `-i`, `-s`, `-r PATTERN`: limit the check to matching tables, indexes, schemas or relations.
+- `--parent-check` and `--rootdescend`: use the deeper B-tree checks, with the same locking cost as above.
+- `--checkunique`: verify unique indexes.
+- `--install-missing`: create the amcheck extension where it is missing.
+- `--skip=all-visible` or `--skip=all-frozen`: skip pages the visibility map marks, for a faster heap pass.
+
+The exit status is what you want in a cron job or monitoring check: 0 means clean, 2 means corruption was found.
+
+## What Corruption Looks Like
+
+To see real messages, we stopped the server, overwrote 64 bytes in a few data files with `dd`, and started it again. This is only safe on a throwaway cluster.
+
+### With data checksums (the default since PostgreSQL 18)
+
+`initdb` enables data checksums by default starting with PostgreSQL 18. With checksums on, our damaged pages failed verification as soon as they were read, before amcheck's own logic ran:
+
+```text
+ERROR:  invalid page in block 5 of relation "base/5/16483"
+```
+
+Every check on that index, from `bt_index_check` to `pg_amcheck`, reported the same thing, and `pg_amcheck` exited with status 2. Our article on [invalid page in block](/blog/postgres-invalid-page-in-block) covers this message in detail.
+
+### Without checksums: logical corruption
+
+Checksums only detect bytes that changed after the page was written. A bug that writes a wrong but well-formed page, which is what the index bugs in the update releases do, passes the checksum, and that is where amcheck earns its keep. On a cluster created with `--no-data-checksums`, we damaged key data inside a B-tree leaf page:
+
+```text
+ERROR:  posting list contains misplaced TID in index "orders_customer"
+DETAIL:  Index tid=(5,3) posting list offset=9 page lsn=0/1FC7420.
+```
+
+Note that an ordinary query on that index still returned an answer (100 rows for `customer = 'customer 42'`) without any error. Corruption can stay silent until you look for it.
+
+For the table, we damaged a tuple header and ran `verify_heapam`, which returns one row per problem instead of stopping at the first:
+
+```sql
+SELECT blkno, offnum, attnum, msg
+FROM verify_heapam('orders', on_error_stop => false);
+```
+
+```text
+ blkno | offnum | attnum |                                             msg
+-------+--------+--------+----------------------------------------------------------------------------------------------
+    10 |      2 |        | data begins at offset 255 beyond the tuple length 107
+    10 |      2 |        | tuple data should begin at byte 24, but actually begins at byte 255 (4 attributes, no nulls)
+```
+
+`pg_amcheck` printed the same two lines, prefixed with `heap table "postgres.public.orders", block 10, offset 2:`.
+
+Our random overwrite of a GIN page did not trigger `gin_index_check`, because the bytes we changed did not break the tree structure the function tests. That matches the documentation: the GIN check finds structural damage, not every possible bad byte.
+
+## Fixing What amcheck Finds
+
+**Index corruption** is the easy case, because an index can be rebuilt from the table:
+
+```sql
+REINDEX INDEX CONCURRENTLY orders_customer;
+SELECT bt_index_check('orders_customer', true);  -- clean again
+```
+
+After the rebuild, both the index check and a new `pg_amcheck` run came back clean (exit status 0). The concurrent form lets reads and writes continue. Our [bloat and REINDEX guide](/blog/postgres-table-bloat-reindex-guide) covers the trade-offs.
+
+**Heap corruption** is harder, because the table is the source of truth. In order of preference:
+
+1. Restore the affected table from a backup or point-in-time recovery taken before the damage.
+2. If the damage is limited to a few rows, copy the readable rows out (`CREATE TABLE ... AS SELECT` with a `WHERE` that avoids the bad `ctid`s), then rebuild.
+3. As a last resort, the `pg_surgery` extension can kill or freeze individual tuples so that the rest of the table becomes readable again.
+
+Before any repair, take a file-level copy of the data directory, and find out why it happened: storage errors in the kernel log, a known bug fixed in a later release, or a restore that skipped a step. The [could not access status of transaction](/blog/postgres-could-not-access-status-of-transaction) article shows a related class of damage.
+
+## A Routine That Works
+
+- Run `pg_amcheck --heapallindexed -j 4` weekly on a restored copy of production, or on a standby. That tests your backups at the same time.
+- After every minor update whose notes mention index corruption, check or rebuild the index types it names.
+- Run `bt_index_check(..., heapallindexed => true)` on the biggest and busiest indexes after storage incidents or crashes.
+- Alert on a non-zero `pg_amcheck` exit status.
+
+When you run these checks across several databases, keeping the catalog query and the `REINDEX` statements in one place helps. In [Chat2DB](https://chat2db.ai/download) you can save them as snippets, switch between connections, and run the same check on each database without retyping it.
+
+## Summary
+
+`amcheck` verifies PostgreSQL indexes and tables without modifying them. `bt_index_check` with `heapallindexed => true` is the everyday B-tree check, and `bt_index_parent_check` goes deeper but blocks writes. `gin_index_check` (PostgreSQL 18) validates GIN tree structure, and `verify_heapam` checks table pages. `pg_amcheck` runs them all and exits with 2 on corruption. Data checksums catch damaged bytes at read time, while amcheck catches well-formed but wrong pages, the kind that index bugs produce. Rebuild corrupt indexes with `REINDEX CONCURRENTLY`, and restore or salvage corrupt tables from backup.

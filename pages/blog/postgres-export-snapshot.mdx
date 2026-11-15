@@ -1,0 +1,202 @@
+---
+title: "pg_export_snapshot and SET TRANSACTION SNAPSHOT"
+description: "Share one consistent PostgreSQL snapshot across sessions with pg_export_snapshot and SET TRANSACTION SNAPSHOT, use pg_dump --snapshot, and fix import errors."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: November 14, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# pg_export_snapshot and SET TRANSACTION SNAPSHOT
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="November 14, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+Sometimes one transaction is not enough. You want to export ten large tables in parallel, but every worker must see the database as of the same instant, or a foreign key in one file points at a row that another file does not contain. PostgreSQL solves this with **synchronized snapshots**: one session exports its snapshot with `pg_export_snapshot()`, and other sessions adopt it with `SET TRANSACTION SNAPSHOT`. Parallel `pg_dump -j` is built on exactly this mechanism.
+
+The feature is small but strict, and its error messages can be cryptic. It is also in the news: the November 12, 2026 update releases fixed a bug where "exporting and importing snapshots taken on a standby server" could corrupt both a parallel dump and the standby's data. This guide shows how the feature works and every error you can hit, with output from PostgreSQL 18.7.
+
+## Exporting a Snapshot
+
+A snapshot is the set of transactions a query considers committed. In `REPEATABLE READ` or `SERIALIZABLE`, a transaction keeps one snapshot from its first statement to its end. `pg_export_snapshot()` saves the current transaction's snapshot and returns an identifier:
+
+```sql
+-- session A
+BEGIN ISOLATION LEVEL REPEATABLE READ;
+SELECT pg_export_snapshot();
+```
+
+```text
+ pg_export_snapshot
+---------------------
+ 0000002B-00000002-1
+```
+
+The identifier is valid **only while the exporting transaction is open**. Session A must stay in its transaction, doing nothing or its own work, until every importer has started.
+
+You can also export from a `READ COMMITTED` transaction. We did, and got a valid identifier. It captures the snapshot of that moment, but that snapshot is not what later statements in session A will see, so for clarity export from `REPEATABLE READ`.
+
+## Importing It
+
+In another session, start a transaction and adopt the snapshot **before running any query**:
+
+```sql
+-- session B
+BEGIN ISOLATION LEVEL REPEATABLE READ;
+SET TRANSACTION SNAPSHOT '0000002B-00000002-1';
+SELECT bal FROM acct WHERE id = 1;
+COMMIT;
+```
+
+To prove it works, we exported the snapshot, then committed `UPDATE acct SET bal = 0 WHERE id = 1` from a third session. Session B, importing afterwards, still saw `bal = 100`: it saw the database exactly as session A did when it exported, not the current state.
+
+## pg_dump --snapshot
+
+`pg_dump` can take its data from an exported snapshot:
+
+```bash
+pg_dump -d app -t acct --data-only --snapshot=0000002B-00000002-1
+```
+
+The dump contained `1	100` for the row that had since been updated to 0. This is how you get a dump that is exactly consistent with something else, for example:
+
+- the starting point of a logical replication slot created with `CREATE_REPLICATION_SLOT ... EXPORT_SNAPSHOT` on a replication connection, so the dump plus the slot's changes add up to exactly the source data. That is the classic way to seed a CDC pipeline.
+- an application-level export done in session A at the same moment.
+
+Parallel `pg_dump -j N -Fd` does the same internally: the leader exports a snapshot and each worker imports it, so all tables in the dump come from one point in time. Our [pg_dump and pg_restore guide](/blog/pg-dump-pg-restore-backup-guide) covers the dump formats.
+
+## Every Import Error, Explained
+
+### Wrong isolation level
+
+```sql
+BEGIN;   -- READ COMMITTED
+SET TRANSACTION SNAPSHOT '0000002B-00000002-1';
+```
+
+```text
+ERROR:  a snapshot-importing transaction must have isolation level SERIALIZABLE or REPEATABLE READ
+```
+
+A `READ COMMITTED` transaction takes a new snapshot for every statement, so an imported one would be thrown away immediately. Use `BEGIN ISOLATION LEVEL REPEATABLE READ`. If you run the command without any `BEGIN`, you get a warning first and then the same error:
+
+```text
+WARNING:  SET TRANSACTION can only be used in transaction blocks
+ERROR:  a snapshot-importing transaction must have isolation level SERIALIZABLE or REPEATABLE READ
+```
+
+### A query already ran
+
+```sql
+BEGIN ISOLATION LEVEL REPEATABLE READ;
+SELECT 1;
+SET TRANSACTION SNAPSHOT '0000002B-00000002-1';
+```
+
+```text
+ERROR:  SET TRANSACTION SNAPSHOT must be called before any query
+```
+
+The first query fixes the transaction's own snapshot, and after that it cannot be replaced. Even a trivial `SELECT 1` counts. Some drivers and connection pools run a statement when a transaction begins (setting the search path, a health check). If you hit this error from application code, look for one of those.
+
+### The exporter has finished
+
+```text
+ERROR:  snapshot "0000002B-00000002-1" does not exist
+```
+
+We got this message as soon as session A committed. `pg_dump --snapshot` failed the same way:
+
+```text
+pg_dump: error: query failed: ERROR:  snapshot "0000002B-00000002-1" does not exist
+pg_dump: detail: Query was: SET TRANSACTION SNAPSHOT '0000002B-00000002-1'
+```
+
+A mistyped but well-formed identifier gives the same message. Keep the exporting session open until every importer has run its first query. Once importers have started, the exporter can finish, and the importers keep their copy.
+
+### Malformed identifier
+
+```text
+ERROR:  invalid snapshot identifier: "hello"
+```
+
+Identifiers look like `0000002B-00000002-1`. Pass them as a quoted string literal, not as a parameter placeholder, because `SET` commands do not accept bind parameters in most drivers.
+
+### Different database
+
+```text
+ERROR:  cannot import a snapshot from a different database
+```
+
+A snapshot belongs to the database where it was exported. To coordinate across databases you need something else, such as a logical replication slot per database or a global quiesce.
+
+### Serializable importer, non-serializable exporter
+
+```sql
+BEGIN ISOLATION LEVEL SERIALIZABLE;
+SET TRANSACTION SNAPSHOT '0000002B-00000002-1';   -- exported from REPEATABLE READ
+```
+
+```text
+ERROR:  a serializable transaction cannot import a snapshot from a non-serializable transaction
+```
+
+Serializable transactions track read/write dependencies, which an exporter outside that system cannot provide. Either export from a `SERIALIZABLE` transaction too, or import in `REPEATABLE READ`. Our article on [transaction isolation levels](/blog/postgres-transaction-isolation-levels) explains the difference between the two.
+
+### Exporting from a subtransaction
+
+```sql
+BEGIN;
+SAVEPOINT s;
+SELECT pg_export_snapshot();
+```
+
+```text
+ERROR:  cannot export a snapshot from a subtransaction
+```
+
+Export before creating savepoints. This also applies inside PL/pgSQL blocks with an `EXCEPTION` clause, which run as subtransactions.
+
+## Things to Watch in Production
+
+**The exporter holds back vacuum.** While session A is open, its snapshot is the oldest one in the system, so `VACUUM` cannot remove rows deleted after it began. A parallel dump of a large database can run for hours, and bloat accumulates the whole time. You can watch it happen. With an exporting session open, we updated a row in another session and looked at the snapshot horizons:
+
+```sql
+SELECT pid, state, backend_xmin, age(backend_xmin) AS xmin_age, now() - xact_start AS xact_age
+FROM pg_stat_activity
+WHERE backend_xmin IS NOT NULL AND pid <> pg_backend_pid()
+ORDER BY age(backend_xmin) DESC;
+```
+
+```text
+  pid  |        state        | backend_xmin | xmin_age |    xact_age
+-------+---------------------+--------------+----------+-----------------
+ 17514 | idle in transaction |          912 |        1 | 00:00:01.168714
+```
+
+The exporter shows up as `idle in transaction`, holding `backend_xmin` 912. `VACUUM (VERBOSE)` on the updated table then reported `1 are dead but not yet removable` and `removable cutoff: 912`. The old row version stays until the exporter and every importer finish. On a busy system `xmin_age` grows by thousands per second, so alert when it passes a threshold that fits your write rate. Our [table bloat guide](/blog/postgres-table-bloat-reindex-guide) shows how to measure the effect, and the [idle in transaction guide](/blog/idle-in-transaction) covers sessions that hold snapshots by accident.
+
+**Locks still matter.** Importing a snapshot does not lock any tables. `pg_dump` takes `ACCESS SHARE` locks on every table it dumps, so a concurrent `ALTER TABLE` waits and blocks other queries behind it. See the [lock_timeout guide](/blog/postgres-lock-timeout-guide).
+
+**Standbys.** You can export and import snapshots on a hot standby, and running `pg_dump -j` against a standby is a common way to keep the load off the primary. The November 2026 releases (18.7, 17.12, 16.16, 15.20, 14.25) fixed a bug in exactly this path. According to the release announcement, it "could corrupt both the dump output and the standby server's data", and "a transaction that imported a snapshot taken on a standby server could return wrong results". If you run parallel dumps against standbys, update first. The same releases also fixed an atomicity problem in snapshot import where, in the words of the release notes, "onlookers might not see the source transaction as still running, possibly allowing wrong decisions by VACUUM". Our [minor update guide](/blog/postgres-minor-version-update) covers how to apply them.
+
+**Max connections.** Every importer is a full session. While `pg_dump -Fd -j 3` was running, `pg_stat_activity` showed four sessions with `application_name = 'pg_dump'`: the leader, which exported the snapshot, plus three workers. A parallel dump with `-j 8` therefore needs nine connections, so check that `max_connections` (and any pooler limit) leaves room for them.
+
+## When You Do Not Need It
+
+If only one session reads the data, you do not need an exported snapshot at all. A single `REPEATABLE READ` transaction already sees one consistent state from its first query to `COMMIT`. That is how a plain `pg_dump` without `-j` works: it runs everything in one transaction (`REPEATABLE READ` by default, or `SERIALIZABLE` with `--serializable-deferrable`). Snapshot export is only for when several sessions must agree on the same point in time, such as parallel workers, a dump paired with a replication slot, or an export split across processes.
+
+## A Small Coordinated Export, Step by Step
+
+1. Session A: `BEGIN ISOLATION LEVEL REPEATABLE READ; SELECT pg_export_snapshot();` and note the identifier.
+2. Each worker: `BEGIN ISOLATION LEVEL REPEATABLE READ; SET TRANSACTION SNAPSHOT '<id>';` as the very first statement, then `COPY (SELECT ...) TO STDOUT` for its share of tables.
+3. When all workers have started, session A may `COMMIT`. The workers keep the snapshot until they finish.
+4. Workers commit (or roll back; they only read).
+
+When you script this by hand, it helps to see each session's transaction start and snapshot horizon. In [Chat2DB](https://chat2db.ai/download) you can open several connections in separate tabs, run the export in one and the imports in the others, and watch `pg_stat_activity` from a fourth.
+
+## Summary
+
+`pg_export_snapshot()` shares a transaction's snapshot, and `SET TRANSACTION SNAPSHOT '<id>'` adopts it in another session. The importer must be `REPEATABLE READ` or `SERIALIZABLE`, must import before its first query, must be in the same database, and the exporter must still be open. Serializable importers need a serializable exporter, and exports cannot come from subtransactions. `pg_dump --snapshot` and parallel `pg_dump -j` use the same mechanism. Keep exporting transactions short to protect vacuum, and update to the November 2026 releases before relying on snapshot export on a standby.

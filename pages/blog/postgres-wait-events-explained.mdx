@@ -1,0 +1,202 @@
+---
+title: "Postgres Wait Events Explained: wait_event Guide"
+description: "What wait_event_type and wait_event in pg_stat_activity mean, how to sample them, and what to do about Lock, LWLock, IO, Client and IPC waits in PostgreSQL."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: November 14, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# Postgres Wait Events Explained: wait_event Guide
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="November 14, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+When a PostgreSQL server is slow, the first useful question is not "which query is slow" but "what are the sessions waiting for". PostgreSQL answers it in two columns of `pg_stat_activity`: `wait_event_type` and `wait_event`. A session that shows `Lock` / `transactionid` is stuck behind another transaction. One that shows `IO` / `DataFileRead` is reading from disk. And one with no wait event at all is busy on the CPU.
+
+This guide explains how to read those columns, how to sample them so a single snapshot does not mislead you, and what the common events mean in practice. All the outputs below are real captures from PostgreSQL 18.7. We created the waits on purpose: blocked updates, DDL behind a lock, a sort spilling to disk, a parallel join and an idle transaction.
+
+## The Two Columns
+
+`wait_event_type` is the category and `wait_event` the specific event. PostgreSQL 17 added a view, `pg_wait_events`, that lists every event the server knows about with a description. On 18.7 it has 274 rows in nine categories:
+
+```sql
+SELECT type, count(*) FROM pg_wait_events GROUP BY 1 ORDER BY 2 DESC;
+```
+
+```text
+   type    | count
+-----------+-------
+ LWLock    |    84
+ IO        |    81
+ IPC       |    58
+ Activity  |    18
+ Lock      |    12
+ Timeout   |    10
+ Client    |     9
+ BufferPin |     1
+ Extension |     1
+```
+
+What each category means:
+
+- **Lock**: a heavyweight lock on a SQL object (a table, a row's transaction, an advisory lock). These can last as long as the transaction holding them, and they show up in `pg_locks`.
+- **LWLock**: a lightweight lock protecting a shared memory structure. Each one is normally held for microseconds, so they only matter when many sessions show the same one.
+- **IO**: waiting for a read, write or fsync to finish.
+- **IPC**: waiting for another server process, such as a parallel worker, the checkpointer or a synchronous standby.
+- **Client**: waiting for the client application to send or read data.
+- **Timeout**: an intentional sleep, such as `pg_sleep()`, the vacuum cost delay or spreading checkpoint writes.
+- **Activity**: a background process idling in its main loop. Always normal.
+- **BufferPin**: waiting for exclusive access to a data page that another session has pinned.
+- **Extension**: waiting inside an extension. Since PostgreSQL 17, extensions can register named wait events of their own.
+
+And the most important value of all: **NULL**. For an active session, no wait event means it is running, usually on the CPU.
+
+You can join the two views to get descriptions next to your sessions:
+
+```sql
+SELECT a.pid, a.state, a.wait_event_type, a.wait_event, w.description
+FROM pg_stat_activity a
+LEFT JOIN pg_wait_events w ON w.type = a.wait_event_type AND w.name = a.wait_event
+WHERE a.backend_type = 'client backend' AND a.pid <> pg_backend_pid();
+```
+
+Note that names are case-sensitive in this join, and some are spelled unexpectedly. The temp-file events are `BuffileRead` and `BuffileWrite`, with a lowercase "f", in both views.
+
+## Sample, Do Not Snapshot
+
+One look at `pg_stat_activity` is a single frame of a movie. To see where time actually goes, take many samples and count them. This loop takes 40 samples, 0.1 seconds apart:
+
+```sql
+CREATE TEMP TABLE samples AS
+SELECT clock_timestamp() AS ts, backend_type, wait_event_type, wait_event
+FROM pg_stat_activity WHERE false;
+
+DO $$
+BEGIN
+  FOR i IN 1..40 LOOP
+    PERFORM pg_stat_clear_snapshot();   -- without this, the session list is frozen
+    INSERT INTO samples
+    SELECT clock_timestamp(), backend_type, wait_event_type, wait_event
+    FROM pg_stat_activity
+    WHERE state = 'active' AND pid <> pg_backend_pid();
+    PERFORM pg_sleep(0.1);
+  END LOOP;
+END $$;
+
+SELECT backend_type, coalesce(wait_event_type, 'CPU') AS type,
+       coalesce(wait_event, 'running') AS event, count(*)
+FROM samples GROUP BY 1, 2, 3 ORDER BY 4 DESC;
+```
+
+We ran it while two loops kept a sort with `work_mem = '64kB'` and a parallel hash join over a 4-million-row table busy:
+
+```text
+  backend_type   | type |    event     | count
+-----------------+------+--------------+-------
+ client backend  | CPU  | running      |    64
+ parallel worker | CPU  | running      |    59
+ client backend  | IO   | BuffileWrite |    14
+ parallel worker | IO   | BuffileWrite |    12
+ parallel worker | IO   | BuffileRead  |     3
+ client backend  | IO   | BuffileRead  |     1
+```
+
+Mostly CPU, plus temp-file I/O from the spilling sort and hash join. On a laptop with the data in the OS cache, that is what you would expect. The point is the method: counts across samples tell you what dominates, and a single row tells you almost nothing.
+
+### The pg_stat_clear_snapshot() trap
+
+The `pg_stat_clear_snapshot()` line is not optional. Within one transaction, PostgreSQL reads the list of backends once and reuses it, while the wait event columns are still read live. We ran the same loop without that line during the same workload, and 72 of the 160 rows came back with an empty `backend_type`. They were parallel workers that had already exited but were still on the cached list. Their wait event came back NULL, so the loop counted them as running on CPU. A sampling loop inside a single `DO` block or function has to clear the snapshot each round. Outside a transaction this is not a concern. In psql, `SELECT wait_event_type, wait_event, count(*) FROM pg_stat_activity GROUP BY 1, 2 ORDER BY 3 DESC` followed by `\watch 1` runs each sample as its own statement.
+
+## Lock Waits: Who Is Blocking Whom
+
+Lock waits are the easiest to fix, because there is always a specific blocker. We opened a transaction that updated row 1 and then slept, started two more updates of the same row, and ran an `ALTER TABLE` on the same table:
+
+```text
+  pid  | state  | wait_event_type |  wait_event   |             query
+-------+--------+-----------------+---------------+--------------------------------
+ 89010 | active | Timeout         | PgSleep       | begin; update w set v=1 where
+ 89018 | active | Lock            | transactionid | update w set v=2 where id=1
+ 89019 | active | Lock            | tuple         | update w set v=3 where id=1
+ 89024 | active | Lock            | relation      | alter table w add column z int
+```
+
+Three different lock events from one root cause:
+
+- **transactionid**: the first waiter waits for the row holder's transaction to finish.
+- **tuple**: the second waiter queues for the row lock itself, behind the first waiter. Several `tuple` waits on one table point at a hot row.
+- **relation**: the `ALTER TABLE` needs an `ACCESS EXCLUSIVE` table lock and waits for the open transaction. Every new query on the table now queues behind it, which is how one DDL statement can freeze an application.
+
+`pg_blocking_pids()` turns this into a tree:
+
+```sql
+SELECT pid, pg_blocking_pids(pid) AS blocked_by, wait_event, left(query, 50) AS query
+FROM pg_stat_activity
+WHERE wait_event_type = 'Lock';
+```
+
+The fix is almost always to shorten or end the blocking transaction and to make waiters give up quickly. Run DDL with `SET lock_timeout = '3s'` and retry on failure. Our [lock_timeout guide](/blog/postgres-lock-timeout-guide) covers the details, and the [deadlock guide](/blog/postgres-deadlock-detected-fix) covers the case where two sessions block each other.
+
+Another Lock event you will meet is **virtualxid**. When we ran `CREATE INDEX CONCURRENTLY` while another transaction was open, it showed `Lock` / `virtualxid` until that transaction ended. Concurrent index builds wait for all older transactions, so a forgotten session can make them hang for hours.
+
+## Client Waits: The Application Is the Bottleneck
+
+**ClientRead** means the backend is waiting for the client to send the next command. Every idle session shows it, which is harmless. It becomes a problem when `state` is `idle in transaction`:
+
+```text
+  pid  |  state              | wait_event_type | wait_event | query
+-------+---------------------+-----------------+------------+-----------
+ 14630 | idle in transaction | Client          | ClientRead | SELECT 1;
+```
+
+That session has an open transaction. It holds its locks and its snapshot, which blocks vacuum cleanup across the whole database, while the application does something else. Find them by age:
+
+```sql
+SELECT pid, usename, application_name, now() - state_change AS idle_for, left(query, 60)
+FROM pg_stat_activity
+WHERE state LIKE 'idle in transaction%'
+ORDER BY idle_for DESC;
+```
+
+Set `idle_in_transaction_session_timeout` as a safety net, and fix the code path that forgets to commit. Our article on [idle in transaction](/blog/idle-in-transaction) goes deeper.
+
+**ClientWrite** is the opposite: the server has rows ready but the client is not reading them, because of a slow network or an application that fetches a huge result and processes it row by row.
+
+## IO Waits: Disk and Temp Files
+
+- **DataFileRead**: a page was not in `shared_buffers` and had to be read from the OS. A few are normal. A large share means the working set does not fit in memory, or that queries read far more than they need. Rank queries by `shared_blks_read` in `pg_stat_statements` (see our [pg_stat_statements guide](/blog/postgres-pg-stat-statements-guide)) and look for missing indexes first.
+- **DataFileWrite**: a backend had to write a dirty page itself to free a buffer. The background writer is not keeping up.
+- **WalSync** and **WalWrite**: every commit waits for WAL to reach durable storage. If these dominate, commit latency is bound by the WAL disk. Group small transactions, put WAL on low-latency storage, or use `synchronous_commit = off` for data you can afford to lose in a crash.
+- **BuffileRead / BuffileWrite**: temporary files from sorts, hash joins and hash aggregates that did not fit in `work_mem`, as in our sample above. Raise `work_mem` for that query (see our [work_mem tuning guide](/blog/postgres-work-mem-tuning)) and set `log_temp_files = 0` to log every spill.
+
+PostgreSQL 18 introduced asynchronous I/O and added new events for it, such as `IO` / `AioIoCompletion` and the `Activity` / `IoWorkerMain` event of the new I/O worker processes. In our captures, three `io worker` processes sat in `IoWorkerMain`, which is their idle state.
+
+## LWLock Waits: Contention Inside the Server
+
+LWLock waits are only worth chasing when many sessions show the same one at once. The usual suspects:
+
+- **LockManager**: contention on the shared lock table. It shows up when queries lock many relations, typically many partitions or many indexes, and run out of fast-path lock slots. PostgreSQL 17 has a fixed 16 fast-path slots per backend. In the PostgreSQL 18 source, the number of slot groups is derived from `max_locks_per_transaction`, so raising that setting helps on 18. Reducing the number of relations per query helps everywhere.
+- **BufferMapping**: many sessions are loading pages into `shared_buffers` at the same time.
+- **WALInsert** / **WALWrite**: very high write concurrency.
+- **SubtransSLRU**: a transaction with more than 64 subtransactions. Each backend caches only 64 subtransaction IDs (`PGPROC_MAX_CACHED_SUBXIDS` in the source), and past that every snapshot has to consult `pg_subtrans`. Savepoints in loops and PL/pgSQL `EXCEPTION` blocks inside loops are the usual cause. PostgreSQL 17 added `subtransaction_buffers` (default 32 on our 17.12 build) to enlarge the cache.
+- **XactSLRU** and **MultiXact\*SLRU**: commit status and shared row lock lookups. Since PostgreSQL 17 the matching caches are configurable with `transaction_buffers`, `multixact_offset_buffers` and `multixact_member_buffers`.
+
+## IPC and Timeout Waits
+
+**SyncRep** means commits wait for a synchronous standby to confirm. If the standby is down and it is the only candidate in `synchronous_standby_names`, every commit hangs. Check `pg_stat_replication`. Note that `SyncRep` also exists as an LWLock name. The two are different events, which is why you should always read both columns.
+
+**ParallelFinish** is a parallel query leader waiting for its workers. **CheckpointDone** shows up in commands that force a checkpoint, such as `CREATE DATABASE`.
+
+Timeout events are intentional. `PgSleep` is a `pg_sleep()` call, `VacuumDelay` is cost-based vacuum throttling, and `CheckpointWriteDelay` is the checkpointer spreading its writes. In our captures the checkpointer sat in `CheckpointWriteDelay` during a checkpoint, which is exactly what it should do.
+
+## A Faster Way to Read Samples
+
+Pasting a sample into a search engine one event at a time is slow. Our free [PostgreSQL Wait Event Lookup](https://chat2db.ai/tools/postgres-wait-event-lookup) takes `pg_stat_activity` output (psql tables, CSV, or `Lock:transactionid` lines from monitoring tools) and ranks the events. It moves background and normal waits to the bottom, and for each real wait it shows the official description, a follow-up query and the usual fix. It also works as a search box for single events.
+
+When you are investigating live, it helps to keep the sampling query, the blocking tree and the idle-transaction query side by side. In [Chat2DB](https://chat2db.ai/download) you can save them as snippets, run them against any connection, and act on a blocker from the same window.
+
+## Summary
+
+`wait_event_type` and `wait_event` tell you what each PostgreSQL session is waiting for, and NULL on an active session means it is running on the CPU. Sample repeatedly and count instead of trusting one snapshot. Lock waits (`transactionid`, `tuple`, `relation`, `virtualxid`) always have a blocker that `pg_blocking_pids()` will name. `ClientRead` with `idle in transaction` is an application bug. IO waits point at memory, disk or `work_mem`, and LWLock waits only matter when many sessions share one. `pg_wait_events`, available since PostgreSQL 17, documents every event your server can report.

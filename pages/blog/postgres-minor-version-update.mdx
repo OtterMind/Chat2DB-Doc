@@ -1,0 +1,175 @@
+---
+title: "How to Apply a PostgreSQL Minor Version Update"
+description: "Update PostgreSQL from 18.x or 17.x to the latest minor release: what changes, apt, dnf, Docker and source steps, replicas first, and the post-update checks."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: November 14, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# How to Apply a PostgreSQL Minor Version Update
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="November 14, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+PostgreSQL versions have two parts. The first number is the major version (18), and the second is the minor version, also called an update release (18.7). The project ships update releases for all supported branches at least once a quarter. They contain only bug fixes and security fixes, and the documentation is explicit that they never change the on-disk format, so you do not need `pg_dump` or `pg_upgrade` to apply one.
+
+That makes a minor update the cheapest maintenance you can do, and also the one that is easiest to put off. This guide shows what actually changes during a minor update, how to apply it on the common platforms, why replicas go first, and which post-update steps you must not skip. We ran the procedure on a real data directory: we created it with PostgreSQL 18.6, stopped it, and started it with 18.7 binaries.
+
+## What Changes in a Minor Update (and What Does Not)
+
+A minor update replaces the server binaries and shared libraries. The data directory stays as it is. You can see this in `pg_controldata`, which prints the format numbers stored in the cluster's control file. These are the values before and after our 18.6 to 18.7 update:
+
+```text
+pg_control version number:            1800
+Catalog version number:               202506291
+```
+
+They were identical on both sides. The catalog version only changes between major versions, and the server refuses to start a data directory whose catalog version does not match its binaries. That is why a major upgrade needs `pg_upgrade` and a minor update does not.
+
+What you do get in a minor update:
+
+- Bug fixes, including fixes for wrong query results, crashes and index corruption. The November 2026 releases fixed over 140 bugs.
+- Security fixes. Each release note lists the CVEs it closes.
+- Time zone data updates (the 18.7 releases ship tzdata 2026f).
+- Occasionally a new configuration parameter, when a security fix needs a switch. 18.6 added `output_plugin_libraries` to restrict logical decoding plugins, for example.
+
+What you do not get: new features, new SQL syntax or new extension versions. In our test, `pg_trgm` stayed at version 1.6 and `pageinspect` at 1.13 before and after the update, so no `ALTER EXTENSION ... UPDATE` was needed.
+
+## Step 1: Check Your Current Version
+
+```sql
+SELECT version();
+SHOW server_version;
+SHOW server_version_num;
+```
+
+After our update these returned `PostgreSQL 18.7 on aarch64-apple-darwin...`, `18.7` and `180007`. `server_version_num` is the easiest form to compare in scripts: the major version times 10000 plus the minor version.
+
+The client tools have their own version, which can lag behind the server:
+
+```bash
+psql --version
+pg_config --version
+```
+
+## Step 2: Read the Release Notes for Every Release You Skip
+
+This is the step people skip, and it is the one that matters. The binaries are cumulative: installing 17.12 gives you every fix from 17.1 to 17.12. Post-update steps are **not** applied for you, though. Each release note starts with a "Migration to Version X.Y" section, and some of them say things like "if you have any indexes on ltree columns, it may be necessary to reindex them after updating" (18.2) or "existing incremental backup files should not be trusted" (18.7). If you jump from 18.1 to 18.7, the 18.2 ltree step still applies to you.
+
+The notes chain these together with a sentence like "if you are upgrading from a version earlier than 18.6, see Section E.2". Following that chain by hand across ten releases is tedious, so we built the free [PostgreSQL Minor Update Checker](https://chat2db.ai/tools/postgres-minor-update-checker). Enter the version you run and it lists every skipped release with its migration notes, the changelog entries that ask for a REINDEX or another manual step, the CVEs fixed, and catalog SQL that finds the affected indexes.
+
+## Step 3: Install the New Binaries
+
+The commands depend on how PostgreSQL was installed. In every case the server must be restarted afterwards, because the running processes still use the old binaries.
+
+### Debian and Ubuntu (PGDG apt repository)
+
+```bash
+sudo apt-get update
+sudo apt-get install --only-upgrade postgresql-18 postgresql-client-18
+# The package scripts restart the cluster; check with:
+pg_lsclusters
+```
+
+Install the matching `postgresql-18-*` extension packages (for example `postgresql-18-pgvector`) in the same step, so the extension libraries are updated together with the server.
+
+### RHEL, Rocky, Alma and Fedora (PGDG yum repository)
+
+```bash
+sudo dnf upgrade postgresql18-server postgresql18 postgresql18-contrib
+sudo systemctl restart postgresql-18
+```
+
+### Docker
+
+The official image tags are per minor version. Pin the full version in your compose file and change it on purpose:
+
+```yaml
+services:
+  db:
+    image: postgres:18.7   # was postgres:18.6
+    volumes:
+      - pgdata:/var/lib/postgresql
+```
+
+Then `docker compose pull db && docker compose up -d db`. The container is recreated on the same volume. Do not change the major version this way. A `postgres:17` volume started with `postgres:18` fails with "database files are incompatible with server".
+
+### Source builds and custom binaries
+
+Install the new build into its own prefix, then point the service at it:
+
+```bash
+pg_ctl -D /var/lib/pgsql/data -m fast stop          # old binaries
+/opt/pgsql-18.7/bin/pg_ctl -D /var/lib/pgsql/data -l logfile start
+```
+
+This is exactly what we ran in our test. The 18.7 server started on the 18.6 data directory without any message other than the normal startup lines.
+
+### Managed services
+
+Amazon RDS, Aurora, Cloud SQL and Azure Database for PostgreSQL apply minor versions for you, either in a maintenance window or when you choose a new version in the console. Providers usually lag the community release by a few weeks, and their version number is the one to type into the checker.
+
+## Step 4: Update Replicas Before the Primary
+
+With streaming replication, update the standbys first, then the primary. The 14.1 release notes explain why: "installations using physical replication should update standby servers before the primary server". A standby running the newer code understands WAL from an older primary, but an older standby may not understand WAL that a fix in the newer primary writes differently. A typical rolling update:
+
+1. Update and restart each standby. Check `pg_stat_replication` on the primary until each one is streaming again.
+2. Optionally switch over to an updated standby, so the old primary restarts while it is a standby.
+3. Update and restart the old primary.
+
+Logical replication subscribers can be updated in any order, but read the notes, because some releases change what publishers allow.
+
+## Step 5: Restart with Minimal Downtime
+
+A restart drops every connection. To keep it short:
+
+- Run `CHECKPOINT;` just before stopping. The shutdown checkpoint then has little left to write, and the server goes down in seconds instead of minutes.
+- Use `pg_ctl stop -m fast` (the default). It rolls back open transactions and disconnects clients. `-m smart` waits for every client to disconnect, which can take forever with a connection pool.
+- Put PgBouncer in front of the database and `PAUSE` it during the restart. Clients wait briefly instead of failing.
+
+## Step 6: Run the Post-Update Steps
+
+Now apply what the release notes asked for. For the November 2026 releases that mostly means rebuilding indexes. Here is one case we checked on our updated cluster. A B-tree index on a `bpchar` column built under 18.6 still had deduplication enabled after the update:
+
+```sql
+SELECT allequalimage FROM bt_metap('codes_code');   -- t, still deduplicating
+REINDEX INDEX CONCURRENTLY codes_code;
+SELECT allequalimage FROM bt_metap('codes_code');   -- f after the rebuild
+```
+
+The update changed the code, but the index on disk only changed when it was rebuilt. Our [18.7 reindex guide](/blog/postgres-18-7-update-reindex) lists every index type the current releases ask you to rebuild, with a catalog query for each.
+
+Finish with a quick sanity check:
+
+```sql
+SELECT version();
+SELECT name, default_version, installed_version
+FROM pg_available_extensions
+WHERE installed_version IS NOT NULL AND installed_version <> default_version;
+```
+
+The second query should normally return nothing after a minor update. If it returns a row, an extension package was updated separately and `ALTER EXTENSION name UPDATE;` brings it in line.
+
+## When a Minor Update Is Not Enough
+
+If your branch is out of support, minor updates stop. PostgreSQL 14 reached end of life on November 12, 2026, and 14.25 is its last release. PostgreSQL 15 follows on November 11, 2027. Updating to 14.25 still makes sense, because it includes the final bug and security fixes, but plan the move to 17 or 18 next. Our guides on [PostgreSQL 14 end of life](/blog/postgres-14-end-of-life-upgrade) and [pg_upgrade](/blog/postgres-pg-upgrade-guide) cover that path, and the [version support timeline](/blog/postgresql-eol-version-support-timeline) lists every branch's dates.
+
+## A Checklist You Can Reuse
+
+1. Record `SELECT version();` and `server_version_num` on every node.
+2. Collect the migration notes for every release between your version and the target (the update checker does this).
+3. Take or confirm a recent backup. If you use incremental backups on 17 or 18, plan a new full backup after the update.
+4. Install the new server, client and extension packages.
+5. Update and restart the standbys, then the primary, with a `CHECKPOINT` right before each stop.
+6. Confirm the new version and replication state.
+7. Run the post-update steps: reindexing, `ANALYZE` or configuration changes.
+8. Note the date. The next update release is usually three months away.
+
+Running the version and catalog queries on many servers by hand gets old fast. In [Chat2DB](https://chat2db.ai/download) you can keep them as saved snippets and run them against each connection in turn, so before-and-after checks take a few clicks.
+
+## Summary
+
+A PostgreSQL minor update replaces binaries, keeps the data directory as it is (the catalog version does not change), and needs only a restart. Apply it often: check your version, read the migration notes of every release you skip, install the packages or bump the image tag, update replicas before the primary, and restart with a checkpoint first. Then do the post-update work the notes ask for. The new code does not repair indexes or backups that the old code already damaged.

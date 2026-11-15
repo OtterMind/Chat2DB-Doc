@@ -1,0 +1,177 @@
+---
+title: "Postgres Incremental Backup with pg_combinebackup"
+description: "Take incremental backups with pg_basebackup --incremental and summarize_wal, restore with pg_combinebackup, and fix common errors in PostgreSQL 17 and 18."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: November 14, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# Postgres Incremental Backup with pg_combinebackup
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="November 14, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+PostgreSQL 17 added incremental backups to the core tools. `pg_basebackup --incremental` copies only the blocks that changed since an earlier backup, and `pg_combinebackup` merges a full backup and its chain of incrementals into a normal data directory you can start. No third-party tool is needed. The only server-side requirement is WAL summarization.
+
+The feature is still young. The November 12, 2026 update releases (17.12 and 18.7) say that "existing incremental backup files should not be trusted" because several ways they could become corrupt were found, and recommend taking a new full backup after updating. This guide covers the whole workflow on PostgreSQL 18.7: enabling WAL summaries, taking a full backup and two incrementals, combining and verifying them, starting the result, and the errors you hit when the chain is wrong. Every command and message below comes from that run.
+
+## How It Works
+
+A normal base backup copies every file. An incremental backup needs to know which blocks changed since the previous backup, and reading the whole cluster to find out would defeat the purpose. PostgreSQL 17 solves this with the **WAL summarizer**, a background process that reads WAL as it is written and records, for each range of WAL, which blocks of which relations were modified. Those summaries live in `pg_wal/summaries`.
+
+When you ask for an incremental backup, you give `pg_basebackup` the `backup_manifest` of the previous backup. The server reads the manifest to learn where that backup started, uses the summaries to find every block modified since then, and sends only those blocks for relation files that changed. For each such file the backup contains an `INCREMENTAL.<name>` file instead of the full file. Small files, such as the free space maps, are still sent whole.
+
+A restore always starts from a full backup and applies each incremental in order. `pg_combinebackup` does that offline and writes a complete data directory.
+
+## Step 1: Enable WAL Summarization
+
+Without summaries, an incremental backup is refused:
+
+```text
+pg_basebackup: error: could not initiate base backup: ERROR:  incremental backups cannot be taken unless WAL summarization is enabled
+pg_basebackup: removing data directory "/backups/incr_fail"
+```
+
+Turn it on. It only needs a reload, not a restart:
+
+```sql
+ALTER SYSTEM SET summarize_wal = on;
+SELECT pg_reload_conf();
+SELECT * FROM pg_get_wal_summarizer_state();
+```
+
+```text
+ summarized_tli | summarized_lsn | pending_lsn | summarizer_pid
+----------------+----------------+-------------+----------------
+              1 | 0/4000000      | 0/5028850   |          14277
+```
+
+The related settings, as reported by `pg_settings` on our server:
+
+```text
+         name          | setting | unit
+-----------------------+---------+------
+ summarize_wal         | on      |
+ wal_level             | replica |
+ wal_summary_keep_time | 14400   | min
+```
+
+`wal_level` must be `replica` or `logical` (it cannot be `minimal`). `wal_summary_keep_time` is how long summary files are kept, 10 days by default (14,400 minutes). An incremental can only be based on a backup whose start is still covered by summaries. If you take a full backup monthly, raise `wal_summary_keep_time` accordingly.
+
+In our test the summarizer started from WAL that was still in `pg_wal`, so an incremental based on a full backup taken just before we enabled it still worked. Do not rely on that. Once the WAL from before the switch has been recycled, the gap cannot be closed. The safe practice is to enable `summarize_wal` and then take a new full backup.
+
+## Step 2: Take a Full Backup
+
+```bash
+pg_basebackup -h db1 -U backup -D /backups/full2 -c fast
+```
+
+`-c fast` requests an immediate checkpoint so the backup starts at once instead of waiting for the next scheduled one. Every backup taken by `pg_basebackup` (PostgreSQL 13 and newer) includes a `backup_manifest`, and that file is what the next incremental needs.
+
+## Step 3: Take Incrementals
+
+After some changes (in our case 5,000 inserts and 100 updates), take the first incremental against the full backup's manifest:
+
+```bash
+pg_basebackup -h db1 -U backup -D /backups/incr1 -c fast \
+  --incremental=/backups/full2/backup_manifest
+```
+
+Later changes go into the next one, based on the **previous incremental's** manifest, which forms a chain:
+
+```bash
+pg_basebackup -h db1 -U backup -D /backups/incr2 -c fast \
+  --incremental=/backups/incr1/backup_manifest
+```
+
+On disk, the full backups were 53 MB each and the incrementals 22 MB. Our test table was small, so the fixed part (system catalogs, WAL needed for consistency, small files sent whole) dominated. On a large database where a few percent of blocks change per day, the difference is far bigger. Inside `incr2/base/5`, 212 files were `INCREMENTAL.*` stubs.
+
+You can see which summaries exist:
+
+```sql
+SELECT count(*) AS summaries, min(start_lsn), max(end_lsn)
+FROM pg_available_wal_summaries();
+```
+
+## Step 4: Combine and Verify
+
+To restore, pass the full backup and then every incremental, oldest first, and an output directory:
+
+```bash
+pg_combinebackup /backups/full2 /backups/incr1 /backups/incr2 -o /restore/data
+pg_verifybackup /restore/data
+```
+
+```text
+backup successfully verified
+```
+
+`pg_combinebackup` writes a fresh `backup_manifest` for the result, so `pg_verifybackup` can check it like any other base backup. You can also verify each incremental on its own before you need it (`pg_verifybackup /backups/incr2` also reported success).
+
+Then start a server on the combined directory. We used a different port on the same machine:
+
+```bash
+pg_ctl -D /restore/data -o "-p 5423" -l restore.log start
+psql -p 5423 -Atc "SELECT count(*), sum(amount) FROM ledger"
+```
+
+The row count and sum matched the source server at the time of the last backup (`206001|20013108049`), and a table created between the first and second incremental was present.
+
+Useful `pg_combinebackup` options:
+
+- `-n, --dry-run`: check the chain without writing anything.
+- `-k, --link`: hard-link unchanged files from the input backups instead of copying them. This is fast and saves space, but the input backups then share files with the output, so you must not modify or start either side carelessly.
+- `--clone` / `--copy-file-range`: use filesystem cloning (reflinks) where supported.
+- `-T OLDDIR=NEWDIR`: relocate tablespaces.
+- `--manifest-checksums`: choose the checksum used in the new manifest.
+
+## Errors When the Chain Is Wrong
+
+`pg_combinebackup` checks that each backup starts where the previous one ended. These are the messages we got for common mistakes.
+
+Skipping an incremental (full2 followed directly by incr2):
+
+```text
+pg_combinebackup: error: backup at "/backups/full2" starts at LSN 0/7000028, but expected 0/9000028
+```
+
+Putting the full backup second:
+
+```text
+pg_combinebackup: error: backup at "/backups/full2" is a full backup, but only the first backup should be a full backup
+```
+
+Using the wrong full backup (an older full followed by an incremental based on a newer one):
+
+```text
+pg_combinebackup: error: backup at "/backups/full" starts at LSN 0/4000028, but expected 0/7000028
+```
+
+In each case the fix is to list the full backup that the first incremental was based on, then every incremental in the order taken. Keeping each chain in its own directory, named with dates, avoids these mistakes.
+
+## Point-in-Time Recovery
+
+A combined backup is an ordinary base backup, so point-in-time recovery works as usual: restore it, configure `restore_command` and a `recovery_target_time`, create `recovery.signal`, and start. Incrementals reduce how much WAL has to be replayed, because the combined backup is more recent than the last full one.
+
+## After the November 2026 Updates
+
+The 17.12 and 18.7 release notes list several incremental backup fixes. One example: "Fix stale visibility maps in incremental backups after heap truncation", where restoring could bring back stale visibility map bits after `VACUUM` truncated a table, if data checksums and `wal_log_hints` were both off. That entry adds that the fix "does not correct existing WAL summaries, therefore incremental backups taken after updating can still be affected". The recommendation is to take a new full backup right after updating and base all later incrementals on it:
+
+1. Update to 17.12 or 18.7 (see our guide on [minor version updates](/blog/postgres-minor-version-update)).
+2. Take a full backup.
+3. Start a new incremental chain from that backup, and treat older chains as less trustworthy.
+
+Our [18.7 reindex guide](/blog/postgres-18-7-update-reindex) covers the other post-update steps in the same releases.
+
+## Built-in Incrementals vs Dedicated Tools
+
+Core incremental backups are good for single servers and simple schedules, and they need nothing beyond the PostgreSQL client tools. Dedicated tools such as pgBackRest add retention policies, parallel compression, encryption, object storage targets and WAL archiving management. If you need those, our [pgBackRest guide](/blog/pgbackrest-postgres-backup-guide) shows a complete setup. Logical dumps with `pg_dump` remain the right choice for moving data between major versions, see the [pg_dump and pg_restore guide](/blog/pg-dump-pg-restore-backup-guide).
+
+A restore you have never tested is a hope, not a backup. Combine and start a recent chain on a scratch server on a schedule, and run a few row counts and checksums against it. In [Chat2DB](https://chat2db.ai/download) you can connect to the production server and the restored copy side by side and run the same verification queries on both.
+
+## Summary
+
+Incremental backups in PostgreSQL 17 and 18 need `summarize_wal = on`, a full backup taken with `pg_basebackup`, and then `pg_basebackup --incremental=<previous backup_manifest>` for each step of the chain. `pg_combinebackup full incr1 incr2 -o dir` rebuilds a normal data directory, `pg_verifybackup` checks it, and the chain must be complete and in order or the tool stops with an LSN mismatch. After updating to 17.12 or 18.7, start a new chain from a fresh full backup.

@@ -1,0 +1,195 @@
+---
+title: "Postgres: Character Has No Equivalent in Encoding"
+description: "Fix ERROR: character with byte sequence has no equivalent in encoding LATIN1 or WIN1252 (22P05) in PostgreSQL: client_encoding, LATIN1 databases and pg_dump."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: November 14, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# Postgres: Character Has No Equivalent in Encoding
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="November 14, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+An emoji in a support ticket, a euro sign in a price, or "smart quotes" pasted from a word processor, and PostgreSQL refuses:
+
+```text
+ERROR:  character with byte sequence 0xf0 0x9f 0x99 0x82 in encoding "UTF8" has no equivalent in encoding "LATIN1"
+```
+
+The SQLSTATE is `22P05` (`untranslatable_character`). PostgreSQL received a valid character, but it has to convert it to another encoding, and that encoding has no such character. This is a different problem from `invalid byte sequence for encoding "UTF8"`, where the bytes were not valid in the first place (see our [invalid byte sequence guide](/blog/postgres-invalid-byte-sequence-for-encoding-utf8)). Here the data is fine but the target cannot hold it.
+
+There are two places where the conversion happens, and the fix depends on which one fails. This guide reproduces both on PostgreSQL 18.7 with a `LATIN1` database, a `WIN1252` database and a UTF8 database read by a LATIN1 client. It also covers one case that produces no error at all and silently corrupts the text.
+
+## Two Encodings, One Conversion
+
+Every connection has two encodings:
+
+- **`server_encoding`**: the encoding of the database, fixed when the database is created.
+- **`client_encoding`**: the encoding the client says it sends and wants to receive. It can be changed at any time with `SET client_encoding`, the `PGCLIENTENCODING` environment variable, or the driver's connection setting.
+
+When they differ, PostgreSQL converts in both directions: incoming SQL and data from client to server, and outgoing results from server to client. The error appears when a character exists in the source encoding but not in the target. UTF8 can represent every Unicode character. `LATIN1` (ISO 8859-1) has only 256 characters, and `WIN1252` is LATIN1 plus a few extras such as `€`, `“ ”` and `—`.
+
+Check both:
+
+```sql
+SHOW server_encoding;
+SHOW client_encoding;
+SELECT datname, pg_encoding_to_char(encoding) AS encoding FROM pg_database;
+```
+
+## Case 1: Storing Text in a LATIN1 Database
+
+We created a LATIN1 database. Databases with a different encoding than the template must be created from `template0`:
+
+```sql
+CREATE DATABASE lat1 ENCODING 'LATIN1' LC_COLLATE 'C' LC_CTYPE 'C' TEMPLATE template0;
+```
+
+(With the default `template1`, which is UTF8, you get `ERROR: new encoding (LATIN1) is incompatible with the encoding of the template database (UTF8)`.)
+
+Connected with `client_encoding = UTF8`, which is what a modern application or terminal sends:
+
+```sql
+INSERT INTO notes VALUES (1, 'café crème');        -- INSERT 0 1
+INSERT INTO notes VALUES (2, 'price: 10€');
+-- ERROR:  character with byte sequence 0xe2 0x82 0xac in encoding "UTF8" has no equivalent in encoding "LATIN1"
+INSERT INTO notes VALUES (3, 'thanks 🙂');
+-- ERROR:  character with byte sequence 0xf0 0x9f 0x99 0x82 in encoding "UTF8" has no equivalent in encoding "LATIN1"
+INSERT INTO notes VALUES (4, '“smart quotes”');
+-- ERROR:  character with byte sequence 0xe2 0x80 0x9c in encoding "UTF8" has no equivalent in encoding "LATIN1"
+```
+
+Accented Latin letters are in LATIN1, so `café` works. The euro sign, emoji and curly quotes are not. The byte sequence in the message is the UTF-8 encoding of the offending character: `e2 82 ac` is `€` (U+20AC), `f0 9f 99 82` is 🙂 (U+1F642) and `e2 80 9c` is `“` (U+201C). Decoding the bytes tells you exactly which character to look for.
+
+A `WIN1252` database accepted `'price: 10€ “quoted”'` but still rejected the emoji, now with `has no equivalent in encoding "WIN1252"`. `COPY` reports the line:
+
+```text
+ERROR:  character with byte sequence 0xe2 0x98 0x83 in encoding "UTF8" has no equivalent in encoding "LATIN1"
+CONTEXT:  COPY notes, line 1
+```
+
+### The real fix: use UTF8
+
+There is no setting that lets a LATIN1 database store an emoji. The long-term fix is to move the data to a UTF8 database:
+
+```bash
+createdb -E UTF8 -T template0 app_utf8
+pg_dump -d app_latin1 | psql -d app_utf8
+```
+
+`pg_dump` records the encoding it used in a `SET client_encoding` line at the top of the dump. That is the database encoding by default, or whatever `-E` or `PGCLIENTENCODING` asks for. Restoring into the UTF8 database converts every LATIN1 character to UTF8, and that direction always succeeds. In our test, `café crème` arrived intact with a length of 10. Test it on a copy, and check collation-dependent things such as sort order and `LIKE` with indexes afterwards. Our [major upgrade guide](/blog/postgres-major-version-upgrade-guide) covers dump-and-restore migrations in general.
+
+## Case 2: Reading UTF8 Data with a Narrow client_encoding
+
+The more common case today is a UTF8 database read by a client that announces a narrower encoding. Older Windows tools, some ODBC setups and scripts with `PGCLIENTENCODING=LATIN1` all do this:
+
+```bash
+PGCLIENTENCODING=LATIN1 psql -d app -c "SELECT * FROM msgs"
+```
+
+```text
+ERROR:  character with byte sequence 0xf0 0x9f 0x99 0x82 in encoding "UTF8" has no equivalent in encoding "LATIN1"
+```
+
+The failure only appears when the result contains an unconvertible character. `SELECT id FROM msgs` worked, and so did `SELECT * FROM msgs WHERE id <= 2` (plain text and `café`). The full `SELECT *` failed as soon as it reached the emoji row. That is why such bugs show up as "the report breaks for some customers".
+
+The fix is on the client side: set `client_encoding` to `UTF8`.
+
+```sql
+SET client_encoding = 'UTF8';
+```
+
+Or set it in the connection string (`options='-c client_encoding=UTF8'`), with `PGCLIENTENCODING=UTF8`, or in the driver. The PostgreSQL JDBC driver always uses UTF8, so with Java the cause is usually a tool or a database further along. In psql on Windows, make sure the console code page matches as well (`chcp 65001`).
+
+### pg_dump with -E
+
+`pg_dump -E LATIN1` asks for the dump in a specific encoding and fails the same way when a table contains characters outside it:
+
+```text
+pg_dump: error: Dumping the contents of table "msgs" failed: PQgetResult() failed.
+pg_dump: detail: Error message from server: ERROR:  character with byte sequence 0xf0 0x9f 0x99 0x82 in encoding "UTF8" has no equivalent in encoding "LATIN1"
+pg_dump: detail: Command was: COPY public.msgs (id, body) TO stdout;
+```
+
+Drop the `-E` option (the dump then uses the database encoding) unless the target really needs that encoding. If it does, clean the data first.
+
+## The Silent Variant: Wrong client_encoding, No Error
+
+Here is the case that causes real damage. When we first ran our LATIN1 test, psql's `client_encoding` defaulted to the database encoding, LATIN1, because the shell had no locale set. The terminal still sent UTF-8 bytes. PostgreSQL believed it was receiving LATIN1, and in LATIN1 every byte is a valid character, so every insert succeeded, emoji included. The text even looked correct in the same terminal. Reading it back with `client_encoding = UTF8` showed what was really stored:
+
+```text
+ id |                  body                  | length | octet_length
+----+----------------------------------------+--------+--------------
+  1 | cafÃ© crÃ¨me                           |     12 |           12
+  2 | price: 10â\u0082¬                      |     12 |           12
+  3 | thanks ð\u009F\u0099\u0082             |     11 |           11
+```
+
+`café crème` has 10 characters but was stored as 12: each accented letter became two LATIN1 characters (mojibake). The clue is a `length()` that is larger than the number of characters you see. To repair data like this, first move it into a UTF8 database (as above, because a LATIN1 database cannot hold the real characters). Then convert the bytes back: `convert_from(convert_to(body, 'LATIN1'), 'UTF8')` reinterprets them as UTF-8. In our UTF8 copy that turned `cafÃ©` back into `café` and `thanks ð...` back into `thanks 🙂`. Rows that were stored correctly fail with `invalid byte sequence for encoding "UTF8"`, so limit the `UPDATE` to the damaged rows (for example `WHERE body ~ '[ÃÂâð]'`) and test on a copy first.
+
+The lesson: always set `client_encoding` explicitly, and make it match what the client really sends.
+
+## Finding Rows That Will Not Convert
+
+Before migrating to a narrower encoding, or when you must feed a LATIN1-only system, find the problem rows first. `convert_to()` raises the same error, so a small function can test each value:
+
+```sql
+CREATE OR REPLACE FUNCTION fits_encoding(t text, enc name)
+RETURNS boolean LANGUAGE plpgsql IMMUTABLE AS $$
+BEGIN
+  PERFORM convert_to(t, enc);
+  RETURN true;
+EXCEPTION WHEN untranslatable_character THEN
+  RETURN false;
+END $$;
+
+SELECT id, body, fits_encoding(body, 'LATIN1') AS latin1, fits_encoding(body, 'WIN1252') AS win1252
+FROM msgs ORDER BY id;
+```
+
+```text
+ id |   body    | latin1 | win1252
+----+-----------+--------+---------
+  1 | plain     | t      | t
+  2 | café      | t      | t
+  3 | thanks 🙂 | f      | f
+  4 | Ā macron  | f      | f
+```
+
+For LATIN1 specifically, a regular expression is faster, because LATIN1 is exactly the code points U+0001 to U+00FF:
+
+```sql
+SELECT id, body FROM msgs WHERE body !~ '^[\x01-\xff]*$';
+```
+
+This returned rows 3 and 4. It does not work for WIN1252, whose extra characters lie outside that range.
+
+## Replacing Characters When You Must
+
+If the target cannot change, decide what each unsupported character becomes. A blunt replacement:
+
+```sql
+SELECT id, regexp_replace(body, '[^\x01-\xff]', '?', 'g') AS latin1_safe FROM msgs ORDER BY id;
+```
+
+That turned `thanks 🙂` into `thanks ?` and `Ā macron` into `? macron`. For accented letters, decomposing first keeps the base letter: `normalize(text, NFD)` splits `Ā` into `A` plus a combining macron, and removing the combining marks (`regexp_replace(normalize(body, NFD), '[̀-ͯ]', '', 'g')`) produced `A macron`, which converts to LATIN1. The `unaccent` extension does the same with a dictionary. Replacement loses information, so keep the original in a UTF8 system if you can.
+
+## Quick Reference
+
+| Situation | Fix |
+|---|---|
+| Insert fails into a LATIN1/WIN1252 database | Move the database to UTF8 (dump and restore into `createdb -E UTF8 -T template0`) |
+| Query fails only for some rows | The client's `client_encoding` is narrower than the data. Set it to UTF8 |
+| `pg_dump -E X` fails | Remove `-E` or clean the data |
+| Data looks garbled, `length()` too big | Past inserts used the wrong `client_encoding`. Move to UTF8, then repair the damaged rows with `convert_from(convert_to(...))` |
+| Must export to a legacy system | Find rows with `fits_encoding()` and replace or transliterate them |
+
+When you investigate encoding problems, seeing the raw bytes helps. In [Chat2DB](https://chat2db.ai/download) you can run `octet_length`, `convert_to` and the `fits_encoding()` check side by side in the result grid, and compare a LATIN1 database with its UTF8 copy in two tabs while you migrate.
+
+## Summary
+
+`character with byte sequence ... has no equivalent in encoding` (22P05) means a valid character cannot be converted into a narrower encoding, either the database encoding (LATIN1, WIN1252) on write or the client encoding on read. The byte sequence in the message is the UTF-8 form of the character. Use UTF8 for databases and set `client_encoding` to UTF8 explicitly in every client. A wrong client encoding can also store mojibake with no error at all. Find unconvertible rows with `convert_to()` wrapped in an exception handler, and replace or transliterate them only when a legacy target leaves no other choice.

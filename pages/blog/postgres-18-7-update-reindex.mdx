@@ -1,0 +1,195 @@
+---
+title: "PostgreSQL 18.7 Update: What to Reindex"
+description: "PostgreSQL 18.7, 17.12, 16.16, 15.20 and 14.25 fix GIN, pg_trgm and bpchar index bugs. Find the affected indexes with tested SQL and reindex them safely."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: November 14, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# PostgreSQL 18.7 Update: What to Reindex
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="November 14, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+On November 12, 2026 the PostgreSQL project shipped 18.7, 17.12, 16.16, 15.20 and 14.25. The announcement says the release "fixes over 140 bugs", and 14.25 is the last release of PostgreSQL 14. Installing it works like any other minor update: stop the server, swap the binaries, start it again. No dump, no `pg_upgrade`.
+
+The catch is in the migration notes. For 18.7 they read:
+
+> A dump/restore is not required for those running 18.X. However, several different bugs have been discovered that could result in index corruption. Examine the changelog entries below that mention REINDEX, and reindex any indexes you have that might be affected.
+
+New binaries stop new damage, but they do not repair indexes that were already built or updated by the buggy code. This guide goes through each entry that asks for a `REINDEX`. For each one it gives a catalog query that lists the indexes you actually have to rebuild, and then shows how to rebuild them without blocking writes. Every query was run on PostgreSQL 18.7 and 17.12. The bpchar behaviour was checked by starting an 18.6 data directory with 18.7 binaries.
+
+## Which Releases and Versions Are Affected
+
+The same set of index fixes was back-patched to every supported branch, so the advice applies whether you run 14, 15, 16, 17 or 18:
+
+| Fix | 18.7 | 17.12 | 16.16 | 15.20 | 14.25 |
+|---|---|---|---|---|---|
+| B-tree deduplication disabled for `bpchar` | yes | yes | yes | yes | yes |
+| GIN: VACUUM could leave dead index entries | yes | yes | yes | yes | yes |
+| GIN: posting tree page deletion after an incomplete split | yes | yes | yes | yes | yes |
+| `pg_trgm` GiST (`gist_trgm_ops`) index corruption | yes | yes | yes | yes | yes |
+| TOAST index fields after `REINDEX CONCURRENTLY` | yes | yes | yes | yes | yes |
+| Incremental backups could be corrupt | yes | yes | n/a | n/a | n/a |
+| `NOT NULL NO INHERIT` on partitioned tables | yes | n/a | n/a | n/a | n/a |
+
+If you skipped earlier releases, their post-update steps still apply too. 18.6, for example, asked users of `btree_gist` float and bit indexes and of `ltree` indexes to reindex. The free [PostgreSQL Minor Update Checker](https://chat2db.ai/tools/postgres-minor-update-checker) takes the version you run and lists every skipped release with its post-update steps, so you can check that nothing from an older release is left.
+
+## First, Install the Update
+
+Check what you run now:
+
+```sql
+SELECT version();
+SHOW server_version_num;   -- 180007 means 18.7
+```
+
+Update the packages for your platform and restart. On Debian or Ubuntu with the PGDG repository that is `apt-get install --only-upgrade postgresql-18` followed by a restart of the cluster. With Docker, bump the image tag (`postgres:18.7`) and recreate the container on the same volume. On managed services the provider schedules the minor version. If you use streaming replication, update the standbys first and the primary last. Our guide on [applying a PostgreSQL minor version update](/blog/postgres-minor-version-update) walks through each method.
+
+Do the reindexing **after** the new binaries are running. If you rebuild an index with the old code still in place, the bug can damage it again.
+
+## bpchar B-tree Indexes: Deduplication Disabled
+
+The changelog entry is "Disable btree index de-duplication support for the bpchar data type". `bpchar` equality ignores trailing spaces, so `'ab'` and `'ab  '` compare equal even though they are stored differently. B-tree deduplication (added in PostgreSQL 13) merges equal keys into one posting list, and an index-only scan can then return the stored form of a different row. The release notes say this can make index-only scans return "subtly wrong results".
+
+Only columns declared as plain `bpchar`, or as `character` with no length, are affected. `char(n)` is fine, because the length modifier pads every value to the same length and equal values are then bitwise equal.
+
+This query lists B-tree indexes whose key columns are `bpchar` without a length. It reads the index's own attributes, so it also catches expression indexes such as `((code::bpchar))` and skips `INCLUDE` columns:
+
+```sql
+SELECT ic.oid::regclass AS index_name, i.indrelid::regclass AS table_name, a.attname AS key_column
+FROM pg_index i
+JOIN pg_class ic ON ic.oid = i.indexrelid
+JOIN pg_am am ON am.oid = ic.relam AND am.amname = 'btree'
+JOIN pg_attribute a ON a.attrelid = i.indexrelid AND a.attnum BETWEEN 1 AND i.indnkeyatts
+JOIN pg_type t ON t.oid = a.atttypid
+WHERE t.typname = 'bpchar' AND a.atttypmod = -1
+ORDER BY 1;
+```
+
+On a test table with a `bpchar` column, a `char(5)` column, an `INCLUDE (bpchar_col)` index and two expression indexes, it returned exactly the `bpchar` column index and the `::bpchar` expression index.
+
+### Why the update alone is not enough
+
+Whether a B-tree uses deduplication is decided when the index is built and stored in its metapage as `allequalimage`. You can read the flag with the `pageinspect` extension. We built a `bpchar` index and a `char(5)` index on 18.6, stopped the server, started the **same data directory** with 18.7 binaries, and checked:
+
+```sql
+CREATE EXTENSION pageinspect;
+SELECT 'codes_code' AS idx, allequalimage FROM bt_metap('codes_code')
+UNION ALL
+SELECT 'codes_code5', allequalimage FROM bt_metap('codes_code5');
+```
+
+```text
+     idx     | allequalimage
+-------------+---------------
+ codes_code  | t
+ codes_code5 | t
+```
+
+After the update, the old `bpchar` index still says `t`: it keeps deduplicating. After `REINDEX INDEX CONCURRENTLY codes_code;` the same query returned `f` for `codes_code`, while `codes_code5` (`char(5)`) stayed `t`. The rebuilt index was also bigger, 456 kB against 152 kB for the `char(5)` index on the same 20,000 rows, because equal keys are no longer merged. Expect some growth on indexes with many duplicate values.
+
+## GIN Indexes: VACUUM and Posting Tree Fixes
+
+Two GIN entries end with "REINDEX is recommended if you suspect this has happened":
+
+- **Ensure that VACUUM cleans up all dead tuples in a GIN index.** When a single VACUUM needed several index passes, some entries could survive, and a race with leaf page splits had the same effect. The notes say these bugs "would eventually lead to a corrupt index with entries pointing at unrelated table rows".
+- **Fix GIN posting tree page deletion after an incomplete page split.** Sibling pages could be disconnected, "causing subsequent index searches to miss rows".
+
+GIN is used by full-text search (`tsvector`), `jsonb` containment (`@>`), arrays and `pg_trgm`'s `gin_trgm_ops`. List all of them with their size, which tells you how long the rebuild will take:
+
+```sql
+SELECT ic.oid::regclass AS index_name, i.indrelid::regclass AS table_name,
+       pg_size_pretty(pg_relation_size(ic.oid)) AS size
+FROM pg_index i
+JOIN pg_class ic ON ic.oid = i.indexrelid
+JOIN pg_am am ON am.oid = ic.relam
+WHERE am.amname = 'gin'
+ORDER BY pg_relation_size(ic.oid) DESC;
+```
+
+Can you test a GIN index instead of rebuilding it blindly? PostgreSQL 18 added `gin_index_check()` to the `amcheck` extension (version 1.5). The documentation says it checks that parent and child tuples are consistent and that the page graph respects the balanced-tree rules. That catches structural damage such as disconnected pages, but it does not compare index entries against the table, so it cannot prove that no entry points at the wrong row. For tables with heavy update and delete traffic, where the VACUUM bug could have hit, rebuilding is the safe choice. On 17 and older, `gin_index_check` does not exist (`function gin_index_check(unknown) does not exist`), so rebuilding is the only option there. Our [amcheck guide](/blog/postgres-amcheck-index-corruption) shows what each check does catch.
+
+## pg_trgm GiST Indexes
+
+"Fix possible index corruption in contrib/pg_trgm GiST indexes" is the clearest entry: "This fix does not repair existing indexes. Users should REINDEX existing gist_trgm_ops indexes after updating." Only GiST trigram indexes are affected. `gin_trgm_ops` indexes are not part of this entry, although they are GIN indexes and therefore covered by the GIN advice above.
+
+Find them by operator class rather than by name:
+
+```sql
+SELECT DISTINCT i.indexrelid::regclass AS index_name, i.indrelid::regclass AS table_name
+FROM pg_index i
+CROSS JOIN LATERAL unnest(i.indclass::oid[]) AS k(opc)
+JOIN pg_opclass o ON o.oid = k.opc
+WHERE o.opcname = 'gist_trgm_ops'
+ORDER BY 1;
+```
+
+The `unnest(i.indclass::oid[])` trick works for multi-column indexes, where only one column may use the trigram class. If you are unsure which index type your fuzzy search uses, our [pg_trgm fuzzy search guide](/blog/postgres-pg-trgm-fuzzy-search) explains the trade-offs between the GIN and GiST variants.
+
+## TOAST Indexes After REINDEX CONCURRENTLY
+
+"Fix failure to update mutable pg_index fields for TOAST-table indexes" covers a bug where, after `REINDEX CONCURRENTLY` rebuilt the index on a TOAST table, later index updates could be missed. The symptom is a read failing with `missing chunk number 0 for toast value ...`. The notes add that "the TOAST table itself is fine, so a REINDEX will suffice to recover".
+
+There is no catalog query that shows whether you were hit. If you have seen `missing chunk number` errors, reindex the table, which also rebuilds its TOAST index:
+
+```sql
+REINDEX TABLE CONCURRENTLY your_table_name;
+```
+
+Our article on [missing chunk number errors](/blog/postgres-missing-chunk-number-toast) covers how to tell index damage from real TOAST data loss.
+
+## Incremental Backups (17 and 18)
+
+The 17.12 and 18.7 notes say that "existing incremental backup files should not be trusted" and recommend taking a new full backup after updating, then basing later incremental backups on it. One of the entries, about stale visibility maps after heap truncation, adds that the fix does not correct existing WAL summaries, so incrementals taken after the update can still be affected until you start a new chain. If you use `pg_basebackup --incremental`, take a full backup right after the update. Our [pg_combinebackup guide](/blog/pg-combinebackup-incremental-backup) shows the whole chain.
+
+## NOT NULL NO INHERIT on Partitioned Tables (18 only)
+
+18.7 now rejects `NOT NULL NO INHERIT` constraints on partitioned tables in every code path. Before, `CREATE TABLE ... (LIKE ...)` could copy one onto a partitioned table, and the partitions then accepted NULLs. The release notes give this query to find broken constraints:
+
+```sql
+SELECT conrelid::regclass, conname
+FROM pg_constraint
+WHERE contype = 'n' AND connoinherit
+  AND conrelid IN (SELECT oid FROM pg_class WHERE relkind = 'p');
+```
+
+The repair is `ALTER TABLE ... ALTER CONSTRAINT ... INHERIT`, which fails while a partition contains NULLs. We reproduced the problem on 18.6, including a query that silently returned the wrong count, in a [separate article on NOT NULL NO INHERIT](/blog/postgres-not-null-no-inherit-partitioned).
+
+## Rebuilding Without Downtime
+
+Plain `REINDEX` takes an `ACCESS EXCLUSIVE` lock on the index's table for the whole rebuild. Use the concurrent form, which lets reads and writes continue:
+
+```sql
+REINDEX INDEX CONCURRENTLY public.documents_body_gin;
+```
+
+To turn any of the queries above into a script, wrap them in `format()`:
+
+```sql
+SELECT format('REINDEX INDEX CONCURRENTLY %s;', ic.oid::regclass)
+FROM pg_index i
+JOIN pg_class ic ON ic.oid = i.indexrelid
+JOIN pg_am am ON am.oid = ic.relam
+WHERE am.amname = 'gin'
+ORDER BY 1;
+```
+
+`regclass` output is already quoted where needed. Our test schema was called `"My Schema"`, and the generated lines came out as `REINDEX INDEX CONCURRENTLY "My Schema".t1_jsonb;`, ready to run. In psql you can append `\gexec` to execute every generated statement in turn.
+
+A few practical points:
+
+- `REINDEX CONCURRENTLY` cannot run inside a transaction block, so do not wrap the script in `BEGIN`/`COMMIT`.
+- It needs disk space for a second copy of each index while it runs.
+- If it fails halfway, it leaves an invalid index named like `documents_body_gin_ccnew`. Find these with `SELECT indexrelid::regclass FROM pg_index WHERE NOT indisvalid;` and drop them before retrying.
+- The command-line tool `reindexdb --concurrently -i index_name` does the same thing. 18.7 also fixed `reindexdb` so it now errors out cleanly when an index-level concurrent reindex is combined with `--jobs`, so pass `-i` without `-j`.
+- Run the catalog queries in **every database**. `pg_index` is per database, so one connection only sees its own indexes.
+
+In [Chat2DB](https://chat2db.ai/download) you can keep these catalog queries as saved snippets, run them against each database connection in turn, and review the generated `REINDEX` list before executing it.
+
+## Summary
+
+The 18.7 / 17.12 / 16.16 / 15.20 / 14.25 releases fix several bugs that leave existing indexes damaged, and installing the binaries does not repair them. After updating, find and rebuild B-tree indexes on length-less `bpchar` columns, GIN indexes on busy tables, and `gist_trgm_ops` indexes. Reindex any table that has shown `missing chunk number` errors, start a new full backup if you use incremental backups, and on 18 check for `NOT NULL NO INHERIT` constraints on partitioned tables. Use `REINDEX INDEX CONCURRENTLY` to do it without blocking writes, and if you skipped earlier minor releases, check their post-update steps as well.

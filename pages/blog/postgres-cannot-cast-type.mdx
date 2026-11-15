@@ -1,0 +1,204 @@
+---
+title: "Postgres: Cannot Cast Type X to Y (42846)"
+description: "Fix ERROR: cannot cast type boolean to date, timestamp to integer, uuid to bigint and json to integer in PostgreSQL, with tested conversions and CREATE CAST."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: November 14, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# Postgres: Cannot Cast Type X to Y (42846)
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="November 14, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+PostgreSQL is strict about types, and sooner or later a `::` cast that looks reasonable gets refused:
+
+```text
+ERROR:  cannot cast type timestamp with time zone to integer
+LINE 1: SELECT now()::int;
+                    ^
+```
+
+The SQLSTATE is `42846` (`cannot_coerce`). It is raised while the query is planned, before any row is read, and it means something specific: there is **no cast defined** between the two types. That is different from a cast that exists but fails on a particular value (`invalid input syntax for type integer: "abc"`, 22P02). This guide shows where PostgreSQL's casts come from, the combinations that most often fail, a working conversion for each, and when `CREATE CAST` is the right fix. All results are from PostgreSQL 18.7. 17.12 produced identical output.
+
+## Where Casts Come From
+
+PostgreSQL has three ways to convert a value:
+
+1. **Explicit casts in `pg_cast`.** Each row says "type A can become type B" and how: with a function (`castmethod = 'f'`), as a binary-compatible relabel (`'b'`), or through I/O (`'i'`). It also says when the cast may be applied automatically (`castcontext`: `e` explicit only, `a` on assignment, `i` implicitly).
+2. **I/O conversion to and from text.** Any type can be cast to `text` or `varchar` by calling its output function, and from `text` by calling the input function of the target type. That is why `'42'::text::int` works without any `pg_cast` row.
+3. **Nothing.** If neither applies, you get `cannot cast type X to Y`.
+
+You can see exactly which casts exist for a type:
+
+```sql
+SELECT castsource::regtype, casttarget::regtype, castcontext, castmethod
+FROM pg_cast
+WHERE castsource = 'boolean'::regtype OR casttarget = 'boolean'::regtype
+ORDER BY 1, 2;
+```
+
+```text
+ castsource |    casttarget     | castcontext | castmethod
+------------+-------------------+-------------+------------
+ boolean    | integer           | e           | f
+ boolean    | text              | a           | f
+ boolean    | character         | a           | f
+ boolean    | character varying | a           | f
+ integer    | boolean           | e           | f
+ jsonb      | boolean           | e           | f
+```
+
+Booleans convert to and from `integer` only, plus text-like types and `jsonb`. Anything else fails.
+
+## Common Failures and What to Write Instead
+
+### timestamp or date to integer
+
+```sql
+SELECT now()::int;            -- ERROR:  cannot cast type timestamp with time zone to integer
+SELECT current_date::int;     -- ERROR:  cannot cast type date to integer
+```
+
+There is no single meaning of "a date as a number", so PostgreSQL makes you choose one:
+
+```sql
+SELECT extract(epoch FROM now())::bigint;          -- Unix seconds
+SELECT to_char(now(), 'YYYYMMDD')::int;            -- 20261114 style
+SELECT current_date - date '2026-01-01';           -- days between dates, already an integer
+```
+
+The last one is often what people want: subtracting two dates returns an `integer` (317 for November 14, 2026). Our [epoch converter](https://chat2db.ai/tools/postgres-epoch-converter) helps with Unix timestamps.
+
+### boolean to date (or anything but integer and text)
+
+```sql
+SELECT true::date;
+-- ERROR:  cannot cast type boolean to date
+```
+
+This usually comes from a `COALESCE` or `CASE` mixing types by mistake. Write the intent explicitly:
+
+```sql
+SELECT CASE WHEN is_active THEN current_date END FROM accounts;
+```
+
+### integer types and boolean
+
+```sql
+SELECT 5::boolean, 0::boolean;    -- t, f
+SELECT 5::bigint::boolean;        -- ERROR:  cannot cast type bigint to boolean
+SELECT '5'::text::boolean;        -- ERROR:  invalid input syntax for type boolean: "5"
+```
+
+Only `integer` (int4) has a cast to `boolean`. `bigint` and `smallint` do not, so either cast through `int` (`col::int::boolean`) or write `col <> 0`, which works for any numeric type and states the rule. The text case fails differently: it uses the boolean input function, which accepts `t`, `true`, `yes`, `on`, `1` and their negatives, but not `5`.
+
+### uuid to bigint
+
+```sql
+SELECT gen_random_uuid()::bigint;
+-- ERROR:  cannot cast type uuid to bigint
+```
+
+A UUID is 128 bits and a `bigint` 64, so there is no lossless cast. If you need a numeric key, keep a separate `bigint` identity column. If you need a hash for partitioning or sampling, use something explicit like `('x' || substr(md5(id::text), 1, 16))::bit(64)::bigint`, and accept that collisions are possible.
+
+### json to integer
+
+```sql
+SELECT '1'::json::int;       -- ERROR:  cannot cast type json to integer
+SELECT '1'::jsonb::int;      -- 1
+SELECT '"1"'::jsonb::int;    -- ERROR:  cannot cast jsonb string to type integer
+```
+
+`jsonb` has casts to `numeric`, the integer types, `float` and `boolean` for JSON scalars of the right kind. `json` has none. To read a field as a number, extract it as text with `->>` and cast that:
+
+```sql
+SELECT ('{"n": "42"}'::jsonb ->> 'n')::int;   -- 42, works for "42" and 42
+```
+
+`->>` returns `text`, and text casts to anything with an input function. The error `cannot cast jsonb string to type integer` is a value-level error with its own message: the cast exists, but the JSON value is a string. See our [jsonb operators guide](/blog/postgres-jsonb-operators-and-functions) for the extraction operators.
+
+### Arrays and records
+
+```sql
+SELECT ARRAY[1,2]::int;      -- ERROR:  cannot cast type integer[] to integer
+SELECT ROW(1,2)::int;        -- ERROR:  cannot cast type record to integer
+```
+
+These usually mean a subquery or function returns more than intended. Pick the element (`(ARRAY[1,2])[1]`), the field (`(row_value).field`), or an aggregate (`array_length`, `cardinality`).
+
+### Enums and integers
+
+```sql
+CREATE TYPE mood AS ENUM ('sad', 'ok', 'happy');
+SELECT 1::mood;            -- ERROR:  cannot cast type integer to mood
+SELECT 'ok'::mood::int;    -- ERROR:  cannot cast type mood to integer
+SELECT 'ok'::mood::text;   -- ok
+SELECT 'ok'::text::mood;   -- ok
+```
+
+Enums convert to and from text, not to their position. If you need the position, use `array_position(enum_range(NULL::mood), 'ok'::mood)`, which returns 2. Our article on [adding enum values](/blog/postgres-enum-add-value-alter-type) covers enum changes.
+
+### inet, xid and other special types
+
+```sql
+SELECT inet '10.0.0.1'::bigint;   -- ERROR:  cannot cast type inet to bigint
+SELECT xid '100'::bigint;          -- ERROR:  cannot cast type xid to bigint
+SELECT '100'::xid::text::bigint;   -- 100
+```
+
+For `inet`, subtracting gives a number: `inet '10.0.0.1' - inet '0.0.0.0'` is `167772161`. For transaction IDs, going through `text` works, as shown. Our [inet and cidr calculator](https://chat2db.ai/tools/postgres-inet-cidr-calculator) helps with address math.
+
+## ALTER COLUMN TYPE: A Related but Different Error
+
+Changing a column's type has its own message, even when a cast exists:
+
+```sql
+ALTER TABLE t ALTER COLUMN flag TYPE int;
+```
+
+```text
+ERROR:  column "flag" cannot be cast automatically to type integer
+HINT:  You might need to specify "USING flag::integer".
+```
+
+`ALTER COLUMN TYPE` applies a cast automatically only if it is allowed in assignment context. `boolean` to `integer` exists but is explicit only (`castcontext = 'e'` above), and `text` to `integer` goes through I/O conversion, which is never automatic. Add the `USING` clause:
+
+```sql
+ALTER TABLE t ALTER COLUMN flag TYPE int USING flag::int;
+ALTER TABLE t ALTER COLUMN ts TYPE bigint USING extract(epoch FROM ts)::bigint;
+```
+
+Both worked. When the hint suggests `USING col::bigint` for a pair that has no cast at all (we got `HINT:  You might need to specify "USING u::bigint"` for a `uuid` column), following it literally only gives you `cannot cast type uuid to bigint`. Write a real conversion expression instead. Our [ALTER COLUMN TYPE guide](/blog/postgres-alter-column-type) and the [ALTER COLUMN TYPE generator](https://chat2db.ai/tools/postgres-alter-column-type-generator) cover rewrites, locks and the `USING` clause in depth.
+
+## When to Use CREATE CAST
+
+If your application really needs a conversion that PostgreSQL does not provide, and it has one unambiguous meaning in your domain, you can define it:
+
+```sql
+CREATE FUNCTION bool_to_date(boolean) RETURNS date
+LANGUAGE sql IMMUTABLE
+AS $$ SELECT CASE WHEN $1 THEN current_date END $$;
+
+CREATE CAST (boolean AS date) WITH FUNCTION bool_to_date(boolean);
+```
+
+This succeeded, and `true::date` then calls the function. Note one problem with this example: `current_date` is not immutable, so declaring the function `IMMUTABLE` is wrong and could give stale results in indexes or plans. A real cast function should be immutable only if it truly is. Some guidelines:
+
+- Only the owner of the source or target type, or a superuser, can create a cast. As an ordinary role, `CREATE CAST (uuid AS bigint) ...` failed with `ERROR: must be owner of type uuid or type bigint`. For built-in types that means a superuser, which is a hint that it is rarely the right fix.
+- Keep it `AS EXPLICIT` (the default). `AS IMPLICIT` makes PostgreSQL apply it silently in comparisons and function calls, which causes surprising plan changes and ambiguity errors.
+- A custom cast is global for the database. Every application and every developer gets it, including ones who do not expect it.
+- Most of the time a named function such as `to_epoch(timestamptz)` is clearer than a cast, and it does not change how other queries resolve.
+
+## Finding the Right Conversion Quickly
+
+Before writing a workaround, check whether a function already exists for the conversion. `\df *to_char*` or a query on `pg_proc` by argument and return type often finds one. Also remember the text route: `col::text::target` works whenever the target's input function understands the source's output, which is true for many pairs (numbers to `numeric`, `xid` to `bigint`, enum labels to another enum with the same labels). Our [CAST guide](/blog/postgresql-cast-data-type-conversion) covers the general syntax.
+
+When you are porting queries from another database, cast errors tend to come in batches, because MySQL and SQL Server convert dates and booleans to numbers implicitly. In [Chat2DB](https://chat2db.ai/download) you can run the failing statements against PostgreSQL, see the error and position for each, and ask the AI assistant to rewrite the casts into the explicit forms shown above.
+
+## Summary
+
+`cannot cast type X to Y` (42846) means PostgreSQL has no cast for that pair. It is caught at planning time, not per row. Check `pg_cast` to see what exists. Use `extract(epoch ...)`, `to_char` or date arithmetic for dates to numbers, `CASE` for booleans, `->>` then a cast for JSON fields, and `array_position(enum_range(...))` for enum positions. For `ALTER COLUMN TYPE`, add a `USING` clause with a real conversion. Reserve `CREATE CAST` for conversions with one clear meaning, and keep them explicit.

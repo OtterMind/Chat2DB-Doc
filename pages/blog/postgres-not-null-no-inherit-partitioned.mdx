@@ -1,0 +1,273 @@
+---
+title: "NOT NULL NO INHERIT on Partitioned Tables in PG 18"
+description: "Fix ERROR: not-null constraints on partitioned tables cannot be NO INHERIT in PostgreSQL 18, find broken constraints after 18.7 and repair them with INHERIT."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: November 14, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# NOT NULL NO INHERIT on Partitioned Tables in PG 18
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="November 14, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+PostgreSQL 18 turned `NOT NULL` into a real, named constraint. Not-null constraints now have rows in `pg_constraint` (with `contype = 'n'`), they can be marked `NO INHERIT`, and they can be changed with `ALTER CONSTRAINT`. That flexibility has a sharp edge on partitioned tables, and the 18.7 update release, published on November 12, 2026, closed a hole that let partitions accept NULLs their parent promised to reject.
+
+If you see this error on PostgreSQL 18:
+
+```text
+ERROR:  not-null constraints on partitioned tables cannot be NO INHERIT
+```
+
+the server is protecting you. This guide explains why the rule exists, shows the bug that existed before 18.7 (including a query that silently returned the wrong answer), and walks through finding and repairing affected tables. Everything was tested on a data directory created with PostgreSQL 18.6 and then started with 18.7 binaries.
+
+## Not-Null Constraints in PostgreSQL 18
+
+Up to PostgreSQL 17, `NOT NULL` was just a flag on the column (`pg_attribute.attnotnull`). In 18 it is also a constraint with a name, usually `<table>_<column>_not_null`:
+
+```sql
+CREATE TABLE tmpl (id int, note text NOT NULL NO INHERIT);
+
+SELECT conname, contype, connoinherit
+FROM pg_constraint
+WHERE conrelid = 'tmpl'::regclass;
+```
+
+```text
+      conname       | contype | connoinherit
+--------------------+---------+--------------
+ tmpl_note_not_null | n       | t
+```
+
+`NO INHERIT` means the constraint applies only to the table itself, not to tables that inherit from it. For classic table inheritance that is a legitimate design:
+
+```sql
+CREATE TABLE plain_parent (id int, note text NOT NULL NO INHERIT);
+CREATE TABLE plain_child () INHERITS (plain_parent);
+INSERT INTO plain_child VALUES (1, NULL);   -- INSERT 0 1
+```
+
+The child accepts the NULL, and querying `plain_parent` (which includes the child's rows) returns it. That is what the declaration asked for.
+
+## Why Partitioned Tables Reject It
+
+A partitioned table stores no rows of its own. Every row lives in a partition. A not-null constraint that does not reach the partitions would therefore constrain nothing, while the planner would still treat the column as NOT NULL whenever it plans a query against the parent. PostgreSQL 18 rejects the combination outright:
+
+```sql
+CREATE TABLE p_bad (id int, note text NOT NULL NO INHERIT) PARTITION BY RANGE (id);
+-- ERROR:  not-null constraints on partitioned tables cannot be NO INHERIT
+
+ALTER TABLE parent ADD CONSTRAINT parent_note_ni NOT NULL note NO INHERIT;
+-- ERROR:  not-null constraints on partitioned tables cannot be NO INHERIT
+```
+
+Both versions we tested (18.6 and 18.7) reject these direct forms with the same message.
+
+## The Bug Fixed in 18.7: CREATE TABLE LIKE
+
+The 18.7 release notes describe the hole: the rule "was already rejected by plain CREATE TABLE, but cases such as CREATE TABLE LIKE missed checking copied constraints, potentially allowing a partition to contain null values when it should not". We reproduced it on 18.6:
+
+```sql
+CREATE TABLE p_like (LIKE tmpl INCLUDING ALL) PARTITION BY RANGE (id);
+CREATE TABLE p_like_1 PARTITION OF p_like FOR VALUES FROM (0) TO (100);
+INSERT INTO p_like VALUES (1, NULL);
+-- INSERT 0 1
+```
+
+The partitioned table copied `tmpl`'s constraint, `tmpl_note_not_null`, with `NO INHERIT`, so the partition never received a not-null constraint and the NULL went in.
+
+### The wrong results
+
+This is worse than a missing check. After the update to 18.7, with two NULL rows in the partition:
+
+```sql
+SELECT * FROM p_like;                               -- shows (1, NULL) and (2, NULL)
+SELECT count(*) FROM p_like WHERE note IS NULL;     -- 0
+SELECT count(*) FROM p_like_1 WHERE note IS NULL;   -- 2
+```
+
+The same rows, counted through the parent, come out as zero. The plan explains why:
+
+```sql
+EXPLAIN (COSTS OFF) SELECT count(*) FROM p_like WHERE note IS NULL;
+```
+
+```text
+           QUERY PLAN
+--------------------------------
+ Aggregate
+   ->  Result
+         One-Time Filter: false
+```
+
+The planner trusts the parent's not-null constraint, concludes that `note IS NULL` can never be true, and does not even scan the partition. A cleanup statement such as `DELETE FROM p_like WHERE note IS NULL` reported `DELETE 0` for the same reason. Data quality checks that rely on `IS NULL` against the parent will report a clean table.
+
+## What 18.7 Changes
+
+On 18.7 the `LIKE` path is checked too. All of these failed with the same error in our test:
+
+```sql
+CREATE TABLE p_like2 (LIKE tmpl INCLUDING ALL) PARTITION BY RANGE (id);
+CREATE TABLE p_like3 (LIKE tmpl) PARTITION BY RANGE (id);
+CREATE TABLE p_like4 (LIKE tmpl EXCLUDING CONSTRAINTS) PARTITION BY RANGE (id);
+-- ERROR:  not-null constraints on partitioned tables cannot be NO INHERIT
+```
+
+On 18.6, all three were accepted. Note the last two. `LIKE` always copies not-null constraints, even without `INCLUDING CONSTRAINTS` and even with `EXCLUDING CONSTRAINTS`, so a template table whose column is `NOT NULL NO INHERIT` can no longer be used as a `LIKE` source for a partitioned table. Either change the template, or write the partitioned table's columns out in full.
+
+The update does **not** touch tables that already exist. Our `p_like`, created on 18.6, still had its `NO INHERIT` constraint after the upgrade, and still accepted NULL inserts until we repaired it.
+
+## Finding Broken Constraints
+
+The release notes give this query. Run it in every database after updating to 18.7:
+
+```sql
+SELECT conrelid::regclass, conname
+FROM pg_constraint
+WHERE contype = 'n' AND connoinherit
+  AND conrelid IN (SELECT oid FROM pg_class WHERE relkind = 'p');
+```
+
+```text
+ conrelid |      conname
+----------+--------------------
+ p_like   | tmpl_note_not_null
+```
+
+Note the name. The constraint keeps the name it had on the template table (`tmpl_note_not_null`), not `p_like_note_not_null`. Our first attempt to fix it used the guessed name and failed with `constraint "p_like_note_not_null" of relation "p_like" does not exist`. Always take the name from this query or from `\d+ p_like`, which shows it in its own section:
+
+```text
+Not-null constraints:
+    "tmpl_note_not_null" NOT NULL "note" NO INHERIT
+```
+
+## Repairing the Constraint
+
+You have two options, as the release notes describe.
+
+### Option 1: keep the constraint and make it inherit
+
+```sql
+ALTER TABLE p_like ALTER CONSTRAINT tmpl_note_not_null INHERIT;
+```
+
+This makes PostgreSQL add the constraint to every partition, and it fails while any partition contains NULLs:
+
+```text
+ERROR:  column "note" of relation "p_like_1" contains null values
+```
+
+So clean the data first. Query the **partitions**, not the parent, because the parent's queries skip NULLs as shown above:
+
+```sql
+SELECT tableoid::regclass, count(*)
+FROM p_like_1
+WHERE note IS NULL
+GROUP BY 1;
+
+UPDATE p_like_1 SET note = '' WHERE note IS NULL;   -- or a real default, or DELETE
+ALTER TABLE p_like ALTER CONSTRAINT tmpl_note_not_null INHERIT;
+```
+
+With many partitions, generate one statement per partition from `pg_inherits`, or query each partition through `pg_partition_tree('p_like')`. After the fix, the catalog shows an inherited copy on the partition:
+
+```sql
+SELECT conrelid::regclass, conname, connoinherit, coninhcount, conislocal
+FROM pg_constraint
+WHERE contype = 'n' AND conrelid IN ('p_like'::regclass, 'p_like_1'::regclass);
+```
+
+```text
+ conrelid |      conname       | connoinherit | coninhcount | conislocal
+----------+--------------------+--------------+-------------+------------
+ p_like   | tmpl_note_not_null | f            |           0 | t
+ p_like_1 | tmpl_note_not_null | f            |           1 | f
+```
+
+And a NULL insert is now rejected where it belongs:
+
+```text
+ERROR:  null value in column "note" of relation "p_like_1" violates not-null constraint
+DETAIL:  Failing row contains (3, null).
+```
+
+Our guide on [null value violates not-null constraint](/blog/postgres-null-value-violates-not-null-constraint) covers that error from the application side.
+
+### Option 2: drop the constraint
+
+If the column was never meant to be NOT NULL, remove it:
+
+```sql
+ALTER TABLE p_like DROP CONSTRAINT tmpl_note_not_null;
+```
+
+After this, queries through the parent stop pruning `IS NULL` conditions. On our test table, `SELECT count(*) ... WHERE note IS NULL` went from 0 to the real count of 1 right after the `DROP CONSTRAINT`.
+
+## Auditing a Whole Partition Tree
+
+The `pg_constraint` query finds the constraint itself. To see the actual effect, which partitions accept NULLs in a column the parent declares NOT NULL, compare each leaf partition with its parent:
+
+```sql
+SELECT p.relid::regclass AS partition, a.attname
+FROM pg_partition_tree('p_like5') p
+JOIN pg_attribute a
+  ON a.attrelid = p.relid AND a.attnum > 0 AND NOT a.attisdropped AND NOT a.attnotnull
+JOIN pg_attribute pa
+  ON pa.attrelid = p.parentrelid AND pa.attname = a.attname AND pa.attnotnull
+WHERE p.isleaf
+ORDER BY 1;
+```
+
+On 18.6 we created a partitioned table with `LIKE tmpl` and two partitions, and the query listed both:
+
+```text
+ partition | attname
+-----------+---------
+ p_like5_1 | note
+ p_like5_2 | note
+```
+
+After repairing with `ALTER CONSTRAINT ... INHERIT`, the same query returns no rows. It is a good check to keep in a schema test suite, because it describes the invariant itself rather than one way of breaking it.
+
+## The Other Paths Are Already Guarded
+
+Two related operations were already strict before 18.7, and you may meet their errors while fixing things.
+
+Turning an existing constraint on a partitioned table into `NO INHERIT`:
+
+```sql
+ALTER TABLE ev ALTER CONSTRAINT ev_id_not_null NO INHERIT;
+```
+
+```text
+ERROR:  not-null constraint "ev_id_not_null" on partitioned table "ev" cannot be NO INHERIT
+```
+
+Attaching a table whose column is nullable to a parent that requires NOT NULL:
+
+```sql
+CREATE TABLE ev (id int NOT NULL, kind text NOT NULL, note text) PARTITION BY LIST (kind);
+CREATE TABLE ev_b (id int, kind text NOT NULL, note text NOT NULL);
+ALTER TABLE ev ATTACH PARTITION ev_b FOR VALUES IN ('b');
+```
+
+```text
+ERROR:  column "id" in child table "ev_b" must be marked NOT NULL
+```
+
+`ATTACH PARTITION` does not add the constraint for you. Run `ALTER TABLE ev_b ALTER COLUMN id SET NOT NULL` on the standalone table first. That scans it once, and the attach then succeeds. A partition may also be stricter than its parent: `ev_b.note` is NOT NULL while `ev.note` is nullable, which is allowed.
+
+## Locking and Large Tables
+
+`ALTER CONSTRAINT ... INHERIT` has to verify that no partition contains NULLs, which means scanning every partition while the `ALTER TABLE` holds its lock. For big partitions, plan a quiet window and do the cleanup first, so the scan succeeds on the first try. Our article on [adding constraints without long locks](/blog/postgres-add-constraint-not-valid) shows how `NOT VALID` and `VALIDATE CONSTRAINT` split the work for other constraint types. The [table partitioning guide](/blog/postgres-table-partitioning-guide) covers partition design in general.
+
+## Checking Many Databases
+
+The finder query is quick and only reads the catalogs, but it has to run in every database of every PostgreSQL 18 cluster. In [Chat2DB](https://chat2db.ai/download) you can save it as a snippet and run it against each connection in turn, then use the same editor to look at the affected partitions before changing anything. The free [PostgreSQL Minor Update Checker](https://chat2db.ai/tools/postgres-minor-update-checker) lists this and every other post-update step for the release you are moving from.
+
+## Summary
+
+In PostgreSQL 18, not-null constraints are named catalog objects that can be `NO INHERIT`, but a partitioned table cannot have one, because it would constrain nothing while the planner still trusted it. Before 18.7, `CREATE TABLE ... (LIKE ...)` could create such a constraint. The partitions then accepted NULLs, and `IS NULL` queries through the parent returned nothing. 18.7 blocks every path, including plain `LIKE`, but leaves existing tables alone. Find them with the `pg_constraint` query, clean NULLs out of the partitions directly, then run `ALTER CONSTRAINT ... INHERIT` or drop the constraint.
