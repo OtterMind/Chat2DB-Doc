@@ -1,0 +1,203 @@
+---
+title: "pg_stat_lock: Lock Wait Statistics in Postgres 19"
+description: "Use PostgreSQL 19's pg_stat_lock view to measure lock waits and fast-path overflows, learn what it does not count, and tune max_locks_per_transaction safely."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: November 15, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# pg_stat_lock: Lock Wait Statistics in Postgres 19
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="November 15, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+Lock problems in PostgreSQL have always been easy to see in the moment and hard to see over time. `pg_locks` and `pg_stat_activity` show who is waiting right now. `log_lock_waits` writes a line for each long wait. But "how much time did we spend waiting for row locks yesterday, compared with last week?" required a log parser or a monitoring agent that sampled `pg_locks` every few seconds.
+
+PostgreSQL 19 adds cumulative lock statistics: the `pg_stat_lock` view. It has one row per lock type, with the number of waits, the total wait time and a counter for fast-path lock slot overflows. This article shows what each column means, exactly what is and is not counted (we tested the edge cases), how to use the fast-path counter to size `max_locks_per_transaction`, and a trap with standbys when you change that setting. All output is from PostgreSQL 19 RC2.
+
+## The View
+
+```sql
+SELECT * FROM pg_stat_lock ORDER BY locktype;
+```
+
+```text
+     locktype     | waits | wait_time | fastpath_exceeded |         stats_reset
+------------------+-------+-----------+-------------------+------------------------------
+ advisory         |     0 |         0 |                 0 | 2026-11-15 16:14:20.40477-08
+ applytransaction |     0 |         0 |                 0 | 2026-11-15 16:14:20.40477-08
+ extend           |     0 |         0 |                 0 | 2026-11-15 16:14:20.40477-08
+ frozenid         |     0 |         0 |                 0 | 2026-11-15 16:14:20.40477-08
+ object           |     0 |         0 |                 0 | 2026-11-15 16:14:20.40477-08
+ page             |     0 |         0 |                 0 | 2026-11-15 16:14:20.40477-08
+ relation         |     0 |         0 |                 0 | 2026-11-15 16:14:20.40477-08
+ spectoken        |     0 |         0 |                 0 | 2026-11-15 16:14:20.40477-08
+ transactionid    |     0 |         0 |                 0 | 2026-11-15 16:14:20.40477-08
+ tuple            |     0 |         0 |                 0 | 2026-11-15 16:14:20.40477-08
+ userlock         |     0 |         0 |                 0 | 2026-11-15 16:14:20.40477-08
+ virtualxid       |     0 |         0 |                 0 | 2026-11-15 16:14:20.40477-08
+(12 rows)
+```
+
+The columns:
+
+- **`locktype`** uses the same names as `pg_locks.locktype`. The ones you will see most are `relation` (table and index locks), `transactionid` (waiting for another transaction to finish, which is how row lock conflicts show up), `tuple`, `virtualxid` (for example `CREATE INDEX CONCURRENTLY` waiting for old transactions), `advisory` and `extend` (relation extension).
+- **`waits`** is the number of lock acquisitions that had to wait.
+- **`wait_time`** is the total wait time in milliseconds.
+- **`fastpath_exceeded`** counts how often a lock could not use the per-backend fast-path slots because they were full.
+- **`stats_reset`** shows when the counters were last reset.
+
+The statistics are cluster-wide: one set of counters for all databases. Reset them with:
+
+```sql
+SELECT pg_stat_reset_shared('lock');
+```
+
+The underlying function is `pg_stat_get_lock()`, which takes no arguments and returns the same columns.
+
+## What Counts as a Wait
+
+The documentation says a wait is counted "only when the lock was successfully acquired after waiting longer than `deadlock_timeout`". We checked what that means in practice, with the default `deadlock_timeout` of 1 second.
+
+**A row lock wait of about 2.5 seconds.** Session A updated a row and slept for 3 seconds. Session B updated the same row and waited 2,464 ms:
+
+```text
+   locktype    | waits | wait_ms
+---------------+-------+---------
+ transactionid |     1 |  2462.6
+```
+
+It was counted, under `transactionid`, not `tuple`. B waited for A's transaction to end.
+
+**A short wait of 0.5 seconds.** The same test with a 0.5-second sleep added nothing. Waits shorter than `deadlock_timeout` are invisible in this view.
+
+**A table lock wait of 1.5 seconds**, where a `SELECT` waited behind `LOCK TABLE ... IN ACCESS EXCLUSIVE MODE`, was counted under `relation` with 1,551 ms.
+
+**A wait cancelled by `lock_timeout`.** A `SELECT` with `lock_timeout = '2s'` waited behind an exclusive lock, then failed with `canceling statement due to lock timeout`. The `relation` counter did not change. Failed waits are not counted.
+
+So after the three timed tests, the view showed exactly two waits:
+
+```text
+   locktype    | waits | wait_ms | fastpath_exceeded
+---------------+-------+---------+-------------------
+ relation      |     1 |  1551.4 |                 0
+ transactionid |     1 |  2462.6 |                 0
+```
+
+These are exactly the waits that `log_lock_waits` reports as "acquired ... after N ms". `log_lock_waits` is now on by default in version 19 (see our [log_min_messages article](/blog/postgres-log-min-messages-per-process)). In other words, `pg_stat_lock` is the aggregated form of those log lines. It does not include short waits, waits that timed out, waits that ended in a deadlock error, or waits still in progress. For those you still need `pg_stat_activity` and `pg_locks`, as described in our [wait events guide](/blog/postgres-wait-events-explained).
+
+If you want more waits to be counted, you could lower `deadlock_timeout`. Be careful, though. It also controls how quickly deadlock detection runs and how chatty `log_lock_waits` is, so changing it only to feed statistics is rarely worth it.
+
+## Turning Counters into Rates
+
+Cumulative counters are only useful as differences. A simple approach is to snapshot the view on a schedule:
+
+```sql
+CREATE TABLE lock_stats_history AS
+SELECT now() AS ts, * FROM pg_stat_lock WITH NO DATA;
+
+-- every 5 minutes, from cron or pg_cron:
+INSERT INTO lock_stats_history SELECT now(), * FROM pg_stat_lock;
+```
+
+Then look at the deltas:
+
+```sql
+SELECT ts, locktype,
+       waits - lag(waits) OVER w                       AS waits,
+       round((wait_time - lag(wait_time) OVER w)::numeric / 1000, 1) AS wait_s,
+       fastpath_exceeded - lag(fastpath_exceeded) OVER w AS fp_exceeded
+FROM lock_stats_history
+WINDOW w AS (PARTITION BY locktype ORDER BY ts)
+ORDER BY ts DESC, wait_s DESC NULLS LAST;
+```
+
+A jump in `transactionid` wait time usually means hot rows: counters, queue tables, or a long transaction holding row locks. A jump in `relation` wait time usually points to DDL or `LOCK TABLE` blocking normal queries. `virtualxid` waits typically come from `CREATE INDEX CONCURRENTLY` or `REINDEX CONCURRENTLY` waiting for old transactions. If `stats_reset` changes between two snapshots, discard that interval.
+
+## fastpath_exceeded and max_locks_per_transaction
+
+Most queries take weak locks on a few tables and indexes. PostgreSQL stores those in a small per-backend array, the *fast path*, without touching the shared lock table. Since PostgreSQL 18, the number of fast-path slots grows with `max_locks_per_transaction`. In PostgreSQL 19 the default of that setting is 128, up from 64. When a transaction needs more weak relation locks than it has slots, the rest go to the shared lock table, which is slower and more contended. `fastpath_exceeded` counts those overflows.
+
+Partitioned tables are the classic way to overflow. We created a table with 200 partitions and counted the locks of one query that touched all of them:
+
+```sql
+BEGIN;
+SELECT count(*) FROM ev;
+SELECT count(*) FILTER (WHERE fastpath) AS fast,
+       count(*) FILTER (WHERE NOT fastpath) AS slow
+FROM pg_locks WHERE pid = pg_backend_pid() AND locktype = 'relation';
+COMMIT;
+```
+
+```text
+ fast | slow
+------+------
+  128 |   74
+```
+
+With the default `max_locks_per_transaction = 128`, the backend had 128 fast-path slots, and the remaining 74 relation locks spilled to the shared table. We then reset the counters and ran a single query against different numbers of partitions:
+
+| Partitions scanned | `fastpath_exceeded` after one query |
+|---|---|
+| 100 | 0 |
+| 120 | 13 |
+| 130 | 218 |
+| 200 | 1,688 |
+
+The counter is not "locks that did not fit": at 200 partitions only 74 locks spilled, but the counter reached 1,688. It evidently counts lock requests that found the slots full, and a single query requests locks on the same relations more than once on its way through planning and execution. So use it as a signal and a trend, not as a count of relations. Zero means the fast path was big enough. A large and growing number means queries regularly lock more relations than the slots allow.
+
+After restarting with `max_locks_per_transaction = 256`, the same 200-partition query left `fastpath_exceeded` at 0. Each slot costs a little shared memory per connection, so raise the setting in steps and watch the counter, rather than setting it to a huge value.
+
+## The Standby Trap
+
+`max_locks_per_transaction` is one of the settings a hot standby must have at least as high as the primary. When we raised it to 256 on the primary only and restarted, the standby stopped serving the new WAL:
+
+```text
+WARNING:  hot standby is not possible because of insufficient parameter settings
+DETAIL:  max_locks_per_transaction = 128 is a lower setting than on the primary server, where its value was 256.
+LOG:  recovery has paused
+DETAIL:  If recovery is unpaused, the server will shut down.
+HINT:  You can then restart the server after making the necessary configuration changes.
+```
+
+The standby kept accepting connections, but replay was paused, so it fell further and further behind. Later, a promotion attempt on that standby failed and shut it down:
+
+```text
+WARNING:  promotion is not possible because of insufficient parameter settings
+DETAIL:  max_locks_per_transaction = 128 is a lower setting than on the primary server, where its value was 256.
+FATAL:  recovery aborted because of insufficient parameter settings
+```
+
+That is the worst moment to find out. The safe order for raising `max_locks_per_transaction` (and also `max_connections`, `max_worker_processes`, `max_wal_senders` and `max_prepared_transactions`) is: **standbys first, then the primary**. To lower it, do the reverse. Our [replication lag guide](/blog/postgres-replication-lag-troubleshooting) has queries to confirm that replay is moving again afterwards.
+
+## From Statistics to the Blocking Session
+
+When the deltas show a spike that is still going on, switch from statistics to live data. `pg_blocking_pids()` lists the sessions that block a given process, which saves you from joining `pg_locks` with itself:
+
+```sql
+SELECT pid, pg_blocking_pids(pid) AS blocked_by,
+       wait_event_type, wait_event, left(query, 40) AS query
+FROM pg_stat_activity
+WHERE cardinality(pg_blocking_pids(pid)) > 0;
+```
+
+For each pid in `blocked_by`, look up its `state`, `xact_start` and `query` in `pg_stat_activity`. A blocker in state `idle in transaction` with an old `xact_start` is the most common finding: an application opened a transaction, took a lock and then waited on something else. `idle_in_transaction_session_timeout` protects against that. The [lock timeout guide](/blog/postgres-lock-timeout-guide) covers setting `lock_timeout` so waiters give up instead of piling up.
+
+## pg_stat_lock and Other Tools
+
+| Question | Where to look |
+|---|---|
+| Who is waiting right now, and on whom? | `pg_stat_activity` with `pg_blocking_pids()`, `pg_locks` |
+| Which statements waited long, and when? | `log_lock_waits` lines in the server log |
+| How much lock waiting is there over time, by type? | `pg_stat_lock` deltas |
+| Is the fast path too small? | `pg_stat_lock.fastpath_exceeded` |
+| Which queries suffer most? | `pg_stat_statements` timing, together with the above |
+
+For a live investigation, a query editor with several tabs makes the workflow faster. In [Chat2DB](https://chat2db.ai/download) you can keep a `pg_stat_lock` delta query, a `pg_blocking_pids()` query and the blocking session's SQL open side by side.
+
+## Summary
+
+PostgreSQL 19's `pg_stat_lock` view keeps cluster-wide, cumulative lock statistics per lock type: `waits`, `wait_time` and `fastpath_exceeded`. A wait is counted only if it lasted longer than `deadlock_timeout` and the lock was then acquired. Short waits, timeouts and deadlocks do not appear. Snapshot the view and compare deltas to see trends, and reset it with `pg_stat_reset_shared('lock')`. `fastpath_exceeded` grows quickly when queries lock more relations than the fast-path slots allow, typically with many partitions. Raising `max_locks_per_transaction` fixes that, but raise it on the standbys before the primary, or replay pauses and promotion fails.

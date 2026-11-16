@@ -1,0 +1,251 @@
+---
+title: "Fill Gaps in Time Series Data in PostgreSQL"
+description: "Fill missing dates and NULLs in PostgreSQL time series: generate_series for missing rows, forward fill, zero fill, linear interpolation and date_bin buckets."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: November 15, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# Fill Gaps in Time Series Data in PostgreSQL
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="November 15, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+Real time series data is never complete. A store has no sales on a holiday, a sensor goes offline for an hour, a metric is only written when it changes. When you chart the data or compute rolling averages, those gaps cause problems. A missing day disappears from the x-axis, a seven-row window covers ten days, and a join on dates silently drops rows.
+
+There are two kinds of gaps, and they need different fixes:
+
+1. **Missing rows.** There is simply no row for November 3. You need to generate it.
+2. **NULL values.** The row exists, but the measurement is NULL. You need to decide what value it should get: zero, the last known value, or something in between.
+
+This guide solves both in plain SQL, using `generate_series()`, outer joins and window functions, including the `IGNORE NULLS` option that PostgreSQL 19 adds. Every query was run on PostgreSQL 19 RC2, and the version-18 equivalents on 18.7.
+
+## Sample Data
+
+Two stores, five days, and several days with no sales:
+
+```sql
+CREATE TABLE sales (day date, store text, amount numeric);
+INSERT INTO sales VALUES
+  ('2026-11-01','x',100), ('2026-11-02','x',120), ('2026-11-05','x',90),
+  ('2026-11-02','y',50),  ('2026-11-04','y',70);
+```
+
+Store `x` has nothing on November 3 and 4. Store `y` has nothing on November 1, 3 and 5.
+
+## Step 0: Find Out Where the Gaps Are
+
+Before filling anything, it is worth knowing how big the holes are. A gap of one day in a daily series is normal noise. A gap of three weeks probably means a broken pipeline, and filling it silently would hide the outage. `lead()` compares each row with the next one in the same group:
+
+```sql
+SELECT store, day AS gap_after, next_day, next_day - day - 1 AS missing_days
+FROM (
+  SELECT store, day, lead(day) OVER (PARTITION BY store ORDER BY day) AS next_day
+  FROM sales
+) s
+WHERE next_day - day > 1
+ORDER BY store, day;
+```
+
+```text
+ store | gap_after  |  next_day  | missing_days
+-------+------------+------------+--------------
+ x     | 2026-11-02 | 2026-11-05 |            2
+ y     | 2026-11-02 | 2026-11-04 |            1
+```
+
+This query only finds gaps between two existing rows. Store `y` is also missing November 1 and 5, at the edges of the range, and only the full calendar in the next steps reveals those. Use the gap report to decide on a maximum gap you are willing to fill, and leave longer gaps as NULL so a chart shows a break instead of a made-up line.
+
+## Step 1: Build the Complete Calendar
+
+`generate_series()` produces one row per step between two values. For dates, step by one day:
+
+```sql
+SELECT d::date AS day
+FROM generate_series(date '2026-11-01', date '2026-11-05', interval '1 day') d;
+```
+
+`generate_series` with a `date` start and an `interval` step returns `timestamp`, which is why the cast back to `date` is there. If you need the range to follow the data, compute it with a subquery: `generate_series((SELECT min(day) FROM sales), (SELECT max(day) FROM sales), interval '1 day')`. There is more detail on the function in our [generate_series guide](/blog/postgres-generate-series-guide).
+
+## Step 2: One Row per Store per Day
+
+For grouped series, cross join the calendar with the list of groups, then left join the facts:
+
+```sql
+SELECT s.store, d::date AS day, coalesce(sa.amount, 0) AS amount
+FROM generate_series(date '2026-11-01', date '2026-11-05', interval '1 day') d
+CROSS JOIN (SELECT DISTINCT store FROM sales) s
+LEFT JOIN sales sa ON sa.day = d::date AND sa.store = s.store
+ORDER BY 1, 2;
+```
+
+```text
+ store |    day     | amount
+-------+------------+--------
+ x     | 2026-11-01 |    100
+ x     | 2026-11-02 |    120
+ x     | 2026-11-03 |      0
+ x     | 2026-11-04 |      0
+ x     | 2026-11-05 |     90
+ y     | 2026-11-01 |      0
+ y     | 2026-11-02 |     50
+ y     | 2026-11-03 |      0
+ y     | 2026-11-04 |     70
+ y     | 2026-11-05 |      0
+(10 rows)
+```
+
+Ten rows, two stores times five days. For additive measures such as sales, order counts or page views, zero is the correct value for a missing day: nothing happened, so the total is zero.
+
+Two details are easy to get wrong here. First, the store filter must be in the `ON` clause, not in `WHERE`. A `WHERE sa.store = 'x'` would throw away the NULL rows the outer join just created. Second, `SELECT DISTINCT store FROM sales` only lists stores that sold something in the table. If a store can have zero sales for the whole period, use your `stores` dimension table instead.
+
+## Step 3: Carry the Last Value Forward
+
+Zero is wrong for measurements that describe a state rather than an event: stock level, account balance, temperature, a price. If the stock was 120 on November 2 and nobody counted on November 3, the best estimate for November 3 is still 120. That is forward fill.
+
+On PostgreSQL 19, use `last_value() IGNORE NULLS`:
+
+```sql
+SELECT s.store, d::date AS day, sa.amount,
+  last_value(sa.amount) IGNORE NULLS OVER (
+    PARTITION BY s.store ORDER BY d
+    ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+  ) AS carried
+FROM generate_series(date '2026-11-01', date '2026-11-05', interval '1 day') d
+CROSS JOIN (SELECT DISTINCT store FROM sales) s
+LEFT JOIN sales sa ON sa.day = d::date AND sa.store = s.store
+ORDER BY 1, 2;
+```
+
+```text
+ store |    day     | amount | carried
+-------+------------+--------+---------
+ x     | 2026-11-01 |    100 |     100
+ x     | 2026-11-02 |    120 |     120
+ x     | 2026-11-03 |        |     120
+ x     | 2026-11-04 |        |     120
+ x     | 2026-11-05 |     90 |      90
+ y     | 2026-11-01 |        |
+ y     | 2026-11-02 |     50 |      50
+ y     | 2026-11-03 |        |      50
+ y     | 2026-11-04 |     70 |      70
+ y     | 2026-11-05 |        |      70
+```
+
+Store `y` on November 1 stays NULL, because there is nothing before it to carry. You can fill it with `first_value(...) IGNORE NULLS` over a forward-looking frame (backward fill), with a constant, or leave it NULL so nobody mistakes an estimate for a measurement. The [IGNORE NULLS guide](/blog/postgres-ignore-nulls-window-functions) covers all five functions that accept the option and why the explicit `ROWS` frame matters.
+
+### Forward Fill on PostgreSQL 18 and Older
+
+Older versions reject `IGNORE NULLS` with `syntax error at or near "NULLS"`. The standard workaround is to number the groups with a running `count()`, which skips NULLs, and spread each group's single value with `max()`:
+
+```sql
+SELECT store, day, amount,
+  max(amount) OVER (PARTITION BY store, grp) AS carried
+FROM (
+  SELECT s.store, d::date AS day, sa.amount,
+    count(sa.amount) OVER (PARTITION BY s.store ORDER BY d ROWS UNBOUNDED PRECEDING) AS grp
+  FROM generate_series(date '2026-11-01', date '2026-11-05', interval '1 day') d
+  CROSS JOIN (SELECT DISTINCT store FROM sales) s
+  LEFT JOIN sales sa ON sa.day = d::date AND sa.store = s.store
+) t
+ORDER BY 1, 2;
+```
+
+It returns the same ten rows on 18.7 and 19 RC2. If you have several columns to fill, each one needs its own `count()` column. The [SQL Forward Fill Generator](https://chat2db.ai/tools/sql-forward-fill-generator) writes that boilerplate for any number of columns, for either version and for SQLite.
+
+## Step 4: Linear Interpolation
+
+For smoothly changing values such as temperature or a metered reading, forward fill produces flat steps. Linear interpolation draws a straight line between the known points instead. For each missing row you need four things: the previous known value and its position, and the next known value and its position. Window functions give you all four:
+
+```sql
+WITH grid AS (
+  SELECT d::date AS day, sa.amount
+  FROM generate_series(date '2026-11-01', date '2026-11-05', interval '1 day') d
+  LEFT JOIN sales sa ON sa.day = d::date AND sa.store = 'x'
+), b AS (
+  SELECT day, amount,
+    last_value(CASE WHEN amount IS NOT NULL THEN day END) IGNORE NULLS OVER (ORDER BY day) AS prev_day,
+    last_value(amount) IGNORE NULLS OVER (ORDER BY day) AS prev_amt,
+    first_value(CASE WHEN amount IS NOT NULL THEN day END) IGNORE NULLS
+      OVER (ORDER BY day ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING) AS next_day,
+    first_value(amount) IGNORE NULLS
+      OVER (ORDER BY day ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING) AS next_amt
+  FROM grid
+)
+SELECT day, amount,
+  coalesce(amount, round(prev_amt + (next_amt - prev_amt) * (day - prev_day)
+                         / nullif(next_day - prev_day, 0), 2)) AS interpolated
+FROM b ORDER BY day;
+```
+
+```text
+    day     | amount | interpolated
+------------+--------+--------------
+ 2026-11-01 |    100 |          100
+ 2026-11-02 |    120 |          120
+ 2026-11-03 |        |       110.00
+ 2026-11-04 |        |       100.00
+ 2026-11-05 |     90 |           90
+```
+
+Between 120 on November 2 and 90 on November 5 there are three days, so each day drops by 10. The `CASE WHEN amount IS NOT NULL THEN day END` trick turns the date into a value that is NULL exactly when the amount is NULL, so `IGNORE NULLS` finds the date of the last real reading. Subtracting two dates gives an integer number of days. For `timestamp` columns, use `extract(epoch FROM ts)` to get seconds instead.
+
+This query uses the default `RANGE` frame for the backward-looking functions. That is safe only because the calendar has exactly one row per day, so there are no peers. With raw data that can repeat timestamps, add an explicit `ROWS` frame and a tiebreaker.
+
+Interpolation leaves leading and trailing gaps NULL. There is no second point to draw the line to, and inventing one (extrapolation) is rarely what you want in reports.
+
+## Step 5: Regular Buckets for Irregular Events
+
+Event data is the other common source of gaps. Requests, logins and errors arrive at random times, and you want counts per 15 minutes, including empty buckets. `date_bin()` puts each event into a bucket, and the bucket grid comes from `generate_series()`:
+
+```sql
+CREATE TABLE events (ts timestamptz);
+INSERT INTO events VALUES
+  ('2026-11-15 10:01+00'), ('2026-11-15 10:07+00'),
+  ('2026-11-15 10:31+00'), ('2026-11-15 10:58+00');
+
+SELECT b AS bucket, count(e.ts) AS n
+FROM generate_series(timestamptz '2026-11-15 10:00+00',
+                     timestamptz '2026-11-15 10:45+00',
+                     interval '15 minutes') b
+LEFT JOIN events e
+  ON date_bin('15 minutes', e.ts, timestamptz '2026-11-15 00:00+00') = b
+GROUP BY b ORDER BY b;
+```
+
+```text
+         bucket         | n
+------------------------+---
+ 2026-11-15 10:00:00+00 | 2
+ 2026-11-15 10:15:00+00 | 0
+ 2026-11-15 10:30:00+00 | 1
+ 2026-11-15 10:45:00+00 | 1
+```
+
+Use `count(e.ts)`, not `count(*)`. With `count(*)`, an empty bucket still counts the one NULL row the outer join produced and shows 1 instead of 0. The origin argument of `date_bin()` must line up with the grid, here midnight. More on bucketing in [date_bin for time series](/blog/using-date_bin-function-in-postgresql-to-analyze-time-series-data).
+
+## Which Fill Method Should You Use?
+
+| Measure type | Example | Fill with |
+|---|---|---|
+| Event counts and sums | sales, page views, errors | 0 |
+| State that persists | stock level, balance, status, price | last value (forward fill) |
+| Smoothly changing reading | temperature, meter, distance | linear interpolation |
+| Leading gap before first reading | new sensor, new account | backward fill, a constant or NULL |
+
+Whatever you choose, document it in the query or the column name (`amount_filled`, `temp_interpolated`). An analyst who sees a smooth line has no way of knowing that half the points were estimated.
+
+## Performance Notes
+
+- Generate the calendar for the range you need, not for all time. A cross join of 10,000 devices with a year of minute buckets is over five billion rows.
+- Index the fact table on `(store, day)` or `(device_id, ts)`, so the left join can find matches quickly.
+- For dashboards that run the same fill repeatedly, store the result in a materialized view and refresh it on a schedule.
+
+You can build these queries step by step in [Chat2DB](https://chat2db.ai/download): run the calendar, then the join, then the window functions, and check each intermediate result in the grid before adding the next layer.
+
+## Summary
+
+Missing rows and NULL values are different problems. Generate missing rows with `generate_series()` cross joined to your groups, and left join the facts with the group filter in the `ON` clause. Fill event counts with zero via `coalesce`. Fill states with the last known value, using `last_value() IGNORE NULLS` on PostgreSQL 19 or the `count()` and `max()` trick on older versions. Interpolate smooth readings with the previous and next known points. For irregular events, bucket with `date_bin()` and count a column, not `*`, so empty buckets show zero.

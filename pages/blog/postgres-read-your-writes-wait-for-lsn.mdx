@@ -1,0 +1,259 @@
+---
+title: "Read-Your-Writes on Postgres Replicas: WAIT FOR"
+description: "Stop stale reads from PostgreSQL read replicas: use the PostgreSQL 19 WAIT FOR LSN command, get the right LSN, handle timeouts, and compare remote_apply."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: November 15, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# Read-Your-Writes on Postgres Replicas: WAIT FOR
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="November 15, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+Sending reads to a streaming replica is the cheapest way to scale a PostgreSQL application, until a user saves a form, gets redirected to the detail page, and sees the old data. The write went to the primary, the read went to a standby, and the standby had not replayed that part of the WAL yet. Replication lag is usually milliseconds, but a page load is also milliseconds, so the race is real.
+
+The guarantee you want is called **read-your-writes consistency**: after a client writes, its own subsequent reads see that write, even on a replica. PostgreSQL 19 adds a command made for this, `WAIT FOR LSN`. This article shows how to use it correctly. That includes a subtle mistake in how you obtain the LSN, the timeout and error behavior, the wait modes, and the alternatives for PostgreSQL 18 and older. Everything was tested on a PostgreSQL 19 RC2 primary with a streaming standby.
+
+## The Idea in One Picture
+
+Every change on the primary is written to the WAL at a position called an LSN (log sequence number). A standby replays the WAL in order. So if a client knows the LSN of its commit, a standby can tell whether that commit is visible: it is visible once the standby's replay position has reached that LSN.
+
+1. The application writes on the primary and commits.
+2. It reads the primary's current WAL position and keeps it, for example in the user's session.
+3. Before reading from a standby, it asks the standby to wait until replay has reached that position.
+4. It reads.
+
+Step 3 is what PostgreSQL 19 adds natively.
+
+## The WAIT FOR Command
+
+```sql
+WAIT FOR LSN 'lsn' [ WITH ( option [, ...] ) ]
+
+-- options:
+--   MODE 'standby_replay' | 'standby_write' | 'standby_flush' | 'primary_flush'
+--   TIMEOUT 'duration'
+--   NO_THROW
+```
+
+A first test. On the primary:
+
+```sql
+INSERT INTO orders_rw (note) VALUES ('first');
+SELECT pg_current_wal_insert_lsn();
+-- 0/08005B58
+```
+
+On the standby:
+
+```sql
+WAIT FOR LSN '0/08005B58' WITH (TIMEOUT '2s');
+```
+
+```text
+ status
+---------
+ success
+(1 row)
+```
+
+`WAIT` returns a one-row result with a `status` column. With the default mode, `standby_replay`, success means the standby has replayed up to that LSN, so a query started now sees the data.
+
+## Get the LSN After the Commit
+
+Here is the mistake to avoid. It is tempting to return the LSN from the write itself:
+
+```sql
+-- Wrong: the LSN is taken before COMMIT
+BEGIN;
+INSERT INTO orders_rw (note) VALUES ('x') RETURNING pg_current_wal_insert_lsn();
+-- 0/08006B18
+COMMIT;
+SELECT pg_current_wal_insert_lsn();
+-- 0/08006B40
+```
+
+The two values differ by the commit record. The row only becomes visible on the standby when the commit record is replayed, and that record sits *after* the first LSN. Waiting for `0/08006B18` can succeed while the commit is still in flight, and then your read misses the row anyway. In autocommit mode the same thing happens with `INSERT ... RETURNING pg_current_wal_insert_lsn()`, because `RETURNING` is evaluated before the implicit commit.
+
+The safe pattern is to read the position in a separate statement after the commit has returned:
+
+```sql
+COMMIT;
+SELECT pg_current_wal_lsn();
+```
+
+Any position at or after your commit works. Waiting for a slightly later LSN costs at most a few extra milliseconds. In our test `pg_current_wal_lsn()`, `pg_current_wal_insert_lsn()` and `pg_current_wal_flush_lsn()` returned the same value on an idle primary. Under load, `pg_current_wal_insert_lsn()` is the furthest ahead and `pg_current_wal_lsn()` (the write position) is a safe and slightly cheaper choice.
+
+## Timeouts, Errors and NO_THROW
+
+To simulate lag, we paused replay on the standby with `SELECT pg_wal_replay_pause();`, wrote another row on the primary, and waited for its LSN:
+
+```sql
+WAIT FOR LSN '0/08005C08' WITH (TIMEOUT '1s');
+```
+
+```text
+ERROR:  timed out while waiting for target LSN 0/08005C08 to be replayed; current standby_replay LSN 0/08005B80
+```
+
+The error message includes how far the standby actually got, which is useful in logs. An error aborts the current transaction, which is awkward in application code that wants to fall back to the primary. Add `NO_THROW` to get a status instead:
+
+```sql
+WAIT FOR LSN '0/08005C08' WITH (TIMEOUT '1s', NO_THROW);
+```
+
+```text
+ status
+---------
+ timeout
+(1 row)
+```
+
+Now the application can check the status, and on `timeout` send this one read to the primary. That is usually the best behavior: the user gets correct data, just a bit slower.
+
+Without a `TIMEOUT`, `WAIT` waits indefinitely. We started a wait with no timeout, and while it was blocked, `pg_stat_activity` on the standby showed:
+
+```text
+  pid  | wait_event_type |    wait_event    | state  |           query
+-------+-----------------+------------------+--------+---------------------------
+ 98473 | IPC             | WaitForWalReplay | active | WAIT FOR LSN '0/08005C08'
+```
+
+After `pg_wal_replay_resume()`, it returned `success` after 1.7 seconds. In production, always set a timeout, or at least a `statement_timeout`, so a stuck standby cannot hang your request threads.
+
+## Wait Modes
+
+The default mode waits for *replay*, which is what read-your-writes needs. The other modes wait for earlier stages:
+
+| Mode | Runs on | Waits until the LSN is | Use it for |
+|---|---|---|---|
+| `standby_replay` (default) | standby | replayed, so visible to queries | read-your-writes |
+| `standby_write` | standby | received and written to the standby's WAL files | measuring receive lag |
+| `standby_flush` | standby | received and fsynced on the standby | durability checks |
+| `primary_flush` | primary | flushed to disk on the primary | making sure your own commit is durable |
+
+While replay was paused, `standby_write` and `standby_flush` both returned `success` for the LSN that `standby_replay` timed out on. The WAL had arrived, it just was not applied. That is exactly the gap between `pg_last_wal_receive_lsn()` (0/08005C30 in our test) and `pg_last_wal_replay_lsn()` (0/08005B80).
+
+## Restrictions and Errors
+
+`WAIT` must run as its own top-level statement, outside any snapshot. These are the errors we hit:
+
+```text
+-- On the primary with the default mode:
+ERROR:  recovery is not in progress
+HINT:  Waiting for the standby_replay LSN can only be executed during recovery.
+
+-- Inside REPEATABLE READ after a query:
+ERROR:  WAIT cannot be executed while the current transaction holds a snapshot
+DETAIL:  This transaction runs at an isolation level higher than READ COMMITTED, so it holds a snapshot from its first query until it ends.
+
+-- Inside a function or DO block:
+ERROR:  WAIT can only be executed as a top-level statement
+DETAIL:  WAIT cannot be used within a function, procedure, or DO block.
+
+-- Bad input:
+ERROR:  invalid input syntax for type pg_lsn: "bogus"
+ERROR:  timeout cannot be negative
+ERROR:  unrecognized value for WAIT option "mode": "replay"
+```
+
+The snapshot rule is the important design constraint. A `REPEATABLE READ` transaction takes its snapshot at the first query, and waiting after that cannot make new data visible to it. So run `WAIT` first, then start the read transaction. In a plain `READ COMMITTED` transaction, `BEGIN; WAIT ...; COMMIT;` worked fine, and so does a `SELECT` after the `WAIT`, because each statement gets a fresh snapshot.
+
+No special privilege is needed. A freshly created login role with no grants could run `WAIT FOR LSN` on the standby. It is also accepted on a read-only standby, unlike anything that writes.
+
+## Putting It in an Application
+
+A minimal flow, in pseudocode:
+
+```text
+on write request:
+    primary.execute("UPDATE ...")          # autocommit, or COMMIT
+    lsn = primary.query("SELECT pg_current_wal_lsn()")
+    session["min_lsn"] = lsn
+
+on read request:
+    if session has min_lsn:
+        status = replica.query("WAIT FOR LSN %s WITH (TIMEOUT '200ms', NO_THROW)", min_lsn)
+        if status != "success":
+            return primary.query(read_sql)
+    return replica.query(read_sql)
+```
+
+A few practical notes:
+
+- **Connection poolers.** `WAIT` is a normal statement and works through PgBouncer in transaction mode, as long as the `WAIT` and the following `SELECT` go to the same backend. Put both in one transaction (`BEGIN; WAIT ...; SELECT ...; COMMIT;`) to guarantee that.
+- **Several replicas.** The LSN is global, so the same value works on any standby of the same primary. Different standbys may need different wait times.
+- **Do not store the LSN forever.** After a few seconds every healthy replica has passed it. Expire it, so old sessions do not pay a wait on every request.
+
+## Before PostgreSQL 19: Polling
+
+On older standbys, you can compare `pg_last_wal_replay_lsn()` in a loop. A DO block works, because the restriction on `WAIT` does not apply to a plain function call:
+
+```sql
+DO $$
+DECLARE
+  target   pg_lsn := '0/110041C0';
+  deadline timestamptz := clock_timestamp() + interval '2 seconds';
+BEGIN
+  WHILE pg_last_wal_replay_lsn() < target LOOP
+    IF clock_timestamp() > deadline THEN
+      RAISE EXCEPTION 'standby has not replayed % yet (at %)', target, pg_last_wal_replay_lsn();
+    END IF;
+    PERFORM pg_sleep(0.01);
+  END LOOP;
+END $$;
+```
+
+With replay paused, it failed as designed:
+
+```text
+ERROR:  standby has not replayed 0/110041C0 yet (at 0/11004108)
+```
+
+It works, but it polls every 10 ms instead of being woken when replay advances, and it adds up to 10 ms of extra latency. Doing the loop in the application, with a quick `SELECT pg_last_wal_replay_lsn() >= $1` per attempt, is equivalent. `WAIT` is simply the efficient, built-in version of this loop.
+
+## Alternative: synchronous_commit = remote_apply
+
+The other approach moves the wait to the writer. With a synchronous standby configured and `synchronous_commit = remote_apply`, `COMMIT` returns only after the standby has *applied* the commit:
+
+```sql
+ALTER SYSTEM SET synchronous_standby_names = 'walreceiver';
+SELECT pg_reload_conf();
+
+SET synchronous_commit = remote_apply;
+INSERT INTO orders_rw (note) VALUES ('ra');   -- 1.6 ms in our lab
+```
+
+Immediately afterwards, the standby returned the row. The cost shows up when the standby stalls. We paused replay and inserted again with `statement_timeout = '2s'`. The insert did not time out. It sat in `wait_event = SyncRep` for over two minutes, until we resumed replay. `statement_timeout` does not cover the time `COMMIT` spends waiting for the standby, so it gives no protection here. At that point the transaction is already committed on the primary; the client is only waiting for the confirmation.
+
+| | `WAIT FOR LSN` (19) | `remote_apply` |
+|---|---|---|
+| Who waits | only readers that need fresh data | every writer using the setting |
+| Standby stall | reader times out and can fall back | writes hang |
+| Scope | per read, any number of async standbys | synchronous standbys only |
+| Versions | 19+ standby | 9.6+ |
+
+For most applications `WAIT FOR LSN` is the better trade: writes stay fast, and only the reads that need it pay for consistency. Our [replication lag guide](/blog/postgres-replication-lag-troubleshooting) covers how to find the cause when standbys fall behind regularly.
+
+## Monitoring the Standby
+
+PostgreSQL 19 also adds the `pg_stat_recovery` view on standbys, which shows replay state in one place. During our paused test:
+
+```text
+promote_triggered        | f
+last_replayed_end_lsn    | 0/08005B80
+recovery_last_xact_time  | 2026-11-15 16:12:19.47965-08
+pause_state              | paused
+```
+
+`pause_state` is a good thing to alert on. A forgotten `pg_wal_replay_pause()` turns every `WAIT` into a timeout.
+
+When you are testing this flow, keep one connection to the primary and one to the standby open side by side. In [Chat2DB](https://chat2db.ai/download) you can run the write and `pg_current_wal_lsn()` in one tab and `WAIT FOR LSN` plus the read in the other, and see exactly where the data appears.
+
+## Summary
+
+Read-your-writes on PostgreSQL replicas means: commit on the primary, read `pg_current_wal_lsn()` after the commit, and make the standby wait until it has replayed that LSN before reading. PostgreSQL 19's `WAIT FOR LSN '...' WITH (TIMEOUT '...', NO_THROW)` does the waiting efficiently and returns `success` or `timeout`. Do not take the LSN inside the writing transaction, run `WAIT` as a top-level statement before the read transaction's snapshot, and always set a timeout. On older versions, poll `pg_last_wal_replay_lsn()`. `synchronous_commit = remote_apply` gives the same guarantee from the writer's side, but it makes writes hang when the standby stalls.

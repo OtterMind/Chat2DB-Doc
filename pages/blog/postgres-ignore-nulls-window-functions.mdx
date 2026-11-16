@@ -1,0 +1,246 @@
+---
+title: "IGNORE NULLS in PostgreSQL 19 Window Functions"
+description: "PostgreSQL 19 adds IGNORE NULLS to lag, lead, first_value, last_value and nth_value. Learn the frame rules, errors, and the count() workaround for 18."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: November 15, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# IGNORE NULLS in PostgreSQL 19 Window Functions
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="November 15, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+"Give me the last known value" is a question that comes up all the time in SQL. What was the sensor's last temperature reading? What was the account's status before this event? What was the price on the last day that had a trade? Oracle, Snowflake, BigQuery and SQL Server 2022 answer it with `IGNORE NULLS`. In PostgreSQL the same query was a syntax error, and people copied a clever but hard-to-read workaround from Stack Overflow.
+
+PostgreSQL 19 closes that gap. The `lead()`, `lag()`, `first_value()`, `last_value()` and `nth_value()` window functions now accept `IGNORE NULLS` and `RESPECT NULLS`. This article explains what the option does for each function, which window frame you need, which errors to expect, and how to get the same result on PostgreSQL 18 and older. All output was captured on PostgreSQL 19 RC2 and 18.7.
+
+## Sample Data
+
+We will use a small readings table with gaps. Each sensor reports a temperature only sometimes:
+
+```sql
+CREATE TABLE readings (sensor text, ts timestamptz, temp numeric);
+INSERT INTO readings VALUES
+ ('a','2026-11-01 00:00+00',20.5), ('a','2026-11-01 01:00+00',NULL),
+ ('a','2026-11-01 02:00+00',NULL), ('a','2026-11-01 03:00+00',22.0),
+ ('a','2026-11-01 04:00+00',NULL),
+ ('b','2026-11-01 00:00+00',NULL), ('b','2026-11-01 01:00+00',18.0),
+ ('b','2026-11-01 02:00+00',NULL);
+SET timezone = 'UTC';
+```
+
+## lag() and lead() with IGNORE NULLS
+
+Plain `lag(temp)` returns the value from the previous row, even if that value is NULL. With `IGNORE NULLS`, it returns the value from the previous row that has a non-NULL value:
+
+```sql
+SELECT sensor, ts::time, temp,
+  lag(temp)               OVER w AS lag_plain,
+  lag(temp) IGNORE NULLS  OVER w AS lag_ignore,
+  lead(temp) IGNORE NULLS OVER w AS lead_ignore
+FROM readings
+WINDOW w AS (PARTITION BY sensor ORDER BY ts)
+ORDER BY sensor, ts;
+```
+
+```text
+ sensor |    ts    | temp | lag_plain | lag_ignore | lead_ignore
+--------+----------+------+-----------+------------+-------------
+ a      | 00:00:00 | 20.5 |           |            |        22.0
+ a      | 01:00:00 |      |      20.5 |       20.5 |        22.0
+ a      | 02:00:00 |      |           |       20.5 |        22.0
+ a      | 03:00:00 | 22.0 |           |       20.5 |
+ a      | 04:00:00 |      |      22.0 |       22.0 |
+ b      | 00:00:00 |      |           |            |        18.0
+ b      | 01:00:00 | 18.0 |           |            |
+ b      | 02:00:00 |      |      18.0 |       18.0 |
+```
+
+Look at the 02:00 row for sensor `a`. `lag_plain` is empty because the row before it, at 01:00, has no reading. `lag_ignore` skips back over that row and finds 20.5. Note also the 03:00 row: `lag` never looks at the current row, so even though 03:00 has its own value, `lag_ignore` reports the previous non-NULL value, 20.5.
+
+The offset and default arguments still work and count only non-NULL rows:
+
+```sql
+SELECT ts::time, temp, lag(temp, 2, -1) IGNORE NULLS OVER (ORDER BY ts)
+FROM readings WHERE sensor = 'a' ORDER BY ts;
+```
+
+```text
+    ts    | temp | lag
+----------+------+------
+ 00:00:00 | 20.5 |   -1
+ 01:00:00 |      |   -1
+ 02:00:00 |      |   -1
+ 03:00:00 | 22.0 |   -1
+ 04:00:00 |      | 20.5
+```
+
+Only at 04:00 are there two earlier non-NULL readings, so only that row finds a value two steps back. Every other row falls back to the default of -1.
+
+## last_value() IGNORE NULLS: Forward Fill
+
+For "the last known value, including my own", `last_value()` is the better fit. Unlike `lag()`, it considers the current row:
+
+```sql
+SELECT sensor, ts::time, temp,
+  last_value(temp) IGNORE NULLS OVER (
+    PARTITION BY sensor ORDER BY ts
+    ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+  ) AS locf
+FROM readings ORDER BY sensor, ts;
+```
+
+```text
+ sensor |    ts    | temp | locf
+--------+----------+------+------
+ a      | 00:00:00 | 20.5 | 20.5
+ a      | 01:00:00 |      | 20.5
+ a      | 02:00:00 |      | 20.5
+ a      | 03:00:00 | 22.0 | 22.0
+ a      | 04:00:00 |      | 22.0
+ b      | 00:00:00 |      |
+ b      | 01:00:00 | 18.0 | 18.0
+ b      | 02:00:00 |      | 18.0
+```
+
+This is forward fill, also called LOCF (last observation carried forward). Sensor `b`'s first row stays NULL because nothing came before it.
+
+### Why the Frame Matters
+
+The frame clause is not decoration. Window functions see only the rows in the current frame, and the default frame with `ORDER BY` is `RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW`. `RANGE` includes all peers of the current row, meaning all rows with the same `ORDER BY` value. If two readings share a timestamp, the default frame lets the first of them see the second one's value, which is not "the value so far". Writing `ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW` makes the frame end exactly at the current row. Better still, make the ordering unique by adding a tiebreaker such as an id.
+
+The frame also explains a common surprise with `last_value()` without `IGNORE NULLS`. Over the default frame it returns the current row's value, not the partition's last value. To get the partition's last value, you need `ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING`.
+
+## first_value() IGNORE NULLS: Backward Fill
+
+Reverse the frame and you get the next known value, which is useful for leading NULLs or for "next observation carried backward":
+
+```sql
+SELECT sensor, ts::time, temp,
+  first_value(temp) IGNORE NULLS OVER (
+    PARTITION BY sensor ORDER BY ts
+    ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+  ) AS nocb
+FROM readings ORDER BY sensor, ts;
+```
+
+Sensor `b` at 00:00 now gets 18.0, while sensor `a` at 04:00 gets NULL because no later reading exists. Combining both with `COALESCE(locf, nocb)` fills every gap that has a value on at least one side.
+
+## nth_value() IGNORE NULLS
+
+`nth_value(temp, 2) IGNORE NULLS` returns the second non-NULL value in the frame. With a whole-partition frame, it answers questions such as "what was each sensor's second reading?":
+
+```sql
+SELECT DISTINCT sensor,
+  nth_value(temp, 2) IGNORE NULLS OVER (
+    PARTITION BY sensor ORDER BY ts
+    ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING
+  ) AS second_reading
+FROM readings;
+```
+
+Sensor `a` returns 22.0. Sensor `b` returns NULL, because it has only one reading.
+
+## RESPECT NULLS
+
+`RESPECT NULLS` is the default behavior, spelled out. It exists for SQL standard compatibility and for code generators that always emit one of the two keywords. `lag(temp) RESPECT NULLS OVER (...)` is exactly the same as `lag(temp) OVER (...)`.
+
+## Errors
+
+Only the five value functions accept the option. Everything else rejects it, with two different messages:
+
+```sql
+SELECT row_number() IGNORE NULLS OVER (ORDER BY ts) FROM readings;
+```
+
+```text
+ERROR:  function row_number does not allow RESPECT/IGNORE NULLS
+```
+
+```sql
+SELECT sum(temp) IGNORE NULLS OVER (ORDER BY ts) FROM readings;
+```
+
+```text
+ERROR:  aggregate functions do not accept RESPECT/IGNORE NULLS
+LINE 1: SELECT sum(temp) IGNORE NULLS OVER (ORDER BY ts) FROM readin...
+               ^
+```
+
+Aggregates ignore NULLs anyway: `sum`, `avg`, `count(col)`, `min` and `max` already skip NULL inputs, so there is nothing to add.
+
+On PostgreSQL 18 and older, every form is a syntax error:
+
+```text
+ERROR:  syntax error at or near "NULLS"
+LINE 3:   lag(temp) IGNORE NULLS OVER w AS lag_ignore,
+                           ^
+```
+
+If you see this error, check `SELECT version();` first. The query may be fine and running on an older server than you think.
+
+## The Workaround for PostgreSQL 18 and Older
+
+The classic workaround uses `count()`, which counts only non-NULL values. Run as a window in time order, `count(temp)` increases on every row with a reading and stays flat on NULL rows. That splits the rows into groups, and each group starts with exactly one non-NULL value:
+
+```sql
+SELECT sensor, ts::time, temp,
+  max(temp) OVER (PARTITION BY sensor, grp) AS locf
+FROM (
+  SELECT *,
+    count(temp) OVER (PARTITION BY sensor ORDER BY ts ROWS UNBOUNDED PRECEDING) AS grp
+  FROM readings
+) s
+ORDER BY sensor, ts;
+```
+
+The output is identical to the `last_value() IGNORE NULLS` result above, on both PostgreSQL 18.7 and 19 RC2. Using `max()` over the group instead of `first_value()` is deliberate. Each group holds one non-NULL value, so `max()` returns it whatever the row order inside the group. `max()` does not exist for every type, though. For `boolean` use `bool_or()`, and for `json`, `jsonb` or `uuid`, which have no `max()` either, use `max(col::text)::jsonb` (or `::uuid`). With one value per group, the text detour is safe.
+
+### How Fast Is Each Version?
+
+We ran both forms over one million rows, 100 sensors and 70% NULLs on PostgreSQL 19 RC2:
+
+```sql
+CREATE TABLE big AS
+SELECT (g % 100) AS sensor, g AS seq,
+       CASE WHEN random() < 0.7 THEN NULL ELSE g END::numeric AS v
+FROM generate_series(1, 1000000) g;
+```
+
+The `IGNORE NULLS` query took about 460 ms and the `count()` workaround about 620 ms, measured twice each. A join of the two result sets found zero rows where they differed. The workaround needs a second sort for the second window, which explains most of the difference. The gap is real but not dramatic, so you do not need to rush to rewrite working code. For new code on version 19, the readability win alone is worth it.
+
+## Writing the Result Back
+
+Window functions are not allowed in `UPDATE ... SET`, so to store the filled values, compute them in a subquery and join back:
+
+```sql
+BEGIN;
+UPDATE readings r
+SET temp = f.filled
+FROM (
+  SELECT ctid AS c,
+         last_value(temp) IGNORE NULLS OVER (
+           PARTITION BY sensor ORDER BY ts
+           ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS filled
+  FROM readings
+) f
+WHERE r.ctid = f.c AND r.temp IS NULL AND f.filled IS NOT NULL;
+-- UPDATE 4
+COMMIT;
+```
+
+Use the primary key instead of `ctid` if the table has one. `ctid` is fine within a single statement but changes whenever a row is updated.
+
+## Generate the Query Instead
+
+The combinations add up quickly: forward or backward fill, several columns, partitions, a fallback constant, version 19 syntax or the workaround, `SELECT` or `UPDATE`. The free [SQL Forward Fill Generator](https://chat2db.ai/tools/sql-forward-fill-generator) writes either version for you, including linear interpolation, and every query shape it produces was checked row by row on PostgreSQL 19 RC2, 18.7 and SQLite. For the classic `lag()`/`lead()` use cases without NULL handling, see our [lag and lead guide](/blog/postgres-lag-lead-window-functions).
+
+When you test the new syntax, it helps to run the same query against a version 18 and a version 19 server and compare results. [Chat2DB](https://chat2db.ai/download) can keep both connections open in tabs and show the result grids next to each other.
+
+## Summary
+
+PostgreSQL 19 lets `lag`, `lead`, `first_value`, `last_value` and `nth_value` skip NULLs with `IGNORE NULLS`. `lag`/`lead` look strictly before or after the current row. `last_value ... ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW` gives forward fill, and `first_value ... ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING` gives backward fill. Write the `ROWS` frame explicitly and keep the ordering unique. Other window functions and aggregates reject the option, and older servers raise a syntax error. On PostgreSQL 18 and older, the `count()` grouping trick with `max()` gives identical results and is only about a third slower.

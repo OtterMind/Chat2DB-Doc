@@ -1,0 +1,335 @@
+---
+title: "INSERT ON CONFLICT DO SELECT in PostgreSQL 19"
+description: "Use PostgreSQL 19 INSERT ... ON CONFLICT DO SELECT for race-free get-or-create, compare it with the old CTE and DO UPDATE tricks, and avoid its errors."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: November 15, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# INSERT ON CONFLICT DO SELECT in PostgreSQL 19
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="November 15, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+"Get or create" is one of the most common things an application asks a database to do. Look up the tag `postgres`, and if it does not exist, create it, and either way give me its id. Until now PostgreSQL had no single statement for that. `ON CONFLICT DO NOTHING` returns nothing for the existing row, and `ON CONFLICT DO UPDATE` returns the row but writes a new row version every time. People worked around this with CTEs, retry loops and dummy updates.
+
+PostgreSQL 19, planned for general availability on November 19, 2026, adds a third conflict action: `ON CONFLICT DO SELECT`. It inserts the row if it is new and returns the existing row if it is not, in one atomic statement, without writing anything for the existing row. This article shows how it behaves, how it compares with the workarounds, and which errors you will meet. Every example and message below comes from PostgreSQL 19 RC2.
+
+## The Syntax
+
+The new action sits next to `DO NOTHING` and `DO UPDATE`:
+
+```sql
+INSERT INTO table_name (columns) VALUES (...)
+ON CONFLICT (conflict_target)
+DO SELECT [ FOR { UPDATE | NO KEY UPDATE | SHARE | KEY SHARE } ] [ WHERE condition ]
+RETURNING ...;
+```
+
+Two parts are mandatory. You must give a conflict target, so PostgreSQL knows which unique index to check, and you must write a `RETURNING` clause, because returning the row is the whole point. The optional locking clause locks the existing row the way `SELECT ... FOR UPDATE` would, and the optional `WHERE` filters which existing rows are returned.
+
+## A Get-or-Create Example
+
+Start with a small tags table:
+
+```sql
+CREATE TABLE tags (
+  id         bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  name       text NOT NULL UNIQUE,
+  created_at timestamptz NOT NULL DEFAULT now()
+);
+INSERT INTO tags (name) VALUES ('postgres'), ('mysql');
+```
+
+Asking for an existing tag returns it:
+
+```sql
+INSERT INTO tags (name) VALUES ('postgres')
+ON CONFLICT (name) DO SELECT
+RETURNING id, name;
+```
+
+```text
+ id |   name
+----+----------
+  1 | postgres
+(1 row)
+
+INSERT 0 1
+```
+
+Asking for a new tag inserts it and returns the new row. The command tag says `INSERT 0 1` in both cases, because the count covers rows inserted, updated or selected for return. So you cannot tell from the tag alone whether the row was new.
+
+### Telling New Rows from Existing Ones
+
+PostgreSQL 18 added `OLD` and `NEW` to `RETURNING`, and they work with the new action. For a row taken from the existing table, `old` holds the existing values. For a freshly inserted row, all `old` values are NULL. That gives you a clean flag:
+
+```sql
+INSERT INTO tags (name) VALUES ('postgres'), ('duckdb')
+ON CONFLICT (name) DO SELECT
+RETURNING id, name, old.id IS NOT NULL AS existed;
+```
+
+```text
+ id |   name   | existed
+----+----------+---------
+  1 | postgres | t
+  9 | duckdb   | f
+(2 rows)
+```
+
+This multi-row form is the real win for applications that import lists of tags, categories or customers. One statement resolves the whole batch, returns an id for every input row, and tells you which ones were created.
+
+## Duplicate Keys in the Same Statement
+
+Here is a difference that matters for batch code. With `DO UPDATE`, two rows in the same statement that hit the same key fail:
+
+```sql
+INSERT INTO tags (name) VALUES ('kafka'), ('kafka')
+ON CONFLICT (name) DO UPDATE SET name = EXCLUDED.name
+RETURNING id;
+```
+
+```text
+ERROR:  ON CONFLICT DO UPDATE command cannot affect row a second time
+HINT:  Ensure that no rows proposed for insertion within the same command have duplicate constrained values.
+```
+
+We covered that error in detail in [ON CONFLICT DO UPDATE cannot affect row a second time](/blog/postgres-on-conflict-cannot-affect-row-second-time). `DO SELECT` does not modify the row, so the restriction does not apply. The same input succeeds and returns the id twice, once per input row:
+
+```sql
+INSERT INTO tags (name) VALUES ('kafka'), ('kafka')
+ON CONFLICT (name) DO SELECT
+RETURNING id, name;
+```
+
+```text
+ id | name
+----+-------
+ 12 | kafka
+ 12 | kafka
+(2 rows)
+
+INSERT 0 2
+```
+
+The first `kafka` was inserted, and the second one found it and returned it. If your code maps input positions to ids, this is exactly the behavior you want. You no longer need to deduplicate the batch first.
+
+## Why the Old CTE Pattern Was Not Safe
+
+Before version 19, the most popular get-or-create query combined `DO NOTHING` with a fallback `SELECT`:
+
+```sql
+WITH ins AS (
+  INSERT INTO tags (name) VALUES ('postgres')
+  ON CONFLICT (name) DO NOTHING
+  RETURNING id
+)
+SELECT id FROM ins
+UNION ALL
+SELECT id FROM tags
+WHERE name = 'postgres' AND NOT EXISTS (SELECT 1 FROM ins);
+```
+
+It works when the row already exists and is committed. It fails in the case it was written for: a concurrent insert. We reproduced the race with two sessions. Session A inserted `race_cte` and kept its transaction open for two seconds. Session B ran the CTE query above for the same name. B blocked on A's uncommitted row, and when A committed, `DO NOTHING` saw the conflict and skipped the insert. Then the fallback `SELECT` ran with the statement's original snapshot, which was taken before A committed, so it could not see the row either. Result:
+
+```text
+ id
+----
+(0 rows)
+```
+
+No row and no error, which is the worst possible answer for "get or create". The usual fix was to wrap it in a retry loop. We repeated the same test with `DO SELECT`:
+
+```sql
+INSERT INTO tags (name) VALUES ('race_doselect')
+ON CONFLICT (name) DO SELECT
+RETURNING id;
+```
+
+```text
+ id
+----
+ 24
+(1 row)
+```
+
+`DO SELECT` waited for session A, then returned the row A had just committed. `ON CONFLICT` handling is allowed to see and return a row that became visible after the statement's snapshot, the same way `DO UPDATE` can update one. That is why it is atomic in a way the CTE could never be.
+
+## Why Not Just Use DO UPDATE?
+
+The other classic trick was a no-op update:
+
+```sql
+INSERT INTO tags (name) VALUES ('postgres')
+ON CONFLICT (name) DO UPDATE SET name = EXCLUDED.name
+RETURNING id;
+```
+
+It always returns the row and it is race-free, but it writes. Every call on an existing row creates a new row version, generates WAL, fires `UPDATE` triggers and leaves a dead tuple for vacuum. You can see it in the system column `xmin`, which changes when a row is rewritten:
+
+```sql
+SELECT xmin, id FROM tags WHERE name = 'postgres';
+-- xmin 663
+
+INSERT INTO tags (name) VALUES ('postgres')
+ON CONFLICT (name) DO SELECT RETURNING xmin, id;
+-- xmin 663, unchanged
+
+INSERT INTO tags (name) VALUES ('postgres')
+ON CONFLICT (name) DO UPDATE SET name = EXCLUDED.name RETURNING xmin, id;
+-- xmin 669, a new row version
+```
+
+On a hot lookup table that is hit thousands of times a second, those dummy updates add up to real bloat and replication traffic. `DO SELECT` leaves the row alone.
+
+## Locking the Existing Row
+
+Sometimes you want the row and you want to keep it stable until you commit, for example before inserting child rows that depend on it. Add a locking clause:
+
+```sql
+BEGIN;
+INSERT INTO tags (name) VALUES ('postgres')
+ON CONFLICT (name) DO SELECT FOR UPDATE
+RETURNING id, xmin, xmax;
+```
+
+```text
+ id | xmin | xmax
+----+------+------
+  1 |  663 |  667
+(1 row)
+```
+
+The non-zero `xmax` is the row lock. Like any row lock, it is stored on the tuple itself, so it does not appear in `pg_locks`. Only the table-level `RowExclusiveLock` does. A second session that tries to update the row now waits. In our test, with `lock_timeout = '500ms'`, it failed with:
+
+```text
+ERROR:  canceling statement due to lock timeout
+CONTEXT:  waiting for ShareLock on transaction 695
+while updating tuple (0,7) in relation "tags"
+```
+
+Use `FOR SHARE` or `FOR KEY SHARE` when you only need to stop the row from being deleted or having its key changed. `FOR KEY SHARE` is what a foreign key check takes, and it conflicts with the fewest other operations.
+
+## Filtering with WHERE
+
+The `WHERE` clause on `DO SELECT` decides whether an existing row is returned. It can reference the existing row through the table name or alias, and the proposed row through `EXCLUDED`:
+
+```sql
+INSERT INTO tags AS t (name) VALUES ('postgres')
+ON CONFLICT (name) DO SELECT WHERE t.id > 100
+RETURNING id;
+```
+
+```text
+ id
+----
+(0 rows)
+
+INSERT 0 0
+```
+
+The existing row has id 1, so it was neither inserted nor returned. Keep in mind that the condition is evaluated after the conflict is found. If you combine it with `FOR UPDATE`, the conflicting row is locked even when the condition is false and nothing is returned.
+
+## Partial Unique Indexes and Expressions
+
+Conflict inference works the same way as for `DO UPDATE`. For a soft-delete table with a case-insensitive email rule:
+
+```sql
+CREATE TABLE users (
+  id         int GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  email      text NOT NULL,
+  deleted_at timestamptz
+);
+CREATE UNIQUE INDEX users_email_live ON users (lower(email)) WHERE deleted_at IS NULL;
+INSERT INTO users (email) VALUES ('Ann@example.com');
+
+INSERT INTO users (email) VALUES ('ann@EXAMPLE.com')
+ON CONFLICT (lower(email)) WHERE deleted_at IS NULL DO SELECT
+RETURNING id, email;
+```
+
+```text
+ id |      email
+----+-----------------
+  1 | Ann@example.com
+(1 row)
+```
+
+Leave out the index predicate and inference fails, because no index matches the target exactly:
+
+```text
+ERROR:  there is no unique or exclusion constraint matching the ON CONFLICT specification
+```
+
+## Errors You Will See
+
+Forgetting `RETURNING`:
+
+```text
+ERROR:  ON CONFLICT DO SELECT requires a RETURNING clause
+```
+
+Leaving out the conflict target:
+
+```text
+ERROR:  ON CONFLICT DO SELECT requires inference specification or constraint name
+HINT:  For example, ON CONFLICT (column_name).
+```
+
+Using an exclusion constraint as the arbiter. Exclusion constraints are fine for `DO NOTHING`, but not for `DO SELECT` or `DO UPDATE`:
+
+```text
+ERROR:  ON CONFLICT DO SELECT not supported with exclusion constraints
+```
+
+Running the statement on PostgreSQL 18 or older gives a plain syntax error at `SELECT`, which is a quick way to discover that a migration reached the wrong server:
+
+```text
+ERROR:  syntax error at or near "SELECT"
+```
+
+## Privileges
+
+`DO SELECT` needs `SELECT` on the table in addition to `INSERT`. A role with only `INSERT` gets `permission denied for table tags`, even when the row is new. Adding a locking clause also requires `UPDATE` privilege on at least one column. In our test the role with `INSERT` and `SELECT` could run plain `DO SELECT`, but `DO SELECT FOR UPDATE` failed with `permission denied for table tags`. If your application role is append-only, check its grants before switching.
+
+## Identity Values Are Still Consumed
+
+One thing does not change. The proposed row is built before the conflict check, so its default values are computed, and that includes `nextval()` for identity and serial columns. In our test `tags_id_seq` moved from 15 to 16 on a call that returned the existing id 1. Gaps in identity columns are normal in PostgreSQL. Just do not use the id to count how many tags were created.
+
+## What About MERGE?
+
+`MERGE` can express get-or-create too, and since PostgreSQL 17 it supports `RETURNING` with `merge_action()`:
+
+```sql
+MERGE INTO tags t
+USING (VALUES ('postgres'), ('oracle')) v(name) ON t.name = v.name
+WHEN NOT MATCHED THEN INSERT (name) VALUES (v.name)
+RETURNING merge_action(), t.id, t.name;
+```
+
+```text
+ merge_action | id |  name
+--------------+----+--------
+ INSERT       | 21 | oracle
+(1 row)
+```
+
+There are two problems. `MERGE` returns only the rows it acted on, so the existing `postgres` row is missing from the output. And `MERGE` does not use the speculative insertion machinery, so two sessions inserting the same new key at the same time can still raise a unique violation. For get-or-create, `ON CONFLICT DO SELECT` is the better tool. `MERGE` remains the right choice for complex synchronization between two tables.
+
+## Migration Checklist
+
+1. Make sure every server that will run the query is on PostgreSQL 19 or later, including read-write replicas created by failover.
+2. Replace CTE get-or-create queries and their retry loops with a single `ON CONFLICT DO SELECT ... RETURNING`.
+3. Replace `DO UPDATE SET col = EXCLUDED.col` no-op updates. Your tables will produce less bloat and WAL.
+4. Use `old.<pk> IS NOT NULL` in `RETURNING` when the application needs to know whether the row existed.
+5. Grant `SELECT` (and `UPDATE` if you lock) to roles that previously had only `INSERT`.
+
+Trying the new clause against a test copy of your schema is the fastest way to see whether it fits. In [Chat2DB](https://chat2db.ai/download) you can keep a PostgreSQL 19 RC connection next to your current production version and run the old and new statements side by side.
+
+## Summary
+
+`INSERT ... ON CONFLICT (key) DO SELECT RETURNING ...` is PostgreSQL 19's built-in get-or-create. It returns the existing row or the inserted one atomically, even under concurrent inserts where the old CTE pattern returned nothing. It does not rewrite existing rows the way the no-op `DO UPDATE` trick does. It accepts duplicate keys in one batch, and it can lock the row with `FOR UPDATE` or `FOR SHARE`. It requires a conflict target and a `RETURNING` clause, it does not work with exclusion constraints, and it needs `SELECT` privilege. With those rules in mind, most get-or-create code can shrink to a single statement.

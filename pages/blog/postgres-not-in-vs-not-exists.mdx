@@ -1,0 +1,230 @@
+---
+title: "NOT IN vs NOT EXISTS in PostgreSQL: NULL Trap"
+description: "Why NOT IN with a NULL returns no rows in PostgreSQL, how NOT EXISTS and anti joins differ, the slow unhashed plan, and the PostgreSQL 19 NOT IN optimization."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: November 15, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# NOT IN vs NOT EXISTS in PostgreSQL: NULL Trap
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="November 15, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+"Find the customers who have never placed an order" is a textbook SQL question, and there are three textbook answers: `NOT IN`, `NOT EXISTS` and `LEFT JOIN ... IS NULL`. They look interchangeable. They are not. `NOT IN` returns no rows at all as soon as the subquery produces a single NULL, and in older PostgreSQL versions it can also fall back to a plan that is a thousand times slower than the alternatives.
+
+PostgreSQL 19 improves the performance side: the planner can now turn `NOT IN` into a real anti join when it can prove that no NULLs are involved. The NULL semantics have not changed, because they are defined by the SQL standard. This article shows both problems with real output from PostgreSQL 19 RC2 and 18.7, explains the rules behind them, and gives a simple guideline.
+
+## The Setup
+
+```sql
+CREATE TABLE customers (id int PRIMARY KEY, name text);
+INSERT INTO customers VALUES (1,'Ann'), (2,'Bo'), (3,'Cy');
+
+CREATE TABLE orders (id int PRIMARY KEY, customer_id int);
+INSERT INTO orders VALUES (10,1), (11,1), (12,NULL);
+```
+
+Customer 1 has orders. Customers 2 and 3 have none. Order 12 has no customer, perhaps a guest checkout. That one NULL is all it takes.
+
+## The NULL Trap
+
+```sql
+SELECT id FROM customers
+WHERE id NOT IN (SELECT customer_id FROM orders);
+```
+
+```text
+ id
+----
+(0 rows)
+```
+
+Zero rows, with no error and no warning. Compare `NOT EXISTS`:
+
+```sql
+SELECT id FROM customers c
+WHERE NOT EXISTS (SELECT 1 FROM orders o WHERE o.customer_id = c.id);
+```
+
+```text
+ id
+----
+  2
+  3
+(2 rows)
+```
+
+`LEFT JOIN orders o ON o.customer_id = c.id WHERE o.id IS NULL` also returns 2 and 3.
+
+### Why NOT IN Returns Nothing
+
+`x NOT IN (a, b, c)` means `x <> a AND x <> b AND x <> c`. If one of the values is NULL, that comparison is NULL (unknown), and `true AND NULL` is NULL, not true. A `WHERE` clause keeps only rows where the condition is true, so every row whose value is not in the list evaluates to NULL and is dropped. Rows whose value *is* in the list evaluate to false and are dropped too. You can see the three-valued logic directly:
+
+```sql
+SELECT 3 NOT IN (1, NULL) AS a,
+       1 NOT IN (1, NULL) AS b,
+       3 IN (1, NULL)     AS c,
+       NULL NOT IN (SELECT 1 WHERE false) AS d;
+```
+
+```text
+ a | b | c | d
+---+---+---+---
+   | f |   | t
+```
+
+`3 NOT IN (1, NULL)` is NULL, not true, because PostgreSQL cannot rule out that the unknown value is 3. `IN` has the same issue, but it hurts less: with `IN` the NULL only removes rows that would not match anyway. Column `d` is the edge case in the other direction: anything `NOT IN` an empty set is true, even NULL.
+
+### The Other Side: NULL in the Outer Column
+
+The two forms also disagree when the outer value is NULL. Suppose a customer row has a NULL reference:
+
+```sql
+-- customers.ref is NULL for customer 4
+SELECT id FROM customers
+WHERE ref NOT IN (SELECT customer_id FROM orders WHERE customer_id IS NOT NULL);
+-- returns 2, 3
+
+SELECT id FROM customers c
+WHERE NOT EXISTS (SELECT 1 FROM orders o WHERE o.customer_id = c.ref);
+-- returns 4, 2, 3
+```
+
+`NULL NOT IN (non-empty list)` is NULL, so `NOT IN` drops customer 4. `NOT EXISTS` finds no order matching NULL, because `NULL = anything` is never true, so it keeps customer 4. Neither is wrong in the abstract, but you need to know which one you asked for.
+
+## Fixing NOT IN
+
+If you want to keep `NOT IN`, exclude NULLs inside the subquery:
+
+```sql
+SELECT id FROM customers
+WHERE id NOT IN (SELECT customer_id FROM orders WHERE customer_id IS NOT NULL);
+```
+
+This returns 2 and 3. It is correct, but it depends on everyone remembering the filter every time, including for columns that are NOT NULL today and may become nullable after the next migration. That is why most style guides, including ours, say: **use NOT EXISTS for "rows without a match"**. It has the semantics people expect and needs no special case.
+
+## The Performance Trap
+
+The second problem is how PostgreSQL executes `NOT IN`. Because of the NULL rules, `NOT IN` is not equivalent to an anti join in general. A hash anti join would happily return rows when the subquery contains NULLs, which `NOT IN` must not do. So until version 19, PostgreSQL never planned `NOT IN (subquery)` as a join. It used a *subplan* instead. Here is PostgreSQL 18.7 with a 200,000-row outer table and a 100,000-row subquery, both columns declared NOT NULL:
+
+```sql
+EXPLAIN (COSTS OFF)
+SELECT count(*) FROM t_big WHERE id NOT IN (SELECT ref FROM t_small);
+```
+
+```text
+ Aggregate
+   ->  Seq Scan on t_big
+         Filter: (NOT (ANY (id = (hashed SubPlan 1).col1)))
+         SubPlan 1
+           ->  Seq Scan on t_small
+```
+
+A *hashed* subplan is fine. The subquery runs once, its results go into a hash table, and each outer row does one lookup. The danger is the word "hashed". PostgreSQL only uses it when the hash table is expected to fit in `work_mem`. If not, it falls back to a plain subplan that scans the materialized subquery result for every outer row. That is O(N × M). To show it without waiting forever, we used a smaller pair of tables (20,000 and 10,000 rows) and a deliberately tiny `work_mem` on PostgreSQL 19 RC2, with nullable columns so the version 19 optimization could not apply:
+
+```sql
+SET work_mem = '64kB';
+EXPLAIN (COSTS OFF) SELECT count(*) FROM nb WHERE id NOT IN (SELECT ref FROM ns);
+```
+
+```text
+ Aggregate
+   ->  Seq Scan on nb
+         Filter: (NOT (ANY (id = (SubPlan any_1).col1)))
+         SubPlan any_1
+           ->  Materialize
+                 ->  Seq Scan on ns
+```
+
+| Query (20,000 × 10,000 rows, work_mem 64kB) | Time |
+|---|---|
+| `NOT IN` (plain subplan) | 3,822 ms |
+| `NOT EXISTS` (hash anti join) | 4 ms |
+| `NOT IN` after `RESET work_mem` (hashed subplan) | 1.6 ms |
+
+Nearly a thousand times slower for the same answer. On real tables with millions of rows, the plain subplan version can run for hours. Our first attempt at 200,000 × 100,000 rows was still running after two minutes, so we cancelled it. `NOT EXISTS` does not have this cliff, because it is planned as an anti join that can use hash, merge or nested loop with an index, and a hash join spills to disk in batches instead of switching algorithms.
+
+Note also that the 19 RC2 plan labels the subplan `any_1` where 18.7 says `SubPlan 1`. If you have scripts that parse `EXPLAIN` output, the subplan names changed in version 19.
+
+### `<> ALL` Is Even Worse
+
+`x <> ALL (SELECT ...)` means the same as `NOT IN`, but PostgreSQL does not hash it. Even with default `work_mem`, version 19 RC2 planned it as a plain subplan:
+
+```text
+ Aggregate
+   ->  Seq Scan on t_big
+         Filter: (ALL (id <> (SubPlan all_1).col1))
+         SubPlan all_1
+           ->  Materialize
+                 ->  Seq Scan on t_small
+```
+
+If you find `<> ALL (subquery)` in old code, rewrite it.
+
+## What PostgreSQL 19 Changes
+
+PostgreSQL 19's release notes list "convert `NOT IN` to `ANTI JOIN` when NULLs are absent". The planner now checks whether both sides are provably non-NULL. When they are, `NOT IN` and `NOT EXISTS` mean the same thing, and it can use a real anti join. With both columns declared `NOT NULL`, RC2 produced:
+
+```text
+ Aggregate
+   ->  Hash Anti Join
+         Hash Cond: (t_big.id = t_small.ref)
+         ->  Seq Scan on t_big
+         ->  Hash
+               ->  Seq Scan on t_small
+```
+
+That is the same plan as `NOT EXISTS`. We tested which conditions are enough to trigger it:
+
+| Outer column | Subquery column | 19 RC2 plan |
+|---|---|---|
+| NOT NULL | NOT NULL | Hash Anti Join |
+| NOT NULL | nullable, subquery has `WHERE ref IS NOT NULL` | Hash Anti Join |
+| NOT NULL | nullable, subquery has `WHERE ref > 10` | Hash Anti Join |
+| NOT NULL | nullable, no filter | hashed SubPlan |
+| nullable | NOT NULL | hashed SubPlan |
+| nullable, outer query has `WHERE id IS NOT NULL` | NOT NULL | hashed SubPlan |
+
+The subquery side can be proven non-NULL by a constraint or by a filter that rejects NULLs, such as `IS NOT NULL` or any strict comparison like `ref > 10`. The outer side needed a `NOT NULL` constraint in our tests. An `IS NOT NULL` condition elsewhere in the outer `WHERE` clause was not enough. On 18.7, every variant we tried used a subplan, including the one with both columns declared NOT NULL.
+
+So version 19 removes the performance trap in the common case where keys are declared NOT NULL. It does not change the result when NULLs are possible, and it cannot, because the standard defines that result.
+
+## LEFT JOIN ... IS NULL
+
+The third idiom is an outer join that keeps the unmatched rows:
+
+```sql
+SELECT c.id
+FROM customers c
+LEFT JOIN orders o ON o.customer_id = c.id
+WHERE o.id IS NULL;
+```
+
+PostgreSQL recognizes this pattern and plans it as an anti join too. Our test produced the same Hash Anti Join as `NOT EXISTS`. Version 19 also extends that recognition to more `LEFT JOIN` shapes. Two warnings apply. Test `IS NULL` on a column that cannot be NULL in matched rows, such as the primary key or the join column. And do not select columns from `o`, because for the rows you keep they are all NULL. `NOT EXISTS` states the intent more directly, so we still prefer it.
+
+## Quick Reference
+
+| Form | NULL in subquery | NULL in outer value | Plan |
+|---|---|---|---|
+| `NOT IN (subquery)` | returns no rows | row dropped | subplan; anti join in 19 if both sides NOT NULL |
+| `NOT IN (... WHERE col IS NOT NULL)` | handled | row dropped | subplan; anti join in 19 if outer is NOT NULL |
+| `NOT EXISTS (correlated)` | ignored | row kept | anti join |
+| `LEFT JOIN ... WHERE key IS NULL` | ignored | row kept | anti join |
+| `<> ALL (subquery)` | returns no rows | row dropped | plain subplan, never hashed |
+
+## A Checklist for Existing Code
+
+1. Search your code for `NOT IN (SELECT`. For each hit, check whether the subquery column is nullable. If it is, either the query is already wrong or it will be the day a NULL appears.
+2. Rewrite to `NOT EXISTS`, or add `WHERE col IS NOT NULL` inside the subquery if the outer-NULL behavior of `NOT IN` is what you want.
+3. Run `EXPLAIN` on the hot ones. A `SubPlan` without the word `hashed` on a large table is a time bomb, and it only takes a lower `work_mem` or a larger table to set it off.
+4. Declare join keys `NOT NULL` wherever the data allows. It is good modeling, and on PostgreSQL 19 it also lets the planner pick an anti join for any remaining `NOT IN`.
+
+Comparing these plans is quick in [Chat2DB](https://chat2db.ai/download): run `EXPLAIN` for the `NOT IN` and `NOT EXISTS` versions in two tabs and look at the node types side by side before you change production code.
+
+## Summary
+
+`NOT IN (subquery)` returns zero rows when the subquery contains a single NULL, and drops outer rows whose value is NULL. `NOT EXISTS` and `LEFT JOIN ... IS NULL` do neither, and are planned as anti joins. Before PostgreSQL 19, `NOT IN` was always executed as a subplan, which is fast only when it is hashed and quadratic when it is not. In our test it was 3.8 seconds versus 4 milliseconds. PostgreSQL 19 plans `NOT IN` as an anti join when both sides are provably non-NULL, but the NULL semantics are unchanged. Use `NOT EXISTS` for "rows without a match", and declare your keys `NOT NULL`.

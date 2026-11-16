@@ -1,0 +1,231 @@
+---
+title: "COPY TO JSON in PostgreSQL 19: Export Tables"
+description: "Export PostgreSQL tables and queries as JSON lines or a JSON array with COPY ... (FORMAT json) in version 19, and the escaping trap in the old row_to_json way."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: November 15, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# COPY TO JSON in PostgreSQL 19: Export Tables
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="November 15, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+Exporting a table as JSON sounds like it should be a one-liner, and in most databases it is. In PostgreSQL it was oddly awkward. `COPY` knew text, CSV and binary, so people wrapped each row in `row_to_json()` and exported that as text. That approach has a nasty escaping bug that corrupts any value containing a quote or a newline. The other option was a `json_agg()` query run through psql with the right flags.
+
+PostgreSQL 19 adds a `json` format to `COPY TO`. One statement now writes one JSON object per row, or a single JSON array with the new `FORCE_ARRAY` option. This article shows the output for real data, the rules and errors, how types are mapped, and the correct way to do the same on PostgreSQL 18 and older. Everything below was run on PostgreSQL 19 RC2 and 18.7.
+
+## Sample Table
+
+The data includes the two characters that break naive exports, a double quote and a newline:
+
+```sql
+CREATE TABLE customers (id int PRIMARY KEY, name text, joined date, meta jsonb);
+INSERT INTO customers VALUES
+  (1, 'Ann', '2026-01-02', '{"tier":"gold"}'),
+  (2, 'Bo "the" Builder', '2026-03-04', NULL),
+  (3, E'Cy\nline', '2026-05-06', '{"tags":["a","b"]}');
+```
+
+## JSON Lines Output
+
+```sql
+COPY customers TO STDOUT (FORMAT json);
+```
+
+```text
+{"id":1,"name":"Ann","joined":"2026-01-02","meta":{"tier": "gold"}}
+{"id":2,"name":"Bo \"the\" Builder","joined":"2026-03-04","meta":null}
+{"id":3,"name":"Cy\nline","joined":"2026-05-06","meta":{"tags": ["a", "b"]}}
+```
+
+This is the JSON Lines (NDJSON) format: one complete JSON object per line, no surrounding array, no commas between rows. Most data tools read it directly, including `jq`, DuckDB's `read_json`, BigQuery and Elasticsearch's bulk API (after you add its action lines). The keys come from the column names. The quote inside Bo's name is escaped as `\"`, and the newline in Cy's name as `\n`, exactly once, so the file is valid JSON. A `jsonb` column is embedded as a JSON value, not as a string, and SQL NULL becomes JSON `null`.
+
+## A Single JSON Array
+
+Many APIs and frontend tools want one array instead. Add `FORCE_ARRAY`:
+
+```sql
+COPY customers TO STDOUT (FORMAT json, FORCE_ARRAY);
+```
+
+```text
+[
+ {"id":1,"name":"Ann","joined":"2026-01-02","meta":{"tier": "gold"}}
+,{"id":2,"name":"Bo \"the\" Builder","joined":"2026-03-04","meta":null}
+,{"id":3,"name":"Cy\nline","joined":"2026-05-06","meta":{"tags": ["a", "b"]}}
+]
+```
+
+The leading commas look unusual, but the result is one valid JSON document, and it is still streamed row by row, so it works for tables larger than memory. `FORCE_ARRAY false` is the same as leaving the option out.
+
+## Export a Query, Not Just a Table
+
+Like every `COPY TO`, the JSON format accepts a query, and the column aliases become the keys:
+
+```sql
+COPY (
+  SELECT id, name AS "Full Name", joined, now()::date - joined AS days
+  FROM customers ORDER BY id
+) TO STDOUT (FORMAT json);
+```
+
+```text
+{"id":1,"Full Name":"Ann","joined":"2026-01-02","days":318}
+{"id":2,"Full Name":"Bo \"the\" Builder","joined":"2026-03-04","days":257}
+{"id":3,"Full Name":"Cy\nline","joined":"2026-05-06","days":194}
+```
+
+A column list limits the output to those columns: `COPY customers (id, meta) TO STDOUT (FORMAT json)` writes objects with just `id` and `meta`.
+
+## How Types Are Mapped
+
+Values are converted the same way `to_json()` converts them. In our test, `row_to_json()` on the same row produced byte-identical output. Here is one row of many types:
+
+```sql
+COPY (SELECT 1.50::numeric n, 1e300::float8 f, 'NaN'::float8 nan, true b,
+             '\x00ff'::bytea by, ARRAY[1,2] arr, '1 day'::interval i,
+             '2026-11-15 10:00+00'::timestamptz t, ROW(1,'x') r,
+             NULL::text nul, '{"a":1}'::json j)
+TO STDOUT (FORMAT json);
+```
+
+```text
+{"n":1.50,"f":1e+300,"nan":"NaN","b":true,"by":"\\x00ff","arr":[1,2],"i":"1 day","t":"2026-11-15T10:00:00+00:00","r":{"f1":1,"f2":"x"},"nul":null,"j":{"a":1}}
+```
+
+What to notice:
+
+- Numbers stay numbers, and `numeric` keeps its scale (`1.50`). Very large floats use exponent notation.
+- `NaN` and infinity become strings, because JSON has no such numbers. A consumer that expects a number will need to handle that.
+- `boolean` becomes `true` or `false`, arrays become JSON arrays, and composite values become nested objects.
+- `bytea` becomes its hex text form as a string, with the backslash escaped.
+- `timestamptz` uses ISO 8601 with a `T` separator, which JavaScript's `Date` parses directly. The offset follows the session's `TimeZone` setting, so set it explicitly in export jobs (`SET timezone = 'UTC'`).
+- `interval` is the PostgreSQL text form (`"1 day"`), not an ISO 8601 duration.
+
+## Nested Documents
+
+Because `COPY` accepts any query, you can build nested JSON per row. A correlated subquery with `json_agg()` turns each customer's orders into an array inside the customer object:
+
+```sql
+COPY (
+  SELECT c.id, c.name,
+         (SELECT coalesce(json_agg(json_build_object('id', o.id) ORDER BY o.id), '[]')
+          FROM orders o WHERE o.customer_id = c.id) AS orders
+  FROM customers c
+  WHERE c.id IN (1, 2)
+  ORDER BY c.id
+) TO STDOUT (FORMAT json);
+```
+
+```text
+{"id":1,"name":"Ann","orders":[{"id" : 10}, {"id" : 11}]}
+{"id":2,"name":"Bo \"the\" Builder","orders":[]}
+```
+
+The `json` value from the subquery is embedded as JSON, not as an escaped string. That is exactly what made this awkward before version 19. The `coalesce(..., '[]')` matters: without it, a customer with no orders gets `"orders":null`, which many consumers handle differently from an empty array. The extra spaces in `{"id" : 10}` are simply how `json_build_object()` formats its output. It is still valid JSON, and any parser ignores the whitespace.
+
+This pattern replaces a lot of application code that loaded rows, grouped them and serialized them. For large exports, check the plan: the correlated subquery runs once per outer row, so it needs an index on `orders.customer_id`.
+
+## Partitioned Tables
+
+PostgreSQL 19 also lets `COPY TO` read a partitioned table directly. This is a separate change, and it works for every format. On 18.7:
+
+```text
+COPY m TO STDOUT;
+ERROR:  cannot copy from partitioned table "m"
+HINT:  Try the COPY (SELECT ...) TO variant.
+```
+
+On 19 RC2 the same command returns the rows from all partitions, and `COPY m TO STDOUT (FORMAT json)` works too.
+
+## Options That Are Not Allowed
+
+Most text and CSV options make no sense for JSON, and `COPY` rejects them with clear messages:
+
+```text
+COPY customers FROM '/tmp/x.json' (FORMAT json);
+ERROR:  COPY FORMAT JSON is not supported for COPY FROM
+
+COPY customers TO STDOUT (FORMAT json, HEADER);
+ERROR:  cannot specify HEADER in JSON mode
+
+COPY customers TO STDOUT (FORMAT json, DELIMITER ',');
+ERROR:  cannot specify DELIMITER in JSON mode
+
+COPY customers TO STDOUT (FORMAT json, NULL 'x');
+ERROR:  cannot specify NULL in JSON mode
+
+COPY customers TO STDOUT (FORMAT csv, FORCE_ARRAY);
+ERROR:  COPY FORCE_ARRAY can only be used with JSON mode
+```
+
+The first one is the important limitation. JSON is export only. To load JSON into PostgreSQL you still need another approach, such as `COPY` into a one-column `jsonb` staging table followed by `INSERT ... SELECT` with `jsonb_populate_recordset()` or `JSON_TABLE`, which our [JSON_TABLE guide](/blog/postgres-json-table-guide) covers.
+
+## Writing to a File
+
+`COPY ... TO '/path/file.json'` writes on the database server and needs superuser or the `pg_write_server_files` role. From a client machine, use psql's `\copy`, which runs `COPY TO STDOUT` and writes the file locally:
+
+```sql
+\copy customers TO 'customers.jsonl' (FORMAT json)
+\copy (SELECT * FROM customers WHERE joined >= '2026-03-01') TO 'recent.json' (FORMAT json, FORCE_ARRAY)
+```
+
+Or from the shell, which is the easiest way to pipe the output into another program:
+
+```bash
+psql -d shop -c "COPY customers TO STDOUT (FORMAT json)" | jq -c 'select(.meta != null)'
+```
+
+## The Old Way and Its Escaping Trap
+
+On PostgreSQL 18 and older, the common recipe looks harmless:
+
+```sql
+COPY (SELECT row_to_json(c) FROM customers c) TO STDOUT;
+```
+
+Here is what it actually writes on 18.7:
+
+```text
+{"id":1,"name":"Ann","joined":"2026-01-02","meta":{"tier": "gold"}}
+{"id":2,"name":"Bo \\"the\\" Builder","joined":"2026-03-04","meta":null}
+{"id":3,"name":"Cy\\nline","joined":"2026-05-06","meta":{"tags": ["a", "b"]}}
+```
+
+Every backslash is doubled. `row_to_json()` correctly produced `\"`, and then `COPY`'s text format escaped that backslash again, because text format treats backslash as its own escape character. Line 2 is now invalid JSON. Line 3 parses, but the name now contains a literal backslash and `n` instead of a newline. The data is silently wrong, and only for rows that contain special characters, so a test with clean sample data passes.
+
+There are two correct ways to do it on older versions.
+
+**Option 1: run a query instead of COPY.** psql's unaligned, tuples-only output prints the value as is:
+
+```bash
+psql -At -d shop -c "SELECT row_to_json(c) FROM customers c" > customers.jsonl
+```
+
+Our test printed the three lines with single backslashes, the same as the version 19 output. For one array, use `SELECT json_agg(c ORDER BY id) FROM customers c`. That builds the whole document in memory, so it is not suitable for very large tables.
+
+**Option 2: CSV with impossible quote and delimiter characters.** This is a widely shared trick that stops `COPY` from escaping anything:
+
+```sql
+COPY (SELECT row_to_json(c) FROM customers c)
+TO STDOUT WITH (FORMAT csv, QUOTE E'\x01', DELIMITER E'\x02');
+```
+
+On 18.7 it produced correct output, because no value contains those control characters. It is a hack, but it streams and works on any version.
+
+## Upgrade Checklist
+
+- Replace `COPY (SELECT row_to_json(...)) TO ...` text-format exports. They have been corrupting quotes and newlines all along. Check old export files too.
+- Prefer `(FORMAT json)` for JSON Lines and `(FORMAT json, FORCE_ARRAY)` for a single document.
+- Set `timezone` explicitly in export scripts. In our test, JSON output kept ISO dates even with `DateStyle = 'SQL, DMY'`, but `timestamptz` values followed `TimeZone` (`2026-11-15T05:00:00-05:00` under America/New_York).
+- Keep an import path. `FORMAT json` does not work for `COPY FROM`.
+
+When you are still working out which columns and aliases the export needs, run the `SELECT` part in [Chat2DB](https://chat2db.ai/download) first and check the result grid. Then wrap the final query in `COPY (...) TO STDOUT (FORMAT json)` for the repeatable job. See also our general [COPY command guide](/blog/how-to-use-the-copy-command-in-postgresql).
+
+## Summary
+
+PostgreSQL 19's `COPY ... TO ... (FORMAT json)` writes one JSON object per row, and `FORCE_ARRAY` wraps them in a single array. Keys are column names or aliases, values are converted like `to_json()`, NULL becomes `null`, and partitioned tables can be copied directly. `HEADER`, `DELIMITER` and `NULL` are rejected, and JSON is export only. On older versions, never export `row_to_json()` through text-format `COPY`, because it doubles every backslash. Use `psql -At` with a query, or the CSV trick with control characters as quote and delimiter.

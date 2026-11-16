@@ -1,0 +1,243 @@
+---
+title: "Per-Process log_min_messages in PostgreSQL 19"
+description: "Set PostgreSQL 19 log_min_messages per process type, such as autovacuum:debug1, read its errors, and use log_autoanalyze_min_duration and log_lock_waits."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: November 15, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# Per-Process log_min_messages in PostgreSQL 19
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="November 15, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+Debug logging in PostgreSQL used to be all or nothing. If you wanted to see what the checkpointer or the autovacuum launcher was doing at `DEBUG1`, you set `log_min_messages = debug1` for the whole server. Then every client backend, WAL sender and background worker started writing debug lines too. On a busy server that can produce gigabytes of log within minutes, and the lines you wanted get lost in the noise.
+
+PostgreSQL 19 lets you set the level per process type: `log_min_messages = 'warning, autovacuum:debug1'` raises verbosity for autovacuum only. This release also splits autovacuum logging into separate vacuum and analyze thresholds, and turns `log_lock_waits` on by default. This article covers the syntax, the error messages you will get when you get it wrong, and practical recipes. Everything was tested on PostgreSQL 19 RC2.
+
+## The New Syntax
+
+`log_min_messages` now takes a comma-separated list. Exactly one entry must be a bare level, the default for all processes. Any number of `type:level` entries override it for specific process types:
+
+```sql
+ALTER SYSTEM SET log_min_messages = 'warning, autovacuum:debug1, checkpointer:debug1';
+SELECT pg_reload_conf();
+SHOW log_min_messages;
+```
+
+```text
+                log_min_messages
+-------------------------------------------------
+ warning, autovacuum:debug1, checkpointer:debug1
+```
+
+The levels are the usual ones, from `debug5` (most verbose) through `debug1`, `info`, `notice`, `warning`, `error` and `log` to `fatal` and `panic`. Remember that in `log_min_messages`, `LOG` ranks between `ERROR` and `FATAL`. That is why server log lines such as checkpoint and connection messages still appear at the default `warning`.
+
+### Process Types
+
+These are the process type names the documentation lists:
+
+| Type | Process |
+|---|---|
+| `backend` | client sessions (regular connections) |
+| `autovacuum` | autovacuum launcher and workers |
+| `bgworker` | background workers, including parallel query workers and logical replication workers |
+| `bgwriter` | background writer |
+| `checkpointer` | checkpointer |
+| `walwriter` | WAL writer |
+| `walsender` | WAL senders (physical and logical replication) |
+| `walreceiver` | WAL receiver on a standby |
+| `walsummarizer` | WAL summarizer (incremental backup) |
+| `startup` | startup process, which replays WAL on standbys and during crash recovery |
+| `archiver` | WAL archiver |
+| `ioworker` | I/O worker processes (`io_method = worker`) |
+| `slotsyncworker` | replication slot sync worker |
+| `syslogger` | logging collector |
+| `postmaster` | the main server process |
+
+## What It Looks Like in Practice
+
+With `checkpointer:debug1` in place, a manual `CHECKPOINT` produced per-file sync lines from the checkpointer process only:
+
+```text
+[97585] DEBUG:  checkpoint sync: number=568 file=base/17235/3764_vm time=0.035 ms
+[97585] DEBUG:  checkpoint sync: number=569 file=base/5/17350 time=0.019 ms
+...
+[97585] LOG:  checkpoint complete: fast force wait: wrote 1160 buffers (7.1%), wrote 1 SLRU buffers; ...
+```
+
+With `autovacuum:debug1`, the launcher and workers report each database they visit, every naptime:
+
+```text
+DEBUG:  autovacuum: processing database "template1"
+DEBUG:  autovacuum: processing database "shop"
+DEBUG:  autovacuum: processing database "postgres"
+```
+
+In both cases, client sessions on the same server wrote no debug lines at all, which is the whole point.
+
+## Session-Level SET Uses the backend Entry
+
+`log_min_messages` can also be changed with `SET` by a superuser, or by a role that has been granted `SET` on it. A client session is a `backend` process, so only the default and the `backend:` entry matter there. We created a temporary table with a primary key, which emits two `DEBUG1` messages, under four settings:
+
+| `SET log_min_messages = ...` | DEBUG lines from this session |
+|---|---|
+| `'debug1'` | `CREATE TABLE / PRIMARY KEY will create implicit index "tt_pkey"...` and `building index "tt_pkey" on table "tt" serially` |
+| `'warning, backend:debug1'` | the same two lines |
+| `'warning, autovacuum:debug1'` | none |
+| `'debug1, backend:warning'` | none |
+
+The last row shows the rule clearly. In a session, the `debug1` default is irrelevant, because a session-level setting only affects that session, and a session is a `backend`. The other entries matter only in `postgresql.conf` or `ALTER SYSTEM`, where every process reads them.
+
+You can store the value per role or database as usual:
+
+```sql
+ALTER ROLE app_debug SET log_min_messages = 'warning, backend:debug1';
+```
+
+## Errors
+
+The parser is strict, and its messages are clear:
+
+```text
+SET log_min_messages = 'autovacuum:debug1';
+ERROR:  invalid value for parameter "log_min_messages": "autovacuum:debug1"
+DETAIL:  Default log level was not defined.
+
+SET log_min_messages = 'warning, autovacum:debug1';
+ERROR:  invalid value for parameter "log_min_messages": "warning, autovacum:debug1"
+DETAIL:  Unrecognized process type "autovacum".
+
+SET log_min_messages = 'warning, backend:debug1, backend:info';
+ERROR:  invalid value for parameter "log_min_messages": "warning, backend:debug1, backend:info"
+DETAIL:  Redundant log level specification for process type "backend".
+
+SET log_min_messages = 'warning, error';
+ERROR:  invalid value for parameter "log_min_messages": "warning, error"
+DETAIL:  Redundant specification of default log level.
+```
+
+The first one is the easiest to hit. You must always include a bare default level, even if you only care about one process type. Order does not matter: `'backend:log, warning'` is accepted and `SHOW` normalizes it to `warning, backend:log`. Letter case is kept as you typed it (`WARNING , Backend:DEBUG2` was shown as `WARNING, Backend:DEBUG2`), but it is not significant.
+
+`ALTER SYSTEM` validates the value too, so a typo is rejected immediately instead of breaking the next restart. Watch out for `pg_settings.reset_val` after a session `SET`. It shows the configured value, which may be a list, while `boot_val` is still the plain `warning`.
+
+On PostgreSQL 18 and older, a list is simply invalid:
+
+```text
+ERROR:  invalid value for parameter "log_min_messages": "warning, backend:debug1"
+HINT:  Available values: debug5, debug4, debug3, debug2, debug1, info, notice, warning, error, log, fatal, panic.
+```
+
+Keep that in mind if you share configuration files between versions, for example through a configuration management template. A server older than 19 will refuse to start with a list value in `postgresql.conf`. Our 18.7 test server stopped with:
+
+```text
+LOG:  invalid value for parameter "log_min_messages": "warning, backend:debug1"
+FATAL:  configuration file "/path/to/postgresql.conf" contains errors
+```
+
+## Autovacuum: Separate Vacuum and Analyze Logging
+
+Until version 18, `log_autovacuum_min_duration` controlled logging for both automatic vacuum and automatic analyze. In version 19 it covers vacuum only, and the new `log_autoanalyze_min_duration` controls analyze. Both default to `10min`, and both accept `0` (log every run) or `-1` (never).
+
+We set `log_autovacuum_min_duration = 0` and `log_autoanalyze_min_duration = -1`, then gave autovacuum some work. The log showed only the vacuum:
+
+```text
+LOG:  automatic vacuum of table "postgres.public.av": index scans: 0
+```
+
+After switching `log_autoanalyze_min_duration` to `0`, the next round logged both:
+
+```text
+LOG:  automatic vacuum of table "postgres.public.av": index scans: 0
+LOG:  automatic analyze of table "postgres.public.av"
+```
+
+This is useful on large databases, where analyze runs far more often than you want to see in the logs, but vacuum duration is worth tracking. Like its vacuum counterpart, the new setting is also a table storage parameter:
+
+```sql
+ALTER TABLE av SET (log_autoanalyze_min_duration = 1000);
+```
+
+`\d+ av` then lists `Options: log_autoanalyze_min_duration=1000`.
+
+If you previously set `log_autovacuum_min_duration = 0` to see everything, check your monitoring after upgrading. Automatic analyze lines will stop appearing until you set the new parameter too.
+
+### Richer Vacuum Log Lines
+
+The vacuum log entry itself also grew in version 19. Besides the usual pages, tuples and buffer lines, our test showed full-page-image bytes in the WAL line and a new memory usage line:
+
+```text
+WAL usage: 444 records, 0 full page images, 26838 bytes, 0 full page image bytes, 0 buffers full
+memory usage: dead item storage 0.02 MB accumulated across 0 resets (limit 64.00 MB each)
+```
+
+The memory line tells you whether `maintenance_work_mem` (or `autovacuum_work_mem`) was large enough. Each reset means the dead tuple storage filled up and vacuum had to scan the indexes an extra time.
+
+## log_lock_waits Is Now On by Default
+
+`log_lock_waits` logs a message when a session has waited longer than `deadlock_timeout` (1 second by default) for a lock. In version 19 it defaults to `on`. Here is the pair of messages for a session that waited 2.5 seconds for a row lock:
+
+```text
+LOG:  process 99040 still waiting for ShareLock on transaction 767 after 1145.453 ms
+LOG:  process 99040 acquired ShareLock on transaction 767 after 2462.600 ms
+```
+
+And here is a wait that ended with `lock_timeout`:
+
+```text
+LOG:  process 99081 still waiting for AccessShareLock on relation 17251 of database 5 after 1145.721 ms at character 22
+ERROR:  canceling statement due to lock timeout at character 22
+```
+
+On most systems this is exactly what you want, because lock waits longer than a second are worth knowing about. On a system with many expected long waits, such as a job queue built on `SELECT ... FOR UPDATE`, the extra lines may be noisy. Turn it off per role with `ALTER ROLE queue_worker SET log_lock_waits = off`. For aggregated numbers instead of log lines, PostgreSQL 19's new [pg_stat_lock view](/blog/postgres-pg-stat-lock) counts the same waits per lock type.
+
+## Three Settings That Are Easy to Confuse
+
+`log_min_messages` is one of three message-level settings, and they answer different questions:
+
+| Setting | Controls | Default |
+|---|---|---|
+| `log_min_messages` | which messages are written to the **server log** | `warning` |
+| `client_min_messages` | which messages are sent to the **client** | `notice` |
+| `log_min_error_statement` | at which level the **SQL statement** that caused a message is logged too | `error` |
+
+In version 19 only `log_min_messages` accepts per-process entries. The other two are still single levels. `client_min_messages` only ever concerns client sessions, so a per-process list would make no sense there. A common combination for chasing a bug in one application is `backend:debug1` in `log_min_messages` for that role, plus `log_min_error_statement = warning`, so each warning in the log is followed by the statement that produced it.
+
+Remember the cost of debug levels. `DEBUG1` is moderate, but `DEBUG2` and below can write several lines per statement, and the logging collector can become a bottleneck. With per-process levels the volume is limited to the processes you chose, but raise the level for a short window, then reset it.
+
+## Recipes
+
+Debug one subsystem without flooding the log:
+
+```sql
+ALTER SYSTEM SET log_min_messages = 'warning, walsender:debug1';  -- replication issues
+ALTER SYSTEM SET log_min_messages = 'warning, archiver:debug1';   -- archive_command problems
+ALTER SYSTEM SET log_min_messages = 'warning, startup:debug1';    -- standby replay
+SELECT pg_reload_conf();
+-- ... reproduce, then:
+ALTER SYSTEM RESET log_min_messages;
+SELECT pg_reload_conf();
+```
+
+Quieter clients, normal background processes:
+
+```sql
+ALTER SYSTEM SET log_min_messages = 'warning, backend:error';
+```
+
+Debug one application role:
+
+```sql
+ALTER ROLE etl_user SET log_min_messages = 'warning, backend:debug1';
+```
+
+Make the log lines easier to filter by process type with `%b` in `log_line_prefix`. Our [log_line_prefix guide](/blog/postgres-log-line-prefix-guide) shows a prefix that works with pgBadger.
+
+Reading these logs is easier when you can query the settings and the activity at the same time. [Chat2DB](https://chat2db.ai/download) lets you keep `pg_settings` and `pg_stat_activity` queries open in tabs next to the log viewer of your choice while you reproduce the problem.
+
+## Summary
+
+PostgreSQL 19's `log_min_messages` accepts `'default, type:level, ...'`, so you can debug autovacuum, the checkpointer, WAL senders or the startup process without debug output from every client. A bare default level is required, and process types and duplicates are validated, with clear error messages. Session-level `SET` uses the `backend:` entry. Version 18 and older reject list values. In the same release, `log_autovacuum_min_duration` now covers only vacuum, and the new `log_autoanalyze_min_duration` covers automatic analyze. `log_lock_waits` is on by default, so lock waits longer than `deadlock_timeout` now appear in the log out of the box.
