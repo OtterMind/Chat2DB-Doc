@@ -1,0 +1,184 @@
+---
+title: "PostgreSQL cache lookup failed Error (XX000)"
+description: "What PostgreSQL's cache lookup failed for function, type or relation errors mean, a real 18.6 bug that raised one, and how to find catalog damage behind it."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: November 16, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# PostgreSQL cache lookup failed Error (XX000)
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="November 16, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+Most PostgreSQL errors tell you what you did wrong: a missing table, a bad type, a violated constraint. `cache lookup failed` is different. It looks like this:
+
+```
+ERROR:  XX000: cache lookup failed for function 0
+```
+
+or `cache lookup failed for type 16421`, `for relation 24577`, `for attribute 3 of relation ...`. The SQLSTATE is `XX000`, `internal_error`. PostgreSQL raises it when its own code looks up an object by OID in a system catalog cache and finds nothing, which, by design, should not happen. There are only a few ways to get there: a bug in PostgreSQL or an extension, an object dropped at an unlucky moment, or damaged system catalogs.
+
+This article shows two real cases, one from a bug fixed in PostgreSQL 18.7 and one from simulated catalog damage, and gives a step-by-step way to tell the causes apart. All examples were run on PostgreSQL 18.6, 18.7 and 17.12 built from source.
+
+## Reading the Message
+
+The message has a fixed shape: `cache lookup failed for <kind> <oid>`. The kind tells you which catalog was searched (`function` is `pg_proc`, `type` is `pg_type`, `relation` is `pg_class`, `operator` is `pg_operator`, `collation` is `pg_collation`, and so on). The number is the OID that was not found.
+
+Two numbers deserve special attention:
+
+- **OID 0** means "no object". The code tried to use an object reference that was never filled in. That is almost always a bug in PostgreSQL or an extension, not damage in your database.
+- **A real-looking OID** (16384 and above are user objects) means something pointed at an object that no longer exists. That can be a race with a concurrent `DROP`, a stale reference, or catalog corruption.
+
+Turn on verbose errors to see where in the source the error was raised; it helps when you search release notes or report a bug:
+
+```sql
+\set VERBOSITY verbose
+```
+
+## Case 1: A PostgreSQL Bug (COPY FROM ... WHERE in 18.6)
+
+The PostgreSQL 18.7 release notes include "Fix missed preprocessing of WHERE clauses in COPY FROM. This caused 'cache lookup failed for function 0' errors with negated operators." It is easy to reproduce on 18.6:
+
+```sql
+CREATE TABLE ct (a int, b text);
+
+COPY ct FROM STDIN WHERE NOT (a = 1);
+1	one
+2	two
+\.
+```
+
+PostgreSQL 18.6:
+
+```
+ERROR:  XX000: cache lookup failed for function 0
+LOCATION:  fmgr_info_cxt_security, fmgr.c:183
+```
+
+`NOT (a = 1)` is rewritten into `a <> 1` using the negator of the `=` operator, but in this code path the step that fills in the function behind the new operator was skipped, so PostgreSQL tried to call function OID 0. `NOT (a <> 2)` failed the same way. Writing the condition without `NOT` worked even on 18.6:
+
+```sql
+COPY ct FROM STDIN WHERE a <> 1;   -- COPY 1 on 18.6
+```
+
+On PostgreSQL 18.7 and 17.12 all three statements succeed and load the expected rows. This is a typical bug-caused `cache lookup failed`: OID 0, a specific statement shape, a workaround by rephrasing, and a fix in a later minor release.
+
+When you hit an error like this:
+
+1. Check your exact minor version with `SELECT version();`.
+2. Search the release notes of newer minor versions for the operation and the message. Minor releases are cumulative, so the newest one for your major version contains every fix.
+3. If the error involves an extension's function or type, test with the extension's latest version as well.
+4. If you can reproduce it on the newest minor version with a self-contained script, report it on the PostgreSQL bug form with that script.
+
+## Case 2: A Dangling Reference in the Catalog
+
+The other family of causes is a catalog row that points at an object that is gone. To show what that looks like, we deliberately removed a function's row from `pg_proc` behind PostgreSQL's back in a scratch database. **Never do this to a real database**; it is here only to produce the symptom.
+
+```sql
+CREATE FUNCTION net_price(numeric) RETURNS numeric LANGUAGE sql IMMUTABLE RETURN $1 * 0.8;
+CREATE TABLE products (id int, price numeric);
+INSERT INTO products VALUES (1, 100);
+CREATE VIEW product_prices AS SELECT id, net_price(price) AS net FROM products;
+
+SELECT * FROM product_prices;          -- 1 | 80.0
+
+DELETE FROM pg_proc WHERE proname = 'net_price';   -- simulated damage
+
+SELECT * FROM product_prices;
+```
+
+```
+ERROR:  XX000: cache lookup failed for function 16504
+LOCATION:  func_parallel, lsyscache.c:2108
+```
+
+Even describing the view fails, because psql's `\d+` asks PostgreSQL to print the view definition:
+
+```
+ERROR:  XX000: cache lookup failed for function 16504
+LOCATION:  generate_function_name, ruleutils.c:13410
+```
+
+The OID is a real user OID this time, and the error appears for every statement that touches the view, not only one statement shape. That is the signature of a stale reference.
+
+### Finding What Points at the Missing Object
+
+`pg_depend` records which objects depend on which. A dependency whose referenced object no longer exists shows where the damage is:
+
+```sql
+SELECT classid::regclass AS dependent_catalog, objid, refobjid AS missing_function_oid
+FROM pg_depend d
+WHERE refclassid = 'pg_proc'::regclass
+  AND NOT EXISTS (SELECT 1 FROM pg_proc p WHERE p.oid = d.refobjid);
+```
+
+```
+ dependent_catalog | objid | missing_function_oid
+-------------------+-------+----------------------
+ pg_rewrite        | 16513 |                16504
+```
+
+`pg_describe_object()` turns that into a name:
+
+```sql
+SELECT pg_describe_object(classid, objid, objsubid)
+FROM pg_depend d
+WHERE refclassid = 'pg_proc'::regclass
+  AND NOT EXISTS (SELECT 1 FROM pg_proc p WHERE p.oid = d.refobjid);
+```
+
+```
+         pg_describe_object
+-------------------------------------
+ rule _RETURN on view product_prices
+```
+
+The view's rewrite rule references the missing function. Replace `pg_proc` with `pg_type`, `pg_class` or `pg_operator` (and the matching `refclassid`) to check the other catalogs. In this case `DROP VIEW product_prices` still worked and removed the dangling dependency, after which the function and the view could be recreated from their source code.
+
+### How Catalogs Get Damaged in Real Life
+
+Nobody should be deleting from `pg_proc`, but the same symptom appears after:
+
+- manual "fixes" to system catalogs with `UPDATE` or `DELETE`, sometimes copied from old forum answers;
+- storage-level corruption: failing disks, a file system without proper `fsync`, or a host crash with `fsync = off` or `full_page_writes = off`;
+- restoring a file-level copy taken without `pg_basebackup` or proper backup mode;
+- old PostgreSQL bugs fixed long ago that left damage behind, carried forward by `pg_upgrade`.
+
+If the dependency query finds orphans that you did not create on purpose, treat the cluster as possibly corrupted: take a fresh logical dump of what can still be read, check indexes with [amcheck](/blog/postgres-amcheck-index-corruption) (`pg_amcheck --heapallindexed` for a whole database), and plan a dump and restore into a new cluster rather than patching catalogs by hand.
+
+## Case 3: Concurrent DROP
+
+PostgreSQL takes locks so that a query cannot lose an object it is using. Utility code that looks up objects by OID without a lock, or monitoring queries that pass OIDs between statements, can still race with a `DROP`. The typical pattern is a script that reads OIDs from `pg_class` in one query and calls a function such as `pg_get_indexdef(oid)` or `pg_relation_size(oid)` later. On 18.7, `pg_get_indexdef()`, `pg_relation_size()`, `pg_get_functiondef()` and `pg_get_viewdef()` return `NULL` for an OID that does not exist (and `format_type()` returns `???`), but other code paths, especially in extensions, can still raise `cache lookup failed` in that situation.
+
+The fix is to tolerate it: rerun the monitoring query, or join to the catalog in the same statement so that dropped objects are simply absent. A transient `cache lookup failed` from a monitoring query during deployments, which never repeats, is not a sign of corruption.
+
+## Collecting Details Before You Report
+
+Whether you file a bug with PostgreSQL, with an extension project or with your cloud provider, the same facts speed things up:
+
+```sql
+SELECT version();
+SHOW server_version_num;                       -- 180007 for 18.7
+SELECT extname, extversion FROM pg_extension;  -- extensions and their versions
+```
+
+Add the full error with `\set VERBOSITY verbose` in psql, which includes the `LOCATION` line (for example `fmgr_info_cxt_security, fmgr.c:183`). On the server side, `log_error_verbosity = verbose` writes the same location into the log for errors that come from applications. Then reduce the failing statement to the smallest script that still fails on an empty database: create the tables, insert a few rows, run the statement. A reproducible script turns an internal error into a quick fix; without one, an `XX000` report is very hard to act on. If the script stops failing on the newest minor release, you have your answer without filing anything.
+
+## A Decision Checklist
+
+| Clue | Likely cause | Next step |
+|---|---|---|
+| OID 0, one statement shape | PostgreSQL or extension bug | Update to the latest minor release; search release notes; rephrase the query |
+| Real OID, every query on one object fails | Dangling catalog reference | Run the `pg_depend` orphan queries; check for manual catalog edits |
+| Real OID, rare, during DDL or deploys | Race with concurrent `DROP` | Retry; make monitoring queries join catalogs in one statement |
+| Many different objects, plus other odd errors | Storage corruption | Stop writes if possible, dump what you can, run `pg_amcheck`, restore to new hardware |
+
+Working through these checks is quicker with the catalogs at hand. In [Chat2DB](https://chat2db.ai/download) you can save the orphan-dependency queries as snippets and run them against each database in a cluster, then open the affected view or function directly from the result.
+
+## Summary
+
+`cache lookup failed for <kind> <oid>` (SQLSTATE `XX000`) means PostgreSQL could not find an object it expected in its system catalogs. OID 0 points to a bug: PostgreSQL 18.6 raised `cache lookup failed for function 0` for `COPY FROM ... WHERE NOT (...)`, fixed in 18.7. A real OID that fails for every query on one object points to a dangling catalog reference, which `pg_depend` orphan queries and `pg_describe_object()` can locate. Rare, unrepeatable occurrences during DDL are usually races. Update to the newest minor release first, never edit catalogs by hand, and treat widespread lookup failures as possible corruption.

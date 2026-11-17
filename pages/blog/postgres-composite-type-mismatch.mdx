@@ -1,0 +1,236 @@
+---
+title: "PostgreSQL composite_type_mismatch and 22P07"
+description: "PostgreSQL 18.7 adds composite_type_mismatch and error 22P07 for row values whose type changed. See what broke before, what errors now, and how to fix it."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: November 16, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# PostgreSQL composite_type_mismatch and 22P07
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="November 16, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+The PostgreSQL update releases of November 12, 2026 include a large set of fixes for composite types, the row types you create with `CREATE TYPE ... AS (...)` and the row type every table has. The release notes for 18.7 describe it as "versioning logic to permit detection of composite datums that don't match the tuple descriptor we wish to interpret them with". In practice that means three visible changes:
+
+1. A new error, `row type of datum tuple was altered after the datum's creation`, with SQLSTATE `22P07` (`datum_version_mismatch`).
+2. A new server parameter, `composite_type_mismatch`, that controls whether that situation raises an error, a warning, or nothing.
+3. Stricter rules for `ALTER TYPE`, including a lock that makes it wait for uncommitted transactions that use the type.
+
+If you upgraded to 18.7 and started seeing `22P07`, or you saw `composite_type_mismatch` in the release notes and wondered whether to touch it, this article walks through what the old versions did wrong, what the new ones do instead, and how to work with it. Everything below was run on PostgreSQL 18.6 and 18.7 built from source.
+
+## The Problem: Row Values Outlive Their Type Definition
+
+A composite value (a "datum") is stored as a small tuple whose layout follows the type definition at the moment it was built: an 8-byte bigint takes 8 bytes, an int takes 4, and so on. Most of the time the value is built and read within one statement, so the definition cannot change in between. Some values live longer: rows held by a `WITH HOLD` cursor, values in session state, values held by a transaction that has not committed yet. If `ALTER TYPE` changes the layout while such a value exists, reading it with the new layout interprets the old bytes wrongly.
+
+### Example 1: A Held Cursor Returns Garbage on 18.6
+
+```sql
+CREATE TYPE pair AS (a text, b int);
+
+BEGIN;
+DECLARE cur SCROLL CURSOR WITH HOLD FOR SELECT ROW('hello', 42)::pair AS p;
+COMMIT;   -- WITH HOLD materializes the result
+
+ALTER TYPE pair ALTER ATTRIBUTE b TYPE bigint;
+
+FETCH FIRST FROM cur;
+```
+
+On PostgreSQL 18.6 the fetch succeeds and returns a wrong number:
+
+```
+          p
+---------------------
+ (hello,-4294967254)
+```
+
+The stored value has a 4-byte integer; the new definition says 8 bytes, so PostgreSQL read 4 bytes of something else along with it. No error, no warning, just a wrong answer.
+
+On PostgreSQL 18.7 the same fetch fails:
+
+```
+ERROR:  22P07: row type of datum tuple was altered after the datum's creation
+HINT:  See server log for additional details.
+LOCATION:  heap_datum_version_mismatch_error, heaptuple.c:1659
+```
+
+The server log has the detail the hint refers to:
+
+```
+LOG:  tuple descriptor for type pair (OID 16399), version 0/179CA08 is incompatible with tuple type pair (OID 16399), version 0/1796540
+```
+
+### Example 2: ALTER TYPE Races an Uncommitted CREATE TABLE
+
+The second case is less contrived. One session creates a table that uses a composite type and inserts a row, but has not committed yet. Another session changes the type:
+
+```sql
+-- session 1
+CREATE TYPE addr AS (street text, zip int);
+BEGIN;
+CREATE TABLE orders_t (id int, ship addr);
+INSERT INTO orders_t VALUES (1, ROW('Main St', 12345));
+-- ... still open
+
+-- session 2
+ALTER TYPE addr ALTER ATTRIBUTE zip TYPE text;
+
+-- session 1
+COMMIT;
+SELECT * FROM orders_t;
+```
+
+On 18.6, `ALTER TYPE` returned immediately, because the new table was invisible to it and nothing seemed to depend on the type. After session 1 committed, the row was damaged:
+
+```
+ id |     ship
+----+---------------
+  1 | ("Main St",0)
+```
+
+The zip code `12345` was stored as an integer and is now read as text. This is data corruption of committed data, caused by two ordinary DDL statements.
+
+On 18.7, `ALTER TYPE` waits for session 1. Once session 1 commits, it sees the new dependency and refuses:
+
+```
+ERROR:  cannot alter type "addr" because column "orders_t.ship" uses it
+```
+
+The row stays `("Main St",12345)`. With `SET lock_timeout = '2s'` in session 2, you get `ERROR:  canceling statement due to lock timeout` instead, which is usually what you want in a migration script.
+
+## How 18.7 Detects Mismatches
+
+PostgreSQL now stamps each attribute of a composite type with a version. You can see it in `pg_attribute.attoptions` on 18.7:
+
+```sql
+CREATE TYPE pv AS (a text, b int);
+ALTER TYPE pv ALTER ATTRIBUTE b TYPE bigint;
+ALTER TYPE pv ADD ATTRIBUTE c date;
+
+SELECT attname, atttypid::regtype, attoptions
+FROM pg_attribute
+WHERE attrelid = (SELECT typrelid FROM pg_type WHERE typname = 'pv') AND attnum > 0;
+```
+
+```
+ attname | atttypid |       attoptions
+---------+----------+------------------------
+ a       | text     | {pg_attver=2811141736}
+ b       | bigint   | {pg_attver=2811159176}
+ c       | date     | {pg_attver=2811159336}
+```
+
+The same query on 18.6 shows empty `attoptions`. Attribute `b` got a new version when its type changed, and `c` got one when it was added. Values built under an older layout carry the older version, so PostgreSQL can tell, when it reads a composite value, that its layout no longer matches the current definition. These are internal bookkeeping values; do not edit them.
+
+Compatible changes do not trigger the error. Adding an attribute is compatible, because old values simply lack the new trailing field. With a held cursor over `pair2 (a text, b int)` followed by `ALTER TYPE pair2 ADD ATTRIBUTE c date`, both 18.6 and 18.7 return `(hello,42,)`.
+
+## The composite_type_mismatch Parameter
+
+The new parameter takes three values:
+
+| Value | Behavior |
+|---|---|
+| `error` (default) | Raise `22P07` and abort the transaction. |
+| `warn` | Emit the same message as a `WARNING` and continue. |
+| `disabled` | Skip the check completely. |
+
+The documentation is blunt about the alternatives: settings other than `error` "may cause crashes, wrong results, or other serious problems". Only superusers and roles granted `SET` privilege on the parameter can change it. Continuing the held-cursor example on 18.7:
+
+```sql
+SET composite_type_mismatch = warn;
+FETCH FIRST FROM cur;
+```
+
+```
+WARNING:  22P07: row type of datum tuple was altered after the datum's creation
+HINT:  See server log for additional details.
+     p
+------------
+ (hello,42)
+```
+
+In this run the value happened to come back intact, but nothing guarantees that. The release notes say the parameter exists so the checks can be disabled "if necessary", for example when a C extension has not been updated yet and reports false mismatches, and that doing so "carries security risks". Treat `warn` as a short-term diagnostic and `disabled` as a last resort.
+
+## Extensions Need Rebuilding
+
+The same update also asks some users to reindex; [the 18.7 reindex guide](/blog/postgres-18-7-update-reindex) lists which indexes are affected.
+
+
+The release notes state that full protection requires rebuilding C-language extensions, and that some extensions need source changes. Minor updates normally keep the extension ABI stable, so this is unusual: after updating the server packages, also update extension packages (PostGIS, pgvector, TimescaleDB, Citus and so on) to builds made for the new minor version, or rebuild your own extensions against the new headers. If an extension starts raising `22P07` on values it builds itself, check for an extension update before reaching for `composite_type_mismatch`.
+
+## Stricter ALTER TYPE Rules
+
+18.7 also refuses some `ALTER TYPE ... ALTER ATTRIBUTE ... TYPE` changes that 18.6 allowed or reported differently. A function whose default argument uses the type:
+
+```sql
+CREATE TYPE money_amt AS (amount numeric(10,2), currency text);
+CREATE FUNCTION fmt(m money_amt DEFAULT ROW(0, 'USD')::money_amt) RETURNS text
+  LANGUAGE sql RETURN m.amount || ' ' || m.currency;
+
+ALTER TYPE money_amt ALTER ATTRIBUTE amount TYPE numeric(12,2);
+```
+
+18.6 refused this with a generic message:
+
+```
+ERROR:  0A000: cannot alter type of a column used by a function or procedure
+DETAIL:  function fmt(money_amt) depends on column "amount"
+```
+
+18.7 names the type:
+
+```
+ERROR:  0A000: cannot alter type "money_amt" because function fmt(money_amt) uses it
+```
+
+A new-style SQL function body (`BEGIN ATOMIC`) that builds the type is the bigger difference:
+
+```sql
+CREATE FUNCTION mk() RETURNS money_amt LANGUAGE sql
+BEGIN ATOMIC SELECT ROW(1, 'EUR')::money_amt; END;
+
+ALTER TYPE money_amt ALTER ATTRIBUTE amount TYPE numeric(14,2);
+```
+
+18.6 accepted the `ALTER TYPE`. 18.7 rejects it:
+
+```
+ERROR:  0A000: cannot alter type "money_amt" because function mk() uses it
+```
+
+Migration scripts that worked on 18.6 can therefore fail on 18.7. The fix is the same as for a view that depends on a column: drop the dependent function, alter the type, and recreate the function, inside one transaction.
+
+```sql
+BEGIN;
+DROP FUNCTION mk();
+ALTER TYPE money_amt ALTER ATTRIBUTE amount TYPE numeric(14,2);
+CREATE FUNCTION mk() RETURNS money_amt LANGUAGE sql
+BEGIN ATOMIC SELECT ROW(1, 'EUR')::money_amt; END;
+COMMIT;
+```
+
+## What to Do When You See 22P07
+
+1. **Find the long-lived value.** The error means a value built before an `ALTER TYPE` was read afterwards. Look for `WITH HOLD` cursors (`SELECT name, statement FROM pg_cursors`), long-running sessions in connection pools, and application code that caches rows.
+2. **Rebuild the value.** Close and reopen the cursor, rerun the query, or reconnect the session. A value built after the `ALTER TYPE` has the new version.
+3. **Check extensions** if the value comes from extension code rather than your own SQL, and update them.
+4. **Leave `composite_type_mismatch = error`** unless an extension vendor tells you otherwise for a specific, temporary reason.
+
+## Changing Composite Types Safely
+
+The new behavior is a good prompt to make type changes boring:
+
+- Set `lock_timeout` in migrations so `ALTER TYPE` does not queue behind a long transaction and block everything after it.
+- Prefer additive changes (`ADD ATTRIBUTE`) over changing an attribute's type. For incompatible changes, create a new type, migrate columns and functions to it, and drop the old one.
+- Close `WITH HOLD` cursors before deploying type changes, and recycle pooled connections after.
+- Remember that a table's row type is a composite type too. With a held cursor over `SELECT t FROM wr t`, running `ALTER TABLE wr ALTER COLUMN b TYPE bigint` made 18.6 return `(x,1374389534819)` for a row that held `('x', 7)`, while 18.7 raised `22P07`. Close such cursors before altering column types.
+
+Reviewing which functions, views and columns depend on a type before you change it is much easier with the dependencies in front of you; in [Chat2DB](https://chat2db.ai/download) you can browse a type's dependent objects and run the `pg_depend` queries from the same workspace before writing the migration.
+
+## Summary
+
+Before 18.7, a composite value built under one type definition could be read under another, which returned garbage from held cursors and could corrupt committed rows when `ALTER TYPE` raced an uncommitted `CREATE TABLE`. PostgreSQL 18.7 (and the other November 2026 update releases) version each attribute, raise `22P07 row type of datum tuple was altered after the datum's creation` on a mismatch, make `ALTER TYPE` wait for uncommitted users of the type, and refuse type changes that function defaults or `BEGIN ATOMIC` bodies depend on. The new `composite_type_mismatch` parameter can downgrade the check to a warning or disable it, at the risk of wrong results or crashes, so keep the default `error`, rebuild C extensions, and fix the long-lived value instead.

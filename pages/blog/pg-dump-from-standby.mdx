@@ -1,0 +1,175 @@
+---
+title: "pg_dump From a Standby: Parallel Dumps Safely"
+description: "Run pg_dump and parallel pg_dump -j against a PostgreSQL standby without recovery conflicts, and why the 18.7 snapshot fix matters for standby dumps."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: November 16, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# pg_dump From a Standby: Parallel Dumps Safely
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="November 16, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+Taking logical backups from a streaming replica instead of the primary is a sensible habit. The dump reads every table, which costs I/O and CPU, and a standby is the obvious place to spend that. It is also where things go wrong in ways people do not expect: a dump that runs fine on the primary fails on the standby with `canceling statement due to conflict with recovery`, and until the November 2026 update releases, a parallel dump from a standby could even produce a corrupted dump.
+
+This guide covers how `pg_dump` and `pg_dump -j` work against a hot standby, the two kinds of recovery conflicts that kill dumps, the settings that prevent them and their costs, and the snapshot bug fixed in PostgreSQL 18.7, 17.12, 16.16, 15.20 and 14.25. The examples come from a PostgreSQL 18.7 primary with a streaming standby.
+
+## A Basic Dump From the Standby
+
+Nothing special is needed to point `pg_dump` at a hot standby. It opens a read-only `REPEATABLE READ` transaction, which a standby allows, and reads the catalog and every table inside that snapshot:
+
+```bash
+pg_dump -h standby.internal -U backup -d app -Fc -f app.dump
+```
+
+A parallel dump works too. `-j` requires the directory format; the leader process exports its snapshot with `pg_export_snapshot()`, and each worker imports it so that all workers see exactly the same data:
+
+```bash
+pg_dump -h standby.internal -U backup -d app -Fd -j 3 -f app.dir
+```
+
+In our test, a three-job directory dump of a small database finished in 4.5 seconds on the standby. Two related options fail on a standby or in combination:
+
+```
+$ pg_dump ... -j 3 -f x.sql
+pg_dump: error: parallel backup only supported by the directory format
+
+$ pg_dump ... -Fc --serializable-deferrable -f x.dump
+pg_dump: error: query failed: ERROR:  cannot use serializable mode in a hot standby
+HINT:  You can use REPEATABLE READ instead.
+pg_dump: detail: Query was: SET TRANSACTION ISOLATION LEVEL SERIALIZABLE, READ ONLY, DEFERRABLE
+```
+
+`--serializable-deferrable` exists to get a dump that is consistent with serializable transactions on the primary. A standby cannot run serializable transactions at all, so if you need that guarantee, dump the primary.
+
+## The 18.7 Snapshot Fix
+
+The November 12, 2026 release notes contain this item: "Fix exporting and importing snapshots taken on a standby server. The issue was detected when running a parallel pg_dump against a standby server, and could corrupt both the dump output and the standby server's data. More generally, a transaction that imported a snapshot taken on a standby server could return wrong results."
+
+That is precisely the `pg_export_snapshot()` / `SET TRANSACTION SNAPSHOT` mechanism that `pg_dump -j` uses. The fix is in 18.7, 17.12, 16.16, 15.20 and 14.25. What to do:
+
+1. Update the **standby servers** you dump from. The bug is in the server, not in `pg_dump`.
+2. Until they are updated, take parallel dumps from the primary, or use a non-parallel format (`-Fc` without `-j`) on the standby, which does not export or import a snapshot.
+3. Consider replacing parallel dumps taken from standbys before the update with fresh ones, especially the ones you would rely on for a restore. Test-restore at least one of them, as you should for any backup.
+
+The same applies to any application code that exports a snapshot on a standby and imports it in other sessions, for example parallel extract jobs.
+
+## Recovery Conflicts: Why Standby Dumps Get Canceled
+
+A standby replays the primary's WAL continuously. Some WAL records cannot be applied while a query on the standby still needs the old state. PostgreSQL then waits up to `max_standby_streaming_delay` (default 30 seconds; `max_standby_archive_delay` for WAL from the archive) and, if the query is still running, cancels it. A long `COPY` inside `pg_dump` is exactly such a query.
+
+To reproduce it quickly, we set `max_standby_streaming_delay = 3s` on the standby and slowed the dump down by piping it into a reader that waits ten seconds. Meanwhile the primary deleted rows from the table being dumped and vacuumed it.
+
+The same error hits any long query on a standby; [canceling statement due to conflict with recovery](/blog/postgres-canceling-statement-conflict-with-recovery) covers it in general. The sections below focus on dumps.
+
+### Snapshot Conflicts
+
+`VACUUM` on the primary removed row versions that the dump's snapshot could still see. When the standby replayed that cleanup, it canceled the dump:
+
+```
+pg_dump: error: Dumping the contents of table "big3" failed: PQgetResult() failed.
+pg_dump: detail: Error message from server: ERROR:  canceling statement due to conflict with recovery
+DETAIL:  User query might have needed to see row versions that must be removed.
+pg_dump: detail: Command was: COPY public.big3 (id, v) TO stdout;
+```
+
+### Lock Conflicts
+
+Running `ALTER TABLE big3 ADD COLUMN note text` on the primary takes an `ACCESS EXCLUSIVE` lock, and the standby replays that lock. The dump holds `ACCESS SHARE` on the table, so the replay waits and then cancels it:
+
+```
+pg_dump: detail: Error message from server: ERROR:  canceling statement due to conflict with recovery
+DETAIL:  User was holding a relation lock for too long.
+pg_dump: detail: Command was: COPY public.big3 (id, v) TO stdout;
+```
+
+Other operations that take `ACCESS EXCLUSIVE` on the primary do the same: `TRUNCATE`, `DROP TABLE`, most `ALTER TABLE` forms, `VACUUM FULL`, `CLUSTER`, `REINDEX` without `CONCURRENTLY`, and the truncation of empty pages at the end of a table during ordinary `VACUUM`.
+
+The standby counts conflicts by type:
+
+```sql
+SELECT datname, confl_snapshot, confl_lock, confl_bufferpin, confl_deadlock
+FROM pg_stat_database_conflicts
+WHERE datname = 'app';
+```
+
+## Preventing the Conflicts
+
+Each fix has a cost, so pick per environment.
+
+### hot_standby_feedback
+
+With `hot_standby_feedback = on` on the standby, it reports the oldest transaction it still needs to the primary, and the primary's `VACUUM` keeps those row versions. After turning it on and repeating the delete-and-vacuum test, the dump finished with exit status 0. The primary shows the standby's horizon:
+
+```sql
+SELECT application_name, backend_xmin FROM pg_stat_replication;
+```
+
+```
+ application_name | backend_xmin
+------------------+--------------
+ walreceiver      |          942
+```
+
+The cost: while a long dump runs, dead rows on the primary cannot be removed, so busy tables bloat for the duration of the dump. It also does **not** help with lock conflicts. With feedback on, the `ALTER TABLE` test still canceled the dump with `User was holding a relation lock for too long`.
+
+### Pause Replay During the Dump
+
+```sql
+-- on the standby
+SELECT pg_wal_replay_pause();
+-- run pg_dump
+SELECT pg_wal_replay_resume();
+```
+
+With replay paused, both the vacuum test and the `ALTER TABLE` test let the dump finish (exit status 0). Nothing is replayed, so nothing can conflict. `pg_get_wal_replay_pause_state()` reports `paused` while it is in effect.
+
+The cost: the standby falls behind for the duration of the dump, WAL accumulates on it, and it is not a usable failover target or a source of fresh reads in the meantime. If the primary uses `synchronous_commit = remote_apply` with this standby as a synchronous standby, commits on the primary wait until replay resumes. Use a dedicated backup replica for this, not the standby your application reads from or fails over to. Always resume replay in a `trap` or `finally` block in the backup script, so a failed dump does not leave the standby paused.
+
+### Raise max_standby_streaming_delay
+
+Setting `max_standby_streaming_delay = -1` makes the standby wait forever instead of canceling queries. That prevents both kinds of conflicts the same way pausing does, but implicitly: replay stops whenever a conflicting record arrives and resumes after the dump's query ends. The lag can grow without bound, and every other query on that standby sees stale data. It is acceptable on a backup-only replica and a bad idea on a read replica that serves users.
+
+### Summary of Options
+
+| Approach | Snapshot conflicts | Lock conflicts | Cost |
+|---|---|---|---|
+| `hot_standby_feedback = on` | prevented | not prevented | bloat on the primary during the dump |
+| `pg_wal_replay_pause()` | prevented | prevented | standby lag; blocks `remote_apply` commits |
+| `max_standby_streaming_delay = -1` | prevented | prevented | unbounded lag while conflicts wait |
+| Dump the primary | none | none | load on the primary |
+
+## Making Dumps Shorter
+
+The other lever is the dump's duration, because every conflict window is as long as the transaction:
+
+- Use `-Fd -j N` (on an updated standby) to read several tables at once.
+- Exclude data you can rebuild: `--exclude-table-data` for logs, caches and materialized-view-like tables.
+- Write to fast local storage first and upload afterwards, rather than streaming the dump over a slow network, which keeps each `COPY` open longer, exactly like the slow reader in our test.
+- Schedule dumps away from batch jobs that run DDL or heavy `DELETE` plus `VACUUM` on the primary.
+
+## A Backup Script Skeleton
+
+```bash
+#!/bin/bash
+set -euo pipefail
+STANDBY="host=backup-replica.internal dbname=app user=backup"
+
+psql "$STANDBY" -Atc "SELECT pg_wal_replay_pause()"
+trap 'psql "$STANDBY" -Atc "SELECT pg_wal_replay_resume()"' EXIT
+
+pg_dump "$STANDBY" -Fd -j 4 -f "/backups/app-$(date +%F)"
+pg_restore --list "/backups/app-$(date +%F)" > /dev/null   # quick sanity check of the TOC
+```
+
+The role running it needs permission to call `pg_wal_replay_pause()` and `pg_wal_replay_resume()`; by default only superusers can, and you can `GRANT EXECUTE` on both functions to a backup role.
+
+Before scheduling a script like this, it helps to look at how far behind the replica normally is and which tables are largest. In [Chat2DB](https://chat2db.ai/download) you can connect to the primary and the replica together and compare `pg_stat_replication`, `pg_stat_database_conflicts` and table sizes side by side.
+
+## Summary
+
+`pg_dump`, including parallel `pg_dump -Fd -j`, runs on a hot standby, but the November 2026 update releases fixed a bug in exporting and importing snapshots on standbys that could corrupt parallel dumps and even standby data, so update the standbys you dump from to 18.7, 17.12, 16.16, 15.20 or 14.25. Long dumps on a standby get canceled by recovery conflicts: VACUUM cleanup (`User query might have needed to see row versions that must be removed`) and `ACCESS EXCLUSIVE` locks (`User was holding a relation lock for too long`). `hot_standby_feedback` prevents only the first, at the cost of bloat on the primary; pausing replay or `max_standby_streaming_delay = -1` prevents both, at the cost of lag. A dedicated backup replica with replay paused during the dump is the cleanest setup.

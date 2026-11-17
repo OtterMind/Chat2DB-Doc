@@ -1,0 +1,256 @@
+---
+title: "PostgreSQL Time Zone Abbreviations Explained"
+description: "How PostgreSQL reads EST, CST, IST and BST in timestamp input, what changed in PostgreSQL 18, and how to configure timezone_abbreviations safely."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: November 16, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# PostgreSQL Time Zone Abbreviations Explained
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="November 16, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+A timestamp string such as `'2027-01-15 09:00 CST'` looks unambiguous until you remember that CST is Central Standard Time in North America, China Standard Time, and Cuba Standard Time, three different offsets. IST is Israel, India or Ireland. PostgreSQL has to pick one, and how it picks depends on a configuration parameter, on the session's time zone, and since PostgreSQL 18 on a new lookup order.
+
+Abbreviations are in the news again because of the November 2026 tzdata update: [Manitoba's new year-round time](/blog/postgres-manitoba-time-change-2026) is labelled EST, and Inuvik's is labelled CST. For full zone names that PostgreSQL rejects, see [time zone not recognized](/blog/postgres-time-zone-not-recognized). This guide explains how PostgreSQL resolves abbreviations in input, how that differs from output, how to customize the table, and the errors you can hit. All examples were run on PostgreSQL 18.7 and 17.12.
+
+## Abbreviations Are Not Time Zones
+
+PostgreSQL treats three kinds of time zone specifications differently:
+
+- **Full zone names** such as `America/Chicago` carry a complete history of offsets and daylight saving rules. They are what you should use for `SET timezone` and for converting with `AT TIME ZONE`.
+- **Abbreviations** such as `CST` stand for one fixed offset. `CST` always means UTC-6 in the default table, even in July when Chicago is on CDT.
+- **Numeric offsets** such as `-06` or `+05:30` are fixed offsets written explicitly.
+
+Abbreviations are recognized in **input** strings for `timestamptz` and `timetz`, and in `AT TIME ZONE` (where `AT TIME ZONE 'CST'` applies a fixed UTC-6). They are not accepted as a `TimeZone` setting: `SET timezone = 'CST'` fails with `invalid value for parameter "TimeZone": "CST"`. `SET timezone = 'EST'` works only because tzdata also contains a zone that happens to be named `EST`. PostgreSQL looks abbreviations up in a table chosen by the `timezone_abbreviations` parameter, whose default value is `Default`.
+
+## What the Default Table Says
+
+The `pg_timezone_abbrevs` view lists the abbreviations PostgreSQL currently accepts:
+
+```sql
+SET timezone = 'UTC';
+SELECT abbrev, utc_offset, is_dst
+FROM pg_timezone_abbrevs
+WHERE abbrev IN ('EST', 'CST', 'IST', 'BST', 'AEST', 'SGT', 'KST')
+ORDER BY abbrev;
+```
+
+```
+ abbrev | utc_offset | is_dst
+--------+------------+--------
+ AEST   | 10:00:00   | f
+ BST    | 01:00:00   | t
+ CST    | -06:00:00  | f
+ EST    | -05:00:00  | f
+ IST    | 02:00:00   | f
+ KST    | 09:00:00   | f
+ SGT    | 08:00:00   | f
+```
+
+With the session in UTC, the `Default` table resolves the ambiguous ones like this:
+
+```sql
+SELECT '2027-01-15 09:00 EST'::timestamptz AS est,
+       '2027-01-15 09:00 CST'::timestamptz AS cst,
+       '2027-01-15 09:00 IST'::timestamptz AS ist,
+       '2027-01-15 09:00 BST'::timestamptz AS bst;
+```
+
+```
+          est           |          cst           |          ist           |          bst
+------------------------+------------------------+------------------------+------------------------
+ 2027-01-15 14:00:00+00 | 2027-01-15 15:00:00+00 | 2027-01-15 07:00:00+00 | 2027-01-15 08:00:00+00
+```
+
+`IST` became UTC+2 (Israel Standard Time) and `CST` became UTC-6 (North American Central). The `Default` file itself documents the conflicts with comments such as `# CONFLICT! IST is not unique`, listing Irish and Indian Standard Time as the losers. The full view in our build listed 195 abbreviations.
+
+## The PostgreSQL 18 Change: Session Zone First
+
+PostgreSQL 18 changed the lookup order. In the release notes' words, the system "will now favor the current session's time zone abbreviations before checking the server variable timezone_abbreviations". If the session's `TimeZone` uses an abbreviation (in tzdata, at any point in its history), that meaning wins.
+
+The same queries on 17.12 and 18.7:
+
+```sql
+SET timezone = 'Asia/Kolkata';
+SELECT '2027-01-15 09:00 IST'::timestamptz;
+
+SET timezone = 'Asia/Shanghai';
+SELECT '2027-01-15 09:00 CST'::timestamptz;
+
+SET timezone = 'America/Havana';
+SELECT '2027-01-15 09:00 CST'::timestamptz;
+
+SET timezone = 'Europe/Dublin';
+SELECT '2027-07-15 09:00 IST'::timestamptz;
+```
+
+| Session zone | Input | PostgreSQL 17.12 | PostgreSQL 18.7 |
+|---|---|---|---|
+| Asia/Kolkata | `09:00 IST` | `12:30:00+05:30` (read as UTC+2) | `09:00:00+05:30` |
+| Asia/Shanghai | `09:00 CST` | `23:00:00+08` (read as UTC-6) | `09:00:00+08` |
+| America/Havana | `09:00 CST` | `11:00:00-04` (read as UTC-6) | `10:00:00-04` (read as UTC-5) |
+| Europe/Dublin | `09:00 IST` | `08:00:00+01` (read as UTC+2) | `09:00:00+01` |
+
+On 17, an Indian user typing `09:00 IST` got a time three and a half hours off. On 18, the session zone resolves it the way the user meant. The rule only helps when the session zone actually uses that abbreviation: with `Australia/Adelaide`, `CST` still resolves through the default table to UTC-6 on 18.7, because tzdata labels Adelaide time `ACST`, so `'2027-07-15 09:00 CST'` lands at `2027-07-16 00:30:00+09:30`.
+
+This change can alter results after a major upgrade. If an application in a session set to `Asia/Kolkata` relied on `IST` meaning UTC+2 (unlikely, but possible in data feeds from Israel processed on Indian servers), the same input now yields a different instant. Treat abbreviation-bearing inputs as something to retest when you upgrade to 18.
+
+## Abbreviations in AT TIME ZONE
+
+Because an abbreviation stands for one fixed offset, using it in `AT TIME ZONE` gives a different answer from the zone it is named after whenever daylight time is in effect:
+
+```sql
+SET timezone = 'UTC';
+SELECT ts AT TIME ZONE 'CST'             AS fixed_cst,
+       ts AT TIME ZONE 'America/Chicago' AS chicago,
+       ts AT TIME ZONE 'CDT'             AS fixed_cdt
+FROM (VALUES (timestamptz '2027-07-15 15:00+00'), (timestamptz '2027-01-15 15:00+00')) v(ts);
+```
+
+```
+      fixed_cst      |       chicago       |      fixed_cdt
+---------------------+---------------------+---------------------
+ 2027-07-15 09:00:00 | 2027-07-15 10:00:00 | 2027-07-15 10:00:00
+ 2027-01-15 09:00:00 | 2027-01-15 09:00:00 | 2027-01-15 10:00:00
+```
+
+In July, `CST` is an hour behind what clocks in Chicago show; in January, `CDT` is an hour ahead. Reports that group by local day or hour with an abbreviation are therefore wrong for half the year. Use the full zone name whenever the intent is "local time in that place".
+
+## Errors You Will See
+
+An abbreviation that is not in the table and not used by the session zone makes the whole literal invalid. The error does not mention time zones:
+
+```sql
+SET timezone = 'UTC';
+SELECT '2027-01-15 09:00 WIB'::timestamptz;
+```
+
+```
+ERROR:  invalid input syntax for type timestamp with time zone: "2027-01-15 09:00 WIB"
+LINE 1: SELECT '2027-01-15 09:00 WIB'::timestamptz;
+               ^
+```
+
+`WIB` (Western Indonesia Time) is not in `Default`. A misspelled abbreviation gives exactly the same error, so if a CSV import fails on timestamps, check the abbreviations before the date format.
+
+Setting the parameter to a file that does not exist fails immediately:
+
+```sql
+SET timezone_abbreviations = 'Nope';
+```
+
+```
+ERROR:  invalid value for parameter "timezone_abbreviations": "Nope"
+```
+
+(Note the different message from a bad zone name in `AT TIME ZONE`, which is `time zone "..." not recognized`.)
+
+## Choosing a Different Table
+
+PostgreSQL ships several abbreviation files in `share/timezonesets` (find the directory with `pg_config --sharedir`). Besides `Default` there are `Australia` and `India`, which resolve the conflicting abbreviations the regional way, plus `.txt` files per region that the main files include. Switching to `India`:
+
+```sql
+SET timezone = 'UTC';
+SET timezone_abbreviations = 'India';
+SELECT '2027-01-15 09:00 IST'::timestamptz AS ist_india;
+```
+
+```
+       ist_india
+------------------------
+ 2027-01-15 03:30:00+00
+```
+
+You can set the parameter per session, per role, per database or in `postgresql.conf`:
+
+```sql
+ALTER DATABASE app_in SET timezone_abbreviations = 'India';
+```
+
+## Writing a Custom File
+
+When none of the shipped files fits, create your own in `share/timezonesets`. The format is one abbreviation per line with an offset in seconds east of UTC, and an optional `D` for daylight time. `@INCLUDE` pulls in another file, and `@OVERRIDE` allows later lines to replace earlier ones:
+
+```
+@INCLUDE Default
+@OVERRIDE
+# Indonesia (not in Default)
+WIB 25200    # Western Indonesia Time, UTC+7
+WITA 28800   # Central Indonesia Time, UTC+8
+# make IST mean India instead of Israel
+IST 19800    # India Standard Time, UTC+5:30
+```
+
+Saved as `MyApp`:
+
+```sql
+SET timezone = 'UTC';
+SET timezone_abbreviations = 'MyApp';
+SELECT '2027-01-15 09:00 WIB'::timestamptz AS wib,
+       '2027-01-15 09:00 IST'::timestamptz AS ist;
+```
+
+```
+          wib           |          ist
+------------------------+------------------------
+ 2027-01-15 02:00:00+00 | 2027-01-15 03:30:00+00
+```
+
+Without the `@OVERRIDE` line, redefining `IST` is an error, and the message says exactly where the conflict is:
+
+```
+ERROR:  time zone abbreviation "ist" is multiply defined
+DETAIL:  Entry in time zone file "Default", line 244, conflicts with entry in file "Broken", line 3.
+```
+
+The file lives inside the PostgreSQL installation, so package upgrades and new servers will not have it unless you deploy it with your configuration management. Put it in the same place as `postgresql.conf` changes in your provisioning code.
+
+## Abbreviations in Output
+
+Output works the other way around. When PostgreSQL prints a `timestamptz` with `to_char(..., 'TZ')` or in the default `DateStyle`, it uses the abbreviation that tzdata defines for the session zone at that instant, not the `timezone_abbreviations` table:
+
+```sql
+SET timezone = 'America/Winnipeg';
+SELECT to_char(timestamptz '2027-01-15 15:00+00', 'HH24:MI TZ') AS winnipeg,
+       '2027-01-15 09:00 EST'::timestamptz AS est_in_winnipeg;
+```
+
+```
+ winnipeg  |    est_in_winnipeg
+-----------+------------------------
+ 10:00 EST | 2027-01-15 09:00:00-05
+```
+
+Since tzdata 2026f, Winnipeg prints `EST` in winter, and `EST` input means UTC-5 both in the default table and in the Winnipeg zone, so the round trip is consistent. Many zones no longer have letter abbreviations at all, because tzdata removed invented ones. São Paulo prints a numeric abbreviation:
+
+```sql
+SET timezone = 'America/Sao_Paulo';
+SELECT to_char(timestamptz '2027-01-15 15:00+00', 'HH24:MI TZ OF') AS sp;
+```
+
+```
+      sp
+---------------
+ 12:00 -03 -03
+```
+
+Numeric abbreviations like `-03` are valid input as well, and they are the safest form to exchange.
+
+## Recommendations
+
+1. **Exchange offsets, not abbreviations.** ISO 8601 with a numeric offset (`2027-01-15T09:00:00-05:00`) or UTC (`Z`) has exactly one meaning everywhere.
+2. **Store zone names, not abbreviations,** when you need to know where a user is. `America/Winnipeg` survives rule changes; `CST` does not even say whether daylight time applies.
+3. **Retest abbreviation inputs when upgrading to PostgreSQL 18,** especially in sessions whose zone uses an abbreviation that conflicts with the default table (India, China, Cuba, Ireland).
+4. **If you must accept abbreviations** from a fixed region, set `timezone_abbreviations` per database or role, or ship a custom file with `@OVERRIDE`, and deploy it with your server configuration.
+5. **Use `pg_timezone_abbrevs`** to answer "what does PostgreSQL think XYZ means right now" instead of guessing.
+
+When you are cleaning up a table full of mixed timestamp strings, it helps to test candidate parsing rules interactively against real rows. [Chat2DB](https://chat2db.ai/download) can run the same conversion query with different `timezone_abbreviations` settings in separate tabs, so you can compare which rows change before committing to one.
+
+## Summary
+
+PostgreSQL resolves abbreviations in timestamp input through the `timezone_abbreviations` table (`Default` unless changed), and since PostgreSQL 18 it first checks the abbreviations used by the session's own time zone, which fixes `IST` in India, `CST` in China and Cuba, and `IST` in Ireland. Unknown abbreviations produce a generic `invalid input syntax` error. You can switch to the shipped `India` or `Australia` tables or write a custom file with `@INCLUDE` and `@OVERRIDE`. Output abbreviations come from tzdata, which is why Winnipeg now prints `EST`. For anything that crosses system boundaries, numeric offsets and full zone names are the reliable choice.

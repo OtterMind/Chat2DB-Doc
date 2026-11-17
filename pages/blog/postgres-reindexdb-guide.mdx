@@ -1,0 +1,257 @@
+---
+title: "reindexdb: Rebuild PostgreSQL Indexes from Shell"
+description: "Use reindexdb to rebuild PostgreSQL indexes by database, schema, table or index, with --concurrently and -j, plus the errors it raises and the 18.7 fixes."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: November 16, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# reindexdb: Rebuild PostgreSQL Indexes from Shell
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="November 16, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+`reindexdb` is the command-line wrapper around the SQL `REINDEX` command. It ships with every PostgreSQL installation, next to `vacuumdb` and `pg_dump`, and it is the convenient way to rebuild indexes from a shell script, a cron job or a post-update runbook. The November 2026 update releases asked many users to reindex specific index types (GIN indexes, `pg_trgm` GiST indexes, B-tree indexes on `bpchar`), (see [which indexes to rebuild after the 18.7 update](/blog/postgres-18-7-update-reindex)), so it is a good moment to look at what `reindexdb` can do, how `--concurrently` and `--jobs` interact, which errors it raises, and two `reindexdb` fixes in PostgreSQL 18.7.
+
+The examples below were run with `reindexdb` from PostgreSQL 18.7, 18.6 and 17.12.
+
+## What reindexdb Does
+
+`reindexdb` connects to a database, works out which objects you asked for, and sends `REINDEX` statements. With `-e` (`--echo`) you can see them:
+
+```bash
+reindexdb -d app -j 2 --concurrently -t r1 -t r2 -e
+```
+
+```
+REINDEX TABLE CONCURRENTLY public.r1;
+REINDEX TABLE CONCURRENTLY public.r2;
+```
+
+Everything it does, you could do in `psql`. What it adds is target selection (all databases, a schema, several tables), parallelism across connections, and an exit status that scripts can check.
+
+The main options, from `reindexdb --help`:
+
+| Option | Meaning |
+|---|---|
+| `-a`, `--all` | reindex all databases |
+| `-d`, `--dbname` | database to reindex |
+| `-S`, `--schema` | only this schema (repeatable) |
+| `-t`, `--table` | only this table (repeatable) |
+| `-i`, `--index` | only this index (repeatable) |
+| `-s`, `--system` | only system catalogs |
+| `--concurrently` | use `REINDEX ... CONCURRENTLY` |
+| `-j`, `--jobs` | number of parallel connections |
+| `--tablespace` | rebuild indexes in this tablespace |
+| `-v`, `-e`, `-q` | verbose server output, echo SQL, quiet |
+
+Connection options (`-h`, `-p`, `-U`, `-w`, `-W`, `--maintenance-db`) work as in other client tools, and the usual `PG*` environment variables apply.
+
+## Common Commands
+
+Rebuild every index in one database, without blocking writes:
+
+```bash
+reindexdb -d app --concurrently -j 4
+```
+
+Rebuild the indexes of one schema, showing progress from the server:
+
+```bash
+reindexdb -d app -S public -j 2 --concurrently -v
+```
+
+On our test database, that last command printed twelve `INFO:  index "..." was reindexed` lines, including the TOAST indexes of the tables in the schema, which `REINDEX TABLE` rebuilds along with the table's own indexes.
+
+Rebuild specific indexes, for example the ones a release note told you to rebuild:
+
+```bash
+reindexdb -d app --concurrently -i public.docs_body_trgm -i public.tags_gin
+```
+
+Rebuild every database in the cluster:
+
+```bash
+reindexdb -a -j 4 --concurrently
+```
+
+With `-a --concurrently`, tables that have nothing to rebuild concurrently produce notices such as `NOTICE:  table "b" has no indexes that can be reindexed concurrently`. Those are harmless.
+
+## --concurrently: What It Buys and What It Costs
+
+Plain `REINDEX` locks out writes to the table (and reads that would use the index) for the whole rebuild. `REINDEX CONCURRENTLY` builds a new copy of each index next to the old one, swaps them, and drops the old one, holding only brief stronger locks. On a production database it is almost always the right choice. The trade-offs:
+
+- **It takes longer** and needs disk space for a second copy of every index being rebuilt.
+- **It cannot run inside a transaction block**, which matters for `-j` as shown below.
+- **It does not apply to system catalogs.** `reindexdb --concurrently -s` fails with `ERROR:  cannot reindex system catalogs concurrently`.
+- **A failure leaves debris.** If a concurrent rebuild is canceled or fails, the half-built copy remains as an invalid index with the suffix `_ccnew`.
+
+Check free space before a large concurrent run. The size of each index you rebuild is a lower bound for the extra space needed while both copies exist; for a whole table, add up its indexes:
+
+```sql
+SELECT pg_size_pretty(pg_indexes_size('r1'))    AS all_indexes_of_r1,
+       pg_size_pretty(pg_relation_size('r1_v')) AS one_index;
+```
+
+WAL volume also grows during the rebuild, because the new index is fully WAL-logged, which matters for replicas and for WAL archive storage.
+
+Here is the last point in action. We canceled a concurrent rebuild of a 207 MB index with a statement timeout:
+
+```bash
+PGOPTIONS="-c statement_timeout=300" reindexdb -d postgres --concurrently -i r1_v
+```
+
+```
+reindexdb: error: processing of database "postgres" failed: ERROR:  canceling statement due to statement timeout
+```
+
+```sql
+SELECT c.relname, i.indisvalid
+FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid
+WHERE i.indrelid = 'r1'::regclass ORDER BY 1;
+```
+
+```
+  relname   | indisvalid
+------------+------------
+ r1_pkey    | t
+ r1_v       | t
+ r1_v_ccnew | f
+```
+
+The original `r1_v` is untouched and valid, but `r1_v_ccnew` still takes up space and slows down every write to the table, because PostgreSQL keeps invalid indexes up to date. Drop it:
+
+```sql
+DROP INDEX CONCURRENTLY r1_v_ccnew;
+```
+
+After any failed `reindexdb --concurrently` run, look for leftovers across the database:
+
+```sql
+SELECT n.nspname, c.relname
+FROM pg_index i
+JOIN pg_class c ON c.oid = i.indexrelid
+JOIN pg_namespace n ON n.oid = c.relnamespace
+WHERE NOT i.indisvalid AND c.relname ~ '_ccnew[0-9]*$';
+```
+
+## --jobs: Parallel Rebuilds
+
+`-j N` opens N connections and rebuilds several objects at once. How it splits the work depends on the target:
+
+- With `-d`, `-S` or `-t`, it runs one `REINDEX TABLE` per table in parallel, so the indexes of a single big table are still rebuilt one after another.
+- With `-i` and without `--concurrently`, it groups the indexes by table and runs them in parallel. With `-e` you see `REINDEX INDEX public.r1_pkey;` and `REINDEX INDEX public.r1_v;`. This worked with both 17.12 and 18.7.
+- With `-s`, parallelism is refused: `reindexdb: error: cannot use multiple jobs to reindex system catalogs`.
+
+### -j with --concurrently and -i: the 18.7 Fix
+
+The combination of `-j`, `--concurrently` and `-i` is where 18.6 went wrong. `reindexdb` 18.6 sent the indexes of one table as a single multi-statement string:
+
+```
+REINDEX INDEX CONCURRENTLY public.r1_pkey;
+REINDEX INDEX CONCURRENTLY public.r1_v;
+reindexdb: error: processing of database "postgres" failed: ERROR:  REINDEX CONCURRENTLY cannot run inside a transaction block
+```
+
+A multi-statement string runs as an implicit transaction block, and `REINDEX CONCURRENTLY` refuses to run in one, so the server rejected it. The error was confusing because nothing in the command line mentioned a transaction. The 18.7 release notes describe the fix: `reindexdb` now "errors cleanly when an index-level REINDEX CONCURRENTLY is requested with multiple jobs". With 18.7 (and 17.12):
+
+```
+reindexdb: error: cannot use multiple jobs to reindex indexes concurrently
+```
+
+The workaround is the same for both versions: drop `-j` when you rebuild individual indexes concurrently.
+
+```bash
+reindexdb -d app --concurrently -i public.r1_v -i public.r1_pkey
+```
+
+This runs the indexes one after another, each in its own statement. If you need parallelism, run several `reindexdb` processes for indexes on different tables, or use `-t` with `-j`.
+
+## Watching a Rebuild in Progress
+
+`REINDEX` reports its progress in `pg_stat_progress_create_index`, so you can follow a long `reindexdb` run from another session:
+
+```sql
+SELECT command, phase, blocks_done, blocks_total, tuples_done, tuples_total,
+       index_relid::regclass
+FROM pg_stat_progress_create_index;
+```
+
+Sampling it every 0.4 seconds while `reindexdb --concurrently -i r1_v` rebuilt an index on a 2.5-million-row table showed the phases of a concurrent rebuild:
+
+```
+REINDEX CONCURRENTLY | building index: scanning table        |  7323 | 20834 |       0 |       0 | r1_v_ccnew
+REINDEX CONCURRENTLY | building index: sorting live tuples   |     0 |     0 |       0 | 2500000 | r1_v_ccnew
+REINDEX CONCURRENTLY | building index: loading tuples in tree|     0 |     0 |  563922 | 2500000 | r1_v_ccnew
+REINDEX CONCURRENTLY | building index: loading tuples in tree|     0 |     0 | 2500000 | 2500000 | r1_v_ccnew
+REINDEX CONCURRENTLY | index validation: scanning table      | 10678 | 20834 |       0 |       0 | r1_v_ccnew
+```
+
+The work happens on the `_ccnew` copy, and a concurrent rebuild scans the table twice: once to build the new index and once to validate it against changes made in the meantime. Comparing `blocks_done` with `blocks_total` in each scan gives a rough completion estimate.
+
+## The Security Fix: Quoting Index Names
+
+The 18.7 release notes also list, under security fixes, that `reindexdb` now quotes index names correctly, because "crafted names could cause SQL injection". `reindexdb` builds SQL from object names it reads from the catalogs, so an index created with a deliberately malicious name could inject SQL when a privileged user later ran `reindexdb` over that database. The same releases fixed similar issues in `vacuumdb` (fully qualified operator names) and `pg_dump` (quoting of `NOT NULL` constraint names).
+
+Since `reindexdb` usually runs as a superuser or the database owner, update the client binaries on every host that runs maintenance jobs, not just the servers. Check with `reindexdb --version`.
+
+## Errors and What They Mean
+
+A table or index that does not exist is reported with the catalog query that failed:
+
+```
+reindexdb: error: query failed: ERROR:  relation "nope" does not exist
+LINE 4:   AND c.oid OPERATOR(pg_catalog.=) 'nope'::pg_catalog.regcla...
+                                           ^
+reindexdb: detail: Query was: SELECT c.relname, ns.nspname
+ FROM pg_catalog.pg_class c, pg_catalog.pg_namespace ns
+ WHERE c.relnamespace OPERATOR(pg_catalog.=) ns.oid
+  AND c.oid OPERATOR(pg_catalog.=) 'nope'::pg_catalog.regclass;
+```
+
+Unqualified names are looked up through the normal `search_path`, so a table in another schema needs its schema: `-t orders` failed with this error for `sales.orders`, while `-t sales.orders` ran `REINDEX TABLE sales.orders;`.
+
+A bad tablespace fails on the server:
+
+```
+reindexdb: error: processing of database "postgres" failed: ERROR:  tablespace "nope" does not exist
+```
+
+An invalid job count fails before connecting:
+
+```
+reindexdb: error: -j/--jobs must be in range 1..2147483647
+```
+
+`reindexdb` exits with status 1 on any error, so `set -e` in a shell script or a non-zero check in a scheduler catches failures.
+
+## A Maintenance Script
+
+```bash
+#!/bin/bash
+set -euo pipefail
+export PGOPTIONS="-c lock_timeout=10s"
+
+# rebuild what the update notes asked for, one index at a time, without blocking writes
+reindexdb -d app --concurrently \
+  -i public.docs_body_trgm \
+  -i public.events_payload_gin
+
+# report leftovers from any earlier failed concurrent rebuild
+psql -d app -v ON_ERROR_STOP=1 -Atc "
+  SELECT format('%I.%I', n.nspname, c.relname)
+  FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid
+  JOIN pg_namespace n ON n.oid = c.relnamespace
+  WHERE NOT i.indisvalid"
+```
+
+`lock_timeout` keeps a concurrent rebuild from queuing indefinitely behind a long transaction for the short locks it still needs. If it times out, you get the same `_ccnew` leftovers, which the second step reports.
+
+Deciding what to rebuild is the harder part: finding GIN indexes, `gist_trgm_ops` indexes or `bpchar` B-trees across many databases. In [Chat2DB](https://chat2db.ai/download) you can run the catalog query that lists those indexes against each database, review the list, and then paste the index names into the `reindexdb` command.
+
+## Summary
+
+`reindexdb` rebuilds indexes for a whole cluster (`-a`), a database, a schema (`-S`), tables (`-t`) or individual indexes (`-i`), optionally with `--concurrently` and parallel jobs (`-j`). Concurrent rebuilds avoid write locks but need extra disk space, do not work on system catalogs, and leave invalid `_ccnew` indexes behind when they fail. In 18.6, `-j --concurrently -i` failed with a confusing `REINDEX CONCURRENTLY cannot run inside a transaction block`; 18.7 and 17.12 reject the combination up front, so drop `-j` for concurrent index-level rebuilds. Update `reindexdb` itself as well as the server, because 18.7 also fixes SQL injection through crafted index names.

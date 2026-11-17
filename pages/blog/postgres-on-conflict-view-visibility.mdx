@@ -1,0 +1,247 @@
+---
+title: "INSERT ON CONFLICT Through a View: 18.7 Change"
+description: "PostgreSQL 18.7 rejects ON CONFLICT DO UPDATE on rows a view hides, with error 55000. See the old behavior, the security issue, and how to rewrite upserts."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: November 16, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# INSERT ON CONFLICT Through a View: 18.7 Change
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="November 16, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+Updatable views are a common way to give an application or a role a slice of a table: `CREATE VIEW active_users AS SELECT ... FROM users WHERE active`, grant `INSERT` and `UPDATE` on the view, and keep the base table private. Until the November 2026 update releases, there was a hole in that design. An `INSERT ... ON CONFLICT DO UPDATE` through the view could update a row that the view's `WHERE` clause hides.
+
+PostgreSQL 18.7 (and the other update releases from November 12, 2026) closes it. The release notes describe the old behavior as documented but "surely unexpected", note that "a user can update rows he should have no privilege to reach", and list it as a security fix. Since 18.7, such a statement fails with a new error:
+
+```
+ERROR:  conflicting row is not visible through view "active_users"
+```
+
+This article shows the old and new behavior side by side, explains which statements are affected, and gives patterns for upserts that work with the new rule. All output comes from PostgreSQL 18.6 and 18.7.
+
+## The Setup
+
+```sql
+CREATE TABLE users (
+  id     int PRIMARY KEY,
+  email  text UNIQUE,
+  name   text,
+  active boolean NOT NULL DEFAULT true,
+  tenant int
+);
+INSERT INTO users VALUES
+  (1, 'ann@x.com', 'Ann', true,  1),
+  (2, 'bob@x.com', 'Bob', false, 1),
+  (3, 'cy@x.com',  'Cy',  true,  2);
+
+CREATE VIEW active_users AS
+  SELECT id, email, name, active, tenant FROM users WHERE active;
+
+CREATE VIEW active_users_chk AS
+  SELECT id, email, name, active, tenant FROM users WHERE active
+  WITH CHECK OPTION;
+```
+
+Bob (id 2) is inactive, so neither view shows him.
+
+## Old Behavior: Updating a Hidden Row
+
+On PostgreSQL 18.6, an upsert through the view that conflicts with Bob's row updates it:
+
+```sql
+INSERT INTO active_users (id, email, name) VALUES (2, 'bob@x.com', 'Bobby')
+ON CONFLICT (id) DO UPDATE SET name = EXCLUDED.name
+RETURNING *;
+```
+
+```
+ id |   email   | name  | active | tenant
+----+-----------+-------+--------+--------
+  2 | bob@x.com | Bobby | f      |      1
+```
+
+The statement both changed a row that the view does not contain and returned it, including columns of a row the caller should not be able to see.
+
+### Why It Is a Security Problem
+
+Give a role access to the view only:
+
+```sql
+CREATE ROLE support_agent;
+GRANT SELECT, INSERT, UPDATE ON active_users TO support_agent;
+SET ROLE support_agent;
+
+SELECT * FROM users;
+-- ERROR:  42501: permission denied for table users
+
+INSERT INTO active_users (id, email, name) VALUES (2, 'bob@x.com', 'changed-by-agent')
+ON CONFLICT (id) DO UPDATE SET email = 'attacker@evil.test'
+RETURNING id, email;
+```
+
+On 18.6:
+
+```
+ id |       email
+----+--------------------
+  2 | attacker@evil.test
+```
+
+The role cannot read the table, and the view is supposed to restrict it to active users, yet it changed the email address of a deactivated account by guessing its id. If the view is your tenant or visibility boundary, that is privilege escalation.
+
+## New Behavior in 18.7
+
+The same statements on PostgreSQL 18.7:
+
+```
+ERROR:  55000: conflicting row is not visible through view "active_users"
+```
+
+The SQLSTATE is `55000` (`object_not_in_prerequisite_state`). Nothing is updated, and Bob's row keeps its original values. The release notes explain the choice of an error: updating the hidden row is wrong, but inserting is impossible as well, because the unique index already has that key.
+
+Here is how each variant behaves:
+
+| Statement through the view | 18.6 | 18.7 |
+|---|---|---|
+| `DO UPDATE`, conflicting row hidden | updates it | error 55000 |
+| `DO UPDATE ... WHERE active_users.active`, row hidden | 0 rows, no change | error 55000 |
+| `DO UPDATE` on a `WITH CHECK OPTION` view, row hidden | `new row violates check option for view` | error 55000 |
+| `DO UPDATE`, conflict on another unique index (email) of a hidden row | updates it | error 55000 |
+| `DO NOTHING`, row hidden | 0 rows | 0 rows |
+| `DO UPDATE`, conflicting row visible | updates it | updates it |
+| Plain `INSERT`, row hidden | `23505 duplicate key` | `23505 duplicate key` |
+
+A few things stand out:
+
+- **A `WHERE` on `DO UPDATE` no longer avoids the problem.** On 18.6, `ON CONFLICT (id) DO UPDATE SET ... WHERE active_users.active` quietly did nothing for hidden rows. On 18.7 the visibility check runs first and the statement errors.
+- **`WITH CHECK OPTION` was only a partial defense.** On 18.6 it blocked the update only because the updated row failed the check (`DETAIL: Failing row contains (2, bob@x.com, Robert, f, 1)`), which also leaked the hidden row's contents in the error detail. 18.7 reports the visibility error without the row.
+- **`DO NOTHING` is unchanged.** It never touched the hidden row, so it still succeeds and returns nothing for that key.
+
+PostgreSQL 19's `ON CONFLICT DO SELECT` gets the matching treatment: per the release notes, it no longer returns rows that the view hides.
+
+## Will This Break My Application?
+
+Only if your code relied on upserting through a view into rows the view excludes. Typical patterns that hit the new error:
+
+- Soft-delete views (`WHERE deleted_at IS NULL`) where a re-signup of a deleted user did an upsert by email through the view and silently reactivated or overwrote the old row.
+- Tenant views (`WHERE tenant_id = current_setting('app.tenant')::int`) where ids or natural keys can collide across tenants.
+- Archive views where a background job upserts by primary key.
+
+Search your code for `ON CONFLICT` statements whose target is a view. `pg_views` and `information_schema.views` list your views; any upsert into one of those names is a candidate.
+
+### Listing the Views That Can Receive Upserts
+
+Only automatically updatable views (or views with `INSTEAD OF` triggers) accept `INSERT`, so the candidates are easy to list:
+
+```sql
+SELECT table_schema, table_name, is_insertable_into, is_updatable
+FROM information_schema.views
+WHERE table_schema NOT IN ('pg_catalog', 'information_schema')
+  AND is_insertable_into = 'YES'
+ORDER BY 1, 2;
+```
+
+```
+ table_schema |    table_name    | is_insertable_into | is_updatable
+--------------+------------------+--------------------+--------------
+ public       | active_users     | YES                | YES
+ public       | active_users_chk | YES                | YES
+```
+
+If `pg_stat_statements` is installed, search its `query` column for `ON CONFLICT` combined with those view names to find the statements your applications actually run, including ones generated by an ORM that never appear in your source code. Then reproduce each one on a test server with a row the view hides. A view that filters on a column the application never changes (a tenant id, for example) only hits the new error when keys collide across the filter, so make sure the test data includes such a collision.
+
+## Rewriting Upserts for the New Rule
+
+### Option 1: Decide Explicitly on the Base Table with MERGE
+
+(For how `MERGE` and `ON CONFLICT` differ under concurrency in general, see [MERGE vs INSERT ON CONFLICT](/blog/postgres-merge-vs-on-conflict).)
+
+If the code is allowed to see the base table, `MERGE` expresses "update only visible rows, ignore hidden ones, insert new ones" directly:
+
+```sql
+MERGE INTO users u
+USING (VALUES (2, 'bob@x.com', 'Bob M'), (4, 'dan@x.com', 'Dan')) s(id, email, name)
+ON u.id = s.id
+WHEN MATCHED AND u.active THEN UPDATE SET name = s.name
+WHEN MATCHED THEN DO NOTHING
+WHEN NOT MATCHED THEN INSERT (id, email, name) VALUES (s.id, s.email, s.name)
+RETURNING merge_action(), u.id, u.name, u.active;
+```
+
+```
+ merge_action | id | name | active
+--------------+----+------+--------
+ INSERT       |  4 | Dan  | t
+```
+
+Bob's hidden row matched the second `WHEN MATCHED` branch and was left alone; Dan was inserted. Note that running the same `MERGE` against the view itself does not help: the view hides Bob, so `MERGE` takes the `NOT MATCHED` branch and fails with `duplicate key value violates unique constraint "users_pkey"` on both versions.
+
+### Option 2: Keep the View and Report Skipped Keys
+
+If the role may only use the view, `DO NOTHING` plus a comparison tells you which keys already exist (visible or not) without touching them:
+
+```sql
+WITH ins AS (
+  INSERT INTO active_users (id, email, name)
+  VALUES (2, 'bob@x.com', 'Bobby'), (5, 'eli@x.com', 'Eli')
+  ON CONFLICT (id) DO NOTHING
+  RETURNING id
+)
+SELECT v.id, (ins.id IS NOT NULL) AS inserted
+FROM (VALUES (2), (5)) v(id) LEFT JOIN ins USING (id);
+```
+
+```
+ id | inserted
+----+----------
+  5 | t
+  2 | f
+```
+
+Then run a normal `UPDATE active_users ... WHERE id = ANY(...)` for the keys that were not inserted. The `UPDATE` through the view only reaches visible rows, so hidden ones are skipped by design.
+
+### Option 3: Handle the Error
+
+Where a hidden conflict is genuinely exceptional, catch it. In PL/pgSQL the condition name is `object_not_in_prerequisite_state`:
+
+```sql
+DO $$
+BEGIN
+  INSERT INTO active_users (id, email, name) VALUES (2, 'bob@x.com', 'B')
+  ON CONFLICT (id) DO UPDATE SET name = EXCLUDED.name;
+EXCEPTION WHEN object_not_in_prerequisite_state THEN
+  RAISE NOTICE 'row % exists but is hidden by the view: %', 2, SQLERRM;
+END $$;
+```
+
+```
+NOTICE:  row 2 exists but is hidden by the view: conflicting row is not visible through view "active_users"
+```
+
+In application code, match on SQLSTATE `55000` rather than the message text. Be aware that `55000` is also used by unrelated errors, so log the message as well.
+
+### Option 4: A Function That Owns the Rule
+
+For an API role, a `SECURITY DEFINER` function that runs the `MERGE` above on the base table keeps the business rule (what happens to inactive users) in one place, while the role still has no direct table privileges. Set `search_path` on the function and grant `EXECUTE` only to the roles that need it.
+
+## A Related Fix: RLS and ON CONFLICT
+
+The same releases also fixed the order of checks for row-level security: PostgreSQL now checks the conflicting row against RLS policies before applying the user's own conditions, so a leaky function in a `DO UPDATE ... WHERE` clause can no longer observe rows a policy forbids. If you use RLS instead of views for tenant isolation, that fix applies to you even though the error message above does not.
+
+## Upgrade Checklist
+
+1. Install the update release for your major version (18.7, 17.12, 16.16, 15.20 or 14.25).
+2. Search for `ON CONFLICT ... DO UPDATE` statements that target views, including ORM-generated upserts.
+3. Run them against a test database on the new version with data that includes hidden rows, and look for `55000`.
+4. Rewrite the ones that fail using `MERGE`, `DO NOTHING` plus `UPDATE`, or explicit error handling.
+
+Running the same upsert against an 18.6 and an 18.7 test server, with the same data, is the quickest way to find out which statements change behavior. [Chat2DB](https://chat2db.ai/download) lets you keep both connections open and rerun a statement on each to compare the results and errors.
+
+## Summary
+
+Before the November 2026 releases, `INSERT ... ON CONFLICT DO UPDATE` through a view could update and return rows that the view's `WHERE` clause hides, which let a role with access only to the view modify rows it should never reach. PostgreSQL 18.7 and the matching releases for 14 to 17 raise `55000: conflicting row is not visible through view` instead, even when the `DO UPDATE` has its own `WHERE` or the view has `WITH CHECK OPTION`. `DO NOTHING` and upserts on visible rows are unaffected. Replace upserts that relied on the old behavior with `MERGE` on the base table, `DO NOTHING` followed by an `UPDATE` through the view, or explicit handling of SQLSTATE `55000`.

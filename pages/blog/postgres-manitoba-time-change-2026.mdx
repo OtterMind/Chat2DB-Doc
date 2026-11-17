@@ -1,0 +1,244 @@
+---
+title: "Manitoba Time Change 2026: PostgreSQL tzdata Fix"
+description: "Manitoba and the Northwest Territories stay on UTC-5 and UTC-6 all year from November 2026. See what changes in PostgreSQL timestamps and how to fix old rows."
+image: "/blog/image/9908.jpg"
+category: "Technical Article"
+date: November 16, 2026
+---
+[![Click to use](/image/blog/bg/chat2db1.png)](https://app.chat2db.ai/)
+# Manitoba Time Change 2026: PostgreSQL tzdata Fix
+
+import Authors, { Author } from "components/authors";
+
+<Authors date="November 16, 2026">
+  <Author name="Chat2DB Team" link="https://chat2db.ai" />
+</Authors>
+
+On November 1, 2026, clocks in Winnipeg did not fall back. Manitoba stayed on UTC-5, the offset it had used all summer, and it will keep that offset all year. Canada's Northwest Territories made the same kind of move: Inuvik and the rest of the territory now stay on UTC-6 all year. The time zone database (tzdata) recorded both changes in release 2026f, and the PostgreSQL update releases of November 12, 2026 (18.7, 17.12, 16.16, 15.20 and 14.25) ship that tzdata.
+
+If your database stores appointments, shifts, delivery windows or billing cutoffs for people in Manitoba or the Northwest Territories, this is not just a news item. Depending on how you store times, rows written before the update can now show a different local time than the one the user typed. This article shows exactly what changes, using a PostgreSQL 18.6 cluster (tzdata 2026c) upgraded in place to 18.7 (tzdata 2026f), and how to find and fix the affected rows.
+
+## What Changed in tzdata 2026f
+
+The relevant zones are `America/Winnipeg` (Manitoba) and `America/Inuvik` (Northwest Territories). The 18.7 release notes summarize the change: from November 2026, the Northwest Territories are on year-round UTC-6 and Manitoba is on year-round UTC-5. tzdata currently labels the new standard time CST for Inuvik and EST for Winnipeg, and the release notes warn that these abbreviations could still change. The same tzdata release also keeps Cuba (`America/Havana`) on daylight saving time this winter.
+
+Here is the same set of instants viewed through both versions. The session runs in UTC and converts a January and a July 2027 timestamp into each zone:
+
+```sql
+SET timezone = 'UTC';
+SELECT z, ts AT TIME ZONE z AS local_time
+FROM (VALUES ('America/Winnipeg'), ('America/Inuvik'), ('America/Havana'), ('America/Toronto')) v(z),
+     (VALUES (timestamptz '2027-01-15 17:00+00'), (timestamptz '2027-07-15 17:00+00')) w(ts)
+ORDER BY z, ts;
+```
+
+On PostgreSQL 18.6:
+
+```
+        z         |     local_time
+------------------+---------------------
+ America/Havana   | 2027-01-15 12:00:00
+ America/Havana   | 2027-07-15 13:00:00
+ America/Inuvik   | 2027-01-15 10:00:00
+ America/Inuvik   | 2027-07-15 11:00:00
+ America/Toronto  | 2027-01-15 12:00:00
+ America/Toronto  | 2027-07-15 13:00:00
+ America/Winnipeg | 2027-01-15 11:00:00
+ America/Winnipeg | 2027-07-15 12:00:00
+```
+
+On PostgreSQL 18.7:
+
+```
+        z         |     local_time
+------------------+---------------------
+ America/Havana   | 2027-01-15 13:00:00
+ America/Havana   | 2027-07-15 13:00:00
+ America/Inuvik   | 2027-01-15 11:00:00
+ America/Inuvik   | 2027-07-15 11:00:00
+ America/Toronto  | 2027-01-15 12:00:00
+ America/Toronto  | 2027-07-15 13:00:00
+ America/Winnipeg | 2027-01-15 12:00:00
+ America/Winnipeg | 2027-07-15 12:00:00
+```
+
+Summer times are identical. Winter times in Winnipeg, Inuvik and Havana are one hour later, because those places no longer switch back to standard time. Toronto is the control row and does not change.
+
+`pg_timezone_names` shows the current offset and abbreviation of each zone. Run on November 16, 2026:
+
+```
+       name       | abbrev | utc_offset | is_dst
+------------------+--------+------------+--------
+ America/Chicago  | CST    | -06:00:00  | f
+ America/Inuvik   | CST    | -06:00:00  | f      -- 18.6 showed MST, -07:00
+ America/Winnipeg | EST    | -05:00:00  | f      -- 18.6 showed CST, -06:00
+```
+
+Note `is_dst = f`: tzdata models the new Winnipeg time as standard time at UTC-5, not as permanent daylight time.
+
+### The Transition Itself
+
+Walking through the morning of November 1, 2026 in Winnipeg shows where the rules split:
+
+```sql
+SET timezone = 'America/Winnipeg';
+SELECT g AS utc, to_char(g, 'TZ OF') AS abbrev_offset
+FROM generate_series(timestamptz '2026-11-01 06:00+00',
+                     timestamptz '2026-11-01 09:00+00', interval '1 hour') g;
+```
+
+18.6 says the clocks fell back from CDT (-05) to CST (-06), so the hour from 01:00 to 02:00 happened twice. 18.7 says the offset stayed at -05 and only the abbreviation changed from CDT to EST:
+
+```
+-- 18.6                                   -- 18.7
+2026-11-01 01:00:00-05 | CDT -05          2026-11-01 01:00:00-05 | CDT -05
+2026-11-01 01:00:00-06 | CST -06          2026-11-01 02:00:00-05 | EST -05
+2026-11-01 02:00:00-06 | CST -06          2026-11-01 03:00:00-05 | EST -05
+```
+
+A side effect: in 18.6, the local time `2026-11-01 01:30` was ambiguous and PostgreSQL resolved it to `-06`. In 18.7 it is a normal time at `-05`. Next spring, 18.6 would also skip from 02:00 to 03:00 on March 14, 2027 (`'2027-03-14 02:30'` became `03:30-05`); 18.7 keeps 02:30 as a valid time.
+
+## What Happens to Rows You Already Stored
+
+This is the part that matters for applications. The effect depends on the column type.
+
+- `timestamptz` stores an absolute instant (internally, UTC). When you insert `'2027-01-15 09:00'` with the session in `America/Winnipeg`, PostgreSQL converts that local time to UTC **with the rules it has at insert time**, then forgets the local time.
+- `timestamp` (without time zone) stores the wall-clock reading as typed. It has no offset at all.
+
+To see the consequence, we created a table on 18.6, stopped the server and started the same data directory with 18.7 binaries, which is exactly what a minor update does:
+
+```sql
+CREATE TABLE appointments (
+  id          int PRIMARY KEY,
+  starts_at   timestamptz,   -- absolute instant
+  local_start timestamp,     -- wall-clock time
+  tz          text
+);
+SET timezone = 'America/Winnipeg';
+INSERT INTO appointments VALUES
+ (1, '2026-10-20 09:00', '2026-10-20 09:00', 'America/Winnipeg'),
+ (2, '2026-12-15 09:00', '2026-12-15 09:00', 'America/Winnipeg'),
+ (3, '2027-01-15 09:00', '2027-01-15 09:00', 'America/Winnipeg'),
+ (4, '2027-07-15 09:00', '2027-07-15 09:00', 'America/Winnipeg');
+
+SELECT id, starts_at, starts_at AT TIME ZONE 'UTC' AS starts_utc,
+       local_start, local_start AT TIME ZONE tz AS local_as_instant
+FROM appointments ORDER BY id;
+```
+
+Before the update (18.6):
+
+```
+ id |       starts_at        |     starts_utc      |     local_start     |    local_as_instant
+----+------------------------+---------------------+---------------------+------------------------
+  1 | 2026-10-20 09:00:00-05 | 2026-10-20 14:00:00 | 2026-10-20 09:00:00 | 2026-10-20 09:00:00-05
+  2 | 2026-12-15 09:00:00-06 | 2026-12-15 15:00:00 | 2026-12-15 09:00:00 | 2026-12-15 09:00:00-06
+  3 | 2027-01-15 09:00:00-06 | 2027-01-15 15:00:00 | 2027-01-15 09:00:00 | 2027-01-15 09:00:00-06
+  4 | 2027-07-15 09:00:00-05 | 2027-07-15 14:00:00 | 2027-07-15 09:00:00 | 2027-07-15 09:00:00-05
+```
+
+After the update (same data directory, 18.7):
+
+```
+ id |       starts_at        |     starts_utc      |     local_start     |    local_as_instant
+----+------------------------+---------------------+---------------------+------------------------
+  1 | 2026-10-20 09:00:00-05 | 2026-10-20 14:00:00 | 2026-10-20 09:00:00 | 2026-10-20 09:00:00-05
+  2 | 2026-12-15 10:00:00-05 | 2026-12-15 15:00:00 | 2026-12-15 09:00:00 | 2026-12-15 09:00:00-05
+  3 | 2027-01-15 10:00:00-05 | 2027-01-15 15:00:00 | 2027-01-15 09:00:00 | 2027-01-15 09:00:00-05
+  4 | 2027-07-15 09:00:00-05 | 2027-07-15 14:00:00 | 2027-07-15 09:00:00 | 2027-07-15 09:00:00-05
+```
+
+Rows 2 and 3 are the problem. The stored UTC instant did not change (15:00 UTC), but that instant now reads as 10:00 in Winnipeg. A dentist appointment the patient booked for 9:00 now shows up at 10:00. Row 1 is in the past and row 4 is in summer, where the offset was -5 under both rule sets, so they are fine.
+
+The `timestamp` + zone column behaves the other way: the wall-clock time stays 09:00 and the computed instant moves by an hour, which is what a person who booked "9:00 local" expects.
+
+### Which Design Is Right?
+
+Neither type is wrong; they answer different questions. For events that already happened (logins, payments, sensor readings), `timestamptz` is correct: the instant is the fact, and a rule change cannot alter when something occurred. For future events defined by local clock time (meetings, store opening hours, recurring jobs at 9:00 local), the user's intent is the wall-clock time plus the place. Storing `timestamp` plus a zone name, and converting at read time, keeps that intent across tzdata updates. Many teams store both: the local time and zone as the source of truth, and a `timestamptz` that is recomputed when tzdata changes.
+
+## Finding the Affected Rows
+
+A row is affected if it is a `timestamptz`, it was written before your database (or application) got tzdata 2026f, it represents a local clock time, and it falls in a period where the old and new offsets differ. For Winnipeg that means the winter part of each year from November 1, 2026 onward. If you have a `created_at` column, you can narrow it down:
+
+```sql
+SELECT id, starts_at
+FROM appointments
+WHERE starts_at >= timestamptz '2026-11-01 07:00+00'   -- old fall-back moment
+  AND created_at < timestamptz '2026-11-12'              -- before you installed the update
+ORDER BY starts_at;
+```
+
+Use the date you actually installed the update, not the release date. If you use system tzdata (see below), the relevant date is when the OS `tzdata` package was updated and PostgreSQL restarted.
+
+## Repairing Winnipeg Rows
+
+Under the old rules, Winnipeg followed exactly the same offsets as `America/Chicago` from 2008 on; we checked every hour from 2008 to 2030 on tzdata 2026c and found zero differences. That gives a precise repair: read the stored instant as Chicago local time (the time the user typed, under the old rules), then convert that wall-clock time back to an instant with the new Winnipeg rules.
+
+```sql
+BEGIN;
+UPDATE appointments
+SET starts_at = (starts_at AT TIME ZONE 'America/Chicago') AT TIME ZONE 'America/Winnipeg'
+WHERE starts_at >= timestamptz '2026-11-01 07:00+00'
+  AND created_at < timestamptz '2026-11-12'
+RETURNING id, starts_at;
+```
+
+On the test table (without the `created_at` filter):
+
+```
+ id |       starts_at
+----+------------------------
+  2 | 2026-12-15 09:00:00-05
+  3 | 2027-01-15 09:00:00-05
+  4 | 2027-07-15 09:00:00-05
+```
+
+Rows 2 and 3 are back to 09:00. Row 4 matched the filter but came out unchanged, because in summer Chicago and new Winnipeg time are both UTC-5. Check the result, then `COMMIT`. Do not run the repair twice, and never run it on rows inserted after the update: those already used the new rules.
+
+Inuvik has a similar shortcut. Under tzdata 2026c, `America/Inuvik` had the same offsets as `America/Denver` for every hour from 2008 to 2030 (zero differences in the same check), so the repair reads the stored instant as Denver time and converts it back with the new Inuvik rules:
+
+```sql
+UPDATE appointments
+SET starts_at = (starts_at AT TIME ZONE 'America/Denver') AT TIME ZONE 'America/Inuvik'
+WHERE tz = 'America/Inuvik'
+  AND starts_at >= timestamptz '2026-11-01 08:00+00'
+  AND created_at < timestamptz '2026-11-12';
+```
+
+The same check also shows why the Northwest Territories moved: in the tzdata that 18.6 bundles (2026c), `America/Edmonton` (Alberta) and `America/Yellowknife` already stay at UTC-6 after November 1, 2026, and only Inuvik still fell back to UTC-7. In 18.7, Inuvik and Edmonton have identical offsets over the whole range. Alberta rows are therefore not affected by this particular minor update, but they were by whichever earlier update brought that change.
+
+## Where Your Tzdata Actually Comes From
+
+A PostgreSQL minor update is not always what brings the new rules. PostgreSQL can be built two ways:
+
+- With its own copy of tzdata, installed under `share/postgresql/timezone`. Updating PostgreSQL to 18.7 (or 17.12, 16.16, 15.20, 14.25) brings 2026f. 18.6 bundled 2026c.
+- With `--with-system-tzdata`, in which case it reads the operating system's `/usr/share/zoneinfo`. Many Linux packages are built this way. The rules then change when the OS `tzdata` package is updated, regardless of the PostgreSQL version.
+
+Check which one you have:
+
+```bash
+pg_config --configure | tr ' ' '\n' | grep -i tzdata
+```
+
+No output means the bundled copy. To see the system version on Linux, `head -1 /usr/share/zoneinfo/tzdata.zi` prints a line such as `# version 2026f` when that file exists.
+
+### Restart After Updating Tzdata
+
+PostgreSQL caches a zone once a process loads it. We replaced the `America/Winnipeg` file in an 18.6 installation whose server `timezone` setting was `America/Winnipeg`: new sessions and a configuration reload still showed the old offset, and only a restart picked up the new rules. A zone that the server had not loaded yet (`America/Inuvik` in our test) was read fresh by the next new session. So after an OS tzdata update, restart PostgreSQL. A minor version update restarts it anyway.
+
+Applications also carry their own tzdata: the JVM, Node.js (through ICU), Python's `zoneinfo` (system files or the `tzdata` package), browsers and mobile operating systems. If the application converts local times to UTC before sending them, the database update alone does not fix anything. Check each layer that converts times.
+
+## A Quick Checklist
+
+1. Find out whether PostgreSQL uses bundled or system tzdata, and whether you have 2026f (`SELECT abbrev, utc_offset FROM pg_timezone_names WHERE name = 'America/Winnipeg'` should show `EST` and `-05:00:00`).
+2. Update and restart. After that, new inserts use the new rules.
+3. List future `timestamptz` rows for Manitoba and Northwest Territories users written before the update, and repair them as shown above or from the application's record of the local time.
+4. Check application-side tzdata in the JVM, Node.js, Python, and mobile clients.
+5. Look at the other tzdata 2026f change while you are at it: [EST5EDT and PST8PDT now differ from America/New_York and America/Los_Angeles](/blog/postgres-est5edt-vs-america-new-york) for timestamps before 1967.
+6. For future-dated local events, consider storing the local time and the zone name rather than only an instant.
+
+Running the before-and-after queries is easier when you can look at both versions at once. In [Chat2DB](https://chat2db.ai/download) you can keep connections to an updated and a not-yet-updated server open side by side and compare `pg_timezone_names` or your own appointment tables directly.
+
+## Summary
+
+tzdata 2026f puts Manitoba on UTC-5 and the Northwest Territories on UTC-6 all year from November 2026, and keeps Cuba on daylight time this winter. PostgreSQL 18.7, 17.12, 16.16, 15.20 and 14.25 bundle it; builds that use system tzdata get it from the OS package. Instants stored in `timestamptz` keep their UTC value, so future winter rows entered as local Winnipeg or Inuvik times now display an hour later. Wall-clock `timestamp` columns keep their local value. Find rows written before the update, repair Winnipeg rows by reinterpreting them through `America/Chicago`, and restart PostgreSQL after any tzdata update so that every session uses the new rules.
